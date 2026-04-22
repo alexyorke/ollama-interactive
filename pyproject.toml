@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ollama-code"
+version = "0.1.0"
+description = "A local coding CLI that drives Ollama models with safe workspace tools."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "OpenAI Codex" }]
+
+[project.scripts]
+ollama-code = "ollama_code.cli:main"
+
+[tool.setuptools]
+packages = ["ollama_code"]
