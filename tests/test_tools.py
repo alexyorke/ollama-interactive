@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +12,13 @@ from ollama_code.tools import ToolExecutor
 
 
 class ToolExecutorTests(unittest.TestCase):
+    def init_git_repo(self, root: Path) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True, capture_output=True, text=True)
+
     def test_list_and_read_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -88,9 +96,80 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "123")
 
+    def test_run_test_uses_configured_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = f'"{sys.executable}" -c "print(321)"'
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["output"], "321")
+
+    def test_run_test_requires_configured_or_explicit_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            result = tools.run_test()
+        self.assertFalse(result["ok"])
+        self.assertIn("No test command", result["summary"])
+
     def test_read_only_blocks_shell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="read-only")
             result = tools.run_shell("echo denied")
+        self.assertFalse(result["ok"])
+        self.assertIn("read-only", result["summary"])
+
+    def test_git_status_and_diff(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.init_git_repo(root)
+            tracked = root / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+            tracked.write_text("before\nafter\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            status = tools.git_status()
+            diff = tools.git_diff(path="tracked.txt")
+
+        self.assertTrue(status["ok"])
+        self.assertIn("tracked.txt", status["output"])
+        self.assertTrue(diff["ok"])
+        self.assertIn("+after", diff["output"])
+
+    def test_git_commit_creates_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.init_git_repo(root)
+            tracked = root / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+            tracked.write_text("before\nafter\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.git_commit("Update tracked file")
+            subject = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(subject, "Update tracked file")
+
+    def test_read_only_blocks_git_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.init_git_repo(root)
+            tracked = root / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+            tracked.write_text("before\nafter\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="read-only")
+            result = tools.git_commit("Blocked commit")
         self.assertFalse(result["ok"])
         self.assertIn("read-only", result["summary"])

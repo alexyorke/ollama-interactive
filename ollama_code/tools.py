@@ -51,6 +51,30 @@ TOOL_DESCRIPTIONS = [
         "description": "Run a shell command inside the workspace.",
     },
     {
+        "name": "run_test",
+        "arguments": {
+            "command": "optional test command override; defaults to the configured test command",
+            "cwd": "relative path, default .",
+            "timeout": "seconds, default 1200",
+        },
+        "description": "Run the project's test command inside the workspace.",
+    },
+    {
+        "name": "git_status",
+        "arguments": {"path": "optional relative path filter"},
+        "description": "Show git status for the workspace or a specific path.",
+    },
+    {
+        "name": "git_diff",
+        "arguments": {"path": "optional relative path filter", "cached": "bool, default false", "context": "int, default 3"},
+        "description": "Show a git diff for working tree or staged changes.",
+    },
+    {
+        "name": "git_commit",
+        "arguments": {"message": "commit message", "add_all": "bool, default true"},
+        "description": "Create a git commit for the current workspace changes.",
+    },
+    {
         "name": "run_agent",
         "arguments": {
             "prompt": "subtask prompt for the child agent",
@@ -79,14 +103,19 @@ class ToolExecutor:
         approval_mode: ApprovalMode = "ask",
         input_func: Callable[[str], str] = input,
         agent_runner: AgentRunner | None = None,
+        test_command: str | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.approval_mode = approval_mode
         self.input_func = input_func
         self.agent_runner = agent_runner
+        self.default_test_command = test_command.strip() if isinstance(test_command, str) and test_command.strip() else None
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
+
+    def set_test_command(self, command: str | None) -> None:
+        self.default_test_command = command.strip() if isinstance(command, str) and command.strip() else None
 
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "run_agent":
@@ -105,6 +134,10 @@ class ToolExecutor:
             "write_file": self.write_file,
             "replace_in_file": self.replace_in_file,
             "run_shell": self.run_shell,
+            "run_test": self.run_test,
+            "git_status": self.git_status,
+            "git_diff": self.git_diff,
+            "git_commit": self.git_commit,
         }
         handler = handlers.get(name)
         if handler is None:
@@ -172,6 +205,32 @@ class ToolExecutor:
         if not approved:
             return False, "User rejected the shell command."
         return True, None
+
+    def _collect_process_output(self, completed: subprocess.CompletedProcess[str]) -> str:
+        parts = []
+        if completed.stdout.strip():
+            parts.append(completed.stdout.strip())
+        if completed.stderr.strip():
+            parts.append(completed.stderr.strip())
+        return "\n".join(parts) if parts else "(no output)"
+
+    def _run_git(self, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+        if shutil.which("git") is None:
+            raise RuntimeError("git is not installed.")
+        return subprocess.run(
+            ["git", *args],
+            cwd=self.workspace_root,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def _ensure_git_repo(self) -> tuple[bool, str | None]:
+        probe = self._run_git(["rev-parse", "--is-inside-work-tree"])
+        if probe.returncode == 0 and probe.stdout.strip() == "true":
+            return True, None
+        return False, self._collect_process_output(probe)
 
     def list_files(self, path: str = ".", max_depth: int = 4, limit: int = 200) -> dict[str, Any]:
         base = self.resolve_path(path, allow_missing=False)
@@ -258,6 +317,84 @@ class ToolExecutor:
             "tool": "search",
             "path": self.relative_label(base),
             "output": "\n".join(matches) if matches else "(no matches)",
+        }
+
+    def git_status(self, path: str | None = None) -> dict[str, Any]:
+        ok, error = self._ensure_git_repo()
+        if not ok:
+            return {"ok": False, "tool": "git_status", "summary": error or "Not inside a git repository."}
+        command = ["status", "--short", "--branch", "--untracked-files=all"]
+        relative_path = None
+        if path:
+            relative_path = self.relative_label(self.resolve_path(path, allow_missing=False))
+            command.extend(["--", relative_path])
+        result = self._run_git(command)
+        output = result.stdout.strip() or "(clean)"
+        if result.stderr.strip():
+            output = f"{output}\n{result.stderr.strip()}"
+        return {
+            "ok": result.returncode == 0,
+            "tool": "git_status",
+            "path": relative_path or ".",
+            "output": output,
+        }
+
+    def git_diff(self, path: str | None = None, cached: bool = False, context: int = 3) -> dict[str, Any]:
+        ok, error = self._ensure_git_repo()
+        if not ok:
+            return {"ok": False, "tool": "git_diff", "summary": error or "Not inside a git repository."}
+        command = ["diff", "--no-ext-diff", f"--unified={max(0, context)}"]
+        if cached:
+            command.append("--cached")
+        relative_path = None
+        if path:
+            relative_path = self.relative_label(self.resolve_path(path, allow_missing=False))
+            command.extend(["--", relative_path])
+        result = self._run_git(command)
+        output = self._collect_process_output(result)
+        if output == "(no output)":
+            output = "(no diff)"
+        return {
+            "ok": result.returncode == 0,
+            "tool": "git_diff",
+            "path": relative_path or ".",
+            "cached": cached,
+            "output": output,
+        }
+
+    def git_commit(self, message: str, add_all: bool = True) -> dict[str, Any]:
+        commit_message = message.strip()
+        if not commit_message:
+            return {"ok": False, "tool": "git_commit", "summary": "git_commit requires a non-empty commit message."}
+        ok, error = self._ensure_git_repo()
+        if not ok:
+            return {"ok": False, "tool": "git_commit", "summary": error or "Not inside a git repository."}
+        status = self._run_git(["status", "--short", "--branch", "--untracked-files=all"])
+        staged = self._run_git(["diff", "--cached", "--stat"])
+        working = self._run_git(["diff", "--stat"])
+        preview_parts = [f"Status:\n{status.stdout.strip() or '(clean)'}"]
+        if staged.stdout.strip():
+            preview_parts.append(f"Staged diff:\n{staged.stdout.strip()}")
+        if add_all and working.stdout.strip():
+            preview_parts.append(f"Working diff:\n{working.stdout.strip()}")
+        preview = "\n\n".join(preview_parts)
+        approved, reason = self._approve_mutation(f'Create git commit "{commit_message}"?', preview)
+        if not approved:
+            return {"ok": False, "tool": "git_commit", "summary": reason}
+        if add_all:
+            added = self._run_git(["add", "-A"])
+            if added.returncode != 0:
+                return {"ok": False, "tool": "git_commit", "summary": self._collect_process_output(added)}
+        has_changes = self._run_git(["diff", "--cached", "--quiet"])
+        if has_changes.returncode == 0:
+            return {"ok": False, "tool": "git_commit", "summary": "No staged changes to commit."}
+        committed = self._run_git(["commit", "-m", commit_message])
+        output = self._collect_process_output(committed)
+        return {
+            "ok": committed.returncode == 0,
+            "tool": "git_commit",
+            "summary": f'Created commit "{commit_message}".' if committed.returncode == 0 else output,
+            "output": output,
         }
 
     def write_file(self, path: str, content: str) -> dict[str, Any]:
@@ -372,12 +509,7 @@ class ToolExecutor:
             check=False,
             **shell_kwargs,
         )
-        parts = []
-        if completed.stdout.strip():
-            parts.append(completed.stdout.strip())
-        if completed.stderr.strip():
-            parts.append(completed.stderr.strip())
-        output = "\n".join(parts) if parts else "(no output)"
+        output = self._collect_process_output(completed)
         return {
             "ok": completed.returncode == 0,
             "tool": "run_shell",
@@ -385,3 +517,16 @@ class ToolExecutor:
             "exit_code": completed.returncode,
             "output": output,
         }
+
+    def run_test(self, command: str | None = None, cwd: str = ".", timeout: int = 1200) -> dict[str, Any]:
+        selected_command = command.strip() if isinstance(command, str) and command.strip() else self.default_test_command
+        if not selected_command:
+            return {
+                "ok": False,
+                "tool": "run_test",
+                "summary": "No test command is configured. Set --test-cmd or pass a command to run_test.",
+            }
+        result = self.run_shell(selected_command, cwd=cwd, timeout=timeout)
+        result["tool"] = "run_test"
+        result["command"] = selected_command
+        return result

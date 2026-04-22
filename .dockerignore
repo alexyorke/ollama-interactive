@@ -9,3 +9,4 @@ build/
 dist/
 *.egg-info/
 scratch/
+.ollama-code/

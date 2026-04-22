@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -8,6 +9,7 @@ from typing import Callable
 
 from ollama_code.agent import OllamaCodeAgent
 from ollama_code.ollama_client import OllamaClient, OllamaError
+from ollama_code.sessions import latest_session_path, load_transcript_payload, new_session_path, resolve_transcript_path
 from ollama_code.tools import ToolExecutor
 
 DEFAULT_MODEL = "batiai/gemma4-26b:iq4"
@@ -19,40 +21,73 @@ def build_parser() -> argparse.ArgumentParser:
         description="Local coding CLI powered by Ollama.",
     )
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name.")
+    parser.add_argument("--model", default=None, help="Ollama model name.")
     parser.add_argument("--host", default=None, help="Override the Ollama host.")
     parser.add_argument("--cwd", default=".", help="Workspace root.")
     parser.add_argument(
         "--approval",
         choices=["ask", "auto", "read-only"],
-        default="ask",
+        default=None,
         help="Approval policy for writes and shell commands.",
     )
+    session_group = parser.add_mutually_exclusive_group()
+    session_group.add_argument("--continue", dest="continue_session", action="store_true", help="Resume the most recent saved session in the workspace.")
+    session_group.add_argument("--resume", default=None, help="Resume a saved session from a transcript path.")
     parser.add_argument("--max-tool-rounds", type=int, default=8, help="Maximum tool rounds per user turn.")
     parser.add_argument("--max-agent-depth", type=int, default=2, help="Maximum nested sub-agent depth.")
     parser.add_argument("--timeout", type=int, default=300, help="Ollama request timeout in seconds.")
-    parser.add_argument("--session-file", default=None, help="Optional JSON transcript path.")
+    parser.add_argument("--test-cmd", default=None, help="Optional default test command for the run_test tool and /test.")
+    parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser
 
 
 def build_agent(args: argparse.Namespace, *, input_func: Callable[[str], str] = input) -> OllamaCodeAgent:
+    workspace_root = Path(args.cwd).resolve()
+    restored_payload: dict[str, object] | None = None
+    resume_path: Path | None = None
+    if args.resume:
+        resume_path = resolve_transcript_path(workspace_root, args.resume)
+        restored_payload = load_transcript_payload(resume_path)
+    elif args.continue_session:
+        resume_path = latest_session_path(workspace_root)
+        if resume_path is None:
+            raise ValueError(f"No saved sessions found in {workspace_root.as_posix()}/.ollama-code/sessions")
+        restored_payload = load_transcript_payload(resume_path)
+
+    model = args.model or DEFAULT_MODEL
+    approval = args.approval or "ask"
+    if restored_payload is not None:
+        saved_model = restored_payload.get("model")
+        saved_approval = restored_payload.get("approval_mode")
+        if args.model is None and isinstance(saved_model, str) and saved_model.strip():
+            model = saved_model
+        if args.approval is None and saved_approval in {"ask", "auto", "read-only"}:
+            approval = str(saved_approval)
+    session_file = args.session_file
+    if session_file is None:
+        session_file = resume_path or new_session_path(workspace_root)
     client = OllamaClient(host=args.host, timeout=args.timeout)
+    test_command = args.test_cmd or os.environ.get("OLLAMA_CODE_TEST_CMD")
     tools = ToolExecutor(
-        Path(args.cwd).resolve(),
-        approval_mode=args.approval,
+        workspace_root,
+        approval_mode=approval,
         input_func=input_func,
+        test_command=test_command,
     )
     status_printer = (lambda message: None) if args.quiet else (lambda message: print(f"[status] {message}"))
-    return OllamaCodeAgent(
+    agent = OllamaCodeAgent(
         client=client,
         tools=tools,
-        model=args.model,
+        model=model,
         max_tool_rounds=args.max_tool_rounds,
-        session_file=args.session_file,
+        session_file=session_file,
         status_printer=status_printer,
         max_agent_depth=args.max_agent_depth,
     )
+    if restored_payload is not None:
+        agent.restore_transcript(restored_payload)
+    return agent
 
 
 def print_banner(agent: OllamaCodeAgent) -> None:
@@ -60,7 +95,11 @@ def print_banner(agent: OllamaCodeAgent) -> None:
     print(f"workspace: {agent.workspace_root().as_posix()}")
     print(f"model: {agent.model}")
     print(f"approval: {agent.approval_mode()}")
-    print("commands: /help /status /models /model /approval /reset /save /tools /quit")
+    if agent.configured_test_command():
+        print(f"test_cmd: {agent.configured_test_command()}")
+    if agent.session_path() is not None:
+        print(f"session: {agent.session_path().as_posix()}")
+    print("commands: /help /status /models /model /approval /reset /save /sessions /load /git /diff /commit /test /tools /quit")
 
 
 def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[str], None]) -> bool | None:
@@ -71,11 +110,13 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
     if action in {"/quit", "/exit"}:
         return False
     if action == "/help":
-        writer("Slash commands: /help /status /models /model <name> /approval <mode> /reset /save [path] /tools /quit")
+        writer("Slash commands: /help /status /models /model <name> /approval <mode> /reset /save [path] /sessions [limit] /load <path> /git /diff [--cached] [path] /commit <message> /test [command] /tools /quit")
         return True
     if action == "/status":
+        session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
+        test_command = agent.configured_test_command() or "(none)"
         writer(
-            f"workspace={agent.workspace_root().as_posix()} model={agent.model} approval={agent.approval_mode()} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth}"
+            f"workspace={agent.workspace_root().as_posix()} model={agent.model} approval={agent.approval_mode()} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
         )
         return True
     if action == "/models":
@@ -104,6 +145,64 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         target = parts[1] if len(parts) > 1 else None
         saved = agent.save_transcript(target)
         writer(f"saved transcript to {saved.as_posix()}")
+        return True
+    if action == "/sessions":
+        limit = 10
+        if len(parts) > 1:
+            try:
+                limit = max(1, int(parts[1]))
+            except ValueError:
+                writer("Usage: /sessions [limit]")
+                return True
+        sessions = agent.list_sessions(limit=limit)
+        if not sessions:
+            writer("(no saved sessions)")
+            return True
+        lines = [
+            f"{index}. {item.path.name} | model={item.model or '(unknown)'} | approval={item.approval_mode or '(unknown)'} | messages={item.message_count} | updated={item.updated_at.strftime('%Y-%m-%d %H:%M:%S')} | {item.summary}"
+            for index, item in enumerate(sessions, start=1)
+        ]
+        writer("\n".join(lines))
+        return True
+    if action == "/load":
+        if len(parts) < 2:
+            writer("Usage: /load <path>")
+            return True
+        loaded = agent.load_session(parts[1])
+        writer(f"loaded session {loaded.as_posix()}")
+        return True
+    if action == "/git":
+        result = agent.git_status()
+        writer(str(result.get("output") or result.get("summary", "(no output)")))
+        return True
+    if action == "/diff":
+        cached = False
+        path = None
+        for token in parts[1:]:
+            if token == "--cached":
+                cached = True
+            elif path is None:
+                path = token
+            else:
+                writer("Usage: /diff [--cached] [path]")
+                return True
+        result = agent.git_diff(cached=cached, path=path)
+        writer(str(result.get("output") or result.get("summary", "(no output)")))
+        return True
+    if action == "/commit":
+        message = " ".join(parts[1:]).strip()
+        if not message:
+            writer("Usage: /commit <message>")
+            return True
+        result = agent.git_commit(message)
+        output = str(result.get("output") or result.get("summary", "(no output)"))
+        writer(output)
+        return True
+    if action == "/test":
+        command_text = " ".join(parts[1:]).strip() or None
+        result = agent.run_test(command_text)
+        output = str(result.get("output") or result.get("summary", "(no output)"))
+        writer(output)
         return True
     if action == "/tools":
         writer(agent.tool_help())
@@ -139,7 +238,11 @@ def run_repl(agent: OllamaCodeAgent, *, quiet: bool = False) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    agent = build_agent(args)
+    try:
+        agent = build_agent(args)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if args.prompt:
         try:
             result = agent.handle_user(" ".join(args.prompt))

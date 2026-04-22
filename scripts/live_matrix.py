@@ -11,10 +11,20 @@ from pathlib import Path
 from typing import Callable
 
 
+def init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Ollama Code Tests"], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+
+
 def build_workspace(root: Path) -> None:
     (root / "docs").mkdir(parents=True, exist_ok=True)
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "notes").mkdir(parents=True, exist_ok=True)
+    (root / "tests").mkdir(parents=True, exist_ok=True)
+    (root / ".gitignore").write_text(".ollama-code/\n", encoding="utf-8")
     (root / "notes" / "alpha.txt").write_text("ORBIT\nsecond line\n", encoding="utf-8")
     (root / "docs" / "spec.md").write_text(
         "# Spec\n\nMAGIC_TOKEN appears here.\nSubagents should read this file.\n",
@@ -24,9 +34,23 @@ def build_workspace(root: Path) -> None:
         "def answer() -> int:\n    return 7 * 6\n",
         encoding="utf-8",
     )
+    (root / "tests" / "test_sample.py").write_text(
+        "import unittest\n\n\nclass SampleTests(unittest.TestCase):\n    def test_truth(self) -> None:\n        self.assertEqual(6 * 7, 42)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+        encoding="utf-8",
+    )
+    init_git_repo(root)
 
 
-def run_cli(repo_root: Path, workspace: Path, model: str, prompt: str, *, approval: str = "auto", timeout: int = 420) -> subprocess.CompletedProcess[str]:
+def run_cli(
+    repo_root: Path,
+    workspace: Path,
+    model: str,
+    prompt: str,
+    *,
+    approval: str = "auto",
+    timeout: int = 420,
+    extra_args: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
         "-m",
@@ -41,8 +65,10 @@ def run_cli(repo_root: Path, workspace: Path, model: str, prompt: str, *, approv
         "12",
         "--max-agent-depth",
         "2",
-        prompt,
     ]
+    if extra_args:
+        command.extend(extra_args)
+    command.append(prompt)
     return subprocess.run(
         command,
         cwd=repo_root,
@@ -106,6 +132,21 @@ def scenario_shell(repo_root: Path, workspace: Path, model: str) -> None:
     require(result, lambda r: "[status] tool run_shell" in r.stdout and "42" in r.stdout and str(workspace).replace("\\", "/") in r.stdout, "shell scenario failed")
 
 
+def scenario_run_test(repo_root: Path, workspace: Path, model: str) -> None:
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Use run_test and tell me whether the test suite passed and which module ran.",
+        extra_args=["--test-cmd", "python3 -m unittest discover -s tests -v"],
+    )
+    require(
+        result,
+        lambda r: "[status] tool run_test" in r.stdout and "test_sample" in r.stdout and ("passed" in r.stdout.lower() or "\nok\n" in r.stdout.lower()),
+        "run_test scenario failed",
+    )
+
+
 def scenario_write(repo_root: Path, workspace: Path, model: str) -> None:
     result = run_cli(
         repo_root,
@@ -152,6 +193,22 @@ def scenario_subagent(repo_root: Path, workspace: Path, model: str, helper_model
     )
 
 
+def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
+    target = workspace / "src" / "sample.py"
+    target.write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Use git_status and git_diff to tell me which file changed and what the added return line is. Mention both the file path and the added line.",
+    )
+    require(
+        result,
+        lambda r: "[status] tool git_status" in r.stdout and "[status] tool git_diff" in r.stdout and "src/sample.py" in r.stdout and "return 99" in r.stdout,
+        "git tool scenario failed",
+    )
+
+
 def scenario_read_only(repo_root: Path, workspace: Path, model: str) -> None:
     blocked = workspace / "blocked.txt"
     result = run_cli(
@@ -189,7 +246,7 @@ def scenario_repl(repo_root: Path, workspace: Path, model: str) -> None:
         env=os.environ.copy(),
         check=False,
     )
-    require(result, lambda r: model in r.stdout and "max_agent_depth=" in r.stdout, "REPL slash-command scenario failed")
+    require(result, lambda r: model in r.stdout and "max_agent_depth=" in r.stdout and "session=" in r.stdout, "REPL slash-command scenario failed")
 
 
 def ollama_host() -> str:
@@ -240,8 +297,10 @@ def main(argv: list[str] | None = None) -> int:
         scenario_read_file,
         scenario_search,
         scenario_shell,
+        scenario_run_test,
         scenario_write,
         scenario_replace,
+        scenario_git_tools,
         scenario_read_only,
         scenario_repl,
     ]

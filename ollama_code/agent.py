@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ollama_code.ollama_client import OllamaClient, OllamaError
-from ollama_code.tools import ToolExecutor, format_tool_help
+from ollama_code.sessions import (
+    SessionSummary,
+    default_session_dir,
+    list_sessions as collect_sessions,
+    load_transcript_payload,
+    resolve_transcript_path,
+)
+from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_tool_help
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ollama Code, a local coding assistant running in a terminal.
@@ -31,7 +38,8 @@ Rules:
 - Do not emit chain-of-thought.
 - If the user asks about filesystem state, search results, command output, file edits, or helper agents, you must use the relevant tool instead of guessing.
 - Never claim a file was changed, a command was run, or a helper agent replied unless you have a successful tool result for it in the current turn.
-- For new files use write_file. For edits use replace_in_file or write_file. For shell work use run_shell. For delegated work use run_agent.
+- For new files use write_file. For edits use replace_in_file or write_file. For shell work use run_shell. For project tests prefer run_test when available. For delegated work use run_agent.
+- For git inspection prefer git_status and git_diff. For git commits use git_commit.
 
 Available tools:
 {tool_help}
@@ -45,6 +53,9 @@ Example when you need a helper agent:
 class AgentResult:
     message: str
     rounds: int
+
+
+KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 
 
 def extract_json_response(raw_text: str) -> dict[str, Any] | None:
@@ -121,8 +132,17 @@ class OllamaCodeAgent:
     def approval_mode(self) -> str:
         return self.tools.approval_mode
 
+    def configured_test_command(self) -> str | None:
+        return self.tools.default_test_command
+
     def workspace_root(self) -> Path:
         return self.tools.workspace_root
+
+    def session_path(self) -> Path | None:
+        return self.session_file
+
+    def session_directory(self) -> Path:
+        return default_session_dir(self.tools.workspace_root)
 
     def tool_help(self) -> str:
         return format_tool_help()
@@ -131,10 +151,57 @@ class OllamaCodeAgent:
         return self.client.list_models()
 
     def _resolve_transcript_path(self, path: str | Path) -> Path:
-        candidate = Path(path)
-        if not candidate.is_absolute():
-            candidate = self.tools.workspace_root / candidate
-        return candidate.resolve()
+        return resolve_transcript_path(self.tools.workspace_root, path)
+
+    def restore_transcript(self, payload: dict[str, Any]) -> None:
+        workspace_root = payload.get("workspace_root")
+        if workspace_root is not None and Path(str(workspace_root)).resolve() != self.tools.workspace_root:
+            raise ValueError("Saved session belongs to a different workspace.")
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("Saved session is missing message history.")
+        restored_messages: list[dict[str, str]] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("Saved session contains an invalid message entry.")
+            role = message.get("role")
+            content = message.get("content")
+            if not isinstance(role, str) or not isinstance(content, str):
+                raise ValueError("Saved session contains a malformed message.")
+            restored_messages.append({"role": role, "content": content})
+        events = payload.get("events")
+        self.messages = restored_messages
+        self.events = list(events) if isinstance(events, list) else []
+        self._autosave()
+
+    def load_session(self, path: str | Path) -> Path:
+        target = self._resolve_transcript_path(path)
+        payload = load_transcript_payload(target)
+        self.session_file = target
+        self.restore_transcript(payload)
+        return target
+
+    def list_sessions(self, limit: int = 10) -> list[SessionSummary]:
+        return collect_sessions(self.tools.workspace_root, limit=limit)
+
+    def git_status(self, path: str | None = None) -> dict[str, Any]:
+        arguments = {"path": path} if path else {}
+        return self.tools.execute("git_status", arguments)
+
+    def git_diff(self, *, cached: bool = False, path: str | None = None) -> dict[str, Any]:
+        arguments: dict[str, Any] = {"cached": cached}
+        if path:
+            arguments["path"] = path
+        return self.tools.execute("git_diff", arguments)
+
+    def git_commit(self, message: str, *, add_all: bool = True) -> dict[str, Any]:
+        return self.tools.execute("git_commit", {"message": message, "add_all": add_all})
+
+    def run_test(self, command: str | None = None) -> dict[str, Any]:
+        arguments: dict[str, Any] = {}
+        if command:
+            arguments["command"] = command
+        return self.tools.execute("run_test", arguments)
 
     def save_transcript(self, path: str | Path | None = None) -> Path:
         target = self._resolve_transcript_path(path) if path else self.session_file
@@ -190,10 +257,22 @@ class OllamaCodeAgent:
             "execute ",
             "shell",
             "command",
+            "test",
+            "tests",
+            "pytest",
+            "unittest",
+            "git",
+            "working tree",
+            "staged",
+            "unstaged",
+            "commit ",
+            "branch",
+            "diff",
             "sub-agent",
             "subagent",
             "helper agent",
             "run_agent",
+            "run_test",
         ]
         if any(phrase in lowered for phrase in tool_phrases):
             return True
@@ -221,6 +300,31 @@ class OllamaCodeAgent:
             r"\bcat\s+>+\b",
         ]
         return any(re.search(pattern, lowered) for pattern in mutation_patterns)
+
+    def _normalize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(payload)
+        response_type = normalized.get("type")
+        tool_name = normalized.get("name")
+        if isinstance(response_type, str):
+            normalized["type"] = response_type.strip()
+        if isinstance(tool_name, str):
+            normalized["name"] = tool_name.strip()
+        response_type = normalized.get("type")
+        tool_name = normalized.get("name")
+        arguments = normalized.get("arguments")
+        if isinstance(response_type, str) and response_type in KNOWN_TOOL_NAMES:
+            normalized["type"] = "tool"
+            if not isinstance(tool_name, str) or not tool_name:
+                normalized["name"] = response_type
+            if not isinstance(arguments, dict):
+                normalized["arguments"] = {}
+            return normalized
+        if isinstance(tool_name, str) and tool_name in KNOWN_TOOL_NAMES and response_type in {None, "", "function", "tool_call"}:
+            normalized["type"] = "tool"
+            if not isinstance(arguments, dict):
+                normalized["arguments"] = {}
+            return normalized
+        return normalized
 
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
@@ -285,18 +389,16 @@ class OllamaCodeAgent:
             payload = extract_json_response(response.content)
             if payload is None:
                 assistant_text = response.content.strip()
-                if not assistant_text:
-                    self.messages.append({"role": "assistant", "content": assistant_text})
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": 'Your previous reply was empty. Reply again with exactly one JSON object using either {"type":"tool",...} or {"type":"final",...}.',
-                        }
-                    )
-                    continue
                 self.messages.append({"role": "assistant", "content": assistant_text})
-                self._record_event("assistant", content=assistant_text, rounds=round_number)
-                return AgentResult(message=assistant_text, rounds=round_number)
+                reminder = "empty" if not assistant_text else "not valid JSON"
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": f'Your previous reply was {reminder}. Reply again with exactly one JSON object using either {{"type":"tool",...}} or {{"type":"final",...}}.',
+                    }
+                )
+                continue
+            payload = self._normalize_payload(payload)
             response_type = payload.get("type")
             if response_type == "final":
                 if requires_tools and not tool_used_this_turn:

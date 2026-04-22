@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Callable
 
 
+def init_git_repo(root: Path) -> None:
+    subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Ollama Code Tests"], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+
+
 def ollama_host() -> str:
     host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
     if not host.startswith(("http://", "https://")):
@@ -43,6 +51,8 @@ def build_workspace(root: Path) -> None:
     (root / "docs").mkdir(parents=True, exist_ok=True)
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "scratch").mkdir(parents=True, exist_ok=True)
+    (root / "tests").mkdir(parents=True, exist_ok=True)
+    (root / ".gitignore").write_text(".ollama-code/\n", encoding="utf-8")
     (root / "docs" / "guide.md").write_text(
         "# Guide\n\nTOKEN_42 lives here.\nThe CLI should read this file with tools.\n",
         encoding="utf-8",
@@ -51,6 +61,11 @@ def build_workspace(root: Path) -> None:
         "def meaning() -> int:\n    return 42\n",
         encoding="utf-8",
     )
+    (root / "tests" / "test_sample.py").write_text(
+        "import unittest\n\n\nclass SampleTests(unittest.TestCase):\n    def test_truth(self) -> None:\n        self.assertEqual(6 * 7, 42)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+        encoding="utf-8",
+    )
+    init_git_repo(root)
 
 
 def run_cli(
@@ -63,6 +78,7 @@ def run_cli(
     timeout: int = 420,
     session_file: Path | None = None,
     stdin_text: str | None = None,
+    extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -79,6 +95,8 @@ def run_cli(
         "--max-agent-depth",
         "2",
     ]
+    if extra_args:
+        command.extend(extra_args)
     if session_file is not None:
         command.extend(["--session-file", str(session_file)])
     command.append(prompt)
@@ -249,6 +267,22 @@ def scenario_shell_failure(repo_root: Path, workspace: Path, model: str) -> None
     require(any(item.get("exit_code") == 5 and item.get("output") == "boom" for item in shells), "shell failure details were not recorded", stdout=result.stdout, stderr=result.stderr, session=session)
 
 
+def scenario_run_test(repo_root: Path, workspace: Path, model: str) -> None:
+    session_file = workspace / "scratch" / "run-test.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Use run_test and tell me whether tests passed and which test module ran.",
+        session_file=session_file,
+        extra_args=["--test-cmd", "python3 -m unittest discover -s tests -v"],
+    )
+    session = load_session(session_file)
+    test_runs = tool_results(session, "run_test")
+    require(result.returncode == 0, "run_test command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") and "test_sample" in str(item.get("output", "")) and "OK" in str(item.get("output", "")) for item in test_runs), "run_test result was not captured", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
 def scenario_subagent_transcript(repo_root: Path, workspace: Path, model: str) -> None:
     session_file = workspace / "scratch" / "subagent.json"
     result = run_cli(
@@ -262,6 +296,44 @@ def scenario_subagent_transcript(repo_root: Path, workspace: Path, model: str) -
     subagents = tool_results(session, "run_agent")
     require(result.returncode == 0, "subagent command failed", stdout=result.stdout, stderr=result.stderr, session=session)
     require(any(item.get("ok") and item.get("event_count", 0) >= 3 and "TOKEN_42" in str(item.get("output", "")) for item in subagents), "subagent result was not captured correctly", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
+    session_file = workspace / "scratch" / "git-tools.json"
+    target = workspace / "src" / "app.py"
+    target.write_text("def meaning() -> int:\n    return 99\n", encoding="utf-8")
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Use git_status and git_diff to identify the modified file and the added return line. Reply with both.",
+        session_file=session_file,
+    )
+    session = load_session(session_file)
+    statuses = tool_results(session, "git_status")
+    diffs = tool_results(session, "git_diff")
+    require(result.returncode == 0, "git tool command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") and "src/app.py" in str(item.get("output", "")) for item in statuses), "git_status result was not captured", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") and "return 99" in str(item.get("output", "")) for item in diffs), "git_diff result was not captured", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_continue_session(repo_root: Path, workspace: Path, model: str) -> None:
+    first = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Remember the exact token CONTINUE_TOKEN_99 for this session and reply with remembered.",
+    )
+    require(first.returncode == 0, "initial continue-session command failed", stdout=first.stdout, stderr=first.stderr)
+    second = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "What token did I ask you to remember earlier in this session? Reply with the token only.",
+        extra_args=["--continue"],
+    )
+    require(second.returncode == 0, "continue-session follow-up failed", stdout=second.stdout, stderr=second.stderr)
+    require("CONTINUE_TOKEN_99" in second.stdout, "continued session did not preserve prior context", stdout=second.stdout, stderr=second.stderr)
 
 
 def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> None:
@@ -304,7 +376,10 @@ def main(argv: list[str] | None = None) -> int:
         ("scenario_approval_reject", scenario_approval_reject),
         ("scenario_path_escape", scenario_path_escape),
         ("scenario_shell_failure", scenario_shell_failure),
+        ("scenario_run_test", scenario_run_test),
         ("scenario_subagent_transcript", scenario_subagent_transcript),
+        ("scenario_git_tools", scenario_git_tools),
+        ("scenario_continue_session", scenario_continue_session),
         ("scenario_multiturn_repl", scenario_multiturn_repl),
     ]
 
