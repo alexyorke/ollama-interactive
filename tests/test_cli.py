@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 
 from ollama_code.cli import build_agent, build_parser, handle_meta_command
@@ -16,14 +16,14 @@ class DummyAgent:
         self._approval = "ask"
         self._workspace = Path.cwd()
         self.saved_path: Path | None = None
-        self.loaded_path: Path | None = None
+        self.loaded_path: Path | PureWindowsPath | None = None
         self._session_path = Path("session.json").resolve()
         self._test_command = "python -m unittest -v"
 
     def workspace_root(self) -> Path:
         return self._workspace
 
-    def session_path(self) -> Path:
+    def session_path(self) -> Path | PureWindowsPath:
         return self._session_path
 
     def approval_mode(self) -> str:
@@ -57,8 +57,11 @@ class DummyAgent:
 
         return [Session(Path("trace.json"), self.model, self._approval, 3, "Inspect repo")]
 
-    def load_session(self, path: str) -> Path:
-        self.loaded_path = Path(path).resolve()
+    def load_session(self, path: str) -> Path | PureWindowsPath:
+        if "\\" in path and len(path) >= 3 and path[1:3] == ":\\":
+            self.loaded_path = PureWindowsPath(path)
+        else:
+            self.loaded_path = Path(path).resolve()
         self._session_path = self.loaded_path
         return self.loaded_path
 
