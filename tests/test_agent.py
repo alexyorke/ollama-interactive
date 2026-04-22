@@ -86,6 +86,21 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "retry me")
         self.assertEqual(agent.events[1]["type"], "tool_call")
 
+    def test_agent_retries_after_empty_model_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient(
+                [
+                    "",
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(len(client.calls), 2)
+
     def test_relative_transcript_paths_use_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

@@ -3,4 +3,8 @@
 *.py text eol=lf
 *.md text eol=lf
 *.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
 *.ps1 text eol=crlf
+Dockerfile text eol=lf
+.dockerignore text eol=lf

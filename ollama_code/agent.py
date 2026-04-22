@@ -285,6 +285,15 @@ class OllamaCodeAgent:
             payload = extract_json_response(response.content)
             if payload is None:
                 assistant_text = response.content.strip()
+                if not assistant_text:
+                    self.messages.append({"role": "assistant", "content": assistant_text})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": 'Your previous reply was empty. Reply again with exactly one JSON object using either {"type":"tool",...} or {"type":"final",...}.',
+                        }
+                    )
+                    continue
                 self.messages.append({"role": "assistant", "content": assistant_text})
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
                 return AgentResult(message=assistant_text, rounds=round_number)

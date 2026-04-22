@@ -47,6 +47,44 @@ If your Ollama daemon is not on the default host, set `OLLAMA_HOST`:
 export OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
+## Docker
+
+Build the image:
+
+```bash
+docker build -t ollama-code:local .
+```
+
+Run the unit test suite inside the image:
+
+```bash
+docker run --rm --entrypoint python ollama-code:local -m unittest discover -s tests -v
+```
+
+Run the REPL in Docker with the current checkout mounted as the workspace:
+
+```bash
+docker compose run --rm ollama-code
+```
+
+Run a one-shot prompt:
+
+```bash
+docker compose run --rm ollama-code --approval auto "Inspect this repo and summarize it."
+```
+
+By default `compose.yaml` points the container at `http://host.docker.internal:11435`, which matches the tested user-space WSL Ollama daemon on this machine. Override `OLLAMA_CODE_OLLAMA_HOST` if your daemon is somewhere else:
+
+```bash
+OLLAMA_CODE_OLLAMA_HOST=http://host.docker.internal:11434 docker compose run --rm ollama-code
+```
+
+If you want a shell inside the container instead of launching the CLI, pass `bash`:
+
+```bash
+docker compose run --rm ollama-code bash
+```
+
 ## WSL + tmux
 
 From WSL in the repo root:
@@ -84,12 +122,19 @@ export OLLAMA_HOST=127.0.0.1:11435
 python3 scripts/e2e_suite.py
 ```
 
+Containerized end-to-end check against the host Ollama daemon:
+
+```bash
+OLLAMA_CODE_OLLAMA_HOST=http://host.docker.internal:11435 docker compose run --rm --entrypoint python ollama-code scripts/e2e_suite.py
+```
+
 ## GitHub Actions
 
 GitHub Actions runs the portable checks on hosted runners:
 
 - install the package
 - run the unit test suite on Ubuntu and Windows across Python 3.10, 3.11, and 3.12
+- build the Docker image and run the unit test suite inside the container
 - build the wheel and source distribution
 
 Tagged releases with `v*` also publish the built `dist/` artifacts to a GitHub release.
