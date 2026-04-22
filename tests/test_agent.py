@@ -88,14 +88,14 @@ class AgentTests(unittest.TestCase):
 
     def test_relative_transcript_paths_use_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             client = FakeClient([])
             tools = ToolExecutor(root, approval_mode="auto")
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file="scratch/session.json")
             saved = agent.save_transcript("scratch/manual.json")
 
-        self.assertEqual(agent.session_file, root / "scratch" / "session.json")
-        self.assertEqual(saved, root / "scratch" / "manual.json")
+        self.assertEqual(agent.session_file, (root / "scratch" / "session.json").resolve())
+        self.assertEqual(saved, (root / "scratch" / "manual.json").resolve())
 
     def test_agent_rejects_shell_mutation_when_file_tools_fit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
