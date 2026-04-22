@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Callable
 
 from ollama_code.agent import OllamaCodeAgent
+from ollama_code.config import load_config
 from ollama_code.ollama_client import OllamaClient, OllamaError
 from ollama_code.sessions import latest_session_path, load_transcript_payload, new_session_path, resolve_transcript_path
 from ollama_code.tools import ToolExecutor
@@ -23,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("prompt", nargs="*", help="Optional one-shot prompt.")
     parser.add_argument("--model", default=None, help="Ollama model name.")
     parser.add_argument("--host", default=None, help="Override the Ollama host.")
+    parser.add_argument("--config", default=None, help="Optional config file path. Defaults to .ollama-code/config.json inside the workspace.")
     parser.add_argument("--cwd", default=".", help="Workspace root.")
     parser.add_argument(
         "--approval",
@@ -42,8 +44,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _non_empty_string(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def build_agent(args: argparse.Namespace, *, input_func: Callable[[str], str] = input) -> OllamaCodeAgent:
     workspace_root = Path(args.cwd).resolve()
+    config = load_config(workspace_root, args.config)
     restored_payload: dict[str, object] | None = None
     resume_path: Path | None = None
     if args.resume:
@@ -55,19 +65,33 @@ def build_agent(args: argparse.Namespace, *, input_func: Callable[[str], str] = 
             raise ValueError(f"No saved sessions found in {workspace_root.as_posix()}/.ollama-code/sessions")
         restored_payload = load_transcript_payload(resume_path)
 
-    model = args.model or DEFAULT_MODEL
+    model = config.model or DEFAULT_MODEL
+    env_model = _non_empty_string(os.environ.get("OLLAMA_CODE_MODEL"))
+    if env_model:
+        model = env_model
     approval = args.approval or "ask"
     if restored_payload is not None:
         saved_model = restored_payload.get("model")
         saved_approval = restored_payload.get("approval_mode")
-        if args.model is None and isinstance(saved_model, str) and saved_model.strip():
+        explicit_model = _non_empty_string(args.model)
+        if explicit_model is None and isinstance(saved_model, str) and saved_model.strip():
             model = saved_model
         if args.approval is None and saved_approval in {"ask", "auto", "read-only"}:
             approval = str(saved_approval)
+    explicit_model = _non_empty_string(args.model)
+    if explicit_model:
+        model = explicit_model
+    host = config.host
+    env_host = _non_empty_string(os.environ.get("OLLAMA_HOST"))
+    if env_host:
+        host = env_host
+    explicit_host = _non_empty_string(args.host)
+    if explicit_host:
+        host = explicit_host
     session_file = args.session_file
     if session_file is None:
         session_file = resume_path or new_session_path(workspace_root)
-    client = OllamaClient(host=args.host, timeout=args.timeout)
+    client = OllamaClient(host=host, timeout=args.timeout)
     test_command = args.test_cmd or os.environ.get("OLLAMA_CODE_TEST_CMD")
     tools = ToolExecutor(
         workspace_root,

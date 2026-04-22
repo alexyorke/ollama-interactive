@@ -29,6 +29,30 @@ Inside WSL:
 python3 -m pip install -e .
 ```
 
+## Config File
+
+Create `.ollama-code/config.json` in your workspace to set the local Ollama endpoint and default model without repeating flags or env vars. This path is already ignored by git.
+
+```json
+{
+  "host": "http://127.0.0.1:11435",
+  "model": "batiai/gemma4-26b:iq4"
+}
+```
+
+You can also point at a custom file:
+
+```bash
+ollama-code --config ~/my-ollama.json
+```
+
+Precedence:
+
+- `--host` and `--model` override everything else
+- when resuming a saved session, the saved model wins unless `--model` is provided
+- `OLLAMA_HOST` and `OLLAMA_CODE_MODEL` override the config file for one-off runs
+- otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
+
 ## Run
 
 Interactive REPL:
