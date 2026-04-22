@@ -110,6 +110,7 @@ class ToolExecutor:
         self.input_func = input_func
         self.agent_runner = agent_runner
         self.default_test_command = test_command.strip() if isinstance(test_command, str) and test_command.strip() else None
+        self._initial_dirty_paths = self._git_dirty_paths()
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
@@ -206,6 +207,19 @@ class ToolExecutor:
             return False, "User rejected the shell command."
         return True, None
 
+    def _windows_powershell(self) -> str | None:
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def _looks_like_powershell_command(self, command: str) -> bool:
+        statement_start = r"(?:^|[;&]\s*)"
+        patterns = [
+            rf"{statement_start}\$[A-Za-z_][\w:]*\s*=",
+            rf"{statement_start}\.[\\/].+\.ps1(?:\s|$)",
+            rf"{statement_start}(?:Get|Set|New|Remove|Move|Copy|Join|Split|Resolve|Test|Write|Start|Stop|Select|Where|ForEach|Measure|Sort)-[A-Za-z]+\b",
+            r"\|\s*(?:Where-Object|Select-Object|ForEach-Object|Sort-Object|Measure-Object)\b",
+        ]
+        return any(re.search(pattern, command, flags=re.IGNORECASE) for pattern in patterns)
+
     def _collect_process_output(self, completed: subprocess.CompletedProcess[str]) -> str:
         parts = []
         if completed.stdout.strip():
@@ -231,6 +245,25 @@ class ToolExecutor:
         if probe.returncode == 0 and probe.stdout.strip() == "true":
             return True, None
         return False, self._collect_process_output(probe)
+
+    def _git_dirty_paths(self) -> set[str]:
+        ok, _ = self._ensure_git_repo()
+        if not ok:
+            return set()
+        paths: set[str] = set()
+        commands = [
+            ["diff", "--name-only", "-z"],
+            ["diff", "--cached", "--name-only", "-z"],
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+        ]
+        for args in commands:
+            completed = self._run_git(args)
+            if completed.returncode != 0:
+                continue
+            for raw_path in completed.stdout.split("\0"):
+                if raw_path:
+                    paths.add(raw_path)
+        return paths
 
     def list_files(self, path: str = ".", max_depth: int = 4, limit: int = 200) -> dict[str, Any]:
         base = self.resolve_path(path, allow_missing=False)
@@ -382,6 +415,17 @@ class ToolExecutor:
         if not approved:
             return {"ok": False, "tool": "git_commit", "summary": reason}
         if add_all:
+            blocked_paths = sorted(self._git_dirty_paths() & self._initial_dirty_paths)
+            if blocked_paths:
+                preview_paths = ", ".join(blocked_paths[:5])
+                if len(blocked_paths) > 5:
+                    preview_paths = f"{preview_paths}, ..."
+                return {
+                    "ok": False,
+                    "tool": "git_commit",
+                    "summary": "git_commit(add_all=True) refused because the repo already had unrelated local changes when this tool session started: "
+                    f"{preview_paths}",
+                }
             added = self._run_git(["add", "-A"])
             if added.returncode != 0:
                 return {"ok": False, "tool": "git_commit", "summary": self._collect_process_output(added)}
@@ -497,18 +541,16 @@ class ToolExecutor:
         approved, reason = self._approve_shell(command, relative_cwd)
         if not approved:
             return {"ok": False, "tool": "run_shell", "cwd": relative_cwd, "summary": reason}
+        run_args: str | list[str] = command
         shell_kwargs: dict[str, Any] = {"shell": True}
-        if os.name != "nt":
+        if os.name == "nt":
+            powershell = self._windows_powershell()
+            if powershell and self._looks_like_powershell_command(command):
+                run_args = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
+                shell_kwargs = {}
+        else:
             shell_kwargs["executable"] = os.environ.get("SHELL", "/bin/sh")
-        completed = subprocess.run(
-            command,
-            cwd=working_dir,
-            timeout=timeout,
-            capture_output=True,
-            text=True,
-            check=False,
-            **shell_kwargs,
-        )
+        completed = subprocess.run(run_args, cwd=working_dir, timeout=timeout, capture_output=True, text=True, check=False, **shell_kwargs)
         output = self._collect_process_output(completed)
         return {
             "ok": completed.returncode == 0,

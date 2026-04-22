@@ -68,6 +68,44 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
 
+    def test_agent_blocks_subagent_approval_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_agent","arguments":{"prompt":"Write a file.","approval_mode":"auto"}}',
+                    '{"type":"final","message":"blocked"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="ask")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            result = agent.handle_user("Delegate this carefully.")
+
+        self.assertEqual(result.message, "blocked")
+        self.assertEqual(agent.events[1]["name"], "run_agent")
+        self.assertFalse(agent.events[2]["result"]["ok"])
+        self.assertIn("more permissive", agent.events[2]["result"]["summary"])
+
+    def test_agent_allows_subagent_to_be_more_restrictive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"helper saw helper data"}',
+                    '{"type":"final","message":"parent got: helper saw helper data"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="ask")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            result = agent.handle_user("delegate this")
+
+        self.assertEqual(result.message, "parent got: helper saw helper data")
+        self.assertTrue(agent.events[2]["result"]["ok"])
+        self.assertEqual(agent.events[2]["result"]["approval_mode"], "read-only")
+
     def test_agent_normalizes_tool_name_in_type_field(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

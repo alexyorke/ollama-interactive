@@ -26,10 +26,14 @@ def default_session_dir(workspace_root: Path) -> Path:
 
 
 def resolve_transcript_path(workspace_root: Path, raw_path: str | Path) -> Path:
+    root = workspace_root.resolve()
     candidate = Path(raw_path)
     if not candidate.is_absolute():
-        candidate = workspace_root / candidate
-    return candidate.resolve()
+        candidate = root / candidate
+    resolved = candidate.resolve(strict=False)
+    if resolved != root and root not in resolved.parents:
+        raise ValueError(f"Transcript path escapes the workspace: {raw_path}")
+    return resolved
 
 
 def new_session_path(workspace_root: Path) -> Path:
@@ -49,11 +53,24 @@ def load_transcript_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
-def latest_session_path(workspace_root: Path) -> Path | None:
+def _safe_session_paths(workspace_root: Path) -> list[Path]:
     session_dir = default_session_dir(workspace_root)
     if not session_dir.exists():
-        return None
-    candidates = sorted((path for path in session_dir.glob("*.json") if path.is_file()), key=lambda item: item.stat().st_mtime, reverse=True)
+        return []
+    candidates: list[Path] = []
+    for path in session_dir.glob("*.json"):
+        if not path.is_file():
+            continue
+        try:
+            resolved = resolve_transcript_path(workspace_root, path)
+        except ValueError:
+            continue
+        candidates.append(resolved)
+    return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
+
+
+def latest_session_path(workspace_root: Path) -> Path | None:
+    candidates = _safe_session_paths(workspace_root)
     return candidates[0] if candidates else None
 
 
@@ -78,12 +95,8 @@ def _payload_summary(payload: dict[str, Any]) -> str:
 
 
 def list_sessions(workspace_root: Path, limit: int = 20) -> list[SessionSummary]:
-    session_dir = default_session_dir(workspace_root)
-    if not session_dir.exists():
-        return []
-    paths = sorted((path for path in session_dir.glob("*.json") if path.is_file()), key=lambda item: item.stat().st_mtime, reverse=True)
     summaries: list[SessionSummary] = []
-    for path in paths[:limit]:
+    for path in _safe_session_paths(workspace_root)[:limit]:
         try:
             payload = load_transcript_payload(path)
         except ValueError:

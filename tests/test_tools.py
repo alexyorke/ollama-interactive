@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -96,6 +97,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "123")
 
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_run_shell_supports_powershell_cmdlets_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            result = tools.run_shell("Write-Output 123")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "123")
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_run_shell_does_not_misclassify_dollar_sign_inside_quoted_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            command = f'{sys.executable} -c "print(\'a $HOME b\')"'
+            result = tools.run_shell(command)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "a $HOME b")
+
     def test_run_test_uses_configured_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -146,8 +164,8 @@ class ToolExecutorTests(unittest.TestCase):
             tracked.write_text("before\n", encoding="utf-8")
             subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
-            tracked.write_text("before\nafter\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
+            tracked.write_text("before\nafter\n", encoding="utf-8")
             result = tools.git_commit("Update tracked file")
             subject = subprocess.run(
                 ["git", "log", "-1", "--pretty=%s"],
@@ -159,6 +177,41 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(subject, "Update tracked file")
+
+    def test_git_commit_add_all_refuses_preexisting_dirty_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.init_git_repo(root)
+            tracked = root / "tracked.txt"
+            unrelated = root / "notes.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            unrelated.write_text("draft\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt", "notes.txt"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+            unrelated.write_text("draft\nlocal-only\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            tracked.write_text("before\nafter\n", encoding="utf-8")
+            result = tools.git_commit("Update tracked file")
+            subject = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            staged = subprocess.run(
+                ["git", "diff", "--cached", "--name-only"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("already had unrelated local changes", result["summary"])
+        self.assertIn("notes.txt", result["summary"])
+        self.assertEqual(subject, "initial")
+        self.assertEqual(staged, "")
 
     def test_read_only_blocks_git_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

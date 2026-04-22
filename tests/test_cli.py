@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ollama_code.cli import build_agent, build_parser, handle_meta_command
 
@@ -135,12 +136,30 @@ class CliCommandTests(unittest.TestCase):
         self.assertIsNotNone(agent.loaded_path)
         self.assertTrue(str(agent.loaded_path).endswith("saved.json"))
 
+    def test_load_command_preserves_windows_backslashes(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        with patch("ollama_code.cli.os.name", "nt"):
+            handled = handle_meta_command(r"/load C:\Users\yorke\saved.json", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIsNotNone(agent.loaded_path)
+        self.assertIn(r"C:\Users\yorke\saved.json", str(agent.loaded_path))
+
     def test_diff_command_prints_git_diff(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
         handled = handle_meta_command("/diff --cached tracked.txt", agent, output.append)
         self.assertTrue(handled)
         self.assertIn("+after", output[0])
+
+    def test_test_command_preserves_windows_executable_path(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        command = r'"C:\Program Files\Python312\python.exe" -m unittest -q'
+        with patch("ollama_code.cli.os.name", "nt"):
+            handled = handle_meta_command(f"/test {command}", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIn(command, output[0])
 
     def test_commit_command_prints_commit_output(self) -> None:
         agent = DummyAgent()

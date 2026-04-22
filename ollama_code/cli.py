@@ -102,11 +102,19 @@ def print_banner(agent: OllamaCodeAgent) -> None:
     print("commands: /help /status /models /model /approval /reset /save /sessions /load /git /diff /commit /test /tools /quit")
 
 
+def _strip_matching_quotes(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
+        return stripped[1:-1]
+    return stripped
+
+
 def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[str], None]) -> bool | None:
     if not command.startswith("/"):
         return None
-    parts = shlex.split(command)
-    action = parts[0].lower()
+    head, _, tail = command.strip().partition(" ")
+    action = head.lower()
+    remainder = tail.strip()
     if action in {"/quit", "/exit"}:
         return False
     if action == "/help":
@@ -124,17 +132,19 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(", ".join(models) if models else "(no local models)")
         return True
     if action == "/model":
-        if len(parts) < 2:
+        model_name = _strip_matching_quotes(remainder)
+        if not model_name:
             writer("Usage: /model <name>")
             return True
-        agent.set_model(parts[1])
+        agent.set_model(model_name)
         writer(f"model set to {agent.model}")
         return True
     if action == "/approval":
-        if len(parts) < 2 or parts[1] not in {"ask", "auto", "read-only"}:
+        mode = _strip_matching_quotes(remainder)
+        if mode not in {"ask", "auto", "read-only"}:
             writer("Usage: /approval ask|auto|read-only")
             return True
-        agent.set_approval_mode(parts[1])
+        agent.set_approval_mode(mode)
         writer(f"approval set to {agent.approval_mode()}")
         return True
     if action == "/reset":
@@ -142,15 +152,15 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer("conversation reset")
         return True
     if action == "/save":
-        target = parts[1] if len(parts) > 1 else None
+        target = _strip_matching_quotes(remainder) or None
         saved = agent.save_transcript(target)
         writer(f"saved transcript to {saved.as_posix()}")
         return True
     if action == "/sessions":
         limit = 10
-        if len(parts) > 1:
+        if remainder:
             try:
-                limit = max(1, int(parts[1]))
+                limit = max(1, int(_strip_matching_quotes(remainder)))
             except ValueError:
                 writer("Usage: /sessions [limit]")
                 return True
@@ -165,10 +175,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer("\n".join(lines))
         return True
     if action == "/load":
-        if len(parts) < 2:
+        target = _strip_matching_quotes(remainder)
+        if not target:
             writer("Usage: /load <path>")
             return True
-        loaded = agent.load_session(parts[1])
+        loaded = agent.load_session(target)
         writer(f"loaded session {loaded.as_posix()}")
         return True
     if action == "/git":
@@ -176,9 +187,14 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(str(result.get("output") or result.get("summary", "(no output)")))
         return True
     if action == "/diff":
+        try:
+            diff_parts = shlex.split(remainder, posix=os.name != "nt") if remainder else []
+        except ValueError:
+            writer("Usage: /diff [--cached] [path]")
+            return True
         cached = False
         path = None
-        for token in parts[1:]:
+        for token in (_strip_matching_quotes(part) for part in diff_parts):
             if token == "--cached":
                 cached = True
             elif path is None:
@@ -190,7 +206,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(str(result.get("output") or result.get("summary", "(no output)")))
         return True
     if action == "/commit":
-        message = " ".join(parts[1:]).strip()
+        message = _strip_matching_quotes(remainder)
         if not message:
             writer("Usage: /commit <message>")
             return True
@@ -199,7 +215,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(output)
         return True
     if action == "/test":
-        command_text = " ".join(parts[1:]).strip() or None
+        command_text = remainder or None
         result = agent.run_test(command_text)
         output = str(result.get("output") or result.get("summary", "(no output)"))
         writer(output)

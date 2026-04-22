@@ -56,6 +56,7 @@ class AgentResult:
 
 
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
+APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
 
 
 def extract_json_response(raw_text: str) -> dict[str, Any] | None:
@@ -344,6 +345,13 @@ class OllamaCodeAgent:
                 "ok": False,
                 "tool": "run_agent",
                 "summary": 'approval_mode must be one of "ask", "auto", or "read-only".',
+            }
+        parent_approval = self.tools.approval_mode
+        if APPROVAL_RANK[str(approval_mode)] > APPROVAL_RANK[parent_approval]:
+            return {
+                "ok": False,
+                "tool": "run_agent",
+                "summary": f"Sub-agent approval_mode cannot be more permissive than the parent ({parent_approval}).",
             }
         max_tool_rounds = arguments.get("max_tool_rounds", self.max_tool_rounds)
         if not isinstance(max_tool_rounds, int) or max_tool_rounds < 1:
