@@ -84,6 +84,23 @@ export OLLAMA_HOST=127.0.0.1:11435
 python3 scripts/e2e_suite.py
 ```
 
+## GitHub Actions
+
+GitHub Actions runs the portable checks on hosted runners:
+
+- install the package
+- run the unit test suite on Ubuntu and Windows across Python 3.10, 3.11, and 3.12
+- build the wheel and source distribution
+
+Tagged releases with `v*` also publish the built `dist/` artifacts to a GitHub release.
+
+Example:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Slash Commands
 
 - `/help`
