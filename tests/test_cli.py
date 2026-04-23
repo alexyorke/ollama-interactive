@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import io
+import shutil
 import tempfile
 import unittest
 from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
+from uuid import uuid4
 
-from ollama_code.cli import build_agent, build_parser, handle_meta_command
+from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, handle_meta_command
 
 
 class DummyAgent:
     def __init__(self) -> None:
-        self.model = "batiai/gemma4-26b:iq4"
-        self.max_tool_rounds = 8
+        self.model = "batiai/qwen3.6-35b:iq4"
+        self.max_tool_rounds = 100
         self.max_agent_depth = 2
         self._approval = "ask"
         self._workspace = Path.cwd()
@@ -31,6 +34,9 @@ class DummyAgent:
 
     def configured_test_command(self) -> str | None:
         return self._test_command
+
+    def set_interrupt_event(self, event: object) -> None:
+        return
 
     def set_model(self, model: str) -> None:
         self.model = model
@@ -82,16 +88,78 @@ class DummyAgent:
         return "list_files\nread_file"
 
     def list_models(self) -> list[str]:
-        return ["batiai/gemma4-26b:iq4", "gemma4:latest"]
+        return ["batiai/qwen3.6-35b:iq4", "gemma4:latest"]
 
 
 class CliCommandTests(unittest.TestCase):
+    def _workspace_scratch(self) -> Path:
+        root = (Path.cwd() / "verify_scratch" / f"test-cli-{uuid4().hex}").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return root
+
     def test_model_command_updates_model(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
         handled = handle_meta_command("/model gemma3:4b", agent, output.append)
         self.assertTrue(handled)
         self.assertEqual(agent.model, "gemma3:4b")
+
+    def test_parser_defaults_max_tool_rounds_to_100(self) -> None:
+        args = build_parser().parse_args([])
+        self.assertIsNone(args.max_tool_rounds)
+
+    def test_build_agent_uses_qwen_default_model(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.model, "batiai/qwen3.6-35b:iq4")
+        self.assertEqual(agent.max_tool_rounds, 100)
+        self.assertEqual(agent.max_agent_depth, 2)
+        self.assertEqual(agent.approval_mode(), "ask")
+
+    def test_status_renderer_shows_last_three_thinking_lines_and_clears_on_status(self) -> None:
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=True)
+
+        renderer.show_thinking("one\ntwo\nthree\nfour")
+        renderer.status("tool read_file {}")
+
+        output = stream.getvalue()
+        self.assertNotIn("\x1b[90mone\x1b[0m", output)
+        self.assertIn("\x1b[90mtwo\x1b[0m", output)
+        self.assertIn("\x1b[90mthree\x1b[0m", output)
+        self.assertIn("\x1b[90mfour\x1b[0m", output)
+        self.assertIn("\x1b[1A", output)
+        self.assertIn("[status] tool read_file {}", output)
+
+    def test_build_agent_uses_config_file_for_runtime_defaults(self) -> None:
+        root = self._workspace_scratch()
+        config_dir = root / ".ollama-code"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.json").write_text(
+            '{'
+            '"host":"http://127.0.0.1:11435",'
+            '"model":"gemma4:latest",'
+            '"approval":"auto",'
+            '"max_tool_rounds":12,'
+            '"max_agent_depth":4,'
+            '"timeout":45,'
+            '"test_cmd":"python -m unittest -v"'
+            '}',
+            encoding="utf-8",
+        )
+        args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.model, "gemma4:latest")
+        self.assertEqual(agent.approval_mode(), "auto")
+        self.assertEqual(agent.max_tool_rounds, 12)
+        self.assertEqual(agent.max_agent_depth, 4)
+        self.assertEqual(agent.configured_test_command(), "python -m unittest -v")
 
     def test_approval_command_updates_mode(self) -> None:
         agent = DummyAgent()
@@ -120,7 +188,7 @@ class CliCommandTests(unittest.TestCase):
         output: list[str] = []
         handled = handle_meta_command("/models", agent, output.append)
         self.assertTrue(handled)
-        self.assertIn("batiai/gemma4-26b:iq4", output[0])
+        self.assertIn("batiai/qwen3.6-35b:iq4", output[0])
 
     def test_sessions_command_lists_saved_sessions(self) -> None:
         agent = DummyAgent()
@@ -179,21 +247,58 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("pytest -q", output[0])
 
     def test_build_agent_continue_restores_latest_session(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            session_dir = root / ".ollama-code" / "sessions"
-            session_dir.mkdir(parents=True)
-            session = session_dir / "saved.json"
-            session.write_text(
-                '{"model":"gemma4:latest","approval_mode":"auto","workspace_root":"'
-                + root.as_posix()
-                + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
-                encoding="utf-8",
-            )
-            parser = build_parser()
-            args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
-            agent = build_agent(args)
+        root = self._workspace_scratch()
+        session_dir = root / ".ollama-code" / "sessions"
+        session_dir.mkdir(parents=True)
+        session = session_dir / "saved.json"
+        session.write_text(
+            '{"model":"gemma4:latest","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
+        agent = build_agent(args)
 
         self.assertEqual(agent.model, "gemma4:latest")
         self.assertEqual(agent.approval_mode(), "auto")
         self.assertEqual(agent.messages[1]["content"], "remember me")
+
+    def test_build_agent_resume_missing_session_raises_value_error(self) -> None:
+        missing = f"missing-{uuid4().hex}.json"
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(Path.cwd()), "--resume", missing, "--quiet"])
+
+        with self.assertRaisesRegex(ValueError, "Transcript file not found"):
+            build_agent(args)
+
+    def test_build_agent_resume_does_not_rewrite_saved_transcript_on_startup(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        session.parent.mkdir(parents=True)
+        original = (
+            '{'
+            '"model":"saved-model",'
+            '"approval_mode":"auto",'
+            '"workspace_root":"'
+            + root.as_posix()
+            + '",'
+            '"extra":"keep-me",'
+            '"messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],'
+            '"events":[{"type":"user","content":"remember me"}]'
+            '}'
+        )
+        session.write_text(original, encoding="utf-8")
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--cwd", str(root), "--resume", str(session), "--model", "override-model", "--approval", "ask", "--quiet"]
+        )
+
+        agent = build_agent(args)
+        on_disk = session.read_text(encoding="utf-8")
+
+        self.assertEqual(agent.model, "override-model")
+        self.assertEqual(agent.approval_mode(), "ask")
+        self.assertEqual(agent.messages[1]["content"], "remember me")
+        self.assertEqual(on_disk, original)

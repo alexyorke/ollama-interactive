@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from uuid import uuid4
 
-from ollama_code.agent import OllamaCodeAgent
+from ollama_code.agent import OllamaCodeAgent, _workspace_roots_match
 from ollama_code.ollama_client import ChatResponse
 from ollama_code.tools import ToolExecutor
 
@@ -13,13 +15,37 @@ class FakeClient:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
         self.calls: list[dict[str, object]] = []
+        self.interrupt_events: list[object | None] = []
 
-    def chat(self, *, model: str, messages: list[dict[str, str]], response_format: str = "json") -> ChatResponse:
-        self.calls.append({"model": model, "messages": list(messages), "response_format": response_format})
+    def set_interrupt_event(self, event: object | None) -> None:
+        self.interrupt_events.append(event)
+
+    def chat(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        response_format: str = "json",
+        on_thinking: object | None = None,
+    ) -> ChatResponse:
+        self.calls.append(
+            {
+                "model": model,
+                "messages": list(messages),
+                "response_format": response_format,
+                "on_thinking": on_thinking,
+            }
+        )
         return ChatResponse(content=self.responses.pop(0), model=model, raw={})
 
 
 class AgentTests(unittest.TestCase):
+    def _workspace_scratch(self) -> Path:
+        root = (Path.cwd() / "verify_scratch" / f"test-agent-{uuid4().hex}").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return root
+
     def test_agent_runs_tool_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -39,6 +65,18 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["type"], "tool_call")
         self.assertEqual(agent.events[2]["type"], "tool_result")
 
+    def test_system_prompt_requires_assumption_checking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        prompt = agent.messages[0]["content"]
+        self.assertIn("Question your assumptions before acting.", prompt)
+        self.assertIn("prove or disprove it with the available tools", prompt)
+        self.assertIn("Do not guess about workspace contents", prompt)
+
     def test_agent_stops_after_max_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient(['{"type":"tool","name":"list_files","arguments":{}}'] * 2)
@@ -49,37 +87,35 @@ class AgentTests(unittest.TestCase):
         self.assertIn("maximum tool rounds", result.message)
 
     def test_agent_can_run_subagent(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("helper data\n", encoding="utf-8")
-            client = FakeClient(
-                [
-                    '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
-                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
-                    '{"type":"final","message":"helper saw helper data"}',
-                    '{"type":"final","message":"parent got: helper saw helper data"}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-            result = agent.handle_user("delegate this")
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"helper saw helper data"}',
+                '{"type":"final","message":"parent got: helper saw helper data"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("delegate this")
 
         self.assertEqual(result.message, "parent got: helper saw helper data")
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
 
     def test_agent_blocks_subagent_approval_escalation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient(
-                [
-                    '{"type":"tool","name":"run_agent","arguments":{"prompt":"Write a file.","approval_mode":"auto"}}',
-                    '{"type":"final","message":"blocked"}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="ask")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-            result = agent.handle_user("Delegate this carefully.")
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_agent","arguments":{"prompt":"Write a file.","approval_mode":"auto"}}',
+                '{"type":"final","message":"blocked"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="ask")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("Delegate this carefully.")
 
         self.assertEqual(result.message, "blocked")
         self.assertEqual(agent.events[1]["name"], "run_agent")
@@ -87,40 +123,61 @@ class AgentTests(unittest.TestCase):
         self.assertIn("more permissive", agent.events[2]["result"]["summary"])
 
     def test_agent_allows_subagent_to_be_more_restrictive(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("helper data\n", encoding="utf-8")
-            client = FakeClient(
-                [
-                    '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
-                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
-                    '{"type":"final","message":"helper saw helper data"}',
-                    '{"type":"final","message":"parent got: helper saw helper data"}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="ask")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-            result = agent.handle_user("delegate this")
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"helper saw helper data"}',
+                '{"type":"final","message":"parent got: helper saw helper data"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="ask")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("delegate this")
 
         self.assertEqual(result.message, "parent got: helper saw helper data")
         self.assertTrue(agent.events[2]["result"]["ok"])
         self.assertEqual(agent.events[2]["result"]["approval_mode"], "read-only")
 
+    def test_agent_retries_after_failed_subagent_does_not_count_as_real_tool_use(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only","max_tool_rounds":1}}',
+                '{"type":"final","message":"helper saw helper data"}',
+                '{"type":"final","message":"parent got: helper saw helper data"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"parent read helper data"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("Delegate reading note.txt, then tell me what it says.")
+
+        self.assertEqual(result.message, "parent read helper data")
+        self.assertFalse(agent.events[2]["result"]["ok"])
+        self.assertIn("Sub-agent failed", agent.events[2]["result"]["summary"])
+        self.assertIn("maximum tool rounds", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+        self.assertEqual(len(client.calls), 5)
+
     def test_agent_normalizes_tool_name_in_type_field(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("helper data\n", encoding="utf-8")
-            client = FakeClient(
-                [
-                    '{"type":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
-                    '{"type":"read_file","arguments":{"path":"note.txt"}}',
-                    '{"type":"final","message":"helper saw helper data"}',
-                    '{"type":"final","message":"parent got: helper saw helper data"}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-            result = agent.handle_user("delegate this")
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
+                '{"type":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"helper saw helper data"}',
+                '{"type":"final","message":"parent got: helper saw helper data"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("delegate this")
 
         self.assertEqual(result.message, "parent got: helper saw helper data")
         self.assertEqual(agent.events[1]["type"], "tool_call")
@@ -145,22 +202,93 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["type"], "tool_call")
 
     def test_agent_retries_when_git_tools_are_required(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient(
-                [
-                    '{"type":"final","message":"repo is clean"}',
-                    '{"type":"tool","name":"git_status","arguments":{}}',
-                    '{"type":"final","message":"repo is clean"}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-            result = agent.handle_user("Tell me the git status of this workspace.")
+        client = FakeClient(
+            [
+                '{"type":"final","message":"repo status checked"}',
+                '{"type":"tool","name":"git_status","arguments":{}}',
+                '{"type":"final","message":"repo status checked"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("Tell me the git status of this workspace.")
 
-        self.assertEqual(result.message, "repo is clean")
+        self.assertEqual(result.message, "repo status checked")
         self.assertEqual(agent.events[1]["type"], "tool_call")
         self.assertEqual(agent.events[1]["name"], "git_status")
+
+    def test_agent_retries_after_unknown_tool_does_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"bogus_tool","arguments":{}}',
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"type":"final","message":"listed workspace"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("List files in the workspace.")
+
+        self.assertEqual(result.message, "listed workspace")
+        self.assertEqual(agent.events[1]["name"], "bogus_tool")
+        self.assertEqual(agent.events[2]["result"]["summary"], "Unknown tool: bogus_tool")
+        self.assertEqual(agent.events[3]["name"], "list_files")
+
+    def test_agent_retries_after_bad_tool_arguments_do_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"start":1}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"readme loaded"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read README.md and summarize it.")
+
+        self.assertEqual(result.message, "readme loaded")
+        self.assertIn("Bad arguments for read_file", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+
+    def test_agent_retries_after_tool_failure_does_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"../secret.txt"}}',
+                '{"type":"final","message":"secret loaded"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"readme loaded"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read README.md and summarize it.")
+
+        self.assertEqual(result.message, "readme loaded")
+        self.assertIn("escapes the workspace", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+        self.assertEqual(len(client.calls), 4)
+
+    def test_agent_retries_after_approval_denial_does_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"cat README.md"}}',
+                '{"type":"final","message":"README loaded from shell"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"README loaded from file"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="read-only")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read README.md and summarize it.")
+
+        self.assertEqual(result.message, "README loaded from file")
+        self.assertIn("denied because approval mode is read-only", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+        self.assertEqual(len(client.calls), 4)
 
     def test_agent_retries_after_empty_model_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +320,20 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "done")
         self.assertEqual(len(client.calls), 2)
 
+    def test_agent_prefers_last_agent_payload_in_mixed_model_output(self) -> None:
+        client = FakeClient(
+            [
+                'Context {"foo":1}\n{"type":"final","message":"done"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(result.rounds, 1)
+        self.assertEqual(len(client.calls), 1)
+
     def test_relative_transcript_paths_use_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -221,8 +363,46 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(loaded, session.resolve())
         self.assertEqual(agent.session_path(), session.resolve())
+        self.assertEqual(agent.model, "fake-model")
+        self.assertEqual(agent.approval_mode(), "auto")
         self.assertEqual(agent.messages[1]["content"], "remember TOKEN_42")
         self.assertEqual(agent.events[0]["content"], "remember TOKEN_42")
+
+    def test_agent_load_session_restores_runtime_settings_without_rewriting_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session = root / ".ollama-code" / "sessions" / "saved.json"
+            session.parent.mkdir(parents=True)
+            original = (
+                '{"model":"saved-model","approval_mode":"read-only","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"restore me"}],"events":[{"type":"user","content":"restore me"}]}'
+            )
+            session.write_text(original, encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="current-model", session_file="scratch/current.json")
+
+            loaded = agent.load_session(session)
+            on_disk = session.read_text(encoding="utf-8")
+
+        self.assertEqual(loaded, session.resolve())
+        self.assertEqual(agent.model, "saved-model")
+        self.assertEqual(agent.approval_mode(), "read-only")
+        self.assertEqual(on_disk, original)
+
+    def test_workspace_roots_match_accepts_wsl_alias_for_windows_path(self) -> None:
+        if Path.cwd().drive:
+            saved_root = "/mnt/c/Users/yorke/OneDrive/Desktop/ollama-interactive"
+            current_root = Path("C:/Users/yorke/OneDrive/Desktop/ollama-interactive")
+        else:
+            saved_root = "C:/Users/yorke/OneDrive/Desktop/ollama-interactive"
+            current_root = Path("/mnt/c/Users/yorke/OneDrive/Desktop/ollama-interactive")
+        self.assertTrue(_workspace_roots_match(saved_root, current_root))
+
+    def test_workspace_roots_match_rejects_different_workspace(self) -> None:
+        current_root = Path(__file__).resolve().parents[1]
+        self.assertFalse(_workspace_roots_match(str(current_root.parent / "other-workspace"), current_root))
 
     def test_agent_rejects_shell_mutation_when_file_tools_fit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

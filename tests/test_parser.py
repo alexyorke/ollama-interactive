@@ -18,3 +18,14 @@ class ParserTests(unittest.TestCase):
         payload = extract_json_response('<think>hidden</think>{"type":"final","message":"done"}')
         self.assertEqual(payload, {"type": "final", "message": "done"})
 
+    def test_prefers_last_agent_payload_over_earlier_non_agent_json(self) -> None:
+        payload = extract_json_response(
+            'context {"foo":1}\n{"type":"tool","name":"list_files","arguments":{}}'
+        )
+        self.assertEqual(payload, {"type": "tool", "name": "list_files", "arguments": {}})
+
+    def test_prefers_last_agent_payload_when_multiple_agent_objects_appear(self) -> None:
+        payload = extract_json_response(
+            '{"type":"final","message":"wrong"}\n{"type":"final","message":"right"}'
+        )
+        self.assertEqual(payload, {"type": "final", "message": "right"})

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -9,6 +10,8 @@ from uuid import uuid4
 
 
 SESSION_SUBDIR = Path(".ollama-code") / "sessions"
+WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
+WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 
 
 @dataclass
@@ -25,9 +28,33 @@ def default_session_dir(workspace_root: Path) -> Path:
     return workspace_root / SESSION_SUBDIR
 
 
+def _coerce_cross_platform_absolute_path(raw_path: str | Path) -> Path | None:
+    text = str(raw_path).strip()
+    if not text:
+        return None
+    candidate = Path(text)
+    if candidate.is_absolute():
+        return candidate
+    normalized = text.replace("\\", "/")
+    windows_match = WINDOWS_DRIVE_PATH.match(normalized)
+    if windows_match:
+        drive = windows_match.group("drive").lower()
+        rest = (windows_match.group("rest") or "").strip("/")
+        suffix = f"/{rest}" if rest else ""
+        return Path(f"/mnt/{drive}{suffix}")
+    wsl_match = WSL_MOUNT_PATH.match(normalized)
+    if wsl_match:
+        drive = wsl_match.group("drive").upper()
+        rest = (wsl_match.group("rest") or "").strip("/")
+        return Path(f"{drive}:/{rest}") if rest else Path(f"{drive}:/")
+    return None
+
+
 def resolve_transcript_path(workspace_root: Path, raw_path: str | Path) -> Path:
     root = workspace_root.resolve()
-    candidate = Path(raw_path)
+    candidate = _coerce_cross_platform_absolute_path(raw_path)
+    if candidate is None:
+        candidate = Path(raw_path)
     if not candidate.is_absolute():
         candidate = root / candidate
     resolved = candidate.resolve(strict=False)
@@ -46,6 +73,8 @@ def new_session_path(workspace_root: Path) -> Path:
 def load_transcript_payload(path: Path) -> dict[str, Any]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Transcript file not found: {path}") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid transcript JSON in {path}") from exc
     if not isinstance(payload, dict):

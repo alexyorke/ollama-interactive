@@ -1,18 +1,41 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor
 
 
 class ToolExecutorTests(unittest.TestCase):
+    def _workspace_scratch(self) -> Path:
+        root = (Path.cwd() / "verify_scratch" / f"test-tools-{uuid4().hex}").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return root
+
+    def _cross_platform_workspace_alias(self, root: Path) -> str:
+        resolved = root.resolve()
+        if resolved.drive:
+            drive = resolved.drive[0].lower()
+            tail = "/".join(part for part in resolved.parts[1:] if part not in {"\\", "/"})
+            return f"/mnt/{drive}/{tail}" if tail else f"/mnt/{drive}"
+        match = re.match(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$", resolved.as_posix())
+        if not match:
+            self.skipTest("workspace is not on a WSL-style /mnt/<drive> path")
+        drive = match.group("drive").upper()
+        rest = (match.group("rest") or "").strip("/")
+        return f"{drive}:/{rest}" if rest else f"{drive}:/"
+
     def init_git_repo(self, root: Path) -> None:
         if shutil.which("git") is None:
             self.skipTest("git is not installed")
@@ -79,6 +102,32 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("escapes the workspace", result["summary"])
 
+    def test_read_file_accepts_cross_platform_workspace_alias(self) -> None:
+        root = Path.cwd().resolve()
+        alias_root = self._cross_platform_workspace_alias(root)
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        result = tools.read_file(f"{alias_root}/README.md", start=1, end=1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["path"], "README.md")
+        self.assertIn("Ollama", result["output"])
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_read_file_normalizes_backslash_relative_path_on_posix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "nested" / "file.txt"
+            target.parent.mkdir(parents=True)
+            target.write_text("hello\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.read_file(r"nested\file.txt", start=1, end=1)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["path"], "nested/file.txt")
+        self.assertIn("hello", result["output"])
+
     def test_search_uses_python_fallback_when_rg_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -96,6 +145,35 @@ class ToolExecutorTests(unittest.TestCase):
             result = tools.run_shell(command)
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "123")
+
+    def test_execute_reports_interrupt_for_run_shell(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        interrupted = threading.Event()
+        tools.set_interrupt_event(interrupted)
+        trigger = threading.Timer(0.2, interrupted.set)
+        trigger.start()
+        try:
+            result = tools.execute("run_shell", {"command": f'"{sys.executable}" -c "import time; time.sleep(5)"', "timeout": 10})
+        finally:
+            trigger.cancel()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["interrupted"])
+        self.assertEqual(result["summary"], "Interrupted by user.")
+
+    def test_run_shell_ignores_posix_shell_env_override(self) -> None:
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        completed = subprocess.CompletedProcess(args=["echo", "ok"], returncode=0, stdout="ok\n", stderr="")
+        with patch("ollama_code.tools.os.name", "posix"):
+            with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
+                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                    result = tools.run_shell("echo ok")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "ok")
+        kwargs = run_mock.call_args.kwargs
+        self.assertTrue(kwargs["shell"])
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_supports_powershell_cmdlets_on_windows(self) -> None:

@@ -3,11 +3,23 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from uuid import uuid4
 
-from ollama_code.sessions import list_sessions, latest_session_path, resolve_transcript_path
+from ollama_code.sessions import list_sessions, latest_session_path, load_transcript_payload, resolve_transcript_path
 
 
 class SessionPathTests(unittest.TestCase):
+    def _cross_platform_workspace_pair(self) -> tuple[Path, str]:
+        if Path.cwd().drive:
+            return (
+                Path("C:/Users/yorke/OneDrive/Desktop/ollama-interactive").resolve(strict=False),
+                "/mnt/c/Users/yorke/OneDrive/Desktop/ollama-interactive",
+            )
+        return (
+            Path("/mnt/c/Users/yorke/OneDrive/Desktop/ollama-interactive"),
+            "C:/Users/yorke/OneDrive/Desktop/ollama-interactive",
+        )
+
     def _write_session(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -42,6 +54,22 @@ class SessionPathTests(unittest.TestCase):
             outside = root.parent / "outside.json"
             with self.assertRaisesRegex(ValueError, "escapes the workspace"):
                 resolve_transcript_path(root, outside)
+
+    def test_resolve_transcript_path_accepts_cross_platform_workspace_alias(self) -> None:
+        root, alias_root = self._cross_platform_workspace_pair()
+        resolved = resolve_transcript_path(root, f"{alias_root}/.ollama-code/sessions/saved.json")
+        self.assertEqual(resolved, (root / ".ollama-code" / "sessions" / "saved.json").resolve(strict=False))
+
+    def test_resolve_transcript_path_blocks_cross_platform_alias_escape(self) -> None:
+        root, alias_root = self._cross_platform_workspace_pair()
+        escaped_alias = alias_root.rsplit("/", 1)[0] + "/other-workspace/saved.json"
+        with self.assertRaisesRegex(ValueError, "escapes the workspace"):
+            resolve_transcript_path(root, escaped_alias)
+
+    def test_load_transcript_payload_reports_missing_file(self) -> None:
+        missing = Path.cwd() / ".ollama-code" / "sessions" / f"missing-{uuid4().hex}.json"
+        with self.assertRaisesRegex(ValueError, "Transcript file not found"):
+            load_transcript_payload(missing)
 
     def test_latest_session_path_ignores_symlink_that_resolves_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

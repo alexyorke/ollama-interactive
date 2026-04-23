@@ -4,13 +4,20 @@ import difflib
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
+from ollama_code.interrupts import OperationInterrupted
+
 ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
+WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
+WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 
 
 TOOL_DESCRIPTIONS = [
@@ -110,10 +117,14 @@ class ToolExecutor:
         self.input_func = input_func
         self.agent_runner = agent_runner
         self.default_test_command = test_command.strip() if isinstance(test_command, str) and test_command.strip() else None
+        self._interrupt_event: threading.Event | None = None
         self._initial_dirty_paths = self._git_dirty_paths()
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
+
+    def set_interrupt_event(self, event: threading.Event | None) -> None:
+        self._interrupt_event = event
 
     def set_test_command(self, command: str | None) -> None:
         self.default_test_command = command.strip() if isinstance(command, str) and command.strip() else None
@@ -124,6 +135,8 @@ class ToolExecutor:
                 return {"ok": False, "tool": name, "summary": "Sub-agent support is not configured."}
             try:
                 return self.agent_runner(arguments)
+            except OperationInterrupted:
+                return {"ok": False, "tool": name, "summary": "Interrupted by user.", "interrupted": True}
             except TypeError as exc:
                 return {"ok": False, "tool": name, "summary": f"Bad arguments for {name}: {exc}"}
             except Exception as exc:  # pragma: no cover - defensive fallback
@@ -145,19 +158,44 @@ class ToolExecutor:
             return {"ok": False, "tool": name, "summary": f"Unknown tool: {name}"}
         try:
             return handler(**arguments)
+        except OperationInterrupted:
+            return {"ok": False, "tool": name, "summary": "Interrupted by user.", "interrupted": True}
         except TypeError as exc:
             return {"ok": False, "tool": name, "summary": f"Bad arguments for {name}: {exc}"}
         except Exception as exc:  # pragma: no cover - defensive fallback
             return {"ok": False, "tool": name, "summary": f"{name} failed: {exc}"}
 
     def resolve_path(self, raw_path: str | None, *, allow_missing: bool = True) -> Path:
-        candidate = self.workspace_root if not raw_path else (self.workspace_root / raw_path)
+        candidate = self.workspace_root if not raw_path else self._coerce_input_path(raw_path)
+        if not candidate.is_absolute():
+            candidate = self.workspace_root / candidate
         resolved = candidate.resolve(strict=False)
         if resolved != self.workspace_root and self.workspace_root not in resolved.parents:
             raise ValueError(f"Path escapes the workspace: {raw_path}")
         if not allow_missing and not resolved.exists():
             raise FileNotFoundError(f"Path does not exist: {raw_path}")
         return resolved
+
+    def _coerce_input_path(self, raw_path: str | Path) -> Path:
+        text = str(raw_path).strip()
+        candidate = Path(text)
+        if candidate.is_absolute():
+            return candidate
+        normalized = text.replace("\\", "/")
+        windows_match = WINDOWS_DRIVE_PATH.match(normalized)
+        if windows_match:
+            drive = windows_match.group("drive").lower()
+            rest = (windows_match.group("rest") or "").strip("/")
+            suffix = f"/{rest}" if rest else ""
+            return Path(f"/mnt/{drive}{suffix}")
+        wsl_match = WSL_MOUNT_PATH.match(normalized)
+        if wsl_match:
+            drive = wsl_match.group("drive").upper()
+            rest = (wsl_match.group("rest") or "").strip("/")
+            return Path(f"{drive}:/{rest}") if rest else Path(f"{drive}:/")
+        if os.name != "nt" and "\\" in text:
+            return Path(normalized)
+        return candidate
 
     def relative_label(self, path: Path) -> str:
         return path.resolve().relative_to(self.workspace_root).as_posix() or "."
@@ -228,16 +266,80 @@ class ToolExecutor:
             parts.append(completed.stderr.strip())
         return "\n".join(parts) if parts else "(no output)"
 
+    def _check_interrupted(self) -> None:
+        if self._interrupt_event is not None and self._interrupt_event.is_set():
+            raise OperationInterrupted("Interrupted by user.")
+
+    def _terminate_process(self, process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if process.poll() is None:
+                process.kill()
+            return
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            process.wait(timeout=1)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+    def _run_process(
+        self,
+        args: str | list[str],
+        *,
+        cwd: Path,
+        timeout: int,
+        shell: bool = False,
+        **kwargs: Any,
+    ) -> subprocess.CompletedProcess[str]:
+        self._check_interrupted()
+        process = subprocess.Popen(
+            args,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            shell=shell,
+            start_new_session=True,
+            **kwargs,
+        )
+        deadline = time.monotonic() + timeout
+        while True:
+            self._check_interrupted()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._terminate_process(process)
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if self._interrupt_event is not None and self._interrupt_event.is_set():
+                    self._terminate_process(process)
+                    raise OperationInterrupted("Interrupted by user.")
+                continue
+
     def _run_git(self, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
         if shutil.which("git") is None:
             raise RuntimeError("git is not installed.")
-        return subprocess.run(
+        return self._run_process(
             ["git", *args],
             cwd=self.workspace_root,
             timeout=timeout,
-            capture_output=True,
-            text=True,
-            check=False,
         )
 
     def _ensure_git_repo(self) -> tuple[bool, str | None]:
@@ -266,12 +368,14 @@ class ToolExecutor:
         return paths
 
     def list_files(self, path: str = ".", max_depth: int = 4, limit: int = 200) -> dict[str, Any]:
+        self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
         if base.is_file():
             items = [self.relative_label(base)]
         else:
             items = []
             for root, dirs, files in os.walk(base):
+                self._check_interrupted()
                 root_path = Path(root)
                 depth = len(root_path.relative_to(base).parts)
                 dirs[:] = sorted(d for d in dirs if not d.startswith("."))
@@ -300,6 +404,7 @@ class ToolExecutor:
         }
 
     def read_file(self, path: str, start: int = 1, end: int = 200) -> dict[str, Any]:
+        self._check_interrupted()
         target = self.resolve_path(path, allow_missing=False)
         if target.is_dir():
             return {"ok": False, "tool": "read_file", "summary": f"{path} is a directory."}
@@ -318,10 +423,11 @@ class ToolExecutor:
         }
 
     def search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
+        self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
         if shutil.which("rg"):
             command = ["rg", "-n", "--color", "never", "--max-count", str(limit), query, str(base)]
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            result = self._run_process(command, cwd=self.workspace_root, timeout=30)
             output = result.stdout.strip() or result.stderr.strip() or "(no matches)"
             return {
                 "ok": result.returncode in {0, 1},
@@ -336,9 +442,11 @@ class ToolExecutor:
         except re.error:
             matcher = lambda text: query in text
         for file_path in sorted(base.rglob("*")):
+            self._check_interrupted()
             if not file_path.is_file() or ".git" in file_path.parts:
                 continue
             for line_no, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
+                self._check_interrupted()
                 if matcher(line):
                     matches.append(f"{self.relative_label(file_path)}:{line_no}:{line}")
                     if len(matches) >= limit:
@@ -547,10 +655,8 @@ class ToolExecutor:
             powershell = self._windows_powershell()
             if powershell and self._looks_like_powershell_command(command):
                 run_args = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
-                shell_kwargs = {}
-        else:
-            shell_kwargs["executable"] = os.environ.get("SHELL", "/bin/sh")
-        completed = subprocess.run(run_args, cwd=working_dir, timeout=timeout, capture_output=True, text=True, check=False, **shell_kwargs)
+                shell_kwargs = {"shell": False}
+        completed = self._run_process(run_args, cwd=working_dir, timeout=timeout, **shell_kwargs)
         output = self._collect_process_output(completed)
         return {
             "ok": completed.returncode == 0,

@@ -29,14 +29,35 @@ Inside WSL:
 python3 -m pip install -e .
 ```
 
+You do not need to activate a virtualenv every time just to run the CLI from this repo. These launchers will prefer `.venv` if it exists and otherwise fall back to your normal Python on `PATH`:
+
+```powershell
+.\start.ps1
+```
+
+```bash
+./start.sh
+```
+
+You can also run it directly from the checkout without installing a console script:
+
+```bash
+python -m ollama_code.cli
+```
+
 ## Config File
 
-Create `.ollama-code/config.json` in your workspace to set the local Ollama endpoint and default model without repeating flags or env vars. This path is already ignored by git.
+Create `.ollama-code/config.json` in your workspace to keep the app defaults in one place instead of repeating flags or env vars. This path is already ignored by git.
 
 ```json
 {
   "host": "http://127.0.0.1:11435",
-  "model": "batiai/gemma4-26b:iq4"
+  "model": "batiai/qwen3.6-35b:iq4",
+  "approval": "ask",
+  "max_tool_rounds": 100,
+  "max_agent_depth": 2,
+  "timeout": 300,
+  "test_cmd": "python -m unittest -v"
 }
 ```
 
@@ -48,9 +69,9 @@ ollama-code --config ~/my-ollama.json
 
 Precedence:
 
-- `--host` and `--model` override everything else
+- CLI flags override everything else
 - when resuming a saved session, the saved model wins unless `--model` is provided
-- `OLLAMA_HOST` and `OLLAMA_CODE_MODEL` override the config file for one-off runs
+- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, and `OLLAMA_CODE_TEST_CMD` override the config file for one-off runs
 - otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
 
 ## Run
@@ -89,6 +110,8 @@ Resume a specific saved transcript:
 export OLLAMA_HOST=127.0.0.1:11435
 ollama-code --resume .ollama-code/sessions/20260421-120000-abcdef.json
 ```
+
+In the interactive REPL, press `Esc` to interrupt the current model request or tool subprocess.
 
 If your Ollama daemon is not on the default host, set `OLLAMA_HOST`:
 
@@ -169,7 +192,7 @@ If your Ollama daemon is on a non-default host or port, set `OLLAMA_HOST` first.
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11435
-python3 scripts/live_matrix.py --models batiai/gemma4-26b:iq4 gemma4
+python3 scripts/live_matrix.py --models batiai/qwen3.6-35b:iq4 gemma4
 ```
 
 For stricter transcript-verified end-to-end checks against one model:
@@ -228,5 +251,5 @@ git push origin v0.1.0
 - Session history is auto-saved under `.ollama-code/sessions` in the workspace.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
-- On this machine, the tested default model is `batiai/gemma4-26b:iq4` on the user-space WSL Ollama daemon at `127.0.0.1:11435`.
+- On this machine, the tested default model is `batiai/qwen3.6-35b:iq4` on the user-space WSL Ollama daemon at `127.0.0.1:11435`.
 - The Windows-side Ollama install still has no usable local models for this project, so running inside WSL is the simplest path.

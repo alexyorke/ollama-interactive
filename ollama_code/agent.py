@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+import threading
 
 from ollama_code.ollama_client import OllamaClient, OllamaError
 from ollama_code.sessions import (
@@ -32,6 +33,9 @@ Valid response shapes:
 Rules:
 - Use at most one tool call per response.
 - Prefer inspecting files before editing them.
+- Question your assumptions before acting.
+- Identify what you are assuming, then prove or disprove it with the available tools whenever a file read, search, git inspection, test run, or shell command can verify it.
+- Do not guess about workspace contents, command output, repo state, or whether an edit worked when you can check instead.
 - Use relative workspace paths.
 - Keep final answers concise and practical.
 - Do not emit markdown fences.
@@ -53,6 +57,7 @@ Example when you need a helper agent:
 class AgentResult:
     message: str
     rounds: int
+    completed: bool = True
 
 
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
@@ -73,14 +78,70 @@ def extract_json_response(raw_text: str) -> dict[str, Any] | None:
     starts = [index for index, char in enumerate(candidate) if char == "{"]
     if candidate.startswith("{"):
         starts = [0] + [index for index in starts if index != 0]
+    parsed_dicts: list[dict[str, Any]] = []
+    agent_payloads: list[dict[str, Any]] = []
     for start in starts:
         try:
             data, _ = decoder.raw_decode(candidate[start:])
         except json.JSONDecodeError:
             continue
         if isinstance(data, dict):
-            return data
+            parsed_dicts.append(data)
+            response_type = data.get("type")
+            tool_name = data.get("name")
+            if isinstance(response_type, str) and response_type.strip() in {"tool", "final", *KNOWN_TOOL_NAMES}:
+                agent_payloads.append(data)
+                continue
+            if isinstance(tool_name, str) and tool_name.strip() in KNOWN_TOOL_NAMES and response_type in {None, "", "function", "tool_call"}:
+                agent_payloads.append(data)
+    if agent_payloads:
+        return agent_payloads[-1]
+    if parsed_dicts:
+        return parsed_dicts[-1]
     return None
+
+
+def _portable_workspace_key(raw_path: str | Path) -> str | None:
+    text = str(raw_path).strip()
+    if not text:
+        return None
+    normalized = text.replace("\\", "/")
+    drive_match = re.match(r"^(?P<drive>[A-Za-z]):(?:/(?P<rest>.*))?$", normalized)
+    if drive_match:
+        drive = drive_match.group("drive").lower()
+        rest = (drive_match.group("rest") or "").strip("/")
+        return f"{drive}:/{rest}" if rest else f"{drive}:/"
+    wsl_match = re.match(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$", normalized)
+    if wsl_match:
+        drive = wsl_match.group("drive").lower()
+        rest = (wsl_match.group("rest") or "").strip("/")
+        return f"{drive}:/{rest}" if rest else f"{drive}:/"
+    try:
+        return Path(text).resolve(strict=False).as_posix()
+    except OSError:
+        return None
+
+
+def _workspace_roots_match(saved_root: object, current_root: Path) -> bool:
+    if saved_root is None:
+        return True
+    saved_text = str(saved_root).strip()
+    if not saved_text:
+        return False
+    current_root = current_root.resolve()
+    try:
+        saved_path = Path(saved_text).resolve(strict=False)
+    except OSError:
+        saved_path = None
+    if saved_path == current_root:
+        return True
+    saved_key = _portable_workspace_key(saved_text)
+    current_key = _portable_workspace_key(current_root)
+    if saved_key is None or current_key is None:
+        return False
+    if re.match(r"^[A-Za-z]:/", saved_key) or re.match(r"^[A-Za-z]:/", current_key):
+        return saved_key.casefold() == current_key.casefold()
+    return saved_key == current_key
 
 
 class OllamaCodeAgent:
@@ -93,6 +154,7 @@ class OllamaCodeAgent:
         max_tool_rounds: int = 8,
         session_file: str | Path | None = None,
         status_printer: Callable[[str], None] | None = None,
+        thinking_printer: Callable[[str], None] | None = None,
         agent_depth: int = 0,
         max_agent_depth: int = 2,
     ) -> None:
@@ -102,9 +164,11 @@ class OllamaCodeAgent:
         self.max_tool_rounds = max_tool_rounds
         self.session_file = self._resolve_transcript_path(session_file) if session_file else None
         self.status_printer = status_printer or (lambda message: None)
+        self.thinking_printer = thinking_printer
         self.agent_depth = agent_depth
         self.max_agent_depth = max_agent_depth
         self.events: list[dict[str, Any]] = []
+        self._interrupt_event: threading.Event | None = None
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
@@ -136,6 +200,11 @@ class OllamaCodeAgent:
     def configured_test_command(self) -> str | None:
         return self.tools.default_test_command
 
+    def set_interrupt_event(self, event: threading.Event | None) -> None:
+        self._interrupt_event = event
+        self.client.set_interrupt_event(event)
+        self.tools.set_interrupt_event(event)
+
     def workspace_root(self) -> Path:
         return self.tools.workspace_root
 
@@ -156,7 +225,7 @@ class OllamaCodeAgent:
 
     def restore_transcript(self, payload: dict[str, Any]) -> None:
         workspace_root = payload.get("workspace_root")
-        if workspace_root is not None and Path(str(workspace_root)).resolve() != self.tools.workspace_root:
+        if not _workspace_roots_match(workspace_root, self.tools.workspace_root):
             raise ValueError("Saved session belongs to a different workspace.")
         messages = payload.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -178,8 +247,20 @@ class OllamaCodeAgent:
     def load_session(self, path: str | Path) -> Path:
         target = self._resolve_transcript_path(path)
         payload = load_transcript_payload(target)
+        previous_session_file = self.session_file
+        self.session_file = None
+        try:
+            self.restore_transcript(payload)
+        except Exception:
+            self.session_file = previous_session_file
+            raise
+        saved_model = payload.get("model")
+        if isinstance(saved_model, str) and saved_model.strip():
+            self.model = saved_model.strip()
+        saved_approval = payload.get("approval_mode")
+        if saved_approval in {"ask", "auto", "read-only"}:
+            self.tools.set_approval_mode(str(saved_approval))
         self.session_file = target
-        self.restore_transcript(payload)
         return target
 
     def list_sessions(self, limit: int = 10) -> list[SessionSummary]:
@@ -327,6 +408,11 @@ class OllamaCodeAgent:
             return normalized
         return normalized
 
+    def _counts_as_real_tool_use(self, name: str, result: dict[str, Any]) -> bool:
+        if name not in KNOWN_TOOL_NAMES:
+            return False
+        return result.get("ok") is True
+
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -368,12 +454,13 @@ class OllamaCodeAgent:
             max_tool_rounds=max_tool_rounds,
             session_file=None,
             status_printer=lambda message: self.status_printer(f"subagent[{selected_model}] {message}"),
+            thinking_printer=self.thinking_printer,
             agent_depth=self.agent_depth + 1,
             max_agent_depth=self.max_agent_depth,
         )
+        child.set_interrupt_event(self._interrupt_event)
         result = child.handle_user(prompt)
-        return {
-            "ok": True,
+        response = {
             "tool": "run_agent",
             "model": selected_model,
             "approval_mode": approval_mode,
@@ -381,6 +468,12 @@ class OllamaCodeAgent:
             "output": result.message,
             "event_count": len(child.events),
         }
+        if not result.completed:
+            response["ok"] = False
+            response["summary"] = f"Sub-agent failed: {result.message}"
+            return response
+        response["ok"] = True
+        return response
 
     def handle_user(self, text: str) -> AgentResult:
         self.messages.append({"role": "user", "content": text})
@@ -391,7 +484,11 @@ class OllamaCodeAgent:
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
-                response = self.client.chat(model=self.model, messages=self.messages)
+                response = self.client.chat(
+                    model=self.model,
+                    messages=self.messages,
+                    on_thinking=self.thinking_printer,
+                )
             except OllamaError:
                 raise
             payload = extract_json_response(response.content)
@@ -421,7 +518,7 @@ class OllamaCodeAgent:
                 assistant_text = str(payload.get("message", "")).strip()
                 self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
-                return AgentResult(message=assistant_text, rounds=round_number)
+                return AgentResult(message=assistant_text, rounds=round_number, completed=True)
             if response_type == "tool":
                 name = str(payload.get("name", "")).strip()
                 arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
@@ -438,18 +535,26 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
-                tool_used_this_turn = True
                 self.status_printer(f"tool {name} {json.dumps(arguments, ensure_ascii=True)}")
                 self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                 self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
                 result = self.tools.execute(name, arguments)
+                real_tool_use = self._counts_as_real_tool_use(name, result)
+                tool_used_this_turn = tool_used_this_turn or real_tool_use
                 self._record_event("tool_result", name=name, result=result, rounds=round_number)
+                follow_up = "Respond with the next JSON object only."
+                if not real_tool_use:
+                    follow_up = (
+                        "That tool call did not complete successfully, so it does not satisfy the tool-use requirement. "
+                        "Fix the issue or use a different appropriate tool, then respond with the next JSON object only."
+                    )
                 self.messages.append(
                     {
                         "role": "user",
                         "content": "Tool result:\n"
                         + json.dumps(result, indent=2, ensure_ascii=True)
-                        + "\nRespond with the next JSON object only.",
+                        + "\n"
+                        + follow_up,
                     }
                 )
                 continue
@@ -462,4 +567,4 @@ class OllamaCodeAgent:
             )
         failure = "Stopped after reaching the maximum tool rounds."
         self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
-        return AgentResult(message=failure, rounds=self.max_tool_rounds)
+        return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
