@@ -77,6 +77,19 @@ class AgentTests(unittest.TestCase):
         self.assertIn("prove or disprove it with the available tools", prompt)
         self.assertIn("Do not guess about workspace contents", prompt)
 
+    def test_system_prompt_enables_caveman_lite_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        prompt = agent.messages[0]["content"]
+        self.assertIn("Default reply style: caveman-lite.", prompt)
+        self.assertIn("keep all technical terms, code, file paths, commands, errors, and JSON exact", prompt)
+        self.assertIn("Do not let terse style reduce investigation depth", prompt)
+        self.assertIn("Tool arguments, JSON wrappers, code, diffs, and commands must stay syntactically correct and complete.", prompt)
+
     def test_agent_stops_after_max_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient(['{"type":"tool","name":"list_files","arguments":{}}'] * 2)
