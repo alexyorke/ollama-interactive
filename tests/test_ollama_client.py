@@ -119,3 +119,38 @@ class OllamaClientTests(unittest.TestCase):
         self.assertEqual(updates[-1], "alpha beta")
         self.assertEqual(response.thinking, "alpha beta")
         self.assertEqual(response.content, "ok")
+
+    def test_chat_stream_deduplicates_cumulative_thinking_chunks(self) -> None:
+        body = (
+            b'{"message":{"content":"","thinking":"Let me inspect files"},"done":false}\n'
+            b'{"message":{"content":"","thinking":"Let me inspect files and check config"},"done":false}\n'
+            b'{"message":{"content":"done","thinking":"Let me inspect files and check config"},"done":true}\n'
+        )
+        client, server, thread = self._with_server(body)
+        updates: list[str] = []
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}], on_thinking=updates.append)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(updates[-1], "Let me inspect files and check config")
+        self.assertEqual(response.thinking, "Let me inspect files and check config")
+        self.assertEqual(response.content, "done")
+
+    def test_chat_stream_deduplicates_overlapping_content_chunks(self) -> None:
+        body = (
+            b'{"message":{"content":"Hel","thinking":""},"done":false}\n'
+            b'{"message":{"content":"Hello","thinking":""},"done":false}\n'
+            b'{"message":{"content":"Hello there","thinking":""},"done":true}\n'
+        )
+        client, server, thread = self._with_server(body)
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}], on_thinking=lambda _: None)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.content, "Hello there")

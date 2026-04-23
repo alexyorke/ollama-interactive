@@ -125,10 +125,26 @@ class OllamaClient:
         error: dict[str, BaseException] = {}
         done = threading.Event()
 
+        def merge_stream_text(existing: str, chunk: str) -> str:
+            if not chunk:
+                return existing
+            if not existing:
+                return chunk
+            if chunk.startswith(existing):
+                return chunk
+            if existing.endswith(chunk):
+                return existing
+            overlap = min(len(existing), len(chunk))
+            while overlap > 0:
+                if existing[-overlap:] == chunk[:overlap]:
+                    return existing + chunk[overlap:]
+                overlap -= 1
+            return existing + chunk
+
         def worker() -> None:
             try:
-                thinking_parts: list[str] = []
-                content_parts: list[str] = []
+                thinking_text = ""
+                content_text = ""
                 final_chunk: dict[str, Any] | None = None
                 with urlopen(request, timeout=self.timeout) as response:
                     for raw_line in response:
@@ -144,15 +160,15 @@ class OllamaClient:
                         message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
                         thinking_delta = str(message.get("thinking", ""))
                         if thinking_delta:
-                            thinking_parts.append(thinking_delta)
-                            on_thinking("".join(thinking_parts))
+                            thinking_text = merge_stream_text(thinking_text, thinking_delta)
+                            on_thinking(thinking_text)
                         content_delta = str(message.get("content", ""))
                         if content_delta:
-                            content_parts.append(content_delta)
+                            content_text = merge_stream_text(content_text, content_delta)
                 merged = final_chunk or {}
                 merged_message = dict(merged.get("message") or {})
-                merged_message["content"] = "".join(content_parts)
-                merged_message["thinking"] = "".join(thinking_parts)
+                merged_message["content"] = content_text
+                merged_message["thinking"] = thinking_text
                 merged["message"] = merged_message
                 merged["model"] = str(merged.get("model") or model)
                 result["value"] = merged
