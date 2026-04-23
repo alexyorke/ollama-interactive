@@ -122,7 +122,7 @@ class CliCommandTests(unittest.TestCase):
 
     def test_status_renderer_shows_last_three_thinking_lines_and_clears_on_status(self) -> None:
         stream = io.StringIO()
-        renderer = CliStatusRenderer(stream=stream, use_ansi=True)
+        renderer = CliStatusRenderer(stream=stream, use_ansi=True, update_interval=0.0)
 
         renderer.show_thinking("one\ntwo\nthree\nfour")
         renderer.status("tool read_file {}")
@@ -134,6 +134,31 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("\x1b[90mfour\x1b[0m", output)
         self.assertIn("\x1b[1A", output)
         self.assertIn("[status] tool read_file {}", output)
+
+    def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=True, update_interval=0.0)
+
+        renderer.show_thinking("one\ntwo\nthree")
+        renderer.show_thinking("one\ntwo\nthree")
+
+        output = stream.getvalue()
+        self.assertEqual(output.count("\x1b[90mone\x1b[0m\n"), 1)
+        self.assertEqual(output.count("\x1b[90mtwo\x1b[0m\n"), 1)
+        self.assertEqual(output.count("\x1b[90mthree\x1b[0m\n"), 1)
+
+    def test_status_renderer_rewrites_only_last_line_when_tail_prefix_matches(self) -> None:
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=True, update_interval=0.0)
+
+        renderer.show_thinking("one\ntwo\nthree")
+        renderer.show_thinking("one\ntwo\nthree more")
+
+        output = stream.getvalue()
+        self.assertEqual(output.count("\x1b[90mone\x1b[0m\n"), 1)
+        self.assertEqual(output.count("\x1b[90mtwo\x1b[0m\n"), 1)
+        self.assertIn("\x1b[1A\r\x1b[2K\x1b[90mthree more\x1b[0m\n", output)
+        self.assertNotIn("\x1b[M", output)
 
     def test_build_agent_uses_config_file_for_runtime_defaults(self) -> None:
         root = self._workspace_scratch()

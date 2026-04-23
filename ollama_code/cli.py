@@ -6,6 +6,7 @@ import os
 import shlex
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Callable
 
@@ -28,10 +29,19 @@ from ollama_code.tools import ToolExecutor
 
 
 class CliStatusRenderer:
-    def __init__(self, stream: io.TextIOBase | None = None, *, use_ansi: bool | None = None) -> None:
+    def __init__(
+        self,
+        stream: io.TextIOBase | None = None,
+        *,
+        use_ansi: bool | None = None,
+        update_interval: float = 0.1,
+    ) -> None:
         self.stream = stream or sys.stdout
         self.use_ansi = self.stream.isatty() if use_ansi is None else use_ansi
+        self.update_interval = max(0.0, update_interval)
         self._thinking_lines = 0
+        self._last_thinking_tail: tuple[str, ...] = ()
+        self._last_render_at = 0.0
         self._lock = threading.Lock()
 
     def _write_locked(self, text: str) -> None:
@@ -40,11 +50,21 @@ class CliStatusRenderer:
 
     def _clear_thinking_locked(self) -> None:
         if not self.use_ansi or self._thinking_lines <= 0:
+            self._last_thinking_tail = ()
+            self._last_render_at = 0.0
             return
         for _ in range(self._thinking_lines):
             self._write_locked("\x1b[1A\r\x1b[2K\x1b[M")
         self._write_locked("\r")
         self._thinking_lines = 0
+        self._last_thinking_tail = ()
+        self._last_render_at = 0.0
+
+    def _rewrite_last_thinking_line_locked(self, line: str) -> None:
+        if not self.use_ansi or self._thinking_lines <= 0:
+            return
+        self._write_locked("\x1b[1A\r\x1b[2K")
+        self._write_locked(f"\x1b[90m{line}\x1b[0m\n")
 
     def clear_thinking(self) -> None:
         with self._lock:
@@ -66,12 +86,30 @@ class CliStatusRenderer:
         lines = [line.rstrip() for line in thinking.splitlines() if line.strip()]
         if not lines:
             return
-        tail = lines[-3:]
+        tail = tuple(lines[-3:])
         with self._lock:
+            now = time.monotonic()
+            if tail == self._last_thinking_tail:
+                return
+            if self.update_interval > 0 and self._last_thinking_tail and (now - self._last_render_at) < self.update_interval:
+                return
+            previous_tail = self._last_thinking_tail
+            if (
+                previous_tail
+                and len(previous_tail) == len(tail)
+                and previous_tail[:-1] == tail[:-1]
+                and len(previous_tail) <= self._thinking_lines
+            ):
+                self._rewrite_last_thinking_line_locked(tail[-1])
+                self._last_thinking_tail = tail
+                self._last_render_at = now
+                return
             self._clear_thinking_locked()
             for line in tail:
                 self._write_locked(f"\x1b[90m{line}\x1b[0m\n")
             self._thinking_lines = len(tail)
+            self._last_thinking_tail = tail
+            self._last_render_at = now
 
 
 def build_parser() -> argparse.ArgumentParser:
