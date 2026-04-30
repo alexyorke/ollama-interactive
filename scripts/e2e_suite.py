@@ -19,6 +19,13 @@ def init_git_repo(root: Path) -> None:
     subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
 
 
+def commit_all(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True, check=True)
+    status = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root, capture_output=True, text=True, check=False)
+    if status.returncode != 0:
+        subprocess.run(["git", "commit", "-m", message], cwd=root, capture_output=True, text=True, check=True)
+
+
 def ollama_host() -> str:
     host = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
     if not host.startswith(("http://", "https://")):
@@ -206,7 +213,7 @@ def scenario_approval_accept(repo_root: Path, workspace: Path, model: str) -> No
         repo_root,
         workspace,
         model,
-        "Create scratch/approved.txt with exactly the text approval accepted followed by a newline, then confirm the contents.",
+        "Create scratch/approved.txt with exactly the single line APPROVED followed by a newline. Then use read_file to confirm it and reply with APPROVED only.",
         approval="ask",
         session_file=session_file,
         stdin_text="y\n",
@@ -214,7 +221,7 @@ def scenario_approval_accept(repo_root: Path, workspace: Path, model: str) -> No
     session = load_session(session_file)
     writes = tool_results(session, "write_file")
     require(result.returncode == 0, "approval accept command failed", stdout=result.stdout, stderr=result.stderr, session=session)
-    require(target.exists() and target.read_text(encoding="utf-8") == "approval accepted\n", "approved file content mismatch", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(target.exists() and target.read_text(encoding="utf-8") == "APPROVED\n", "approved file content mismatch", stdout=result.stdout, stderr=result.stderr, session=session)
     require(any(result.get("ok") for result in writes), "write_file was not approved successfully", stdout=result.stdout, stderr=result.stderr, session=session)
 
 
@@ -225,7 +232,7 @@ def scenario_approval_reject(repo_root: Path, workspace: Path, model: str) -> No
         repo_root,
         workspace,
         model,
-        "Create scratch/rejected.txt with any content and then tell me what happened.",
+        "Create scratch/rejected.txt with exactly the single line REJECTED followed by a newline. If it does not happen, tell me what happened.",
         approval="ask",
         session_file=session_file,
         stdin_text="n\n",
@@ -300,13 +307,14 @@ def scenario_subagent_transcript(repo_root: Path, workspace: Path, model: str) -
 
 def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
     session_file = workspace / "scratch" / "git-tools.json"
+    commit_all(workspace, "checkpoint before git scenario")
     target = workspace / "src" / "app.py"
     target.write_text("def meaning() -> int:\n    return 99\n", encoding="utf-8")
     result = run_cli(
         repo_root,
         workspace,
         model,
-        "Use git_status and git_diff to identify the modified file and the added return line. Reply with both.",
+        "Use git_status on src/app.py. Then use git_diff on src/app.py for the working tree only; omit cached or set cached to false. Do not use read_file. Reply with src/app.py and whether the diff adds return 99.",
         session_file=session_file,
     )
     session = load_session(session_file)

@@ -74,7 +74,7 @@ TOOL_DESCRIPTIONS = [
     {
         "name": "git_diff",
         "arguments": {"path": "optional relative path filter", "cached": "bool, default false", "context": "int, default 3"},
-        "description": "Show a git diff for working tree or staged changes.",
+        "description": "Show a git diff for working tree or staged changes. Leave cached unset for working-tree changes; use cached=true only when the user explicitly asks for staged diff.",
     },
     {
         "name": "git_commit",

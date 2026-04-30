@@ -13,6 +13,7 @@ It gives the model a guarded tool loop for:
 - inspecting git status and diffs
 - creating guarded git commits
 - running nested sub-agents for scoped subtasks
+- running a default-on against/for/judge self-debate around each usable model reply
 
 By default it asks before edits or shell commands. You can switch to `--approval auto` for hands-off runs.
 Sessions are also auto-saved locally under `.ollama-code/sessions`, so you can continue or resume prior work.
@@ -51,9 +52,10 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
 
 ```json
 {
-  "host": "http://127.0.0.1:11435",
+  "host": "http://127.0.0.1:11434",
   "model": "batiai/qwen3.6-35b:iq4",
   "approval": "ask",
+  "debate": true,
   "max_tool_rounds": 100,
   "max_agent_depth": 2,
   "timeout": 300,
@@ -71,7 +73,7 @@ Precedence:
 
 - CLI flags override everything else
 - when resuming a saved session, the saved model wins unless `--model` is provided
-- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, and `OLLAMA_CODE_TEST_CMD` override the config file for one-off runs
+- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_TEST_CMD`, and `OLLAMA_CODE_DEBATE` override the config file for one-off runs
 - otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
 
 ## Run
@@ -79,35 +81,42 @@ Precedence:
 Interactive REPL:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 ollama-code
 ```
 
 One-shot prompt:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --approval auto "Inspect this repo and explain what it does."
 ```
 
 Continue the most recent local session in the current workspace:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --continue
 ```
 
 Run with a default test command so the model can use `run_test` and `/test` directly:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --test-cmd "python3 -m unittest discover -s tests -v"
+```
+
+Debate is on by default. Disable it for faster or more literal runs:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+ollama-code --debate off
 ```
 
 Resume a specific saved transcript:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --resume .ollama-code/sessions/20260421-120000-abcdef.json
 ```
 
@@ -120,6 +129,7 @@ export OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
 You can also set the default test command with `OLLAMA_CODE_TEST_CMD`.
+You can disable debate with `OLLAMA_CODE_DEBATE=off`.
 
 ## Docker
 
@@ -153,7 +163,7 @@ Continue the latest saved session in Docker:
 docker compose run --rm ollama-code --continue
 ```
 
-By default `compose.yaml` points the container at `http://host.docker.internal:11435`, which matches the tested user-space WSL Ollama daemon on this machine. Override `OLLAMA_CODE_OLLAMA_HOST` if your daemon is somewhere else:
+By default `compose.yaml` points the container at `http://host.docker.internal:11434`, which matches the tested WSL Ollama daemon on this machine. Override `OLLAMA_CODE_OLLAMA_HOST` if your daemon is somewhere else:
 
 ```bash
 OLLAMA_CODE_OLLAMA_HOST=http://host.docker.internal:11434 docker compose run --rm ollama-code
@@ -184,28 +194,28 @@ From PowerShell:
 Run the real-model smoke matrix from WSL:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/live_matrix.py
 ```
 
-If your Ollama daemon is on a non-default host or port, set `OLLAMA_HOST` first. Example for a user-space WSL daemon on `127.0.0.1:11435`:
+If your Ollama daemon is on a non-default host or port, set `OLLAMA_HOST` first. Example for the tested WSL daemon on `127.0.0.1:11434`:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/live_matrix.py --models batiai/qwen3.6-35b:iq4 gemma4
 ```
 
 For stricter transcript-verified end-to-end checks against one model:
 
 ```bash
-export OLLAMA_HOST=127.0.0.1:11435
+export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/e2e_suite.py
 ```
 
 Containerized end-to-end check against the host Ollama daemon:
 
 ```bash
-OLLAMA_CODE_OLLAMA_HOST=http://host.docker.internal:11435 docker compose run --rm --entrypoint python ollama-code scripts/e2e_suite.py
+OLLAMA_CODE_OLLAMA_HOST=http://host.docker.internal:11434 docker compose run --rm --entrypoint python ollama-code scripts/e2e_suite.py
 ```
 
 ## GitHub Actions
@@ -233,6 +243,7 @@ git push origin v0.1.0
 - `/models`
 - `/model <name>`
 - `/approval ask|auto|read-only`
+- `/debate on|off`
 - `/reset`
 - `/save [path]`
 - `/sessions [limit]`
@@ -249,7 +260,8 @@ git push origin v0.1.0
 - The CLI is designed to run inside the current workspace root.
 - File mutations are limited to that workspace.
 - Session history is auto-saved under `.ollama-code/sessions` in the workspace.
+- Debate is enabled by default for final-answer candidates: the main model proposes a final reply, then the CLI runs an against pass, a for pass, and a judge pass before accepting it. Tool-selection rounds are not debated, which keeps tool use fast enough to stay practical. If the judge returns invalid controller JSON, the original candidate is kept.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
-- On this machine, the tested default model is `batiai/qwen3.6-35b:iq4` on the user-space WSL Ollama daemon at `127.0.0.1:11435`.
+- On this machine, the tested serial live model is `gemma3:4b` on the WSL Ollama daemon at `127.0.0.1:11434`. If you do not pass `--model` and the built-in preferred default is not installed, the CLI falls back to the first available preferred local model and reports that choice.
 - The Windows-side Ollama install still has no usable local models for this project, so running inside WSL is the simplest path.

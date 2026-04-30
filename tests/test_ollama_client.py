@@ -12,8 +12,11 @@ from ollama_code.ollama_client import OllamaClient, OllamaError
 
 class _MalformedResponseHandler(BaseHTTPRequestHandler):
     response_body = b"{}"
+    response_status = 200
     response_delay = 0.0
+    response_sequence: list[tuple[int, bytes]] = []
     last_request_body = b""
+    last_request_bodies: list[bytes] = []
 
     def do_POST(self) -> None:
         if self.path != "/api/chat":
@@ -21,12 +24,17 @@ class _MalformedResponseHandler(BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0"))
         type(self).last_request_body = self.rfile.read(length)
+        type(self).last_request_bodies.append(type(self).last_request_body)
+        status = type(self).response_status
+        body = type(self).response_body
+        if type(self).response_sequence:
+            status, body = type(self).response_sequence.pop(0)
         if type(self).response_delay:
             time.sleep(type(self).response_delay)
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(type(self).response_body)
+        self.wfile.write(body)
 
     def do_GET(self) -> None:
         if self.path != "/api/tags":
@@ -46,8 +54,11 @@ class _MalformedResponseHandler(BaseHTTPRequestHandler):
 class OllamaClientTests(unittest.TestCase):
     def _with_server(self, body: bytes, *, delay: float = 0.0) -> tuple[OllamaClient, ThreadingHTTPServer, threading.Thread]:
         _MalformedResponseHandler.response_body = body
+        _MalformedResponseHandler.response_status = 200
         _MalformedResponseHandler.response_delay = delay
+        _MalformedResponseHandler.response_sequence = []
         _MalformedResponseHandler.last_request_body = b""
+        _MalformedResponseHandler.last_request_bodies = []
         server = ThreadingHTTPServer(("127.0.0.1", 0), _MalformedResponseHandler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -101,6 +112,25 @@ class OllamaClientTests(unittest.TestCase):
             thread.join(timeout=5)
 
         self.assertTrue(payload["think"])
+
+    def test_chat_retries_without_thinking_when_model_rejects_it(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        _MalformedResponseHandler.response_sequence = [
+            (400, b'{"error":"\\"fake-model\\" does not support thinking"}'),
+            (200, b'{"message":{"content":"ok"}}'),
+        ]
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        first_payload = json.loads(_MalformedResponseHandler.last_request_bodies[0].decode("utf-8"))
+        second_payload = json.loads(_MalformedResponseHandler.last_request_bodies[1].decode("utf-8"))
+        self.assertEqual(response.content, "ok")
+        self.assertTrue(first_payload["think"])
+        self.assertFalse(second_payload["think"])
 
     def test_chat_streams_thinking_updates(self) -> None:
         body = (

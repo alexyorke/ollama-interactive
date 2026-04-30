@@ -36,6 +36,33 @@ class OllamaClient:
     def set_interrupt_event(self, event: threading.Event | None) -> None:
         self._interrupt_event = event
 
+    def _build_chat_request(
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, str]],
+        response_format: str | dict[str, Any] | None,
+        stream: bool,
+        think: bool,
+    ) -> Request:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": stream,
+            "think": think,
+        }
+        if response_format is not None:
+            payload["format"] = response_format
+        return Request(
+            f"{self.host}/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+    def _thinking_unsupported(self, body: str) -> bool:
+        lowered = body.lower()
+        return "does not support thinking" in lowered
+
     def _request_json(self, request: Request) -> dict[str, Any]:
         if self._interrupt_event is not None and self._interrupt_event.is_set():
             raise OperationInterrupted("Interrupted while waiting for Ollama.")
@@ -70,33 +97,36 @@ class OllamaClient:
         response_format: str | dict[str, Any] | None = "json",
         on_thinking: Callable[[str], None] | None = None,
     ) -> ChatResponse:
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "stream": on_thinking is not None,
-            "think": True,
-        }
-        if response_format is not None:
-            payload["format"] = response_format
-        request = Request(
-            f"{self.host}/api/chat",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-        )
-        try:
+        def perform_request(*, think_enabled: bool) -> dict[str, Any]:
+            request = self._build_chat_request(
+                model=model,
+                messages=messages,
+                response_format=response_format,
+                stream=on_thinking is not None,
+                think=think_enabled,
+            )
             if on_thinking is None:
-                raw = self._request_json(request)
-                message = raw.get("message") or {}
-                return ChatResponse(
-                    content=str(message.get("content", "")),
-                    thinking=str(message.get("thinking", "")),
-                    model=str(raw.get("model") or model),
-                    raw=raw,
-                )
-            raw = self._request_chat_stream(request, model=model, on_thinking=on_thinking)
+                return self._request_json(request)
+            return self._request_chat_stream(request, model=model, on_thinking=on_thinking)
+
+        try:
+            raw = perform_request(think_enabled=True)
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            raise OllamaError(f"Ollama HTTP error {exc.code}: {body}") from exc
+            if exc.code == 400 and self._thinking_unsupported(body):
+                try:
+                    raw = perform_request(think_enabled=False)
+                except HTTPError as retry_exc:
+                    retry_body = retry_exc.read().decode("utf-8", errors="replace")
+                    raise OllamaError(f"Ollama HTTP error {retry_exc.code}: {retry_body}") from retry_exc
+                except URLError as retry_exc:
+                    raise OllamaError(f"Could not reach Ollama at {self.host}: {retry_exc}") from retry_exc
+                except TimeoutError as retry_exc:
+                    raise OllamaError(f"Ollama timed out after {self.timeout} seconds.") from retry_exc
+                except json.JSONDecodeError as retry_exc:
+                    raise OllamaError("Ollama returned invalid JSON from /api/chat.") from retry_exc
+            else:
+                raise OllamaError(f"Ollama HTTP error {exc.code}: {body}") from exc
         except URLError as exc:
             raise OllamaError(f"Could not reach Ollama at {self.host}: {exc}") from exc
         except TimeoutError as exc:

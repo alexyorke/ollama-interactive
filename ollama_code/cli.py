@@ -13,10 +13,12 @@ from typing import Callable
 from ollama_code.agent import OllamaCodeAgent
 from ollama_code.config import (
     DEFAULT_APPROVAL_MODE,
+    DEFAULT_DEBATE_ENABLED,
     DEFAULT_MAX_AGENT_DEPTH,
     DEFAULT_MAX_TOOL_ROUNDS,
     DEFAULT_MODEL,
     DEFAULT_TIMEOUT,
+    ENV_OLLAMA_CODE_DEBATE,
     ENV_OLLAMA_CODE_MODEL,
     ENV_OLLAMA_CODE_TEST_CMD,
     ENV_OLLAMA_HOST,
@@ -26,6 +28,14 @@ from ollama_code.interrupts import InterruptController, OperationInterrupted
 from ollama_code.ollama_client import OllamaClient, OllamaError
 from ollama_code.sessions import latest_session_path, load_transcript_payload, new_session_path, resolve_transcript_path
 from ollama_code.tools import ToolExecutor
+
+PREFERRED_FALLBACK_MODELS = [
+    DEFAULT_MODEL,
+    "batiai/gemma4-26b:iq4",
+    "qwen3:8b",
+    "gemma3:4b",
+    "gpt-oss:20b",
+]
 
 
 class CliStatusRenderer:
@@ -135,6 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-agent-depth", type=int, default=None, help="Maximum nested sub-agent depth.")
     parser.add_argument("--timeout", type=int, default=None, help="Ollama request timeout in seconds.")
     parser.add_argument("--test-cmd", default=None, help="Optional default test command for the run_test tool and /test.")
+    parser.add_argument("--debate", choices=["on", "off"], default=None, help="Enable or disable multi-call self-debate for each usable model reply.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser
@@ -145,6 +156,17 @@ def _non_empty_string(value: object) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _bool_from_text(value: str | None) -> bool | None:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    return None
 
 
 def build_agent(
@@ -192,6 +214,12 @@ def build_agent(
         host = explicit_host
     if args.approval is not None:
         approval = args.approval
+    debate_enabled = config.debate if config.debate is not None else DEFAULT_DEBATE_ENABLED
+    env_debate = _bool_from_text(_non_empty_string(os.environ.get(ENV_OLLAMA_CODE_DEBATE)))
+    if env_debate is not None:
+        debate_enabled = env_debate
+    if args.debate is not None:
+        debate_enabled = args.debate == "on"
     max_tool_rounds = args.max_tool_rounds if args.max_tool_rounds is not None else (config.max_tool_rounds or DEFAULT_MAX_TOOL_ROUNDS)
     max_agent_depth = args.max_agent_depth if args.max_agent_depth is not None else (config.max_agent_depth or DEFAULT_MAX_AGENT_DEPTH)
     timeout = args.timeout if args.timeout is not None else (config.timeout or DEFAULT_TIMEOUT)
@@ -223,6 +251,7 @@ def build_agent(
         status_printer=resolved_status_printer,
         thinking_printer=thinking_printer,
         max_agent_depth=max_agent_depth,
+        debate_enabled=debate_enabled,
     )
     if restored_payload is not None:
         agent.restore_transcript(restored_payload)
@@ -230,17 +259,68 @@ def build_agent(
     return agent
 
 
+def _env_model_is_explicit() -> bool:
+    return _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_MODEL)) is not None
+
+
+def _should_resolve_runtime_default_model(args: argparse.Namespace) -> bool:
+    if _non_empty_string(args.model) is not None:
+        return False
+    if _env_model_is_explicit():
+        return False
+    if args.resume or args.continue_session:
+        return False
+    workspace_root = Path(args.cwd).resolve()
+    config = load_config(workspace_root, args.config)
+    return config.model is None
+
+
+def _resolve_model_candidate(candidate: str, available: set[str]) -> str | None:
+    if candidate in available:
+        return candidate
+    if not candidate.endswith(":latest"):
+        latest = f"{candidate}:latest"
+        if latest in available:
+            return latest
+    return None
+
+
+def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespace, renderer: CliStatusRenderer) -> None:
+    if not _should_resolve_runtime_default_model(args):
+        return
+    available_models = agent.list_models()
+    if not available_models:
+        return
+    available = set(available_models)
+    current = _resolve_model_candidate(agent.model, available)
+    if current is not None:
+        if current != agent.model:
+            agent.set_model(current)
+        return
+    for candidate in PREFERRED_FALLBACK_MODELS:
+        resolved = _resolve_model_candidate(candidate, available)
+        if resolved is None:
+            continue
+        agent.set_model(resolved)
+        renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {resolved}")
+        return
+    fallback = available_models[0]
+    agent.set_model(fallback)
+    renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}")
+
+
 def print_banner(agent: OllamaCodeAgent) -> None:
     print("Ollama Code")
     print(f"workspace: {agent.workspace_root().as_posix()}")
     print(f"model: {agent.model}")
     print(f"approval: {agent.approval_mode()}")
+    print(f"debate: {'on' if agent.debate_mode() else 'off'}")
     if agent.configured_test_command():
         print(f"test_cmd: {agent.configured_test_command()}")
     if agent.session_path() is not None:
         print(f"session: {agent.session_path().as_posix()}")
     print("press Esc to interrupt the current model or tool call")
-    print("commands: /help /status /models /model /approval /reset /save /sessions /load /git /diff /commit /test /tools /quit")
+    print("commands: /help /status /models /model /approval /debate /reset /save /sessions /load /git /diff /commit /test /tools /quit")
 
 
 def _strip_matching_quotes(text: str) -> str:
@@ -260,7 +340,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         return False
     if action == "/help":
         writer(
-            "Slash commands: /help /status /models /model <name> /approval <mode> /reset /save [path] /sessions [limit] "
+            "Slash commands: /help /status /models /model <name> /approval <mode> /debate on|off /reset /save [path] /sessions [limit] "
             "/load <path> /git /diff [--cached] [path] /commit <message> /test [command] /tools /quit\nPress Esc during model "
             "or tool execution to interrupt the current task."
         )
@@ -269,7 +349,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
         test_command = agent.configured_test_command() or "(none)"
         writer(
-            f"workspace={agent.workspace_root().as_posix()} model={agent.model} approval={agent.approval_mode()} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
+            f"workspace={agent.workspace_root().as_posix()} model={agent.model} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
         )
         return True
     if action == "/models":
@@ -291,6 +371,14 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
             return True
         agent.set_approval_mode(mode)
         writer(f"approval set to {agent.approval_mode()}")
+        return True
+    if action == "/debate":
+        mode = _strip_matching_quotes(remainder)
+        if mode not in {"on", "off"}:
+            writer("Usage: /debate on|off")
+            return True
+        agent.set_debate_enabled(mode == "on")
+        writer(f"debate set to {'on' if agent.debate_mode() else 'off'}")
         return True
     if action == "/reset":
         agent.reset()
@@ -413,6 +501,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         agent = build_agent(args, status_printer=renderer.status, thinking_printer=renderer.show_thinking)
     except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    try:
+        ensure_runtime_default_model(agent, args, renderer)
+    except OllamaError as exc:
+        renderer.clear_thinking()
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if args.prompt:

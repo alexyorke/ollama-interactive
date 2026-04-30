@@ -19,6 +19,13 @@ def init_git_repo(root: Path) -> None:
     subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
 
 
+def commit_all(root: Path, message: str) -> None:
+    subprocess.run(["git", "add", "-A"], cwd=root, capture_output=True, text=True, check=True)
+    status = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=root, capture_output=True, text=True, check=False)
+    if status.returncode != 0:
+        subprocess.run(["git", "commit", "-m", message], cwd=root, capture_output=True, text=True, check=True)
+
+
 def build_workspace(root: Path) -> None:
     (root / "docs").mkdir(parents=True, exist_ok=True)
     (root / "src").mkdir(parents=True, exist_ok=True)
@@ -49,6 +56,7 @@ def run_cli(
     *,
     approval: str = "auto",
     timeout: int = 420,
+    session_file: Path | None = None,
     extra_args: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [
@@ -66,6 +74,8 @@ def run_cli(
         "--max-agent-depth",
         "2",
     ]
+    if session_file is not None:
+        command.extend(["--session-file", str(session_file)])
     if extra_args:
         command.extend(extra_args)
     command.append(prompt)
@@ -85,6 +95,26 @@ def last_non_status_line(stdout: str) -> str:
     return lines[-1] if lines else ""
 
 
+def load_session(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def tool_results(session: dict[str, object], tool_name: str) -> list[dict[str, object]]:
+    results: list[dict[str, object]] = []
+    events = session.get("events")
+    if not isinstance(events, list):
+        return results
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("type") != "tool_result" or event.get("name") != tool_name:
+            continue
+        result = event.get("result")
+        if isinstance(result, dict):
+            results.append(result)
+    return results
+
+
 def require(result: subprocess.CompletedProcess[str], predicate: Callable[[subprocess.CompletedProcess[str]], bool], message: str) -> None:
     if result.returncode != 0:
         raise AssertionError(f"{message}: exit code {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
@@ -97,7 +127,7 @@ def scenario_filesystem(repo_root: Path, workspace: Path, model: str) -> None:
         repo_root,
         workspace,
         model,
-        "Use your tools to inspect this workspace and tell me the three top-level entries. Mention docs, notes, and src.",
+        "Use list_files on . with a high enough limit to inspect the workspace. Reply with docs, notes, and src only.",
     )
     require(result, lambda r: "[status] tool list_files" in r.stdout and "docs" in r.stdout and "notes" in r.stdout and "src" in r.stdout, "filesystem inspection failed")
 
@@ -133,18 +163,24 @@ def scenario_shell(repo_root: Path, workspace: Path, model: str) -> None:
 
 
 def scenario_run_test(repo_root: Path, workspace: Path, model: str) -> None:
+    session_file = workspace / ".ollama-code" / "run-test.json"
     result = run_cli(
         repo_root,
         workspace,
         model,
-        "Use run_test and tell me whether the test suite passed and which module ran.",
+        "Use run_test and tell me whether the test suite passed.",
+        session_file=session_file,
         extra_args=["--test-cmd", "python3 -m unittest discover -s tests -v"],
     )
+    session = load_session(session_file)
+    tests = tool_results(session, "run_test")
     require(
         result,
-        lambda r: "[status] tool run_test" in r.stdout and "test_sample" in r.stdout and ("passed" in r.stdout.lower() or "\nok\n" in r.stdout.lower()),
+        lambda r: "[status] tool run_test" in r.stdout and ("passed" in r.stdout.lower() or "\nok\n" in r.stdout.lower()),
         "run_test scenario failed",
     )
+    if not any(item.get("ok") and "OK" in str(item.get("output", "")) for item in tests):
+        raise AssertionError(f"run_test tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
 def scenario_write(repo_root: Path, workspace: Path, model: str) -> None:
@@ -194,19 +230,29 @@ def scenario_subagent(repo_root: Path, workspace: Path, model: str, helper_model
 
 
 def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
+    session_file = workspace / ".ollama-code" / "git-tools.json"
+    commit_all(workspace, "checkpoint before git scenario")
     target = workspace / "src" / "sample.py"
     target.write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
     result = run_cli(
         repo_root,
         workspace,
         model,
-        "Use git_status and git_diff to tell me which file changed and what the added return line is. Mention both the file path and the added line.",
+        "Use git_status on src/sample.py. Then use git_diff on src/sample.py for the working tree only; omit cached or set cached to false. Do not use read_file. Reply with src/sample.py and whether the diff adds return 99.",
+        session_file=session_file,
     )
+    session = load_session(session_file)
+    statuses = tool_results(session, "git_status")
+    diffs = tool_results(session, "git_diff")
     require(
         result,
-        lambda r: "[status] tool git_status" in r.stdout and "[status] tool git_diff" in r.stdout and "src/sample.py" in r.stdout and "return 99" in r.stdout,
+        lambda r: "[status] tool git_status" in r.stdout and "[status] tool git_diff" in r.stdout,
         "git tool scenario failed",
     )
+    if not any(item.get("ok") and "src/sample.py" in str(item.get("output", "")) for item in statuses):
+        raise AssertionError(f"git_status tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+    if not any(item.get("ok") and "return 99" in str(item.get("output", "")) for item in diffs):
+        raise AssertionError(f"git_diff tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
 def scenario_read_only(repo_root: Path, workspace: Path, model: str) -> None:

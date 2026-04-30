@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,8 +14,9 @@ from ollama_code.tools import ToolExecutor
 
 
 class FakeClient:
-    def __init__(self, responses: list[str]) -> None:
+    def __init__(self, responses: list[str], *, script_debate: bool = False) -> None:
         self.responses = list(responses)
+        self.script_debate = script_debate
         self.calls: list[dict[str, object]] = []
         self.interrupt_events: list[object | None] = []
 
@@ -28,6 +31,7 @@ class FakeClient:
         response_format: str = "json",
         on_thinking: object | None = None,
     ) -> ChatResponse:
+        system_prompt = messages[0]["content"] if messages else ""
         self.calls.append(
             {
                 "model": model,
@@ -36,6 +40,15 @@ class FakeClient:
                 "on_thinking": on_thinking,
             }
         )
+        if not self.script_debate and isinstance(system_prompt, str):
+            if system_prompt.startswith("You are Against Agent."):
+                return ChatResponse(content="Candidate risk low.", model=model, raw={})
+            if system_prompt.startswith("You are For Agent."):
+                return ChatResponse(content="Candidate fits request.", model=model, raw={})
+            if system_prompt.startswith("You are Judge Agent for a coding CLI controller."):
+                payload = json.loads(messages[-1]["content"])
+                candidate = str(payload.get("candidate_response", "")).strip()
+                return ChatResponse(content=candidate, model=model, raw={})
         return ChatResponse(content=self.responses.pop(0), model=model, raw={})
 
 
@@ -57,7 +70,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
             result = agent.handle_user("Summarize note.txt")
 
         self.assertEqual(result.message, "The file says hello world.")
@@ -94,7 +107,7 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient(['{"type":"tool","name":"list_files","arguments":{}}'] * 2)
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=1)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=1, debate_enabled=False)
             result = agent.handle_user("loop forever")
 
         self.assertIn("maximum tool rounds", result.message)
@@ -111,12 +124,190 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("delegate this")
 
         self.assertEqual(result.message, "parent got: helper saw helper data")
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
+
+    def test_agent_runs_debate_by_default_and_uses_judge_result(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"final","message":"base answer"}',
+                "Candidate ignores a stronger direct answer.",
+                "Candidate is acceptable but could be clearer.",
+                '{"type":"final","message":"judged answer"}',
+            ],
+            script_debate=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Say something brief.")
+
+        self.assertEqual(result.message, "judged answer")
+        self.assertEqual(len(client.calls), 4)
+        debate_events = [event for event in agent.events if event["type"] == "debate"]
+        self.assertEqual(len(debate_events), 1)
+        self.assertTrue(debate_events[0]["applied"])
+
+    def test_agent_debate_can_be_disabled(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"final","message":"base answer"}'])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("Say something brief.")
+
+        self.assertEqual(result.message, "base answer")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_agent_keeps_primary_candidate_when_judge_returns_invalid_json(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"final","message":"base answer"}',
+                "Skeptic note.",
+                "Defender note.",
+                "not json",
+            ],
+            script_debate=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Say something brief.")
+
+        self.assertEqual(result.message, "base answer")
+        debate_events = [event for event in agent.events if event["type"] == "debate"]
+        self.assertEqual(len(debate_events), 1)
+        self.assertFalse(debate_events[0]["applied"])
+
+    def test_agent_skips_debate_for_tool_candidates(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"done"}',
+                "Skeptic note.",
+                "Defender note.",
+                '{"type":"final","message":"done"}',
+            ],
+            script_debate=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use read_file on note.txt and then tell me when you are done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(agent.events[2]["name"], "read_file")
+        self.assertEqual(len(client.calls), 5)
+        debate_events = [event for event in agent.events if event["type"] == "debate"]
+        self.assertEqual(len(debate_events), 1)
+        self.assertTrue(debate_events[0]["applied"])
+
+    def test_agent_requires_explicitly_named_tool_before_final_answer(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"type":"final","message":"done"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"done"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("Use read_file on note.txt and then tell me when you are done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(agent.events[1]["name"], "list_files")
+        self.assertEqual(agent.events[3]["name"], "read_file")
+
+    def test_agent_allows_final_answer_after_requested_tool_failure_details(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"../outside.txt"}}',
+                '{"type":"final","message":"Path escapes the workspace: ../outside.txt"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
+
+        self.assertIn("escapes the workspace", result.message)
+        self.assertEqual(len(client.calls), 2)
+
+    def test_agent_retries_after_unverified_file_mutation_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"note.txt has been updated."}',
+                    '{"type":"final","message":"note.txt line 1 is hello"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use read_file on note.txt and tell me what line 1 says.")
+
+        self.assertEqual(result.message, "note.txt line 1 is hello")
+        self.assertEqual(len(client.calls), 3)
+
+    def test_agent_allows_file_mutation_claim_after_write_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"note.txt","content":"changed\\n"}}',
+                    '{"type":"final","message":"note.txt has been updated."}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Create note.txt with changed on line 1.")
+            self.assertEqual((root / "note.txt").read_text(encoding="utf-8"), "changed\n")
+
+        self.assertEqual(result.message, "note.txt has been updated.")
+
+    def test_agent_retries_git_diff_with_working_tree_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Tests"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"git_diff","arguments":{"path":"app.py","cached":true}}',
+                    '{"type":"tool","name":"git_diff","arguments":{"path":"app.py"}}',
+                    '{"type":"final","message":"app.py diff adds return 99"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use git_diff on app.py for the working tree only and tell me whether it adds return 99.")
+
+        self.assertEqual(result.message, "app.py diff adds return 99")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "git_diff")
+        self.assertNotIn("cached", tool_calls[0]["arguments"])
 
     def test_agent_blocks_subagent_approval_escalation(self) -> None:
         root = self._workspace_scratch()
@@ -127,7 +318,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(root, approval_mode="ask")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("Delegate this carefully.")
 
         self.assertEqual(result.message, "blocked")
@@ -147,7 +338,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(root, approval_mode="ask")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("delegate this")
 
         self.assertEqual(result.message, "parent got: helper saw helper data")
@@ -167,7 +358,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("Delegate reading note.txt, then tell me what it says.")
 
         self.assertEqual(result.message, "parent read helper data")
@@ -189,7 +380,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("delegate this")
 
         self.assertEqual(result.message, "parent got: helper saw helper data")
@@ -208,7 +399,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
             result = agent.handle_user("Read note.txt and tell me what it says.")
 
         self.assertEqual(result.message, "retry me")
@@ -223,7 +414,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("Tell me the git status of this workspace.")
 
         self.assertEqual(result.message, "repo status checked")
@@ -239,7 +430,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         result = agent.handle_user("List files in the workspace.")
 
@@ -257,7 +448,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         result = agent.handle_user("Read README.md and summarize it.")
 
@@ -275,7 +466,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         result = agent.handle_user("Read README.md and summarize it.")
 
@@ -294,7 +485,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(Path.cwd(), approval_mode="read-only")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         result = agent.handle_user("Read README.md and summarize it.")
 
@@ -312,7 +503,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
             result = agent.handle_user("Say done.")
 
         self.assertEqual(result.message, "done")
@@ -327,7 +518,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
             result = agent.handle_user("Say done.")
 
         self.assertEqual(result.message, "done")
@@ -340,7 +531,7 @@ class AgentTests(unittest.TestCase):
             ]
         )
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
         result = agent.handle_user("Say done.")
 
         self.assertEqual(result.message, "done")
@@ -352,7 +543,7 @@ class AgentTests(unittest.TestCase):
             root = Path(tmp).resolve()
             client = FakeClient([])
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file="scratch/session.json")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file="scratch/session.json", debate_enabled=False)
             saved = agent.save_transcript("scratch/manual.json")
 
         self.assertEqual(agent.session_file, (root / "scratch" / "session.json").resolve())
@@ -371,7 +562,7 @@ class AgentTests(unittest.TestCase):
             )
             client = FakeClient([])
             tools = ToolExecutor(root, approval_mode="ask")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file="scratch/current.json")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file="scratch/current.json", debate_enabled=False)
             loaded = agent.load_session(session)
 
         self.assertEqual(loaded, session.resolve())
@@ -394,7 +585,7 @@ class AgentTests(unittest.TestCase):
             session.write_text(original, encoding="utf-8")
             client = FakeClient([])
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="current-model", session_file="scratch/current.json")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="current-model", session_file="scratch/current.json", debate_enabled=False)
 
             loaded = agent.load_session(session)
             on_disk = session.read_text(encoding="utf-8")
@@ -428,7 +619,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
             result = agent.handle_user("Create scratch/file.txt with hi and a newline.")
 
         self.assertEqual(result.message, "done")

@@ -17,6 +17,7 @@ class DummyAgent:
         self.max_tool_rounds = 100
         self.max_agent_depth = 2
         self._approval = "ask"
+        self._debate_enabled = True
         self._workspace = Path.cwd()
         self.saved_path: Path | None = None
         self.loaded_path: Path | PureWindowsPath | None = None
@@ -32,6 +33,9 @@ class DummyAgent:
     def approval_mode(self) -> str:
         return self._approval
 
+    def debate_mode(self) -> bool:
+        return self._debate_enabled
+
     def configured_test_command(self) -> str | None:
         return self._test_command
 
@@ -43,6 +47,9 @@ class DummyAgent:
 
     def set_approval_mode(self, mode: str) -> None:
         self._approval = mode
+
+    def set_debate_enabled(self, enabled: bool) -> None:
+        self._debate_enabled = enabled
 
     def reset(self) -> None:
         pass
@@ -119,6 +126,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.max_tool_rounds, 100)
         self.assertEqual(agent.max_agent_depth, 2)
         self.assertEqual(agent.approval_mode(), "ask")
+        self.assertTrue(agent.debate_mode())
 
     def test_status_renderer_shows_last_three_thinking_lines_and_clears_on_status(self) -> None:
         stream = io.StringIO()
@@ -169,6 +177,7 @@ class CliCommandTests(unittest.TestCase):
             '"host":"http://127.0.0.1:11435",'
             '"model":"gemma4:latest",'
             '"approval":"auto",'
+            '"debate":false,'
             '"max_tool_rounds":12,'
             '"max_agent_depth":4,'
             '"timeout":45,'
@@ -185,6 +194,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.max_tool_rounds, 12)
         self.assertEqual(agent.max_agent_depth, 4)
         self.assertEqual(agent.configured_test_command(), "python -m unittest -v")
+        self.assertFalse(agent.debate_mode())
 
     def test_approval_command_updates_mode(self) -> None:
         agent = DummyAgent()
@@ -192,6 +202,14 @@ class CliCommandTests(unittest.TestCase):
         handled = handle_meta_command("/approval auto", agent, output.append)
         self.assertTrue(handled)
         self.assertEqual(agent.approval_mode(), "auto")
+
+    def test_debate_command_updates_mode(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/debate off", agent, output.append)
+        self.assertTrue(handled)
+        self.assertFalse(agent.debate_mode())
+        self.assertIn("debate set to off", output[0])
 
     def test_save_command_uses_custom_path(self) -> None:
         agent = DummyAgent()

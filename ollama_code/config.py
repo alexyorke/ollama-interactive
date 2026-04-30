@@ -13,9 +13,11 @@ DEFAULT_APPROVAL_MODE = "ask"
 DEFAULT_MAX_TOOL_ROUNDS = 100
 DEFAULT_MAX_AGENT_DEPTH = 2
 DEFAULT_TIMEOUT = 300
+DEFAULT_DEBATE_ENABLED = True
 ENV_OLLAMA_HOST = "OLLAMA_HOST"
 ENV_OLLAMA_CODE_MODEL = "OLLAMA_CODE_MODEL"
 ENV_OLLAMA_CODE_TEST_CMD = "OLLAMA_CODE_TEST_CMD"
+ENV_OLLAMA_CODE_DEBATE = "OLLAMA_CODE_DEBATE"
 
 
 @dataclass(frozen=True)
@@ -27,6 +29,7 @@ class CliConfig:
     max_agent_depth: int | None = None
     timeout: int | None = None
     test_cmd: str | None = None
+    debate: bool | None = None
     path: Path | None = None
 
 
@@ -67,6 +70,15 @@ def _approval_config_value(payload: dict[str, Any], path: Path) -> str | None:
     return value
 
 
+def _bool_config_value(payload: dict[str, Any], key: str, path: Path) -> bool | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f'Config value "{key}" must be a boolean in {path}')
+    return value
+
+
 def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> CliConfig:
     path = resolve_config_path(workspace_root, raw_path)
     explicit_path = raw_path is not None
@@ -97,5 +109,6 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
         max_agent_depth=_int_config_value(data, "max_agent_depth", path),
         timeout=_int_config_value(data, "timeout", path),
         test_cmd=_config_value(data, "test_cmd", path),
+        debate=_bool_config_value(data, "debate", path),
         path=path,
     )

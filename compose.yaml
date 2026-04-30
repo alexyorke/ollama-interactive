@@ -12,7 +12,7 @@ services:
     volumes:
       - .:/workspace
     environment:
-      OLLAMA_HOST: ${OLLAMA_CODE_OLLAMA_HOST:-http://host.docker.internal:11435}
+      OLLAMA_HOST: ${OLLAMA_CODE_OLLAMA_HOST:-http://host.docker.internal:11434}
       OLLAMA_CODE_MODEL: ${OLLAMA_CODE_MODEL:-batiai/gemma4-26b:iq4}
       OLLAMA_CODE_WORKSPACE: /workspace
     extra_hosts:

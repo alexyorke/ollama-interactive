@@ -1,6 +1,6 @@
 param(
     [string]$Session = "ollama-code",
-    [string]$Model = "batiai/gemma4-26b:iq4"
+    [string]$Model = ""
 )
 
 $repo = Split-Path -Parent $PSScriptRoot
