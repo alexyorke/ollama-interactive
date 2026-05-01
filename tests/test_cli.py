@@ -18,6 +18,7 @@ class DummyAgent:
         self.max_agent_depth = 2
         self._approval = "ask"
         self._debate_enabled = True
+        self._verifier_model: str | None = None
         self._workspace = Path.cwd()
         self.saved_path: Path | None = None
         self.loaded_path: Path | PureWindowsPath | None = None
@@ -38,6 +39,9 @@ class DummyAgent:
 
     def configured_test_command(self) -> str | None:
         return self._test_command
+
+    def verifier_model_name(self) -> str | None:
+        return self._verifier_model
 
     def set_interrupt_event(self, event: object) -> None:
         return

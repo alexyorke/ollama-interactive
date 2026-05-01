@@ -16,6 +16,7 @@ DEFAULT_TIMEOUT = 300
 DEFAULT_DEBATE_ENABLED = True
 ENV_OLLAMA_HOST = "OLLAMA_HOST"
 ENV_OLLAMA_CODE_MODEL = "OLLAMA_CODE_MODEL"
+ENV_OLLAMA_CODE_VERIFIER_MODEL = "OLLAMA_CODE_VERIFIER_MODEL"
 ENV_OLLAMA_CODE_TEST_CMD = "OLLAMA_CODE_TEST_CMD"
 ENV_OLLAMA_CODE_DEBATE = "OLLAMA_CODE_DEBATE"
 
@@ -24,6 +25,7 @@ ENV_OLLAMA_CODE_DEBATE = "OLLAMA_CODE_DEBATE"
 class CliConfig:
     host: str | None = None
     model: str | None = None
+    verifier_model: str | None = None
     approval: str | None = None
     max_tool_rounds: int | None = None
     max_agent_depth: int | None = None
@@ -104,6 +106,7 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
     return CliConfig(
         host=_config_value(data, "host", path),
         model=_config_value(data, "model", path),
+        verifier_model=_config_value(data, "verifier_model", path),
         approval=_approval_config_value(data, path),
         max_tool_rounds=_int_config_value(data, "max_tool_rounds", path),
         max_agent_depth=_int_config_value(data, "max_agent_depth", path),

@@ -85,6 +85,14 @@ def assumption_audit_retry_count(session: dict[str, Any]) -> int:
     return count
 
 
+def verification_rewrite_count(session: dict[str, Any]) -> int:
+    count = 0
+    for event in session.get("events", []):
+        if event.get("type") == "verification_rewrite":
+            count += 1
+    return count
+
+
 def final_assistant_message(session: dict[str, Any]) -> str:
     for event in reversed(session.get("events", [])):
         if event.get("type") == "assistant" and isinstance(event.get("content"), str):
@@ -117,12 +125,15 @@ def evaluate_case(
     case: EvalCase,
     *,
     verification_enabled: bool,
+    verifier_model: str | None,
     timeout: int,
 ) -> dict[str, Any]:
     if case.prepare is not None:
         case.prepare(workspace)
     session_file = workspace / "scratch" / f"{case.name}-{'on' if verification_enabled else 'off'}.json"
     extra_args = ["--debate", "on" if verification_enabled else "off"]
+    if verifier_model:
+        extra_args.extend(["--verifier-model", verifier_model])
     started = time.perf_counter()
     result = run_cli(
         repo_root,
@@ -160,6 +171,7 @@ def evaluate_case(
     return {
         "case": case.name,
         "model": model,
+        "verifier_model": verifier_model,
         "verification": "on" if verification_enabled else "off",
         "status": status,
         "latency_s": round(elapsed, 2),
@@ -167,6 +179,7 @@ def evaluate_case(
         "assumption_audits": assumption_audit_count(session),
         "assumption_audit_retries": assumption_audit_retry_count(session),
         "verification_retries": verification_retry_count(session),
+        "verification_rewrites": verification_rewrite_count(session),
         "final": assistant,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -177,6 +190,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial verification on/off evals against real Ollama Code models.")
     parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b", "gemma4:e4b"], help="Models to test serially.")
     parser.add_argument("--modes", nargs="+", choices=["on", "off"], default=["off", "on"], help="Verification modes to run.")
+    parser.add_argument("--verifier-model", default=None, help="Optional verifier/rewrite model override to use serially.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-run timeout in seconds.")
     parser.add_argument("--strict-on", action="store_true", help="Exit non-zero if any verification-on run lands outside the acceptable status set for its case.")
     args = parser.parse_args(argv)
@@ -217,12 +231,14 @@ def main(argv: list[str] | None = None) -> int:
                         model,
                         case,
                         verification_enabled=verification_enabled,
+                        verifier_model=args.verifier_model,
                         timeout=args.timeout,
                     )
                 tools = ",".join(outcome["tool_calls"]) if outcome["tool_calls"] else "-"
                 print(
                     "[verify-eval]"
                     f" model={outcome['model']}"
+                    f" verifier_model={outcome['verifier_model'] or '-'}"
                     f" verification={outcome['verification']}"
                     f" case={outcome['case']}"
                     f" status={outcome['status']}"
@@ -230,6 +246,7 @@ def main(argv: list[str] | None = None) -> int:
                     f" assumption_audits={outcome['assumption_audits']}"
                     f" assumption_audit_retries={outcome['assumption_audit_retries']}"
                     f" verifier_retries={outcome['verification_retries']}"
+                    f" verifier_rewrites={outcome['verification_rewrites']}"
                     f" tools={tools}"
                     f" final={outcome['final']!r}"
                 )

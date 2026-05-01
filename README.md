@@ -13,7 +13,7 @@ It gives the model a guarded tool loop for:
 - inspecting git status and diffs
 - creating guarded git commits
 - running nested sub-agents for scoped subtasks
-- running default-on tool-step assumption audits plus risky final verification
+- running default-on tool-step assumption audits plus claim-aware risky final verification and evidence-backed rewrite
 
 By default it asks before edits or shell commands. You can switch to `--approval auto` for hands-off runs.
 Sessions are also auto-saved locally under `.ollama-code/sessions`, so you can continue or resume prior work.
@@ -54,6 +54,7 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
 {
   "host": "http://127.0.0.1:11434",
   "model": "batiai/qwen3.6-35b:iq4",
+  "verifier_model": "granite4.1:8b",
   "approval": "ask",
   "debate": true,
   "max_tool_rounds": 100,
@@ -73,7 +74,7 @@ Precedence:
 
 - CLI flags override everything else
 - when resuming a saved session, the saved model wins unless `--model` is provided
-- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_TEST_CMD`, and `OLLAMA_CODE_DEBATE` override the config file for one-off runs
+- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_VERIFIER_MODEL`, `OLLAMA_CODE_TEST_CMD`, and `OLLAMA_CODE_DEBATE` override the config file for one-off runs
 - otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
 
 ## Run
@@ -113,6 +114,13 @@ export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --debate off
 ```
 
+Use a stronger serial verifier/rewrite model while keeping the main working model smaller:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+ollama-code --model gemma3:4b --verifier-model granite4.1:8b
+```
+
 Resume a specific saved transcript:
 
 ```bash
@@ -130,6 +138,7 @@ export OLLAMA_HOST=http://127.0.0.1:11434
 
 You can also set the default test command with `OLLAMA_CODE_TEST_CMD`.
 You can disable assumption auditing and grounded verification with `OLLAMA_CODE_DEBATE=off`.
+You can override the verifier/rewrite model with `OLLAMA_CODE_VERIFIER_MODEL`.
 
 ## Docker
 
@@ -219,11 +228,18 @@ export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/e2e_suite.py
 ```
 
-For serial verification on/off A/B runs that record latency, tool-call sequences, assumption-audit retries, verifier retries, and pass/fail:
+For serial verification on/off A/B runs that record latency, tool-call sequences, assumption-audit retries, verifier retries, verifier rewrites, and pass/fail:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/verification_eval.py --strict-on
+```
+
+To test a stronger verifier model serially:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+python3 scripts/verification_eval.py --models gemma3:4b --verifier-model granite4.1:8b --strict-on
 ```
 
 Containerized end-to-end check against the host Ollama daemon:
@@ -274,7 +290,8 @@ git push origin v0.1.0
 - The CLI is designed to run inside the current workspace root.
 - File mutations are limited to that workspace.
 - Session history is auto-saved under `.ollama-code/sessions` in the workspace.
-- Debate mode now means two controller checks on the same model with `think=false`: a pre-tool assumption auditor on tool turns, plus grounded verification on risky final replies. The auditor can accept or force up to two corrective retries before a tool runs. The verifier can accept a risky final or force up to two corrective retries. Low-risk finals still skip verification, cached read-only tool repeats skip the auditor, and exact tool-error requests can return directly from the tool result.
+- Debate mode now means two controller checks with `think=false`: a pre-tool assumption auditor on tool turns, plus claim-aware grounded verification on risky final replies. The auditor can accept or force up to two corrective retries before a tool runs. The verifier now receives extracted candidate claims and a compact evidence table, can return structured claim corrections, and can trigger one evidence-backed rewrite before the controller falls back to another primary-model retry or fails closed. Low-risk finals still skip verification, cached read-only tool repeats skip the auditor, and exact tool-error requests can return directly from the tool result.
+- `verifier_model` is optional. When set, it is used for final verification and evidence-backed rewrite only; the primary model still handles the normal tool loop and tool-step assumption audits.
 - Explicit forbidden-tool constraints such as `do not use read_file` are enforced before tool execution.
 - Tool-heavy turns run with thinking disabled by default to cut latency and token use. Simple non-tool turns still use the normal Ollama thinking path.
 - Repeated read-only tool calls in one user turn are cached, and only compact tool-result summaries are fed back into the model. Full raw tool results still stay in the transcript and event log.

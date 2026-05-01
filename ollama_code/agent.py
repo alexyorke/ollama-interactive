@@ -75,14 +75,26 @@ class ExactFileWriteSpec:
     line: str
 
 
+@dataclass(frozen=True)
+class FinalRewriteOutcome:
+    accepted_message: str | None = None
+    retry_decision: dict[str, Any] | None = None
+    rejected_message: str | None = None
+
+
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
 VERIFICATION_HISTORY_LIMIT = 4
 VERIFICATION_CONTENT_LIMIT = 6000
 MAX_VERIFICATION_RETRIES = 2
+MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
 AUDIT_LIST_ITEM_LIMIT = 3
 AUDIT_TEXT_ITEM_LIMIT = 180
+CANDIDATE_CLAIM_LIMIT = 6
+CANDIDATE_CLAIM_TEXT_LIMIT = 220
+VERIFICATION_EVIDENCE_LIMIT = 6
+VERIFICATION_EVIDENCE_TEXT_LIMIT = 260
 MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "git_commit"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "git_status", "git_diff"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
@@ -102,21 +114,43 @@ VERIFICATION_TOOL_DIFF_LIMIT = 1000
 
 FINAL_VERIFIER_SYSTEM_PROMPT = """You are a grounded final verifier for a coding CLI controller.
 
-You will receive the original user request, the candidate final answer, current-turn tool calls, current-turn successful tool results, accepted tool-step assumption audits, and explicit required/forbidden tool constraints.
+You will receive the original user request, the candidate final answer, extracted candidate claims, a compact evidence table derived from current-turn successful tool results, accepted tool-step assumption audits, and explicit required/forbidden tool constraints.
 Return exactly one JSON object and nothing else.
 
 Valid replies:
-{"verdict":"accept"}
-{"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"]}
+{"verdict":"accept","claim_checks":[{"claim":"...","status":"supported","evidence":"E1"}]}
+{"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"],"claim_checks":[{"claim":"...","status":"contradicted","evidence":"E2","correction":"..."}],"rewrite_guidance":["..."],"rewrite_from_evidence":true}
 
 Rules:
-- Check whether the candidate final answer should be accepted as grounded and compliant.
+- Check whether the candidate final answer should be accepted as grounded and compliant claim by claim.
 - Prefer accept when the candidate already matches the tool results and request.
 - Return retry if the candidate contradicts tool results, ignores required tools, violates forbidden-tool constraints, hallucinates workspace state, or needs another tool/result first.
 - Consider accepted assumption-audit events as additional grounding context. Return retry if the candidate leaves those assumptions unresolved or contradicts the evidence they gathered.
+- Use candidate_claims when present. If the candidate has multiple concrete claims, assess them individually in claim_checks.
+- claim_checks entries must use status supported, contradicted, or unverified.
+- evidence should cite evidence ids like E1, E2 when possible.
+- correction must be brief and must come directly from the supplied evidence table.
+- Set rewrite_from_evidence true only when the existing evidence is sufficient to rewrite a correct final answer without another tool call.
+- rewrite_guidance should be short concrete instructions for an evidence-backed rewrite.
 - Do not rewrite the final answer yourself.
 - Keep the reason brief and concrete.
 - required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
+"""
+
+FINAL_REWRITER_SYSTEM_PROMPT = """You are an evidence-backed final rewriter for a coding CLI controller.
+
+You will receive the original user request, the rejected candidate final answer, extracted candidate claims, a compact evidence table derived from successful tool results, verifier claim checks, and rewrite guidance.
+Return exactly one JSON object and nothing else.
+
+Valid reply:
+{"type":"final","message":"Accurate final answer grounded only in the supplied evidence."}
+
+Rules:
+- Rewrite only from the supplied evidence table and verifier claim checks.
+- Do not invent claims, files, commands, diffs, or outcomes that are not directly supported by evidence.
+- If a claim was contradicted and a correction is supplied, use the correction or omit that claim.
+- If some requested detail is unsupported, answer with the narrowest accurate statement from the evidence instead of guessing.
+- Keep the final answer concise and directly useful.
 """
 
 TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT = """You are a tool-step assumption auditor for a coding CLI controller.
@@ -156,12 +190,15 @@ def extract_json_response(raw_text: str) -> dict[str, Any] | None:
         starts = [0] + [index for index in starts if index != 0]
     parsed_dicts: list[dict[str, Any]] = []
     agent_payloads: list[dict[str, Any]] = []
+    top_level_dict: dict[str, Any] | None = None
     for start in starts:
         try:
-            data, _ = decoder.raw_decode(candidate[start:])
+            data, end_index = decoder.raw_decode(candidate[start:])
         except json.JSONDecodeError:
             continue
         if isinstance(data, dict):
+            if start == 0 and not candidate[end_index:].strip():
+                top_level_dict = data
             parsed_dicts.append(data)
             response_type = data.get("type")
             tool_name = data.get("name")
@@ -172,6 +209,8 @@ def extract_json_response(raw_text: str) -> dict[str, Any] | None:
                 agent_payloads.append(data)
     if agent_payloads:
         return agent_payloads[-1]
+    if top_level_dict is not None:
+        return top_level_dict
     if parsed_dicts:
         return parsed_dicts[-1]
     return None
@@ -234,10 +273,12 @@ class OllamaCodeAgent:
         agent_depth: int = 0,
         max_agent_depth: int = 2,
         debate_enabled: bool = True,
+        verifier_model: str | None = None,
     ) -> None:
         self.client = client
         self.tools = tools
         self.model = model
+        self.verifier_model = verifier_model.strip() if isinstance(verifier_model, str) and verifier_model.strip() else None
         self.max_tool_rounds = max_tool_rounds
         self.session_file = self._resolve_transcript_path(session_file) if session_file else None
         self.status_printer = status_printer or (lambda message: None)
@@ -271,6 +312,12 @@ class OllamaCodeAgent:
 
     def set_model(self, model: str) -> None:
         self.model = model
+
+    def verifier_model_name(self) -> str | None:
+        return self.verifier_model
+
+    def verification_model(self) -> str:
+        return self.verifier_model or self.model
 
     def set_approval_mode(self, mode: str) -> None:
         self.tools.set_approval_mode(mode)
@@ -344,6 +391,8 @@ class OllamaCodeAgent:
         saved_model = payload.get("model")
         if isinstance(saved_model, str) and saved_model.strip():
             self.model = saved_model.strip()
+        saved_verifier_model = payload.get("verifier_model")
+        self.verifier_model = saved_verifier_model.strip() if isinstance(saved_verifier_model, str) and saved_verifier_model.strip() else None
         saved_approval = payload.get("approval_mode")
         if saved_approval in {"ask", "auto", "read-only"}:
             self.tools.set_approval_mode(str(saved_approval))
@@ -378,6 +427,7 @@ class OllamaCodeAgent:
             raise ValueError("No transcript path was provided.")
         payload = {
             "model": self.model,
+            "verifier_model": self.verifier_model,
             "workspace_root": self.tools.workspace_root.as_posix(),
             "approval_mode": self.tools.approval_mode,
             "messages": self.messages,
@@ -429,6 +479,88 @@ class OllamaCodeAgent:
             if len(normalized) >= AUDIT_LIST_ITEM_LIMIT:
                 break
         return normalized
+
+    def _normalize_candidate_claims(self, claims: object) -> list[str]:
+        if not isinstance(claims, list):
+            return []
+        normalized: list[str] = []
+        for item in claims:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            normalized.append(self._truncate_text(text, limit=CANDIDATE_CLAIM_TEXT_LIMIT))
+            if len(normalized) >= CANDIDATE_CLAIM_LIMIT:
+                break
+        return normalized
+
+    def _extract_candidate_claims(self, text: str) -> list[str]:
+        normalized: list[str] = []
+        for raw_line in text.replace("\r\n", "\n").split("\n"):
+            line = re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", raw_line).strip()
+            if not line:
+                continue
+            fragments = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9`\"'])|;\s+", line)
+            for fragment in fragments:
+                claim = fragment.strip()
+                if not claim:
+                    continue
+                normalized.append(self._truncate_text(claim, limit=CANDIDATE_CLAIM_TEXT_LIMIT))
+                if len(normalized) >= CANDIDATE_CLAIM_LIMIT:
+                    return normalized
+        return normalized
+
+    def _evidence_observation_for_result(self, name: str, result: dict[str, Any]) -> str:
+        for field in ("summary", "output", "diff"):
+            value = result.get(field)
+            if isinstance(value, str) and value.strip():
+                return self._truncate_text(value.strip(), limit=VERIFICATION_EVIDENCE_TEXT_LIMIT)
+        compact = self._compact_tool_result_for_context(name, result, for_verification=True)
+        return self._truncate_text(json.dumps(compact, ensure_ascii=True), limit=VERIFICATION_EVIDENCE_TEXT_LIMIT)
+
+    def _build_verification_evidence_table(self, successful_tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        evidence: list[dict[str, Any]] = []
+        for index, item in enumerate(successful_tool_results[-VERIFICATION_EVIDENCE_LIMIT:], start=1):
+            name = str(item.get("name", "")).strip()
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            row: dict[str, Any] = {
+                "id": f"E{index}",
+                "tool": name,
+                "arguments": self._truncate_json_value(arguments, limit=240),
+                "observation": self._evidence_observation_for_result(name, result),
+            }
+            path = result.get("path")
+            if isinstance(path, str) and path.strip():
+                row["path"] = path.strip()
+            evidence.append(row)
+        return evidence
+
+    def _normalize_claim_checks(self, items: object) -> list[dict[str, str]]:
+        if not isinstance(items, list):
+            return []
+        claim_checks: list[dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim", "")).strip()
+            if not claim:
+                continue
+            status = str(item.get("status", "")).strip().lower()
+            if status not in {"supported", "contradicted", "unverified"}:
+                status = "unverified"
+            claim_checks.append(
+                {
+                    "claim": self._truncate_text(claim, limit=CANDIDATE_CLAIM_TEXT_LIMIT),
+                    "status": status,
+                    "evidence": self._truncate_text(str(item.get("evidence", "")).strip(), limit=120),
+                    "correction": self._truncate_text(str(item.get("correction", "")).strip(), limit=180),
+                }
+            )
+            if len(claim_checks) >= CANDIDATE_CLAIM_LIMIT:
+                break
+        return claim_checks
 
     def _candidate_eligible_for_verification(self, response_text: str) -> bool:
         candidate = response_text.strip()
@@ -486,17 +618,22 @@ class OllamaCodeAgent:
             for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
             if message.get("role") != "system"
         ]
+        candidate_claims = self._extract_candidate_claims(candidate_message)
+        evidence_table = self._build_verification_evidence_table(successful_tool_results)
         return {
             "round": round_number,
             "model": self.model,
+            "verifier_model": self.verification_model(),
             "workspace_root": self.tools.workspace_root.as_posix(),
             "original_user_request": self._truncate_text(request_text),
             "recent_messages": recent_messages,
             "candidate_final_answer": self._truncate_text(candidate_message),
+            "candidate_claims": candidate_claims,
             "required_tools": sorted(required_tool_names),
             "forbidden_tools": sorted(forbidden_tool_names),
             "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls],
             "successful_tool_results": [self._compact_successful_tool_result_for_verification(item) for item in successful_tool_results],
+            "evidence_table": evidence_table,
             "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
 
@@ -514,12 +651,136 @@ class OllamaCodeAgent:
         reason = str(decision.get("reason", "")).strip()
         required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
         forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        rewrite_guidance = self._normalize_audit_text_items(decision.get("rewrite_guidance"))
         return {
             "verdict": verdict,
             "reason": reason,
             "required_tools": sorted(set(required_tools)),
             "forbidden_tools": sorted(set(forbidden_tools)),
+            "claim_checks": self._normalize_claim_checks(decision.get("claim_checks")),
+            "rewrite_guidance": rewrite_guidance,
+            "rewrite_from_evidence": bool(decision.get("rewrite_from_evidence")),
         }
+
+    def _rewrite_context_payload(
+        self,
+        *,
+        request_text: str,
+        candidate_message: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        verification_decision: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "round": round_number,
+            "model": self.model,
+            "verifier_model": self.verification_model(),
+            "original_user_request": self._truncate_text(request_text),
+            "candidate_final_answer": self._truncate_text(candidate_message),
+            "candidate_claims": self._extract_candidate_claims(candidate_message),
+            "evidence_table": self._build_verification_evidence_table(successful_tool_results),
+            "claim_checks": verification_decision.get("claim_checks", []),
+            "rewrite_guidance": verification_decision.get("rewrite_guidance", []),
+            "reason": self._truncate_text(str(verification_decision.get("reason", "")).strip(), limit=240),
+        }
+
+    def _rewrite_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": FINAL_REWRITER_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=True)},
+        ]
+
+    def _rewrite_eligible_from_verification(
+        self,
+        decision: dict[str, Any],
+        *,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        if decision.get("verdict") != "retry":
+            return False
+        if decision.get("required_tools"):
+            return False
+        if not successful_tool_results:
+            return False
+        if decision.get("rewrite_from_evidence"):
+            return True
+        claim_checks = decision.get("claim_checks")
+        if isinstance(claim_checks, list) and claim_checks:
+            return True
+        return bool(decision.get("reason"))
+
+    def _rewrite_final_from_evidence(
+        self,
+        *,
+        request_text: str,
+        candidate_message: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        verification_decision: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> FinalRewriteOutcome:
+        payload = self._rewrite_context_payload(
+            request_text=request_text,
+            candidate_message=candidate_message,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            verification_decision=verification_decision,
+        )
+        self.status_printer("rewriting final from evidence")
+        rewrite_response = self.client.chat(
+            model=self.verification_model(),
+            messages=self._rewrite_messages(payload),
+            think=False,
+        )
+        rewrite_payload = self._normalize_payload(extract_json_response(rewrite_response.content) or {})
+        if rewrite_payload.get("type") != "final":
+            self._record_event(
+                "verification_rewrite",
+                round=round_number,
+                verdict="invalid",
+                candidate=candidate_message,
+                rewritten=rewrite_response.content,
+                verifier_model=self.verification_model(),
+            )
+            return FinalRewriteOutcome()
+        rewritten_message = str(rewrite_payload.get("message", "")).strip()
+        if not rewritten_message:
+            self._record_event(
+                "verification_rewrite",
+                round=round_number,
+                verdict="empty",
+                candidate=candidate_message,
+                rewritten=rewritten_message,
+                verifier_model=self.verification_model(),
+            )
+            return FinalRewriteOutcome()
+        rewritten_response = ChatResponse(content=json.dumps({"type": "final", "message": rewritten_message}, ensure_ascii=True), model=self.verification_model(), raw={})
+        rewrite_decision = self._verify_final_candidate(
+            rewritten_response,
+            request_text=request_text,
+            round_number=round_number,
+            tool_calls=tool_calls,
+            successful_tool_results=successful_tool_results,
+            accepted_assumption_audits=accepted_assumption_audits,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        )
+        self._record_event(
+            "verification_rewrite",
+            round=round_number,
+            verdict=rewrite_decision["verdict"],
+            candidate=candidate_message,
+            rewritten=rewritten_message,
+            verifier_model=self.verification_model(),
+            claim_checks=rewrite_decision.get("claim_checks", []),
+            rewrite_guidance=rewrite_decision.get("rewrite_guidance", []),
+        )
+        if rewrite_decision["verdict"] == "accept":
+            return FinalRewriteOutcome(accepted_message=rewritten_message)
+        return FinalRewriteOutcome(retry_decision=rewrite_decision, rejected_message=rewritten_message)
 
     def _assumption_audit_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
         return [
@@ -651,6 +912,7 @@ class OllamaCodeAgent:
             validation_steps=decision["validation_steps"],
             required_tools=decision["required_tools"],
             forbidden_tools=decision["forbidden_tools"],
+            auditor_model=self.model,
             auditor=verdict_response.content,
         )
         return decision
@@ -684,7 +946,7 @@ class OllamaCodeAgent:
         try:
             self.status_printer("verifying final")
             verdict_response = self.client.chat(
-                model=self.model,
+                model=self.verification_model(),
                 messages=self._verification_messages(context_payload),
                 think=False,
             )
@@ -701,6 +963,12 @@ class OllamaCodeAgent:
             reason=decision["reason"],
             required_tools=decision["required_tools"],
             forbidden_tools=decision["forbidden_tools"],
+            candidate_claims=context_payload.get("candidate_claims", []),
+            evidence_table=context_payload.get("evidence_table", []),
+            claim_checks=decision.get("claim_checks", []),
+            rewrite_guidance=decision.get("rewrite_guidance", []),
+            rewrite_from_evidence=decision.get("rewrite_from_evidence", False),
+            verifier_model=self.verification_model(),
             verifier=verdict_response.content,
         )
         return decision
@@ -712,6 +980,31 @@ class OllamaCodeAgent:
             "Use existing tool results when they already answer the question; otherwise use another appropriate tool before finishing.",
             "Do not contradict successful tool results, accepted assumption-audit evidence, or explicit user constraints.",
         ]
+        claim_checks = decision.get("claim_checks") if isinstance(decision.get("claim_checks"), list) else []
+        if claim_checks:
+            corrections: list[str] = []
+            for item in claim_checks:
+                if not isinstance(item, dict):
+                    continue
+                claim = str(item.get("claim", "")).strip()
+                status = str(item.get("status", "")).strip()
+                correction = str(item.get("correction", "")).strip()
+                evidence = str(item.get("evidence", "")).strip()
+                if not claim or status == "supported":
+                    continue
+                detail = f'"{claim}" is {status}'
+                if correction:
+                    detail += f"; use \"{correction}\""
+                if evidence:
+                    detail += f" from {evidence}"
+                corrections.append(detail)
+                if len(corrections) >= 3:
+                    break
+            if corrections:
+                parts.append("Claim fixes: " + " | ".join(corrections) + ".")
+        rewrite_guidance = decision.get("rewrite_guidance") if isinstance(decision.get("rewrite_guidance"), list) else []
+        if rewrite_guidance:
+            parts.append("Rewrite guidance: " + "; ".join(str(item) for item in rewrite_guidance[:3]) + ".")
         required_tools = decision.get("required_tools") if isinstance(decision.get("required_tools"), list) else []
         forbidden_tools = decision.get("forbidden_tools") if isinstance(decision.get("forbidden_tools"), list) else []
         if required_tools:
@@ -1236,12 +1529,14 @@ class OllamaCodeAgent:
             agent_depth=self.agent_depth + 1,
             max_agent_depth=self.max_agent_depth,
             debate_enabled=self.debate_enabled,
+            verifier_model=self.verifier_model,
         )
         child.set_interrupt_event(self._interrupt_event)
         result = child.handle_user(prompt)
         response = {
             "tool": "run_agent",
             "model": selected_model,
+            "verifier_model": self.verifier_model,
             "approval_mode": approval_mode,
             "rounds": result.rounds,
             "output": result.message,
@@ -1277,6 +1572,7 @@ class OllamaCodeAgent:
         mutation_verified_this_turn = False
         assumption_audit_retries = 0
         verification_retries = 0
+        verification_rewrite_attempts = 0
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
@@ -1409,15 +1705,51 @@ class OllamaCodeAgent:
                         if assistant_text:
                             rejected_final_messages.add(assistant_text)
                         verification_retries += 1
-                        required_tool_names.update(decision["required_tools"])
-                        forbidden_tool_names.update(decision["forbidden_tools"])
-                        required_tool_names.difference_update(forbidden_tool_names)
                         if verification_retries > MAX_VERIFICATION_RETRIES:
                             failure = "Stopped because grounded final verification could not accept a final answer."
                             self._record_event("assistant", content=failure, rounds=round_number)
                             return AgentResult(message=failure, rounds=round_number, completed=False)
+                        retry_decision = decision
+                        if (
+                            verification_rewrite_attempts < MAX_VERIFICATION_REWRITE_ATTEMPTS
+                            and self._rewrite_eligible_from_verification(
+                                decision,
+                                successful_tool_results=successful_tool_results,
+                            )
+                        ):
+                            verification_rewrite_attempts += 1
+                            rewrite_outcome = self._rewrite_final_from_evidence(
+                                request_text=text,
+                                candidate_message=assistant_text,
+                                round_number=round_number,
+                                successful_tool_results=successful_tool_results,
+                                verification_decision=decision,
+                                tool_calls=tool_calls_this_turn,
+                                accepted_assumption_audits=accepted_assumption_audits,
+                                required_tool_names=required_tool_names,
+                                forbidden_tool_names=forbidden_tool_names,
+                            )
+                            if rewrite_outcome.accepted_message is not None:
+                                rewritten_message = rewrite_outcome.accepted_message
+                                self.messages.append({"role": "assistant", "content": json.dumps({"type": "final", "message": rewritten_message}, ensure_ascii=True)})
+                                self._record_event(
+                                    "assistant_rewritten",
+                                    original=assistant_text,
+                                    rewritten=rewritten_message,
+                                    reason="Evidence-backed rewrite accepted by grounded verification.",
+                                    rounds=round_number,
+                                )
+                                self._record_event("assistant", content=rewritten_message, rounds=round_number)
+                                return AgentResult(message=rewritten_message, rounds=round_number, completed=True)
+                            if rewrite_outcome.rejected_message:
+                                rejected_final_messages.add(rewrite_outcome.rejected_message)
+                            if rewrite_outcome.retry_decision is not None:
+                                retry_decision = rewrite_outcome.retry_decision
+                        required_tool_names.update(retry_decision["required_tools"])
+                        forbidden_tool_names.update(retry_decision["forbidden_tools"])
+                        required_tool_names.difference_update(forbidden_tool_names)
                         self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
-                        self.messages.append({"role": "user", "content": self._verification_retry_message(decision)})
+                        self.messages.append({"role": "user", "content": self._verification_retry_message(retry_decision)})
                         continue
                 self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                 self._record_event("assistant", content=assistant_text, rounds=round_number)

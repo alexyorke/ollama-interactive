@@ -20,16 +20,17 @@ class ConfigTests(unittest.TestCase):
             root = Path(tmp)
             (root / ".ollama-code").mkdir(parents=True)
             (root / ".ollama-code" / "config.json").write_text(
-                json.dumps({"host": "http://127.0.0.1:11435", "model": "config-model"}),
+                json.dumps({"host": "http://127.0.0.1:11435", "model": "config-model", "verifier_model": "config-verifier"}),
                 encoding="utf-8",
             )
             parser = build_parser()
             args = parser.parse_args(["--cwd", str(root), "--quiet"])
-            with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": ""}, clear=False):
+            with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": "", "OLLAMA_CODE_VERIFIER_MODEL": ""}, clear=False):
                 agent = build_agent(args)
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:11435")
         self.assertEqual(agent.model, "config-model")
+        self.assertEqual(agent.verifier_model_name(), "config-verifier")
 
     def test_build_agent_reads_explicit_config_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -41,7 +42,7 @@ class ConfigTests(unittest.TestCase):
             )
             parser = build_parser()
             args = parser.parse_args(["--cwd", str(root), "--config", "settings.json", "--quiet"])
-            with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": ""}, clear=False):
+            with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": "", "OLLAMA_CODE_VERIFIER_MODEL": ""}, clear=False):
                 agent = build_agent(args)
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:23456")
@@ -61,6 +62,7 @@ class ConfigTests(unittest.TestCase):
                 json.dumps(
                     {
                         "model": "session-model",
+                        "verifier_model": "session-verifier",
                         "approval_mode": "auto",
                         "workspace_root": root.as_posix(),
                         "messages": [
@@ -74,11 +76,12 @@ class ConfigTests(unittest.TestCase):
             )
             parser = build_parser()
             args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
-            with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": ""}, clear=False):
+            with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": "", "OLLAMA_CODE_VERIFIER_MODEL": ""}, clear=False):
                 agent = build_agent(args)
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:11435")
         self.assertEqual(agent.model, "session-model")
+        self.assertEqual(agent.verifier_model_name(), "session-verifier")
 
     def test_env_overrides_workspace_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -90,11 +93,12 @@ class ConfigTests(unittest.TestCase):
             )
             parser = build_parser()
             args = parser.parse_args(["--cwd", str(root), "--quiet"])
-            with patch.dict(os.environ, {"OLLAMA_HOST": "http://127.0.0.1:34567", "OLLAMA_CODE_MODEL": "env-model"}, clear=False):
+            with patch.dict(os.environ, {"OLLAMA_HOST": "http://127.0.0.1:34567", "OLLAMA_CODE_MODEL": "env-model", "OLLAMA_CODE_VERIFIER_MODEL": "env-verifier"}, clear=False):
                 agent = build_agent(args)
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:34567")
         self.assertEqual(agent.model, "env-model")
+        self.assertEqual(agent.verifier_model_name(), "env-verifier")
 
     def test_missing_explicit_config_file_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -177,7 +181,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     check=False,
-                    env={key: value for key, value in os.environ.items() if key not in {"OLLAMA_HOST", "OLLAMA_CODE_MODEL"}},
+                    env={key: value for key, value in os.environ.items() if key not in {"OLLAMA_HOST", "OLLAMA_CODE_MODEL", "OLLAMA_CODE_VERIFIER_MODEL"}},
                     timeout=30,
                 )
             finally:
@@ -213,7 +217,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     check=False,
-                    env={key: value for key, value in os.environ.items() if key not in {"OLLAMA_HOST", "OLLAMA_CODE_MODEL"}},
+                    env={key: value for key, value in os.environ.items() if key not in {"OLLAMA_HOST", "OLLAMA_CODE_MODEL", "OLLAMA_CODE_VERIFIER_MODEL"}},
                     timeout=30,
                 )
             finally:

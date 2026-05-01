@@ -21,6 +21,7 @@ from ollama_code.config import (
     ENV_OLLAMA_CODE_DEBATE,
     ENV_OLLAMA_CODE_MODEL,
     ENV_OLLAMA_CODE_TEST_CMD,
+    ENV_OLLAMA_CODE_VERIFIER_MODEL,
     ENV_OLLAMA_HOST,
     load_config,
 )
@@ -146,6 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=None, help="Ollama request timeout in seconds.")
     parser.add_argument("--test-cmd", default=None, help="Optional default test command for the run_test tool and /test.")
     parser.add_argument("--debate", choices=["on", "off"], default=None, help="Enable or disable tool-step assumption auditing plus grounded risky-final verification.")
+    parser.add_argument("--verifier-model", default=None, help="Optional model override for grounded final verification and evidence-backed rewrite.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser
@@ -205,6 +207,17 @@ def build_agent(
     explicit_model = _non_empty_string(args.model)
     if explicit_model:
         model = explicit_model
+    verifier_model = config.verifier_model
+    env_verifier_model = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_VERIFIER_MODEL))
+    if env_verifier_model:
+        verifier_model = env_verifier_model
+    explicit_verifier_model = _non_empty_string(args.verifier_model)
+    if restored_payload is not None:
+        saved_verifier_model = restored_payload.get("verifier_model")
+        if explicit_verifier_model is None and env_verifier_model is None and isinstance(saved_verifier_model, str) and saved_verifier_model.strip():
+            verifier_model = saved_verifier_model.strip()
+    if explicit_verifier_model:
+        verifier_model = explicit_verifier_model
     host = config.host
     env_host = _non_empty_string(os.environ.get(ENV_OLLAMA_HOST))
     if env_host:
@@ -252,6 +265,7 @@ def build_agent(
         thinking_printer=thinking_printer,
         max_agent_depth=max_agent_depth,
         debate_enabled=debate_enabled,
+        verifier_model=verifier_model,
     )
     if restored_payload is not None:
         agent.restore_transcript(restored_payload)
@@ -349,7 +363,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
         test_command = agent.configured_test_command() or "(none)"
         writer(
-            f"workspace={agent.workspace_root().as_posix()} model={agent.model} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
+            f"workspace={agent.workspace_root().as_posix()} model={agent.model} verifier_model={agent.verifier_model_name() or '-'} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
         )
         return True
     if action == "/models":

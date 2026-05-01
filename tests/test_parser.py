@@ -29,3 +29,16 @@ class ParserTests(unittest.TestCase):
             '{"type":"final","message":"wrong"}\n{"type":"final","message":"right"}'
         )
         self.assertEqual(payload, {"type": "final", "message": "right"})
+
+    def test_keeps_top_level_non_agent_json_over_nested_objects(self) -> None:
+        payload = extract_json_response(
+            '{"verdict":"retry","claim_checks":[{"claim":"x","status":"contradicted","evidence":"E1"}],"rewrite_from_evidence":true}'
+        )
+        self.assertEqual(
+            payload,
+            {
+                "verdict": "retry",
+                "claim_checks": [{"claim": "x", "status": "contradicted", "evidence": "E1"}],
+                "rewrite_from_evidence": True,
+            },
+        )

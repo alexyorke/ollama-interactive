@@ -20,10 +20,12 @@ class FakeClient:
         *,
         script_verification: bool = False,
         script_assumption_audit: bool = False,
+        script_final_rewrite: bool = False,
     ) -> None:
         self.responses = list(responses)
         self.script_verification = script_verification
         self.script_assumption_audit = script_assumption_audit
+        self.script_final_rewrite = script_final_rewrite
         self.calls: list[dict[str, object]] = []
         self.interrupt_events: list[object | None] = []
 
@@ -55,6 +57,13 @@ class FakeClient:
             if system_prompt.startswith("You are a tool-step assumption auditor") and not self.script_assumption_audit:
                 return ChatResponse(
                     content='{"verdict":"accept","reason":"","assumptions":["tool is needed"],"validation_steps":["run the tool to gather evidence"],"required_tools":[],"forbidden_tools":[]}',
+                    model=model,
+                    raw={},
+                )
+            if system_prompt.startswith("You are an evidence-backed final rewriter") and not self.script_final_rewrite:
+                payload = json.loads(messages[1]["content"])
+                return ChatResponse(
+                    content=json.dumps({"type": "final", "message": payload.get("candidate_final_answer", "")}),
                     model=model,
                     raw={},
                 )
@@ -290,6 +299,62 @@ class AgentTests(unittest.TestCase):
         verifier_payload = json.loads(str(client.calls[-1]["messages"][1]["content"]))
         self.assertEqual(len(verifier_payload["accepted_assumption_audits"]), 1)
         self.assertEqual(verifier_payload["accepted_assumption_audits"][0]["tool"], "read_file")
+        self.assertEqual(verifier_payload["candidate_claims"], ["line 1 is hello"])
+        self.assertEqual(len(verifier_payload["evidence_table"]), 1)
+        self.assertEqual(verifier_payload["evidence_table"][0]["tool"], "read_file")
+
+    def test_agent_rewrites_from_evidence_after_verifier_retry(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"line 1 is goodbye"}',
+                '{"verdict":"retry","reason":"Tool result says hello, not goodbye.","required_tools":[],"forbidden_tools":[],"claim_checks":[{"claim":"line 1 is goodbye","status":"contradicted","evidence":"E1","correction":"line 1 is hello"}],"rewrite_guidance":["Use the verified file contents."],"rewrite_from_evidence":true}',
+                '{"type":"final","message":"line 1 is hello"}',
+                '{"verdict":"accept","claim_checks":[{"claim":"line 1 is hello","status":"supported","evidence":"E1"}]}',
+            ],
+            script_verification=True,
+            script_final_rewrite=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read note.txt and tell me what line 1 says.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "line 1 is hello")
+        rewrite_events = [event for event in agent.events if event["type"] == "verification_rewrite"]
+        self.assertEqual(len(rewrite_events), 1)
+        self.assertEqual(rewrite_events[0]["verdict"], "accept")
+        self.assertEqual(client.calls[4]["messages"][0]["content"].splitlines()[0], "You are an evidence-backed final rewriter for a coding CLI controller.")
+
+    def test_agent_uses_verifier_model_for_verification_and_rewrite(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"line 1 is goodbye"}',
+                '{"verdict":"retry","reason":"Tool result says hello, not goodbye.","claim_checks":[{"claim":"line 1 is goodbye","status":"contradicted","evidence":"E1","correction":"line 1 is hello"}],"rewrite_guidance":["Use the verified file contents."],"rewrite_from_evidence":true}',
+                '{"type":"final","message":"line 1 is hello"}',
+                '{"verdict":"accept"}',
+            ],
+            script_verification=True,
+            script_final_rewrite=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="base-model", verifier_model="judge-model")
+
+        result = agent.handle_user("Read note.txt and tell me what line 1 says.")
+
+        self.assertEqual(result.message, "line 1 is hello")
+        self.assertEqual(client.calls[0]["model"], "base-model")
+        self.assertEqual(client.calls[1]["model"], "base-model")
+        self.assertEqual(client.calls[2]["model"], "base-model")
+        self.assertEqual(client.calls[3]["model"], "judge-model")
+        self.assertEqual(client.calls[4]["model"], "judge-model")
+        self.assertEqual(client.calls[5]["model"], "judge-model")
 
     def test_agent_retries_after_verifier_rejects_candidate_and_recovers(self) -> None:
         root = self._workspace_scratch()
@@ -298,7 +363,7 @@ class AgentTests(unittest.TestCase):
             [
                 '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
                 '{"type":"final","message":"line 1 is goodbye"}',
-                '{"verdict":"retry","reason":"Tool result says hello, not goodbye."}',
+                '{"verdict":"retry","reason":"Tool result says hello, not goodbye.","required_tools":["read_file"],"forbidden_tools":[]}',
                 '{"type":"final","message":"line 1 is hello"}',
                 '{"verdict":"accept"}',
             ],
@@ -332,11 +397,11 @@ class AgentTests(unittest.TestCase):
             [
                 '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
                 '{"type":"final","message":"answer one"}',
-                '{"verdict":"retry","reason":"Need grounded answer."}',
+                '{"verdict":"retry","reason":"Need grounded answer.","required_tools":["read_file"],"forbidden_tools":[]}',
                 '{"type":"final","message":"answer two"}',
-                '{"verdict":"retry","reason":"Still not grounded."}',
+                '{"verdict":"retry","reason":"Still not grounded.","required_tools":["read_file"],"forbidden_tools":[]}',
                 '{"type":"final","message":"answer three"}',
-                '{"verdict":"retry","reason":"Still not grounded."}',
+                '{"verdict":"retry","reason":"Still not grounded.","required_tools":["read_file"],"forbidden_tools":[]}',
             ],
             script_verification=True,
         )
@@ -359,7 +424,7 @@ class AgentTests(unittest.TestCase):
             [
                 '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
                 '{"type":"final","message":"line 1 is goodbye"}',
-                '{"verdict":"retry","reason":"Tool result says hello, not goodbye."}',
+                '{"verdict":"retry","reason":"Tool result says hello, not goodbye.","required_tools":["read_file"],"forbidden_tools":[]}',
                 '{"type":"final","message":"line 1 is goodbye"}',
             ],
             script_verification=True,
