@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import subprocess
@@ -9,6 +10,21 @@ import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Callable
+
+
+_LOADED_MODELS: set[str] = set()
+
+
+def unload_model(model: str) -> None:
+    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, check=False)
+
+
+def _cleanup_loaded_models() -> None:
+    for model in sorted(_LOADED_MODELS):
+        unload_model(model)
+
+
+atexit.register(_cleanup_loaded_models)
 
 
 def init_git_repo(root: Path) -> None:
@@ -115,6 +131,17 @@ def tool_results(session: dict[str, object], tool_name: str) -> list[dict[str, o
     return results
 
 
+def tool_calls(session: dict[str, object]) -> list[str]:
+    names: list[str] = []
+    events = session.get("events")
+    if not isinstance(events, list):
+        return names
+    for event in events:
+        if isinstance(event, dict) and event.get("type") == "tool_call" and isinstance(event.get("name"), str):
+            names.append(str(event["name"]))
+    return names
+
+
 def require(result: subprocess.CompletedProcess[str], predicate: Callable[[subprocess.CompletedProcess[str]], bool], message: str) -> None:
     if result.returncode != 0:
         raise AssertionError(f"{message}: exit code {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
@@ -153,13 +180,19 @@ def scenario_search(repo_root: Path, workspace: Path, model: str) -> None:
 
 
 def scenario_shell(repo_root: Path, workspace: Path, model: str) -> None:
+    session_file = workspace / ".ollama-code" / "shell.json"
     result = run_cli(
         repo_root,
         workspace,
         model,
         "Use run_shell to execute exactly: pwd && python3 -c 'print(6*7)'. Then tell me the number and the directory.",
+        session_file=session_file,
     )
-    require(result, lambda r: "[status] tool run_shell" in r.stdout and "42" in r.stdout and str(workspace).replace("\\", "/") in r.stdout, "shell scenario failed")
+    session = load_session(session_file)
+    shells = tool_results(session, "run_shell")
+    require(result, lambda r: "[status] tool run_shell" in r.stdout and "42" in r.stdout, "shell scenario failed")
+    if not any(item.get("ok") and "42" in str(item.get("output", "")) and str(workspace).replace("\\", "/") in str(item.get("output", "")) for item in shells):
+        raise AssertionError(f"shell tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
 def scenario_run_test(repo_root: Path, workspace: Path, model: str) -> None:
@@ -244,6 +277,7 @@ def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
     session = load_session(session_file)
     statuses = tool_results(session, "git_status")
     diffs = tool_results(session, "git_diff")
+    calls = tool_calls(session)
     require(
         result,
         lambda r: "[status] tool git_status" in r.stdout and "[status] tool git_diff" in r.stdout,
@@ -253,22 +287,37 @@ def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
         raise AssertionError(f"git_status tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
     if not any(item.get("ok") and "return 99" in str(item.get("output", "")) for item in diffs):
         raise AssertionError(f"git_diff tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
+    if "read_file" in calls:
+        raise AssertionError(f"git tool scenario used forbidden read_file\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
 def scenario_read_only(repo_root: Path, workspace: Path, model: str) -> None:
     blocked = workspace / "blocked.txt"
+    session_file = workspace / ".ollama-code" / "read-only.json"
     result = run_cli(
         repo_root,
         workspace,
         model,
         "Try to create blocked.txt with any content. If you cannot, explain why.",
         approval="read-only",
+        session_file=session_file,
     )
+    session = load_session(session_file)
+    writes = tool_results(session, "write_file")
     require(
         result,
-        lambda r: not blocked.exists() and "[status] tool write_file" in r.stdout and ("unable" in r.stdout.lower() or "denied" in r.stdout.lower() or "read-only" in r.stdout.lower()),
+        lambda r: not blocked.exists()
+        and "[status] tool write_file" in r.stdout
+        and (
+            "unable" in r.stdout.lower()
+            or "denied" in r.stdout.lower()
+            or "read-only" in r.stdout.lower()
+            or "grounded final verification could not accept a final answer" in r.stdout.lower()
+        ),
         "read-only guard scenario failed",
     )
+    if not any(not item.get("ok") and "read-only" in str(item.get("summary", "")).lower() for item in writes):
+        raise AssertionError(f"read-only denial was not captured in transcript\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
 def scenario_repl(repo_root: Path, workspace: Path, model: str) -> None:
@@ -328,7 +377,7 @@ def resolve_requested_models(requested: list[str], available: set[str]) -> list[
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run live Ollama Code smoke tests against real local models.")
-    parser.add_argument("--models", nargs="+", default=["batiai/gemma4-26b:iq4", "gemma4"], help="Models to test.")
+    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b", "gemma4:e4b"], help="Models to test.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -355,11 +404,14 @@ def main(argv: list[str] | None = None) -> int:
             workspace = Path(tmp)
             build_workspace(workspace)
             print(f"[live] model={model}")
+            _LOADED_MODELS.add(model)
             for scenario in scenarios:
                 print(f"[live]   {scenario.__name__}")
                 scenario(repo_root, workspace, model)
             print(f"[live]   scenario_subagent")
             scenario_subagent(repo_root, workspace, model, model)
+        unload_model(model)
+        _LOADED_MODELS.discard(model)
     print("[live] all scenarios passed")
     return 0
 

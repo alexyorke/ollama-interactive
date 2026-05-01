@@ -13,7 +13,7 @@ It gives the model a guarded tool loop for:
 - inspecting git status and diffs
 - creating guarded git commits
 - running nested sub-agents for scoped subtasks
-- running a default-on against/for/judge self-debate around each usable model reply
+- running default-on tool-step assumption audits plus risky final verification
 
 By default it asks before edits or shell commands. You can switch to `--approval auto` for hands-off runs.
 Sessions are also auto-saved locally under `.ollama-code/sessions`, so you can continue or resume prior work.
@@ -106,7 +106,7 @@ export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --test-cmd "python3 -m unittest discover -s tests -v"
 ```
 
-Debate is on by default. Disable it for faster or more literal runs:
+Debate mode is on by default. It now means tool-step assumption auditing plus grounded verification for risky final answers. Low-risk replies skip verification automatically. Disable it entirely for the fastest or most literal runs:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
@@ -129,7 +129,7 @@ export OLLAMA_HOST=http://127.0.0.1:11434
 ```
 
 You can also set the default test command with `OLLAMA_CODE_TEST_CMD`.
-You can disable debate with `OLLAMA_CODE_DEBATE=off`.
+You can disable assumption auditing and grounded verification with `OLLAMA_CODE_DEBATE=off`.
 
 ## Docker
 
@@ -198,11 +198,18 @@ export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/live_matrix.py
 ```
 
+The default serial smoke matrix tries the installed baseline models first, then optional Granite and Gemma eval targets:
+
+- `gemma3:4b`
+- `qwen3:8b`
+- `granite4.1:8b`
+- `gemma4:e4b`
+
 If your Ollama daemon is on a non-default host or port, set `OLLAMA_HOST` first. Example for the tested WSL daemon on `127.0.0.1:11434`:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-python3 scripts/live_matrix.py --models batiai/qwen3.6-35b:iq4 gemma4
+python3 scripts/live_matrix.py --models gemma3:4b qwen3:8b
 ```
 
 For stricter transcript-verified end-to-end checks against one model:
@@ -210,6 +217,13 @@ For stricter transcript-verified end-to-end checks against one model:
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/e2e_suite.py
+```
+
+For serial verification on/off A/B runs that record latency, tool-call sequences, assumption-audit retries, verifier retries, and pass/fail:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+python3 scripts/verification_eval.py --strict-on
 ```
 
 Containerized end-to-end check against the host Ollama daemon:
@@ -260,8 +274,12 @@ git push origin v0.1.0
 - The CLI is designed to run inside the current workspace root.
 - File mutations are limited to that workspace.
 - Session history is auto-saved under `.ollama-code/sessions` in the workspace.
-- Debate is enabled by default for final-answer candidates: the main model proposes a final reply, then the CLI runs an against pass, a for pass, and a judge pass before accepting it. Tool-selection rounds are not debated, which keeps tool use fast enough to stay practical. If the judge returns invalid controller JSON, the original candidate is kept.
+- Debate mode now means two controller checks on the same model with `think=false`: a pre-tool assumption auditor on tool turns, plus grounded verification on risky final replies. The auditor can accept or force up to two corrective retries before a tool runs. The verifier can accept a risky final or force up to two corrective retries. Low-risk finals still skip verification, cached read-only tool repeats skip the auditor, and exact tool-error requests can return directly from the tool result.
+- Explicit forbidden-tool constraints such as `do not use read_file` are enforced before tool execution.
+- Tool-heavy turns run with thinking disabled by default to cut latency and token use. Simple non-tool turns still use the normal Ollama thinking path.
+- Repeated read-only tool calls in one user turn are cached, and only compact tool-result summaries are fed back into the model. Full raw tool results still stay in the transcript and event log.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
-- On this machine, the tested serial live model is `gemma3:4b` on the WSL Ollama daemon at `127.0.0.1:11434`. If you do not pass `--model` and the built-in preferred default is not installed, the CLI falls back to the first available preferred local model and reports that choice.
+- The recommended serial eval order is `gemma3:4b`, `qwen3:8b`, `granite4.1:8b`, then `gemma4:e4b`.
+- On this machine, the tested serial live baselines are `gemma3:4b` and `qwen3:8b` on the WSL Ollama daemon at `127.0.0.1:11434`. If you do not pass `--model` and the built-in preferred default is not installed, the CLI falls back to the first available preferred local model and reports that choice.
 - The Windows-side Ollama install still has no usable local models for this project, so running inside WSL is the simplest path.

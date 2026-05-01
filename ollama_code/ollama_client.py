@@ -96,6 +96,7 @@ class OllamaClient:
         messages: list[dict[str, str]],
         response_format: str | dict[str, Any] | None = "json",
         on_thinking: Callable[[str], None] | None = None,
+        think: bool | None = None,
     ) -> ChatResponse:
         def perform_request(*, think_enabled: bool) -> dict[str, Any]:
             request = self._build_chat_request(
@@ -109,11 +110,12 @@ class OllamaClient:
                 return self._request_json(request)
             return self._request_chat_stream(request, model=model, on_thinking=on_thinking)
 
+        requested_think = True if think is None else bool(think)
         try:
-            raw = perform_request(think_enabled=True)
+            raw = perform_request(think_enabled=requested_think)
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
-            if exc.code == 400 and self._thinking_unsupported(body):
+            if exc.code == 400 and requested_think and self._thinking_unsupported(body):
                 try:
                     raw = perform_request(think_enabled=False)
                 except HTTPError as retry_exc:

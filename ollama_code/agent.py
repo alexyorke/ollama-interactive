@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from dataclasses import dataclass
@@ -33,6 +34,9 @@ Valid response shapes:
 Rules:
 - Use at most one tool call per response.
 - Prefer inspecting files before editing them.
+- For broad repo questions, prefer search or list_files before read_file.
+- When you use read_file, request the narrowest useful start/end range instead of rereading large files.
+- Reuse recent tool results already in the conversation when they still answer the question. Avoid repeating identical read-only tools unless state changed.
 - Question your assumptions before acting.
 - Identify what you are assuming, then prove or disprove it with the available tools whenever a file read, search, git inspection, test run, or shell command can verify it.
 - Do not guess about workspace contents, command output, repo state, or whether an edit worked when you can check instead.
@@ -65,37 +69,74 @@ class AgentResult:
     completed: bool = True
 
 
+@dataclass(frozen=True)
+class ExactFileWriteSpec:
+    path: str
+    line: str
+
+
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
-DEBATE_HISTORY_LIMIT = 8
-DEBATE_CONTENT_LIMIT = 6000
+VERIFICATION_HISTORY_LIMIT = 4
+VERIFICATION_CONTENT_LIMIT = 6000
+MAX_VERIFICATION_RETRIES = 2
+MAX_ASSUMPTION_AUDIT_RETRIES = 2
+AUDIT_LIST_ITEM_LIMIT = 3
+AUDIT_TEXT_ITEM_LIMIT = 180
 MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "git_commit"}
+READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "git_status", "git_diff"}
+RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
+MODEL_TOOL_RESULT_LIMITS = {
+    "list_files": 1200,
+    "read_file": 2200,
+    "search": 1600,
+    "git_status": 1000,
+    "git_diff": 1800,
+    "run_shell": 1400,
+    "run_test": 1400,
+    "run_agent": 1200,
+}
+MODEL_TOOL_DIFF_LIMIT = 1400
+VERIFICATION_TOOL_RESULT_LIMIT = 1200
+VERIFICATION_TOOL_DIFF_LIMIT = 1000
 
-DEBATE_AGAINST_SYSTEM_PROMPT = """You are Against Agent.
+FINAL_VERIFIER_SYSTEM_PROMPT = """You are a grounded final verifier for a coding CLI controller.
 
-Review the candidate next-step reply for a coding CLI controller.
-Be skeptical. Hunt for mistakes, unsafe assumptions, rule violations, missing verification, bad tool choice, malformed JSON risk, path/shell risk, approval mistakes, or weaker alternatives.
-Reply in plain text only. Be concise and concrete."""
-
-DEBATE_FOR_SYSTEM_PROMPT = """You are For Agent.
-
-Defend the candidate next-step reply for a coding CLI controller.
-Explain why it fits the request, follows the rules, uses an appropriate tool if needed, and is a reasonable next action.
-Reply in plain text only. Be concise and concrete."""
-
-DEBATE_JUDGE_SYSTEM_PROMPT = """You are Judge Agent for a coding CLI controller.
-
-You will receive the original controller context, the candidate next-step reply, the skeptic argument, and the defender argument.
+You will receive the original user request, the candidate final answer, current-turn tool calls, current-turn successful tool results, accepted tool-step assumption audits, and explicit required/forbidden tool constraints.
 Return exactly one JSON object and nothing else.
 
+Valid replies:
+{"verdict":"accept"}
+{"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"]}
+
 Rules:
-- Preserve the controller contract. Valid shapes:
-  {"type":"tool","name":"read_file","arguments":{"path":"README.md"}}
-  {"type":"final","message":"Your final answer to the user."}
-- Use at most one tool call.
-- Prefer the original candidate if it is already strong.
-- Change the candidate only when the skeptic found a real issue or the defender identified a clearly better compliant action.
-- Do not add markdown fences or commentary outside the JSON object.
+- Check whether the candidate final answer should be accepted as grounded and compliant.
+- Prefer accept when the candidate already matches the tool results and request.
+- Return retry if the candidate contradicts tool results, ignores required tools, violates forbidden-tool constraints, hallucinates workspace state, or needs another tool/result first.
+- Consider accepted assumption-audit events as additional grounding context. Return retry if the candidate leaves those assumptions unresolved or contradicts the evidence they gathered.
+- Do not rewrite the final answer yourself.
+- Keep the reason brief and concrete.
+- required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
+"""
+
+TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT = """You are a tool-step assumption auditor for a coding CLI controller.
+
+You will receive the original user request, recent messages, a proposed tool call, current-turn tool calls, current-turn successful tool results, accepted tool-step assumption audits, and explicit required/forbidden tool constraints.
+Return exactly one JSON object and nothing else.
+
+Valid replies:
+{"verdict":"accept","reason":"","assumptions":["..."],"validation_steps":["..."],"required_tools":[],"forbidden_tools":[]}
+{"verdict":"retry","reason":"brief concrete reason","assumptions":["..."],"validation_steps":["..."],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
+
+Rules:
+- Check whether the proposed tool call is a grounded next step.
+- assumptions must be short concrete assumptions that the tool relies on or tests.
+- validation_steps must be short concrete descriptions of how the tool call validates those assumptions or gathers the needed evidence.
+- Prefer accept when the proposed tool is a reasonable next validation step, even if the tool may fail and the user explicitly asked for that exact tool error or boundary failure.
+- Return retry if the tool is redundant, too broad, violates required/forbidden-tool constraints, mutates when inspection should happen first, skips a needed validation step, or fails to test the key assumption behind the next step.
+- Do not rewrite the tool call yourself.
+- Keep reason brief and concrete.
+- required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
 """
 
 
@@ -206,6 +247,8 @@ class OllamaCodeAgent:
         self.debate_enabled = debate_enabled
         self.events: list[dict[str, Any]] = []
         self._interrupt_event: threading.Event | None = None
+        self._turn_tool_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
+        self._turn_cache_epoch = 0
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
@@ -223,6 +266,7 @@ class OllamaCodeAgent:
     def reset(self) -> None:
         self.messages = self._base_messages()
         self.events = []
+        self._reset_turn_cache()
         self._autosave()
 
     def set_model(self, model: str) -> None:
@@ -357,12 +401,36 @@ class OllamaCodeAgent:
         )
         self._autosave()
 
-    def _truncate_text(self, text: str, *, limit: int = DEBATE_CONTENT_LIMIT) -> str:
+    def _truncate_text(self, text: str, *, limit: int = VERIFICATION_CONTENT_LIMIT) -> str:
         if len(text) <= limit:
             return text
         return text[: limit - 21] + "\n... truncated ..."
 
-    def _candidate_eligible_for_debate(self, response_text: str) -> bool:
+    def _truncate_json_value(self, value: Any, *, limit: int = VERIFICATION_CONTENT_LIMIT) -> Any:
+        if isinstance(value, str):
+            return self._truncate_text(value, limit=limit)
+        if isinstance(value, dict):
+            return {str(key): self._truncate_json_value(item, limit=limit) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._truncate_json_value(item, limit=limit) for item in value[:50]]
+        return value
+
+    def _normalize_audit_text_items(self, items: object) -> list[str]:
+        if not isinstance(items, list):
+            return []
+        normalized: list[str] = []
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            text = item.strip()
+            if not text:
+                continue
+            normalized.append(self._truncate_text(text, limit=AUDIT_TEXT_ITEM_LIMIT))
+            if len(normalized) >= AUDIT_LIST_ITEM_LIMIT:
+                break
+        return normalized
+
+    def _candidate_eligible_for_verification(self, response_text: str) -> bool:
         candidate = response_text.strip()
         if not candidate:
             return False
@@ -372,102 +440,446 @@ class OllamaCodeAgent:
         normalized = self._normalize_payload(payload)
         return normalized.get("type") == "final"
 
-    def _requested_tool_names(self, text: str) -> set[str]:
-        lowered = text.lower()
-        return {name for name in KNOWN_TOOL_NAMES if name in lowered}
+    def _tool_names_in_fragment(self, text: str) -> set[str]:
+        matches: set[str] = set()
+        for name in KNOWN_TOOL_NAMES:
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name.lower())}(?![A-Za-z0-9_])", text):
+                matches.add(name)
+        return matches
 
-    def _debate_context_payload(self, candidate_response: str, round_number: int) -> dict[str, Any]:
+    def _forbidden_tool_names(self, text: str) -> set[str]:
+        lowered = text.lower()
+        fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", lowered)
+        fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", lowered))
+        forbidden: set[str] = set()
+        for fragment in fragments:
+            forbidden.update(self._tool_names_in_fragment(fragment))
+        return forbidden
+
+    def _requested_tool_names(self, text: str, *, forbidden_tool_names: set[str] | None = None) -> set[str]:
+        lowered = text.lower()
+        fragments = re.findall(r"\b(?:use|call|run|invoke|start)\b[^.?!\n]{0,160}", lowered)
+        requested: set[str] = set()
+        for fragment in fragments:
+            requested.update(self._tool_names_in_fragment(fragment))
+        if forbidden_tool_names:
+            requested.difference_update(forbidden_tool_names)
+        return requested
+
+    def _verification_context_payload(
+        self,
+        *,
+        request_text: str,
+        candidate_message: str,
+        round_number: int,
+        tool_calls: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> dict[str, Any]:
         recent_messages = [
             {
                 "role": message["role"],
-                "content": self._truncate_text(message["content"]),
+                "content": self._truncate_text(message["content"], limit=800),
             }
-            for message in self.messages[-DEBATE_HISTORY_LIMIT:]
+            for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
+            if message.get("role") != "system"
         ]
         return {
             "round": round_number,
             "model": self.model,
             "workspace_root": self.tools.workspace_root.as_posix(),
+            "original_user_request": self._truncate_text(request_text),
             "recent_messages": recent_messages,
-            "candidate_response": candidate_response,
+            "candidate_final_answer": self._truncate_text(candidate_message),
+            "required_tools": sorted(required_tool_names),
+            "forbidden_tools": sorted(forbidden_tool_names),
+            "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls],
+            "successful_tool_results": [self._compact_successful_tool_result_for_verification(item) for item in successful_tool_results],
+            "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
 
-    def _debate_messages(self, system_prompt: str, payload: dict[str, Any]) -> list[dict[str, str]]:
+    def _verification_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
         return [
-            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": FINAL_VERIFIER_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=True)},
         ]
 
-    def _run_debate(self, response: ChatResponse, *, round_number: int) -> ChatResponse:
-        if not self.debate_enabled or not self._candidate_eligible_for_debate(response.content):
-            return response
-        original_payload = self._normalize_payload(extract_json_response(response.content) or {})
-        context_payload = self._debate_context_payload(response.content, round_number)
+    def _normalize_verification_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        decision = payload if isinstance(payload, dict) else {}
+        verdict = str(decision.get("verdict", "")).strip().lower()
+        if verdict not in {"accept", "retry"}:
+            verdict = "retry"
+        reason = str(decision.get("reason", "")).strip()
+        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        return {
+            "verdict": verdict,
+            "reason": reason,
+            "required_tools": sorted(set(required_tools)),
+            "forbidden_tools": sorted(set(forbidden_tools)),
+        }
+
+    def _assumption_audit_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=True)},
+        ]
+
+    def _compact_assumption_audit_for_context(self, audit: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "tool": str(audit.get("tool", "")).strip(),
+            "verdict": str(audit.get("verdict", "")).strip(),
+            "reason": self._truncate_text(str(audit.get("reason", "")).strip(), limit=240),
+            "assumptions": self._normalize_audit_text_items(audit.get("assumptions")),
+            "validation_steps": self._normalize_audit_text_items(audit.get("validation_steps")),
+        }
+
+    def _assumption_audit_context_payload(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        proposed_tool_name: str,
+        proposed_arguments: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        mutation_allowed: bool,
+        expected_exact_file_line: str | None,
+        expected_exact_reply_text: str | None,
+    ) -> dict[str, Any]:
+        recent_messages = [
+            {
+                "role": message["role"],
+                "content": self._truncate_text(message["content"], limit=800),
+            }
+            for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
+            if message.get("role") != "system"
+        ]
+        exact_constraints: list[str] = []
+        if expected_exact_file_line is not None:
+            exact_constraints.append(f'exact_file_line={expected_exact_file_line}')
+        if expected_exact_reply_text is not None:
+            exact_constraints.append(f'exact_reply={expected_exact_reply_text}')
+        return {
+            "round": round_number,
+            "model": self.model,
+            "workspace_root": self.tools.workspace_root.as_posix(),
+            "original_user_request": self._truncate_text(request_text),
+            "recent_messages": recent_messages,
+            "proposed_tool": {
+                "name": proposed_tool_name,
+                "arguments": self._truncate_json_value(proposed_arguments, limit=800),
+            },
+            "required_tools": sorted(required_tool_names),
+            "forbidden_tools": sorted(forbidden_tool_names),
+            "mutation_allowed": mutation_allowed,
+            "exact_constraints": exact_constraints,
+            "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls],
+            "successful_tool_results": [self._compact_successful_tool_result_for_verification(item) for item in successful_tool_results],
+            "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
+        }
+
+    def _normalize_assumption_audit_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        decision = payload if isinstance(payload, dict) else {}
+        verdict = str(decision.get("verdict", "")).strip().lower()
+        if verdict not in {"accept", "retry"}:
+            verdict = "retry"
+        reason = str(decision.get("reason", "")).strip()
+        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        return {
+            "verdict": verdict,
+            "reason": reason,
+            "assumptions": self._normalize_audit_text_items(decision.get("assumptions")),
+            "validation_steps": self._normalize_audit_text_items(decision.get("validation_steps")),
+            "required_tools": sorted(set(required_tools)),
+            "forbidden_tools": sorted(set(forbidden_tools)),
+        }
+
+    def _audit_tool_candidate(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        proposed_tool_name: str,
+        proposed_arguments: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        mutation_allowed: bool,
+        expected_exact_file_line: str | None,
+        expected_exact_reply_text: str | None,
+    ) -> dict[str, Any]:
+        context_payload = self._assumption_audit_context_payload(
+            request_text=request_text,
+            round_number=round_number,
+            proposed_tool_name=proposed_tool_name,
+            proposed_arguments=proposed_arguments,
+            tool_calls=tool_calls,
+            successful_tool_results=successful_tool_results,
+            accepted_assumption_audits=accepted_assumption_audits,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+            mutation_allowed=mutation_allowed,
+            expected_exact_file_line=expected_exact_file_line,
+            expected_exact_reply_text=expected_exact_reply_text,
+        )
+        self.status_printer("auditing tool assumptions")
+        verdict_response = self.client.chat(
+            model=self.model,
+            messages=self._assumption_audit_messages(context_payload),
+            think=False,
+        )
+        decision = self._normalize_assumption_audit_payload(extract_json_response(verdict_response.content))
+        if decision["verdict"] == "retry" and not decision["reason"]:
+            decision["reason"] = "Tool step assumptions were not validated."
+        self._record_event(
+            "assumption_audit",
+            round=round_number,
+            tool=proposed_tool_name,
+            arguments=self._truncate_json_value(proposed_arguments, limit=800),
+            verdict=decision["verdict"],
+            reason=decision["reason"],
+            assumptions=decision["assumptions"],
+            validation_steps=decision["validation_steps"],
+            required_tools=decision["required_tools"],
+            forbidden_tools=decision["forbidden_tools"],
+            auditor=verdict_response.content,
+        )
+        return decision
+
+    def _verify_final_candidate(
+        self,
+        response: ChatResponse,
+        *,
+        request_text: str,
+        round_number: int,
+        tool_calls: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> dict[str, Any]:
+        if not self.debate_enabled or not self._candidate_eligible_for_verification(response.content):
+            return {"verdict": "accept", "reason": "", "required_tools": [], "forbidden_tools": []}
+        candidate_payload = self._normalize_payload(extract_json_response(response.content) or {})
+        candidate_message = str(candidate_payload.get("message", "")).strip()
+        context_payload = self._verification_context_payload(
+            request_text=request_text,
+            candidate_message=candidate_message,
+            round_number=round_number,
+            tool_calls=tool_calls,
+            successful_tool_results=successful_tool_results,
+            accepted_assumption_audits=accepted_assumption_audits,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        )
         try:
-            self.status_printer("debate against")
-            against = self.client.chat(
+            self.status_printer("verifying final")
+            verdict_response = self.client.chat(
                 model=self.model,
-                messages=self._debate_messages(DEBATE_AGAINST_SYSTEM_PROMPT, context_payload),
-                response_format=None,
-            )
-            self.status_printer("debate for")
-            support = self.client.chat(
-                model=self.model,
-                messages=self._debate_messages(DEBATE_FOR_SYSTEM_PROMPT, context_payload),
-                response_format=None,
-            )
-            judge_payload = dict(context_payload)
-            judge_payload["against_argument"] = self._truncate_text(against.content)
-            judge_payload["for_argument"] = self._truncate_text(support.content)
-            self.status_printer("debate judge")
-            judged = self.client.chat(
-                model=self.model,
-                messages=self._debate_messages(DEBATE_JUDGE_SYSTEM_PROMPT, judge_payload),
+                messages=self._verification_messages(context_payload),
+                think=False,
             )
         except OllamaError as exc:
-            self._record_event(
-                "debate",
-                round=round_number,
-                candidate=response.content,
-                applied=False,
-                summary=f"debate failed: {exc}",
-            )
-            return response
-        if not self._candidate_eligible_for_debate(judged.content):
-            self._record_event(
-                "debate",
-                round=round_number,
-                candidate=response.content,
-                against=against.content,
-                for_argument=support.content,
-                judge=judged.content,
-                applied=False,
-                summary="judge returned invalid controller JSON; kept original candidate",
-            )
-            return response
-        judged_payload = self._normalize_payload(extract_json_response(judged.content) or {})
-        if original_payload.get("type") == "tool" and judged_payload.get("type") != "tool":
-            self._record_event(
-                "debate",
-                round=round_number,
-                candidate=response.content,
-                against=against.content,
-                for_argument=support.content,
-                judge=judged.content,
-                applied=False,
-                summary="judge downgraded a tool candidate into a final answer; kept original tool call",
-            )
-            return response
+            raise exc
+        decision = self._normalize_verification_payload(extract_json_response(verdict_response.content))
+        if decision["verdict"] == "retry" and not decision["reason"]:
+            decision["reason"] = "Final answer was not accepted by grounded verification."
         self._record_event(
-            "debate",
+            "verification",
             round=round_number,
-            candidate=response.content,
-            against=against.content,
-            for_argument=support.content,
-            judge=judged.content,
-            applied=True,
+            candidate=candidate_message,
+            verdict=decision["verdict"],
+            reason=decision["reason"],
+            required_tools=decision["required_tools"],
+            forbidden_tools=decision["forbidden_tools"],
+            verifier=verdict_response.content,
         )
-        return judged
+        return decision
+
+    def _verification_retry_message(self, decision: dict[str, Any]) -> str:
+        parts = [
+            "Grounded final verification rejected your previous final answer.",
+            "Reason: " + str(decision.get("reason") or "It was not grounded in the current tool results."),
+            "Use existing tool results when they already answer the question; otherwise use another appropriate tool before finishing.",
+            "Do not contradict successful tool results, accepted assumption-audit evidence, or explicit user constraints.",
+        ]
+        required_tools = decision.get("required_tools") if isinstance(decision.get("required_tools"), list) else []
+        forbidden_tools = decision.get("forbidden_tools") if isinstance(decision.get("forbidden_tools"), list) else []
+        if required_tools:
+            parts.append("Required tools for this turn: " + ", ".join(str(item) for item in required_tools) + ".")
+        if forbidden_tools:
+            parts.append("Forbidden tools for this turn: " + ", ".join(str(item) for item in forbidden_tools) + ".")
+        parts.append("Respond with the next JSON object only.")
+        return " ".join(parts)
+
+    def _assumption_audit_retry_message(self, decision: dict[str, Any]) -> str:
+        parts = [
+            "Assumption audit rejected your previous tool choice.",
+            "Reason: " + str(decision.get("reason") or "The proposed tool did not validate the needed assumption."),
+        ]
+        assumptions = decision.get("assumptions") if isinstance(decision.get("assumptions"), list) else []
+        validation_steps = decision.get("validation_steps") if isinstance(decision.get("validation_steps"), list) else []
+        required_tools = decision.get("required_tools") if isinstance(decision.get("required_tools"), list) else []
+        forbidden_tools = decision.get("forbidden_tools") if isinstance(decision.get("forbidden_tools"), list) else []
+        if assumptions:
+            parts.append("Weak or unresolved assumptions: " + "; ".join(str(item) for item in assumptions) + ".")
+        if validation_steps:
+            parts.append("Validation needed: " + "; ".join(str(item) for item in validation_steps) + ".")
+        if required_tools:
+            parts.append("Required tools for this turn: " + ", ".join(str(item) for item in required_tools) + ".")
+        if forbidden_tools:
+            parts.append("Forbidden tools for this turn: " + ", ".join(str(item) for item in forbidden_tools) + ".")
+        parts.append("Choose a better next JSON object only.")
+        return " ".join(parts)
+
+    def _reset_turn_cache(self) -> None:
+        self._turn_tool_cache = {}
+        self._turn_cache_epoch = 0
+
+    def _tool_cache_key(self, name: str, arguments: dict[str, Any]) -> tuple[str, str, int] | None:
+        if name not in READ_ONLY_CACHEABLE_TOOL_NAMES:
+            return None
+        try:
+            encoded_arguments = json.dumps(arguments, sort_keys=True, ensure_ascii=True)
+        except TypeError:
+            return None
+        return (name, encoded_arguments, self._turn_cache_epoch)
+
+    def _get_cached_tool_result(self, name: str, arguments: dict[str, Any]) -> dict[str, Any] | None:
+        key = self._tool_cache_key(name, arguments)
+        if key is None:
+            return None
+        cached = self._turn_tool_cache.get(key)
+        if cached is None:
+            return None
+        return deepcopy(cached)
+
+    def _store_cached_tool_result(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        key = self._tool_cache_key(name, arguments)
+        if key is None or result.get("ok") is not True:
+            return
+        self._turn_tool_cache[key] = deepcopy(result)
+
+    def _invalidate_turn_cache_if_needed(self, name: str, result: dict[str, Any]) -> None:
+        if result.get("ok") is not True:
+            return
+        if name in MUTATING_TOOL_NAMES or name in {"run_shell", "run_agent"}:
+            self._turn_cache_epoch += 1
+
+    def _tool_result_limit(self, name: str, *, for_verification: bool = False) -> int:
+        default_limit = VERIFICATION_TOOL_RESULT_LIMIT if for_verification else 1000
+        limit = MODEL_TOOL_RESULT_LIMITS.get(name, default_limit)
+        if for_verification:
+            return min(limit, VERIFICATION_TOOL_RESULT_LIMIT)
+        return limit
+
+    def _compact_tool_result_for_context(
+        self,
+        name: str,
+        result: dict[str, Any],
+        *,
+        for_verification: bool = False,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"tool": name, "ok": result.get("ok") is True}
+        for key in (
+            "path",
+            "cwd",
+            "start",
+            "end",
+            "count",
+            "cached",
+            "exit_code",
+            "command",
+            "summary",
+            "model",
+            "approval_mode",
+            "rounds",
+            "event_count",
+        ):
+            if key in result:
+                payload[key] = result[key]
+        for field in ("output", "diff"):
+            value = result.get(field)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            if field == "diff":
+                limit = VERIFICATION_TOOL_DIFF_LIMIT if for_verification else MODEL_TOOL_DIFF_LIMIT
+            else:
+                limit = self._tool_result_limit(name, for_verification=for_verification)
+            payload[field] = self._truncate_text(value, limit=limit)
+        return payload
+
+    def _compact_tool_call_for_verification(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        name = str(tool_call.get("name", "")).strip()
+        arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
+        return {
+            "name": name,
+            "arguments": self._truncate_json_value(arguments, limit=600),
+        }
+
+    def _compact_successful_tool_result_for_verification(self, item: dict[str, Any]) -> dict[str, Any]:
+        name = str(item.get("name", "")).strip()
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        return {
+            "name": name,
+            "arguments": self._truncate_json_value(arguments, limit=600),
+            "result": self._compact_tool_result_for_context(name, result, for_verification=True),
+        }
+
+    def _tool_result_feedback_message(self, name: str, result: dict[str, Any], *, real_tool_use: bool) -> str:
+        payload = self._compact_tool_result_for_context(name, result, for_verification=False)
+        follow_up = "Respond with the next JSON object only."
+        if not real_tool_use:
+            follow_up = (
+                "That tool call did not complete successfully, so it does not satisfy the tool-use requirement. "
+                "Fix the issue or use a different appropriate tool, then respond with the next JSON object only."
+            )
+        return "Tool result summary:\n" + json.dumps(payload, indent=2, ensure_ascii=True) + "\n" + follow_up
+
+    def _final_requires_verification(
+        self,
+        *,
+        request_text: str,
+        assistant_text: str,
+        tool_calls: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        mutation_verified_this_turn: bool,
+        expected_exact_file_line: str | None,
+    ) -> bool:
+        if required_tool_names or forbidden_tool_names:
+            return True
+        if mutation_verified_this_turn or self._final_claims_file_mutation(assistant_text):
+            return True
+        if expected_exact_file_line is not None:
+            return True
+        if tool_calls and self._request_needs_exact_grounding(request_text):
+            return True
+        tool_names = {str(item.get("name", "")).strip() for item in tool_calls}
+        if len(tool_calls) >= 2:
+            return True
+        return any(name in RISKY_VERIFICATION_TOOL_NAMES for name in tool_names)
+
+    def _primary_think_override(
+        self,
+        *,
+        requires_tools: bool,
+        round_number: int,
+        tool_used_this_turn: bool,
+    ) -> bool | None:
+        if requires_tools or tool_used_this_turn or round_number > 1:
+            return False
+        return None
 
     def _request_requires_tools(self, text: str) -> bool:
         lowered = text.lower()
@@ -523,6 +935,144 @@ class OllamaCodeAgent:
         has_file_target = bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)) or "/" in text
         return has_file_target and any(verb in lowered for verb in file_verbs)
 
+    def _request_targets_session_memory(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            phrase in lowered
+            for phrase in [
+                "earlier in this session",
+                "earlier in this conversation",
+                "what token did i ask you to remember",
+                "what did i ask you to remember",
+                "remember earlier",
+                "remember in this session",
+            ]
+        )
+
+    def _requested_exact_file_line(self, text: str) -> str | None:
+        patterns = [
+            r"exactly the text ['\"]([^'\"]+)['\"] followed by a newline",
+            r"exactly the single line ['\"]([^'\"]+)['\"] followed by a newline",
+            r"exactly the single line ([A-Za-z0-9_.:/@+-]+) followed by a newline",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                value = match.group(1).strip()
+                if value:
+                    return value
+        return None
+
+    def _requested_exact_single_line_file_write(self, text: str) -> ExactFileWriteSpec | None:
+        line = self._requested_exact_file_line(text)
+        if line is None:
+            return None
+        patterns = [
+            r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the single line\b",
+            r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the text\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                path = match.group("path").strip()
+                if path:
+                    return ExactFileWriteSpec(path=path, line=line)
+        return None
+
+    def _requested_exact_reply_text(self, text: str) -> str | None:
+        patterns = [
+            r"\b(?:reply|respond)\s+with\s+['\"]([^'\"]+)['\"]\s+only\b",
+            r"\b(?:reply|respond)\s+with\s+(?:exactly\s+)?([A-Z0-9_.:/@+-]+)\s+only\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                value = match.group(1).strip()
+                if value:
+                    return value
+        return None
+
+    def _latest_read_confirms_exact_line(
+        self,
+        tool_results: list[dict[str, Any]],
+        expected_line: str,
+        *,
+        path: str | None = None,
+    ) -> bool:
+        for item in reversed(tool_results):
+            if item.get("name") != "read_file":
+                continue
+            arguments = item.get("arguments")
+            if path is not None and isinstance(arguments, dict) and str(arguments.get("path", "")).strip() != path:
+                continue
+            result = item.get("result")
+            if not isinstance(result, dict):
+                continue
+            output = str(result.get("output", ""))
+            if expected_line in output:
+                return True
+        return False
+
+    def _normalize_exact_literal_tool_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        exact_file_write: ExactFileWriteSpec | None,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if exact_file_write is None:
+            return name, arguments, None
+        if name == "write_file" or name == "replace_in_file":
+            return (
+                "write_file",
+                {"path": exact_file_write.path, "content": exact_file_write.line + "\n"},
+                "Normalized exact single-line file write to a deterministic write_file call.",
+            )
+        if name == "read_file":
+            return (
+                "read_file",
+                {"path": exact_file_write.path, "start": 1, "end": 1},
+                "Normalized exact single-line confirmation read to the requested file and line range.",
+            )
+        return name, arguments, None
+
+    def _request_needs_exact_grounding(self, text: str) -> bool:
+        lowered = text.lower()
+        patterns = [
+            r"\bexact(?:ly)?\b",
+            r"\bline\s+\d+\b",
+            r"\bfirst line\b",
+            r"\bsingle line\b",
+            r"\bwhat(?:'s| is)? .* say\b",
+            r"\btoken\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _request_allows_mutation(self, text: str) -> bool:
+        lowered = text.lower()
+        mutation_phrases = [
+            "create ",
+            "write ",
+            "replace ",
+            "edit ",
+            "update ",
+            "rewrite ",
+            "append ",
+            "modify ",
+            "change ",
+            "delete ",
+            "remove ",
+            "rename ",
+            "fix ",
+            "implement ",
+            "patch ",
+            "refactor ",
+            "make ",
+            "add ",
+            "commit ",
+        ]
+        return any(phrase in lowered for phrase in mutation_phrases)
+
     def _shell_looks_like_file_mutation(self, command: str) -> bool:
         lowered = command.lower()
         mutation_patterns = [
@@ -568,6 +1118,15 @@ class OllamaCodeAgent:
             return False
         return result.get("ok") is True
 
+    def _latest_successful_tool_result(self, tool_results: list[dict[str, Any]], name: str) -> dict[str, Any] | None:
+        for item in reversed(tool_results):
+            if item.get("name") != name:
+                continue
+            result = item.get("result")
+            if isinstance(result, dict):
+                return result
+        return None
+
     def _failure_result_counts_for_request(self, request_text: str, name: str, result: dict[str, Any]) -> bool:
         if name not in KNOWN_TOOL_NAMES:
             return False
@@ -599,6 +1158,19 @@ class OllamaCodeAgent:
         summary = str(result.get("summary", "")).strip()
         output = str(result.get("output", "")).strip()
         return bool(summary or output)
+
+    def _request_expects_exact_tool_error(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            phrase in lowered
+            for phrase in [
+                "exact tool error",
+                "tell me the exact tool error",
+                "reply with the exact tool error",
+                "what happened",
+                "tell me what happened",
+            ]
+        )
 
     def _final_claims_file_mutation(self, message: str) -> bool:
         lowered = message.lower()
@@ -683,15 +1255,28 @@ class OllamaCodeAgent:
         return response
 
     def handle_user(self, text: str) -> AgentResult:
+        self._reset_turn_cache()
         self.messages.append({"role": "user", "content": text})
         self._record_event("user", content=text)
         requires_tools = self._request_requires_tools(text)
-        required_tool_names = self._requested_tool_names(text)
+        forbidden_tool_names = self._forbidden_tool_names(text)
+        required_tool_names = self._requested_tool_names(text, forbidden_tool_names=forbidden_tool_names)
         requested_git_diff_mode = self._requested_git_diff_mode(text)
+        expected_exact_file_line = self._requested_exact_file_line(text)
+        exact_file_write = self._requested_exact_single_line_file_write(text)
+        expected_exact_reply_text = self._requested_exact_reply_text(text)
         prefers_structured_file_tools = self._request_prefers_structured_file_tools(text)
+        session_memory_request = self._request_targets_session_memory(text)
+        mutation_allowed = self._request_allows_mutation(text)
         tool_used_this_turn = False
-        successful_tools_this_turn: set[str] = set()
+        satisfied_tool_names: set[str] = set()
+        successful_tool_results: list[dict[str, Any]] = []
+        tool_calls_this_turn: list[dict[str, Any]] = []
+        accepted_assumption_audits: list[dict[str, Any]] = []
+        rejected_final_messages: set[str] = set()
         mutation_verified_this_turn = False
+        assumption_audit_retries = 0
+        verification_retries = 0
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
@@ -699,10 +1284,14 @@ class OllamaCodeAgent:
                     model=self.model,
                     messages=self.messages,
                     on_thinking=self.thinking_printer,
+                    think=self._primary_think_override(
+                        requires_tools=requires_tools,
+                        round_number=round_number,
+                        tool_used_this_turn=tool_used_this_turn,
+                    ),
                 )
             except OllamaError:
                 raise
-            response = self._run_debate(response, round_number=round_number)
             payload = extract_json_response(response.content)
             if payload is None:
                 assistant_text = response.content.strip()
@@ -718,7 +1307,7 @@ class OllamaCodeAgent:
             payload = self._normalize_payload(payload)
             response_type = payload.get("type")
             if response_type == "final":
-                missing_requested_tools = sorted(required_tool_names - successful_tools_this_turn)
+                missing_requested_tools = sorted(required_tool_names - satisfied_tool_names)
                 if missing_requested_tools:
                     self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                     self.messages.append(
@@ -749,12 +1338,151 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if assistant_text and assistant_text in rejected_final_messages:
+                    failure = "Stopped because grounded final verification could not accept a final answer."
+                    self._record_event(
+                        "assistant",
+                        content=failure,
+                        rounds=round_number,
+                        repeated_rejected_final=assistant_text,
+                    )
+                    return AgentResult(message=failure, rounds=round_number, completed=False)
+                if expected_exact_file_line is not None:
+                    latest_read_result = self._latest_successful_tool_result(successful_tool_results, "read_file")
+                    if latest_read_result is not None:
+                        latest_read_output = str(latest_read_result.get("output", ""))
+                        if expected_exact_file_line not in latest_read_output:
+                            self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": f'The exact required line is "{expected_exact_file_line}", but the latest read_file confirmation was "{latest_read_output.strip()}". Write the required line exactly, confirm it again with read_file, and only then finish. Respond with the next JSON object only.',
+                                }
+                            )
+                            continue
+                if expected_exact_reply_text is not None and assistant_text != expected_exact_reply_text:
+                    exact_reply_confirmed = expected_exact_reply_text == expected_exact_file_line and self._latest_read_confirms_exact_line(
+                        successful_tool_results,
+                        expected_exact_reply_text,
+                        path=exact_file_write.path if exact_file_write is not None else None,
+                    )
+                    if exact_reply_confirmed:
+                        normalized_payload = {"type": "final", "message": expected_exact_reply_text}
+                        self.messages.append({"role": "assistant", "content": json.dumps(normalized_payload, ensure_ascii=True)})
+                        self._record_event(
+                            "assistant_normalized",
+                            original=assistant_text,
+                            normalized=expected_exact_reply_text,
+                            reason="Exact reply constraint matched verified file content.",
+                            rounds=round_number,
+                        )
+                        self._record_event("assistant", content=expected_exact_reply_text, rounds=round_number)
+                        return AgentResult(message=expected_exact_reply_text, rounds=round_number, completed=True)
+                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": f'Reply with exactly "{expected_exact_reply_text}" and nothing else. Respond with the next JSON object only.',
+                        }
+                    )
+                    continue
+                if not session_memory_request and self._final_requires_verification(
+                    request_text=text,
+                    assistant_text=assistant_text,
+                    tool_calls=tool_calls_this_turn,
+                    required_tool_names=required_tool_names,
+                    forbidden_tool_names=forbidden_tool_names,
+                    mutation_verified_this_turn=mutation_verified_this_turn,
+                    expected_exact_file_line=expected_exact_file_line,
+                ):
+                    decision = self._verify_final_candidate(
+                        response,
+                        request_text=text,
+                        round_number=round_number,
+                        tool_calls=tool_calls_this_turn,
+                        successful_tool_results=successful_tool_results,
+                        accepted_assumption_audits=accepted_assumption_audits,
+                        required_tool_names=required_tool_names,
+                        forbidden_tool_names=forbidden_tool_names,
+                    )
+                    if decision["verdict"] == "retry":
+                        if assistant_text:
+                            rejected_final_messages.add(assistant_text)
+                        verification_retries += 1
+                        required_tool_names.update(decision["required_tools"])
+                        forbidden_tool_names.update(decision["forbidden_tools"])
+                        required_tool_names.difference_update(forbidden_tool_names)
+                        if verification_retries > MAX_VERIFICATION_RETRIES:
+                            failure = "Stopped because grounded final verification could not accept a final answer."
+                            self._record_event("assistant", content=failure, rounds=round_number)
+                            return AgentResult(message=failure, rounds=round_number, completed=False)
+                        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                        self.messages.append({"role": "user", "content": self._verification_retry_message(decision)})
+                        continue
                 self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
                 return AgentResult(message=assistant_text, rounds=round_number, completed=True)
             if response_type == "tool":
                 name = str(payload.get("name", "")).strip()
                 arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                original_name = name
+                original_arguments = deepcopy(arguments)
+                name, arguments, normalization_reason = self._normalize_exact_literal_tool_call(
+                    name,
+                    arguments,
+                    exact_file_write=exact_file_write,
+                )
+                if normalization_reason is not None:
+                    payload = {"type": "tool", "name": name, "arguments": arguments}
+                    self._record_event(
+                        "tool_normalized",
+                        original_name=original_name,
+                        original_arguments=original_arguments,
+                        normalized_name=name,
+                        normalized_arguments=arguments,
+                        reason=normalization_reason,
+                        rounds=round_number,
+                    )
+                if name in forbidden_tool_names:
+                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": f"Do not use {name} in this turn. Choose a different allowed tool or answer from existing verified tool results. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if session_memory_request:
+                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "This request is about prior chat/session memory, not the workspace. Answer from the conversation history already in context. Do not use tools for it. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if name in MUTATING_TOOL_NAMES and not mutation_allowed:
+                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not mutate files or create commits in this turn. The user asked for inspection or reporting only. Use a read-only tool or answer from verified tool results. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if (
+                    name == "run_shell"
+                    and not mutation_allowed
+                    and self._shell_looks_like_file_mutation(str(arguments.get("command", "")))
+                ):
+                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not use run_shell for file or git mutation in this turn. The user asked for inspection or reporting only. Use a read-only tool or answer from verified tool results. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
                 if (
                     name == "run_shell"
                     and prefers_structured_file_tools
@@ -786,32 +1514,91 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                cached_result = self._get_cached_tool_result(name, arguments)
+                cache_hit = cached_result is not None
+                should_skip_assumption_audit = (
+                    not self.debate_enabled
+                    or normalization_reason is not None
+                    or cache_hit
+                )
+                if not should_skip_assumption_audit:
+                    audit_decision = self._audit_tool_candidate(
+                        request_text=text,
+                        round_number=round_number,
+                        proposed_tool_name=name,
+                        proposed_arguments=arguments,
+                        tool_calls=tool_calls_this_turn,
+                        successful_tool_results=successful_tool_results,
+                        accepted_assumption_audits=accepted_assumption_audits,
+                        required_tool_names=required_tool_names,
+                        forbidden_tool_names=forbidden_tool_names,
+                        mutation_allowed=mutation_allowed,
+                        expected_exact_file_line=expected_exact_file_line,
+                        expected_exact_reply_text=expected_exact_reply_text,
+                    )
+                    if audit_decision["verdict"] == "retry":
+                        assumption_audit_retries += 1
+                        required_tool_names.update(audit_decision["required_tools"])
+                        forbidden_tool_names.update(audit_decision["forbidden_tools"])
+                        required_tool_names.difference_update(forbidden_tool_names)
+                        if assumption_audit_retries > MAX_ASSUMPTION_AUDIT_RETRIES:
+                            failure = "Stopped because assumption audit could not approve a next tool step."
+                            self._record_event("assistant", content=failure, rounds=round_number)
+                            return AgentResult(message=failure, rounds=round_number, completed=False)
+                        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                        self.messages.append({"role": "user", "content": self._assumption_audit_retry_message(audit_decision)})
+                        continue
+                    accepted_assumption_audits.append(
+                        {
+                            "tool": name,
+                            "verdict": audit_decision["verdict"],
+                            "reason": audit_decision["reason"],
+                            "assumptions": audit_decision["assumptions"],
+                            "validation_steps": audit_decision["validation_steps"],
+                        }
+                    )
                 self.status_printer(f"tool {name} {json.dumps(arguments, ensure_ascii=True)}")
                 self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                 self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
-                result = self.tools.execute(name, arguments)
+                tool_calls_this_turn.append(
+                    {
+                        "name": name,
+                        "arguments": deepcopy(arguments),
+                    }
+                )
+                result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
+                if not cache_hit:
+                    self._store_cached_tool_result(name, arguments, result)
+                self._invalidate_turn_cache_if_needed(name, result)
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
                 if real_tool_use:
-                    successful_tools_this_turn.add(name)
+                    satisfied_tool_names.add(name)
                     if name in MUTATING_TOOL_NAMES:
                         mutation_verified_this_turn = True
-                self._record_event("tool_result", name=name, result=result, rounds=round_number)
-                follow_up = "Respond with the next JSON object only."
-                if not real_tool_use:
-                    follow_up = (
-                        "That tool call did not complete successfully, so it does not satisfy the tool-use requirement. "
-                        "Fix the issue or use a different appropriate tool, then respond with the next JSON object only."
+                if self._counts_as_real_tool_use(name, result):
+                    successful_tool_results.append(
+                        {
+                            "name": name,
+                            "arguments": deepcopy(arguments),
+                            "result": deepcopy(result),
+                        }
                     )
+                self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit)
                 self.messages.append(
                     {
                         "role": "user",
-                        "content": "Tool result:\n"
-                        + json.dumps(result, indent=2, ensure_ascii=True)
-                        + "\n"
-                        + follow_up,
+                        "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use),
                     }
                 )
+                if (
+                    self._request_expects_exact_tool_error(text)
+                    and self._failure_result_counts_for_request(text, name, result)
+                ):
+                    failure_message = str(result.get("summary") or result.get("output") or "").strip()
+                    if failure_message:
+                        self._record_event("assistant", content=failure_message, rounds=round_number)
+                        return AgentResult(message=failure_message, rounds=round_number, completed=True)
                 continue
             self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
             self.messages.append(

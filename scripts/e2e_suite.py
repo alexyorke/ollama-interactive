@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import subprocess
@@ -9,6 +10,21 @@ import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+
+_LOADED_MODELS: set[str] = set()
+
+
+def unload_model(model: str) -> None:
+    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, check=False)
+
+
+def _cleanup_loaded_models() -> None:
+    for model in sorted(_LOADED_MODELS):
+        unload_model(model)
+
+
+atexit.register(_cleanup_loaded_models)
 
 
 def init_git_repo(root: Path) -> None:
@@ -190,6 +206,14 @@ def tool_results(session: dict[str, Any], tool_name: str) -> list[dict[str, Any]
     return results
 
 
+def tool_calls(session: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for event in session.get("events", []):
+        if event.get("type") == "tool_call" and isinstance(event.get("name"), str):
+            names.append(str(event["name"]))
+    return names
+
+
 def scenario_transcripted_tool_use(repo_root: Path, workspace: Path, model: str) -> None:
     session_file = workspace / "scratch" / "tool-use.json"
     result = run_cli(
@@ -216,7 +240,7 @@ def scenario_approval_accept(repo_root: Path, workspace: Path, model: str) -> No
         "Create scratch/approved.txt with exactly the single line APPROVED followed by a newline. Then use read_file to confirm it and reply with APPROVED only.",
         approval="ask",
         session_file=session_file,
-        stdin_text="y\n",
+        stdin_text="y\ny\ny\ny\ny\n",
     )
     session = load_session(session_file)
     writes = tool_results(session, "write_file")
@@ -235,7 +259,7 @@ def scenario_approval_reject(repo_root: Path, workspace: Path, model: str) -> No
         "Create scratch/rejected.txt with exactly the single line REJECTED followed by a newline. If it does not happen, tell me what happened.",
         approval="ask",
         session_file=session_file,
-        stdin_text="n\n",
+        stdin_text="n\nn\nn\nn\nn\n",
     )
     session = load_session(session_file)
     writes = tool_results(session, "write_file")
@@ -320,12 +344,15 @@ def scenario_git_tools(repo_root: Path, workspace: Path, model: str) -> None:
     session = load_session(session_file)
     statuses = tool_results(session, "git_status")
     diffs = tool_results(session, "git_diff")
+    calls = tool_calls(session)
     require(result.returncode == 0, "git tool command failed", stdout=result.stdout, stderr=result.stderr, session=session)
     require(any(item.get("ok") and "src/app.py" in str(item.get("output", "")) for item in statuses), "git_status result was not captured", stdout=result.stdout, stderr=result.stderr, session=session)
     require(any(item.get("ok") and "return 99" in str(item.get("output", "")) for item in diffs), "git_diff result was not captured", stdout=result.stdout, stderr=result.stderr, session=session)
+    require("read_file" not in calls, "git tool command used forbidden read_file", stdout=result.stdout, stderr=result.stderr, session=session)
 
 
 def scenario_continue_session(repo_root: Path, workspace: Path, model: str) -> None:
+    session_dir = workspace / ".ollama-code" / "sessions"
     first = run_cli(
         repo_root,
         workspace,
@@ -333,6 +360,7 @@ def scenario_continue_session(repo_root: Path, workspace: Path, model: str) -> N
         "Remember the exact token CONTINUE_TOKEN_99 for this session and reply with remembered.",
     )
     require(first.returncode == 0, "initial continue-session command failed", stdout=first.stdout, stderr=first.stderr)
+    require(session_dir.exists(), "continue-session did not create a session directory", stdout=first.stdout, stderr=first.stderr)
     second = run_cli(
         repo_root,
         workspace,
@@ -341,7 +369,29 @@ def scenario_continue_session(repo_root: Path, workspace: Path, model: str) -> N
         extra_args=["--continue"],
     )
     require(second.returncode == 0, "continue-session follow-up failed", stdout=second.stdout, stderr=second.stderr)
-    require("CONTINUE_TOKEN_99" in second.stdout, "continued session did not preserve prior context", stdout=second.stdout, stderr=second.stderr)
+    session_files = sorted(session_dir.glob("*.json"), key=lambda path: path.stat().st_mtime)
+    require(bool(session_files), "continue-session did not save any transcript", stdout=second.stdout, stderr=second.stderr)
+    session = load_session(session_files[-1])
+    messages = session.get("messages", [])
+    require(
+        any(isinstance(message, dict) and "CONTINUE_TOKEN_99" in str(message.get("content", "")) for message in messages),
+        "continued session transcript did not preserve the prior token",
+        stdout=second.stdout,
+        stderr=second.stderr,
+        session=session,
+    )
+    require(
+        any(
+            isinstance(message, dict)
+            and message.get("role") == "user"
+            and "What token did I ask you to remember earlier in this session?" in str(message.get("content", ""))
+            for message in messages
+        ),
+        "continued session transcript did not append the follow-up prompt",
+        stdout=second.stdout,
+        stderr=second.stderr,
+        session=session,
+    )
 
 
 def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> None:
@@ -395,9 +445,12 @@ def main(argv: list[str] | None = None) -> int:
         workspace = Path(tmp)
         build_workspace(workspace)
         print(f"[e2e] model={model}")
+        _LOADED_MODELS.add(model)
         for name, scenario in scenarios:
             print(f"[e2e]   {name}")
             scenario(repo_root, workspace, model)
+    unload_model(model)
+    _LOADED_MODELS.discard(model)
     print("[e2e] all scenarios passed")
     return 0
 

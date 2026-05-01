@@ -145,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-agent-depth", type=int, default=None, help="Maximum nested sub-agent depth.")
     parser.add_argument("--timeout", type=int, default=None, help="Ollama request timeout in seconds.")
     parser.add_argument("--test-cmd", default=None, help="Optional default test command for the run_test tool and /test.")
-    parser.add_argument("--debate", choices=["on", "off"], default=None, help="Enable or disable multi-call self-debate for each usable model reply.")
+    parser.add_argument("--debate", choices=["on", "off"], default=None, help="Enable or disable tool-step assumption auditing plus grounded risky-final verification.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser

@@ -132,6 +132,19 @@ class OllamaClientTests(unittest.TestCase):
         self.assertTrue(first_payload["think"])
         self.assertFalse(second_payload["think"])
 
+    def test_chat_allows_explicit_think_disable(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}], think=False)
+            payload = json.loads(_MalformedResponseHandler.last_request_body.decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.content, "ok")
+        self.assertFalse(payload["think"])
+
     def test_chat_streams_thinking_updates(self) -> None:
         body = (
             b'{"message":{"content":"","thinking":"alpha"},"done":false}\n'

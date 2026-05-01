@@ -129,10 +129,20 @@ class _FakeOllamaHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         payload = json.loads(self.rfile.read(length).decode("utf-8"))
         type(self).requests.append(payload)
-        response = {
-            "model": payload.get("model", ""),
-            "message": {"content": '{"type":"final","message":"config smoke ok"}'},
-        }
+        messages = payload.get("messages") if isinstance(payload.get("messages"), list) else []
+        system_prompt = ""
+        if messages and isinstance(messages[0], dict):
+            system_prompt = str(messages[0].get("content", ""))
+        if system_prompt.startswith("You are a grounded final verifier"):
+            response = {
+                "model": payload.get("model", ""),
+                "message": {"content": '{"verdict":"accept"}'},
+            }
+        else:
+            response = {
+                "model": payload.get("model", ""),
+                "message": {"content": '{"type":"final","message":"config smoke ok"}'},
+            }
         body = json.dumps(response).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -177,7 +187,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip().splitlines()[-1], "config smoke ok")
-        self.assertEqual(len(_FakeOllamaHandler.requests), 4)
+        self.assertEqual(len(_FakeOllamaHandler.requests), 1)
         self.assertEqual(_FakeOllamaHandler.tag_requests, 0)
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "config-model")
 
@@ -214,5 +224,5 @@ class ConfigCliSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip().splitlines()[-1], "config smoke ok")
         self.assertEqual(_FakeOllamaHandler.tag_requests, 1)
-        self.assertEqual(len(_FakeOllamaHandler.requests), 4)
+        self.assertEqual(len(_FakeOllamaHandler.requests), 1)
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "gemma3:4b")

@@ -14,9 +14,16 @@ from ollama_code.tools import ToolExecutor
 
 
 class FakeClient:
-    def __init__(self, responses: list[str], *, script_debate: bool = False) -> None:
+    def __init__(
+        self,
+        responses: list[str],
+        *,
+        script_verification: bool = False,
+        script_assumption_audit: bool = False,
+    ) -> None:
         self.responses = list(responses)
-        self.script_debate = script_debate
+        self.script_verification = script_verification
+        self.script_assumption_audit = script_assumption_audit
         self.calls: list[dict[str, object]] = []
         self.interrupt_events: list[object | None] = []
 
@@ -30,6 +37,7 @@ class FakeClient:
         messages: list[dict[str, str]],
         response_format: str = "json",
         on_thinking: object | None = None,
+        think: bool | None = None,
     ) -> ChatResponse:
         system_prompt = messages[0]["content"] if messages else ""
         self.calls.append(
@@ -38,18 +46,29 @@ class FakeClient:
                 "messages": list(messages),
                 "response_format": response_format,
                 "on_thinking": on_thinking,
+                "think": think,
             }
         )
-        if not self.script_debate and isinstance(system_prompt, str):
-            if system_prompt.startswith("You are Against Agent."):
-                return ChatResponse(content="Candidate risk low.", model=model, raw={})
-            if system_prompt.startswith("You are For Agent."):
-                return ChatResponse(content="Candidate fits request.", model=model, raw={})
-            if system_prompt.startswith("You are Judge Agent for a coding CLI controller."):
-                payload = json.loads(messages[-1]["content"])
-                candidate = str(payload.get("candidate_response", "")).strip()
-                return ChatResponse(content=candidate, model=model, raw={})
+        if isinstance(system_prompt, str):
+            if system_prompt.startswith("You are a grounded final verifier") and not self.script_verification:
+                return ChatResponse(content='{"verdict":"accept"}', model=model, raw={})
+            if system_prompt.startswith("You are a tool-step assumption auditor") and not self.script_assumption_audit:
+                return ChatResponse(
+                    content='{"verdict":"accept","reason":"","assumptions":["tool is needed"],"validation_steps":["run the tool to gather evidence"],"required_tools":[],"forbidden_tools":[]}',
+                    model=model,
+                    raw={},
+                )
         return ChatResponse(content=self.responses.pop(0), model=model, raw={})
+
+
+class CountingToolExecutor(ToolExecutor):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.execute_counts: dict[str, int] = {}
+
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
+        return super().execute(name, arguments)
 
 
 class AgentTests(unittest.TestCase):
@@ -131,29 +150,49 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
 
-    def test_agent_runs_debate_by_default_and_uses_judge_result(self) -> None:
+    def test_agent_runs_verification_by_default_and_accepts_candidate(self) -> None:
         root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
         client = FakeClient(
             [
-                '{"type":"final","message":"base answer"}',
-                "Candidate ignores a stronger direct answer.",
-                "Candidate is acceptable but could be clearer.",
-                '{"type":"final","message":"judged answer"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"line 1 is hello"}',
+                '{"verdict":"accept"}',
             ],
-            script_debate=True,
+            script_verification=True,
         )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use read_file on note.txt and tell me line 1.")
+
+        self.assertEqual(result.message, "line 1 is hello")
+        self.assertEqual(len(client.calls), 4)
+        self.assertFalse(client.calls[0]["think"])
+        self.assertFalse(client.calls[1]["think"])
+        self.assertFalse(client.calls[2]["think"])
+        self.assertFalse(client.calls[3]["think"])
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 1)
+        self.assertEqual(assumption_audits[0]["verdict"], "accept")
+        verification_events = [event for event in agent.events if event["type"] == "verification"]
+        self.assertEqual(len(verification_events), 1)
+        self.assertEqual(verification_events[0]["verdict"], "accept")
+
+    def test_agent_skips_verification_for_low_risk_final(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"final","message":"base answer"}'], script_verification=True)
         tools = ToolExecutor(root, approval_mode="auto")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
 
         result = agent.handle_user("Say something brief.")
 
-        self.assertEqual(result.message, "judged answer")
-        self.assertEqual(len(client.calls), 4)
-        debate_events = [event for event in agent.events if event["type"] == "debate"]
-        self.assertEqual(len(debate_events), 1)
-        self.assertTrue(debate_events[0]["applied"])
+        self.assertEqual(result.message, "base answer")
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNone(client.calls[0]["think"])
+        self.assertFalse(any(event["type"] == "verification" for event in agent.events))
 
-    def test_agent_debate_can_be_disabled(self) -> None:
+    def test_agent_verification_can_be_disabled(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(['{"type":"final","message":"base answer"}'])
         tools = ToolExecutor(root, approval_mode="auto")
@@ -164,39 +203,189 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "base answer")
         self.assertEqual(len(client.calls), 1)
 
-    def test_agent_keeps_primary_candidate_when_judge_returns_invalid_json(self) -> None:
+    def test_agent_retries_after_assumption_audit_rejects_tool_and_recovers(self) -> None:
         root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
         client = FakeClient(
             [
-                '{"type":"final","message":"base answer"}',
-                "Skeptic note.",
-                "Defender note.",
-                "not json",
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"verdict":"retry","reason":"Listing files does not validate line 1.","assumptions":["You need file contents."],"validation_steps":["Read note.txt directly."],"required_tools":["read_file"],"forbidden_tools":["list_files"]}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"verdict":"accept","reason":"","assumptions":["note.txt exists"],"validation_steps":["read_file will show line 1"],"required_tools":[],"forbidden_tools":[]}',
+                '{"type":"final","message":"line 1 is hello"}',
             ],
-            script_debate=True,
+            script_assumption_audit=True,
         )
         tools = ToolExecutor(root, approval_mode="auto")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
 
-        result = agent.handle_user("Say something brief.")
+        result = agent.handle_user("Read note.txt and tell me what line 1 says.")
 
-        self.assertEqual(result.message, "base answer")
-        debate_events = [event for event in agent.events if event["type"] == "debate"]
-        self.assertEqual(len(debate_events), 1)
-        self.assertFalse(debate_events[0]["applied"])
+        self.assertEqual(result.message, "line 1 is hello")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual([event["verdict"] for event in audits], ["retry", "accept"])
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual([event["name"] for event in tool_calls], ["read_file"])
 
-    def test_agent_skips_debate_for_tool_candidates(self) -> None:
+    def test_agent_fails_closed_after_assumption_audit_retry_cap(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"verdict":"retry","reason":"Need direct evidence.","assumptions":["list_files is enough"],"validation_steps":["Read the file instead."],"required_tools":["read_file"],"forbidden_tools":["list_files"]}',
+                '{"type":"tool","name":"search","arguments":{"query":"hello","path":"."}}',
+                '{"verdict":"retry","reason":"Search is still indirect.","assumptions":["Search proves line 1."],"validation_steps":["Read the file directly."],"required_tools":["read_file"],"forbidden_tools":[]}',
+                '{"type":"tool","name":"git_status","arguments":{}}',
+                '{"verdict":"retry","reason":"Git status does not answer the question.","assumptions":["Repo state helps."],"validation_steps":["Use read_file."],"required_tools":["read_file"],"forbidden_tools":[]}',
+            ],
+            script_assumption_audit=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read README.md and tell me line 1.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("assumption audit could not approve", result.message)
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 3)
+        self.assertTrue(all(event["verdict"] == "retry" for event in audits))
+
+    def test_agent_skips_assumption_audit_for_cached_read_only_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            result = agent.handle_user("Read note.txt twice, then say done.")
+
+        self.assertEqual(result.message, "done")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 1)
+
+    def test_final_verifier_receives_accepted_assumption_audits(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"line 1 is hello"}',
+                '{"verdict":"accept"}',
+            ],
+            script_verification=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use read_file on note.txt and tell me line 1.")
+
+        self.assertEqual(result.message, "line 1 is hello")
+        verifier_payload = json.loads(str(client.calls[-1]["messages"][1]["content"]))
+        self.assertEqual(len(verifier_payload["accepted_assumption_audits"]), 1)
+        self.assertEqual(verifier_payload["accepted_assumption_audits"][0]["tool"], "read_file")
+
+    def test_agent_retries_after_verifier_rejects_candidate_and_recovers(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"line 1 is goodbye"}',
+                '{"verdict":"retry","reason":"Tool result says hello, not goodbye."}',
+                '{"type":"final","message":"line 1 is hello"}',
+                '{"verdict":"accept"}',
+            ],
+            script_verification=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read note.txt and tell me what line 1 says.")
+
+        self.assertEqual(result.message, "line 1 is hello")
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 1)
+        self.assertEqual(assumption_audits[0]["verdict"], "accept")
+        verification_events = [event for event in agent.events if event["type"] == "verification"]
+        self.assertEqual(len(verification_events), 2)
+        self.assertEqual(verification_events[0]["verdict"], "retry")
+        self.assertEqual(verification_events[1]["verdict"], "accept")
+        self.assertEqual(agent.events[2]["name"], "read_file")
+        self.assertFalse(client.calls[0]["think"])
+        self.assertFalse(client.calls[1]["think"])
+        self.assertFalse(client.calls[2]["think"])
+        self.assertFalse(client.calls[3]["think"])
+        self.assertFalse(client.calls[4]["think"])
+        self.assertFalse(client.calls[5]["think"])
+
+    def test_agent_fails_closed_after_verification_retry_cap(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"answer one"}',
+                '{"verdict":"retry","reason":"Need grounded answer."}',
+                '{"type":"final","message":"answer two"}',
+                '{"verdict":"retry","reason":"Still not grounded."}',
+                '{"type":"final","message":"answer three"}',
+                '{"verdict":"retry","reason":"Still not grounded."}',
+            ],
+            script_verification=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use read_file on note.txt and answer carefully.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("grounded final verification", result.message)
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 1)
+        verification_events = [event for event in agent.events if event["type"] == "verification"]
+        self.assertEqual(len(verification_events), 3)
+
+    def test_agent_fails_closed_when_model_repeats_rejected_final(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"line 1 is goodbye"}',
+                '{"verdict":"retry","reason":"Tool result says hello, not goodbye."}',
+                '{"type":"final","message":"line 1 is goodbye"}',
+            ],
+            script_verification=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Read note.txt and tell me what line 1 says.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("grounded final verification", result.message)
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 1)
+        verification_events = [event for event in agent.events if event["type"] == "verification"]
+        self.assertEqual(len(verification_events), 1)
+
+    def test_agent_skips_verification_for_tool_candidates(self) -> None:
         root = self._workspace_scratch()
         (root / "note.txt").write_text("hello\n", encoding="utf-8")
         client = FakeClient(
             [
                 '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
                 '{"type":"final","message":"done"}',
-                "Skeptic note.",
-                "Defender note.",
-                '{"type":"final","message":"done"}',
+                '{"verdict":"accept"}',
             ],
-            script_debate=True,
+            script_verification=True,
         )
         tools = ToolExecutor(root, approval_mode="auto")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
@@ -205,10 +394,12 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "done")
         self.assertEqual(agent.events[2]["name"], "read_file")
-        self.assertEqual(len(client.calls), 5)
-        debate_events = [event for event in agent.events if event["type"] == "debate"]
-        self.assertEqual(len(debate_events), 1)
-        self.assertTrue(debate_events[0]["applied"])
+        self.assertEqual(len(client.calls), 4)
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 1)
+        verification_events = [event for event in agent.events if event["type"] == "verification"]
+        self.assertEqual(len(verification_events), 1)
+        self.assertEqual(verification_events[0]["verdict"], "accept")
 
     def test_agent_requires_explicitly_named_tool_before_final_answer(self) -> None:
         root = self._workspace_scratch()
@@ -243,7 +434,23 @@ class AgentTests(unittest.TestCase):
         result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
 
         self.assertIn("escapes the workspace", result.message)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_agent_short_circuits_exact_tool_error_with_debate_enabled(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"../outside.txt"}}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
+
+        self.assertIn("escapes the workspace", result.message)
         self.assertEqual(len(client.calls), 2)
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 1)
 
     def test_agent_retries_after_unverified_file_mutation_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -439,6 +646,105 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[2]["result"]["summary"], "Unknown tool: bogus_tool")
         self.assertEqual(agent.events[3]["name"], "list_files")
 
+    def test_agent_rejects_forbidden_tool_and_retries(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"type":"final","message":"listed workspace"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("List files in the workspace. Do not use read_file.")
+
+        self.assertEqual(result.message, "listed workspace")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "list_files")
+
+    def test_agent_rejects_mutating_tool_for_read_only_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"replace_in_file","arguments":{"path":"note.txt","old":"hello","new":"goodbye"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"line 1 is hello"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Read note.txt and tell me what line 1 says.")
+            final_content = (root / "note.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "line 1 is hello")
+        self.assertEqual(final_content, "hello\n")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "read_file")
+
+    def test_agent_rejects_tools_for_session_memory_question(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"type":"final","message":"CONTINUE_TOKEN_99"}',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent.messages.append({"role": "user", "content": "Remember the exact token CONTINUE_TOKEN_99 for this session."})
+
+        result = agent.handle_user("What token did I ask you to remember earlier in this session? Reply with the token only.")
+
+        self.assertEqual(result.message, "CONTINUE_TOKEN_99")
+        self.assertFalse(any(event["type"] == "tool_call" for event in agent.events))
+
+    def test_agent_skips_verification_for_session_memory_question(self) -> None:
+        client = FakeClient(['{"type":"final","message":"CONTINUE_TOKEN_99"}'], script_verification=True)
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent.messages.append({"role": "user", "content": "Remember the exact token CONTINUE_TOKEN_99 for this session."})
+
+        result = agent.handle_user("What token did I ask you to remember earlier in this session? Reply with the token only.")
+
+        self.assertEqual(result.message, "CONTINUE_TOKEN_99")
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(any(event["type"] == "verification" for event in agent.events))
+
+    def test_agent_requires_exact_readback_match_before_final_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"note.txt","content":"APROVED\\n"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"APROVED"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Create note.txt with exactly the single line APPROVED followed by a newline. Then use read_file to confirm it and reply with APPROVED only."
+            )
+            final_content = (root / "note.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "APPROVED")
+        self.assertEqual(final_content, "APPROVED\n")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual([event["name"] for event in tool_calls], ["write_file", "read_file"])
+        normalized_events = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(len(normalized_events), 2)
+        self.assertEqual(normalized_events[0]["normalized_arguments"]["content"], "APPROVED\n")
+        assistant_normalized = [event for event in agent.events if event["type"] == "assistant_normalized"]
+        self.assertEqual(len(assistant_normalized), 1)
+        self.assertEqual(assistant_normalized[0]["normalized"], "APPROVED")
+        self.assertFalse(any(event["type"] == "assumption_audit" for event in agent.events))
+
     def test_agent_retries_after_bad_tool_arguments_do_not_count_as_real_tool_use(self) -> None:
         client = FakeClient(
             [
@@ -625,3 +931,45 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "done")
         self.assertEqual(agent.events[1]["name"], "write_file")
         self.assertFalse(any(event.get("name") == "run_shell" for event in agent.events if event["type"] == "tool_call"))
+
+    def test_agent_caches_repeated_read_only_tool_calls_within_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Read note.txt twice, then say done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        tool_results = [event for event in agent.events if event["type"] == "tool_result"]
+        self.assertEqual(len(tool_results), 2)
+        self.assertFalse(tool_results[0].get("cached", False))
+        self.assertTrue(tool_results[1].get("cached", False))
+
+    def test_agent_compacts_large_tool_results_in_follow_up_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            large_lines = "\n".join(f"line {index} " + ("x" * 80) for index in range(1, 201)) + "\n"
+            (root / "big.txt").write_text(large_lines, encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"big.txt"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Summarize big.txt.")
+
+        self.assertEqual(result.message, "done")
+        tool_feedback = next(message["content"] for message in agent.messages if message["role"] == "user" and message["content"].startswith("Tool result summary:\n"))
+        self.assertIn("... truncated ...", tool_feedback)
+        self.assertNotIn(" 200 |", tool_feedback)
