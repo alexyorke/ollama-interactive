@@ -40,6 +40,15 @@ Additional live smoke:
 | `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass |
 | `qwen3:8b` | 8 local coding smoke cases | 7/8 pass; debate-on `instructed_edit` timed out, so this model is not recommended for complex edit loops |
 
+Public benchmark smoke from [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark), Python Exercism tasks `list-ops`, `pig-latin`, `wordy`, `granite4.1:8b`, debate off:
+
+| Pass | Tokens | LLM calls | Note |
+|---:|---:|---:|---|
+| 0/3 | 39,161 | 28 | Baseline after correcting Exercism test discovery to `*_test.py` |
+| 0/3 | 27,168 | 22 | After shell-test normalization and prompt trim |
+
+The model still fails these public tasks, so this is not an accuracy claim. It is useful token profiling: normalizing accidental `run_shell "python -m unittest ..."` calls to configured `run_test` cut one public-smoke run by 30.6% without a pass-to-fail regression. Single-task reruns are noisy with 8B local models, so compare full JSON runs rather than one task.
+
 ## Second-Pass Direct Routing
 
 | Model | Verifier | Debate | First optimized prompt | Second-pass prompt | LLM calls before -> after | Pass before -> after |
@@ -112,7 +121,7 @@ Profiling a realistic symbol-summary task found the main waste pattern: models o
 
 Fixes from that profile:
 
-- Compacted primary system prompt/tool schema; current full system prompt with tool list is about 1,557 chars for a benchmark workspace path.
+- Compacted primary system prompt/tool schema; current full system prompt with tool list is about 1,464 chars for a benchmark workspace path.
 - Shortened tool-result feedback from verbose prose to compact `Tool result:` plus `Next JSON only.`
 - Added deterministic symbol return-value synthesis for prompts like “find function X in file Y and summarize what value it returns.”
 - Broadened deterministic symbol extraction to `find`, `locate`, `function`, `method`, `class`, and `symbol` wording.
@@ -155,7 +164,7 @@ After the fix, the same symbol-summary task passes on all tested models and deba
 
 ## Validation
 
-- `python -m unittest discover -v`: 163 passed, 3 skipped.
+- `python -m unittest discover -v`: 169 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
 - Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
 - Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.

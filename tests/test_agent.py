@@ -1050,6 +1050,37 @@ class AgentTests(unittest.TestCase):
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_sample OK\')"')
 
+    def test_agent_normalizes_shell_test_to_configured_run_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(['{"type":"tool","name":"run_shell","arguments":{"command":"python -m unittest example_test.py"}}'])
+            tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_polyglot OK\')"')
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Run tests and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_test")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_polyglot OK\')"')
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "run_test")
+
+    def test_agent_preserves_explicit_shell_test_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "--help"])
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_polyglot OK\')"')
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(f"Use run_shell to execute exactly: {command}. Then tell me the exit code.")
+
+        self.assertIn("Exit code: 0", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_shell")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], command)
+
     def test_agent_audits_mutating_tool_under_debate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

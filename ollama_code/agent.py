@@ -22,18 +22,18 @@ from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_compact_to
 
 SYSTEM_PROMPT_TEMPLATE = """Ollama Code. Workspace: {workspace_root}
 
-Reply as one JSON object only:
+JSON only:
 {{"type":"tool","name":"read_file","arguments":{{"path":"README.md"}}}}
 {{"type":"final","message":"..."}}
 
 Rules:
-- One tool call or one final. Relative paths. No fences. No chain-of-thought.
-- Need repo/file/git/shell/edit/subagent facts? Use tools; do not guess.
-- Inspect before edit. New/write: write_file. Edit: replace_in_file. Shell: run_shell. Tests: run_test. Git: git_status/git_diff/git_commit. Agents: run_agent.
+- One tool or one final. Relative paths. No fences/thought.
+- Need repo/file/git/shell/edit/agent facts? Use tools; do not guess.
+- Inspect before edit. Write: write_file. Edit: replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
 - Code nav: prefer search_symbols, code_outline, then read_symbol before broad read_file. Search/list before broad reads; use ranges.
-- Reuse results; avoid repeated read-only calls unless state changed.
+- Reuse results; avoid repeat read-only calls unless state changed.
 - Question your assumptions before acting; prove or disprove with tools when possible.
-- Never claim edit/command/test/agent success without successful current-turn tool result.
+- Never claim edit/cmd/test/agent success without current-turn success.
 - Style: caveman-lite concise; keep code, paths, commands, errors, JSON exact and syntactically complete.
 
 Tools:
@@ -1225,9 +1225,9 @@ class OllamaCodeAgent:
         payload = self._compact_tool_result_for_context(name, result, for_verification=False)
         follow_up = "Next JSON only."
         if not real_tool_use:
-            follow_up = "Tool failed; it does not satisfy required tool use. Fix or choose another tool. Next JSON only."
+            follow_up = "Tool failed; not required success. Fix or choose another. Next JSON only."
         elif name == "run_test" and result.get("ok") is not True:
-            follow_up = "Tests failed. Inspect failing file/source or edit from evidence before rerunning. Next JSON only."
+            follow_up = "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
         return "Tool result:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
 
     def _final_requires_verification(
@@ -1706,6 +1706,46 @@ class OllamaCodeAgent:
         normalized = dict(arguments)
         normalized["command"] = self.tools.default_test_command
         return "run_test", normalized, "Normalized vague run_test command to the configured test command."
+
+    def _shell_command_looks_like_test_run(self, command: str) -> bool:
+        lowered = command.lower()
+        test_patterns = [
+            r"\bpytest\b",
+            r"\bunittest\b",
+            r"\bpython(?:3|\.exe)?\s+-m\s+unittest\b",
+            r"\bgo\s+test\b",
+            r"\bcargo\s+test\b",
+            r"\bnpm\s+(?:run\s+)?test\b",
+            r"\bpnpm\s+(?:run\s+)?test\b",
+            r"\byarn\s+test\b",
+            r"\bmvn\s+test\b",
+            r"\bgradle\s+test\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in test_patterns)
+
+    def _normalize_shell_test_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_text: str,
+        exact_shell_command: str | None,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "run_shell" or not self.tools.default_test_command:
+            return name, arguments, None
+        command = str(arguments.get("command", "")).strip()
+        if not command or not self._shell_command_looks_like_test_run(command):
+            return name, arguments, None
+        if exact_shell_command and command == exact_shell_command:
+            return name, arguments, None
+        if self._request_explicitly_requests_tool(request_text, "run_shell"):
+            return name, arguments, None
+        normalized: dict[str, Any] = {"command": self.tools.default_test_command}
+        if "cwd" in arguments:
+            normalized["cwd"] = arguments["cwd"]
+        if "timeout" in arguments:
+            normalized["timeout"] = arguments["timeout"]
+        return "run_test", normalized, "Normalized shell test command to the configured run_test command."
 
     def _request_explicitly_requests_tool(self, text: str, name: str) -> bool:
         requested = self._requested_tool_names(text, forbidden_tool_names=set())
@@ -2563,6 +2603,13 @@ class OllamaCodeAgent:
                         name,
                         arguments,
                         request_text=text,
+                    )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_shell_test_call(
+                        name,
+                        arguments,
+                        request_text=text,
+                        exact_shell_command=exact_shell_command,
                     )
                 if name == "run_shell" and exact_shell_command and str(arguments.get("command", "")).strip() != exact_shell_command:
                     arguments = dict(arguments)

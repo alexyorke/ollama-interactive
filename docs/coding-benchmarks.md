@@ -20,6 +20,7 @@ External benchmark inspiration:
 - `local-small`: 8 fast tasks for regular local checks.
 - `local-full`: 20 tasks including larger symbol navigation, multi-turn editing, refactors, path/shell/git regressions, and token traps.
 - `external-smoke`: preflight checks for optional external harnesses; not CI-blocking and not leaderboard-comparable.
+- `scripts/public_benchmark_eval.py`: serial public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
 
 ## Metrics
 
@@ -55,6 +56,18 @@ Check optional external harness availability:
 
 ```bash
 python scripts/coding_benchmark_eval.py --suite external-smoke --output scratch/coding-benchmark/external-smoke.json
+```
+
+Run public Aider Polyglot Python smoke:
+
+```bash
+python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --tasks list-ops pig-latin wordy --output scratch/public-bench/aider-polyglot-python-smoke.json
+```
+
+Compare public smoke before/after:
+
+```bash
+python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --tasks list-ops pig-latin wordy --compare scratch/public-bench/baseline.json --output scratch/public-bench/after.json
 ```
 
 Raw JSON stays ignored under `scratch/`. Track only concise summaries when results are worth preserving.
