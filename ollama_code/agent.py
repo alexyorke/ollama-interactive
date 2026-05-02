@@ -1809,6 +1809,21 @@ class OllamaCodeAgent:
                 path = str(result.get("path") or arguments.get("path") or ".")
                 return f"{path} diff adds return {value}" if adds_value else f"{path} diff does not add return {value}"
 
+        if name == "run_shell" and result.get("ok") is True:
+            lowered = request_text.lower()
+            if "artifact" in lowered and ("written" in lowered or "wrote" in lowered):
+                command = str(arguments.get("command", ""))
+                normalized_command = command.replace("\\", "/")
+                path_candidates = re.findall(r"['\"]((?:scratch|docs|src|data|tests)/[^'\"]+)['\"]", normalized_command)
+                for candidate in reversed(path_candidates):
+                    try:
+                        target = self.tools.resolve_path(candidate, allow_missing=False)
+                    except (OSError, ValueError):
+                        continue
+                    if target.is_file():
+                        return f"Artifact written: {candidate}."
+                return "Command completed successfully."
+
         if name == "run_shell" and "exit code" in request_text.lower():
             if "exit_code" not in result:
                 return None

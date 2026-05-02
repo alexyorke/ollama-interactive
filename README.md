@@ -250,6 +250,15 @@ export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/token_efficiency_eval.py --output scratch/token-efficiency/after.json --compare scratch/token-efficiency/baseline.json --strict-accuracy
 ```
 
+For realistic coding-task accuracy plus token-profile checks:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+python3 scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b qwen3:8b granite4.1:8b --modes off on --strict-accuracy --strict-budget
+```
+
+See [docs/coding-benchmarks.md](docs/coding-benchmarks.md) for the local suites, recorded metrics, and optional external benchmark preflights.
+
 Containerized end-to-end check against the host Ollama daemon:
 
 ```bash

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -896,6 +897,30 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 0)
         normalized = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(len(normalized), 0)
+
+    def test_agent_synthesizes_exact_shell_artifact_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scratch").mkdir()
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            exact_command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('scratch/artifact.txt').write_text('ok\\n')",
+                ]
+            )
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me what artifact was written."
+            )
+            artifact_exists = (root / "scratch" / "artifact.txt").exists()
+
+        self.assertEqual(result.message, "Artifact written: scratch/artifact.txt.")
+        self.assertEqual(len(client.calls), 0)
+        self.assertTrue(artifact_exists)
 
     def test_agent_audits_shell_tool_under_debate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
