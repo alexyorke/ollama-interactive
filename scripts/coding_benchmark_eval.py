@@ -339,7 +339,7 @@ def prepare_test_repair_task(workspace: Path) -> None:
 
 def validate_test_repair_task(ctx: BenchmarkContext) -> str:
     hidden = "import sys; sys.path.insert(0, 'src'); from slug import slugify; assert slugify('  Many   Spaces ') == 'many-spaces'"
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _tool_success(ctx.session, "run_test") else "fail"
+    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
 
 
 def prepare_forbidden_tool_efficiency(workspace: Path) -> None:
@@ -514,8 +514,8 @@ LOCAL_CASES: list[BenchmarkCase] = [
         prepare=prepare_issue_fix_hidden_tests,
         validate=validate_issue_fix_hidden_tests,
         test_cmd=_python_test_cmd(),
-        budget_off=SMALL_BUDGET_OFF,
-        budget_on=SMALL_BUDGET_ON,
+        budget_off=BenchmarkBudget(max_llm_calls=12, max_total_tokens=80_000),
+        budget_on=BenchmarkBudget(max_llm_calls=16, max_total_tokens=120_000),
     ),
     BenchmarkCase(
         name="multi_file_refactor",

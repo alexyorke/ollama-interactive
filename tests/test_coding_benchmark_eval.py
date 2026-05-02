@@ -156,6 +156,24 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(status, "fail")
 
+    def test_test_repair_validator_accepts_shell_test_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bench.prepare_test_repair_task(workspace)
+            (workspace / "src" / "slug.py").write_text(
+                "import re\n\n"
+                "def slugify(value: str) -> str:\n"
+                "    value = re.sub(r'[^\\w\\s-]', '', value.strip().lower())\n"
+                "    value = re.sub(r'[\\s-]+', '-', value)\n"
+                "    return value.strip('-')\n",
+                encoding="utf-8",
+            )
+            session = {"events": [{"type": "tool_call", "name": "run_shell", "arguments": {"command": "python -m unittest"}}]}
+
+            status = bench.validate_test_repair_task(self._context(workspace, session))
+
+        self.assertEqual(status, "pass")
+
     def test_regression_token_trap_rejects_duplicate_symbol_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
