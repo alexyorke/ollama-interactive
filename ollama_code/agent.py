@@ -555,6 +555,85 @@ class OllamaCodeAgent:
             return [self._truncate_json_value(item, limit=limit) for item in value[:50]]
         return value
 
+    def _compact_run_test_output(self, output: str, *, limit: int) -> str:
+        text = output.strip()
+        if len(text) <= limit:
+            return text
+
+        lines = text.replace("\r\n", "\n").split("\n")
+        selected: list[str] = []
+        seen: set[str] = set()
+
+        def add(line: str) -> None:
+            compact = line.rstrip()
+            if not compact:
+                return
+            key = compact.strip()
+            if key in seen:
+                return
+            selected.append(compact)
+            seen.add(key)
+
+        summary_patterns = [
+            r"^Ran \d+ tests? in\b",
+            r"^(?:OK|FAILED|ERRORS?|FAILURES?)(?:\b|\()",
+            r"^=+ .*?(?:failed|passed|error|errors|failures).*?=+$",
+            r"^short test summary info$",
+        ]
+        for line in lines:
+            stripped = line.strip()
+            if any(re.search(pattern, stripped, flags=re.IGNORECASE) for pattern in summary_patterns):
+                add(stripped)
+
+        marker_index: int | None = None
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if re.match(r"^(?:ERROR|FAIL):\s+", stripped):
+                marker_index = index
+                break
+        if marker_index is None:
+            for index, line in enumerate(lines):
+                if re.search(
+                    r"(?:Traceback|SyntaxError|AssertionError|ImportError|ModuleNotFoundError|NameError|TypeError|ValueError)",
+                    line,
+                ):
+                    marker_index = index
+                    break
+
+        if marker_index is not None:
+            start = max(0, marker_index - 2)
+            end = min(len(lines), marker_index + 24)
+            add("[first actionable failure]")
+            for absolute_index, line in enumerate(lines[start:end], start=start):
+                stripped = line.strip()
+                if not stripped:
+                    if absolute_index > marker_index:
+                        break
+                    continue
+                if set(stripped) <= {"-", "=", "_"}:
+                    continue
+                if re.match(r"^[\w.: \-/\[\]()]+ \.\.\. (?:FAIL|ERROR|ok|skipped)$", stripped, flags=re.IGNORECASE):
+                    continue
+                add(line)
+
+        diagnostic_pattern = re.compile(
+            r"(?:File \".+\", line \d+|^\s*\^\s*$|^\s*E\s+|^\s*>\s+|"
+            r"AssertionError|SyntaxError|ImportError|ModuleNotFoundError|NameError|TypeError|ValueError)"
+        )
+        for index, line in enumerate(lines):
+            if not diagnostic_pattern.search(line):
+                continue
+            start = max(0, index - 1)
+            end = min(len(lines), index + 2)
+            for nearby in lines[start:end]:
+                add(nearby)
+            if len("\n".join(selected)) >= limit:
+                break
+
+        if not selected:
+            return self._truncate_text(text, limit=limit)
+        return self._truncate_text("\n".join(selected), limit=limit)
+
     def _normalize_audit_text_items(self, items: object) -> list[str]:
         if not isinstance(items, list):
             return []
@@ -1185,6 +1264,8 @@ class OllamaCodeAgent:
             "exit_code",
             "command",
             "summary",
+            "diagnostic",
+            "syntax_ok",
             "model",
             "approval_mode",
             "rounds",
@@ -1200,7 +1281,10 @@ class OllamaCodeAgent:
                 limit = VERIFICATION_TOOL_DIFF_LIMIT if for_verification else MODEL_TOOL_DIFF_LIMIT
             else:
                 limit = self._tool_result_limit(name, for_verification=for_verification)
-            payload[field] = self._truncate_text(value, limit=limit)
+            if name == "run_test" and field == "output":
+                payload[field] = self._compact_run_test_output(value, limit=limit)
+            else:
+                payload[field] = self._truncate_text(value, limit=limit)
         return payload
 
     def _compact_tool_call_for_verification(self, tool_call: dict[str, Any]) -> dict[str, Any]:
@@ -1221,13 +1305,41 @@ class OllamaCodeAgent:
             "result": self._compact_tool_result_for_context(name, result, for_verification=True),
         }
 
+    def _run_test_failure_follow_up(self, result: dict[str, Any]) -> str:
+        text = str(result.get("output") or result.get("summary") or "")
+        syntax_match = re.search(
+            r"File \"(?P<path>[^\"]+)\", line (?P<line>\d+).*?\n(?:.*\n){0,2}?(?P<error>(?:IndentationError|SyntaxError): [^\n]+)",
+            text,
+            flags=re.DOTALL,
+        )
+        if syntax_match:
+            path = Path(syntax_match.group("path")).name
+            line = syntax_match.group("line")
+            error = syntax_match.group("error").strip()
+            return (
+                f"Tests failed with {error} at {path}:{line}. Fix that file, then rerun run_test. "
+                "Do not blame imports unless error is ModuleNotFoundError. Next JSON only."
+            )
+        module_match = re.search(r"(ModuleNotFoundError|ImportError): [^\n]+", text)
+        if module_match:
+            return f"Tests failed with {module_match.group(0).strip()}. Inspect imports/files, fix, then rerun run_test. Next JSON only."
+        assertion_match = re.search(r"AssertionError: [^\n]+", text)
+        if assertion_match:
+            return f"Tests failed with {assertion_match.group(0).strip()}. Edit implementation, then rerun run_test. Next JSON only."
+        return "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
+
+    def _run_test_repeat_key(self, arguments: dict[str, Any], mutation_version: int) -> tuple[str, str, int]:
+        command = str(arguments.get("command") or self.tools.default_test_command or "").strip()
+        cwd = str(arguments.get("cwd") or ".").strip()
+        return (command, cwd, mutation_version)
+
     def _tool_result_feedback_message(self, name: str, result: dict[str, Any], *, real_tool_use: bool) -> str:
         payload = self._compact_tool_result_for_context(name, result, for_verification=False)
         follow_up = "Next JSON only."
         if not real_tool_use:
             follow_up = "Tool failed; not required success. Fix or choose another. Next JSON only."
         elif name == "run_test" and result.get("ok") is not True:
-            follow_up = "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
+            follow_up = self._run_test_failure_follow_up(result)
         return "Tool result:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
 
     def _final_requires_verification(
@@ -1340,6 +1452,8 @@ class OllamaCodeAgent:
         patterns = [
             r"exactly the text ['\"]([^'\"]+)['\"] followed by a newline",
             r"exactly the single line ['\"]([^'\"]+)['\"] followed by a newline",
+            r"exactly the text ([^\n.]+?) followed by a newline",
+            r"exactly the single line ([^\n.]+?) followed by a newline",
             r"exactly the single line ([A-Za-z0-9_.:/@+-]+) followed by a newline",
         ]
         for pattern in patterns:
@@ -1459,6 +1573,53 @@ class OllamaCodeAgent:
             "commit ",
         ]
         return any(phrase in lowered for phrase in mutation_phrases)
+
+    def _request_requires_mutation(self, text: str) -> bool:
+        lowered = text.lower()
+        read_only_phrases = [
+            "do not edit",
+            "don't edit",
+            "without editing",
+            "without changing",
+            "no changes",
+            "read-only",
+            "inspect only",
+            "summarize only",
+        ]
+        if any(phrase in lowered for phrase in read_only_phrases):
+            return False
+        if re.search(r"\b(?:how|what|why)\s+(?:would|should|can)\b", lowered):
+            return False
+        mutation_patterns = [
+            r"\bimplement\b",
+            r"\bfix\b",
+            r"\bpatch\b",
+            r"\brefactor\s+(?:[\w./-]+\.[A-Za-z0-9]+|[A-Za-z_][\w./-]*\s+to|code\s+to|module\s+to|tests?\s+to)",
+            r"\bedit\b",
+            r"\bupdate\b",
+            r"\brewrite\b",
+            r"\bmodify\b",
+            r"\bchange\b",
+            r"\bcreate\b",
+            r"\bwrite\b",
+            r"\badd\b",
+            r"\bremove\b",
+            r"\bdelete\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in mutation_patterns)
+
+    def _request_requires_test_run(self, text: str) -> bool:
+        lowered = text.lower()
+        patterns = [
+            r"\brun (?:the )?tests?\b",
+            r"\brerun (?:the )?tests?\b",
+            r"\bexecute (?:the )?tests?\b",
+            r"\btest suite\b",
+            r"\bpytest\b",
+            r"\bunittest\b",
+            r"\brun_test\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in patterns)
 
     def _shell_looks_like_file_mutation(self, command: str) -> bool:
         lowered = command.lower()
@@ -1694,6 +1855,10 @@ class OllamaCodeAgent:
         *,
         request_text: str,
     ) -> tuple[str, dict[str, Any], str | None]:
+        if name in {"test", "tests", "pytest", "unittest"} and self.tools.default_test_command:
+            normalized = dict(arguments)
+            normalized["command"] = self.tools.default_test_command
+            return "run_test", normalized, f"Normalized {name} tool alias to the configured run_test command."
         if name != "run_test" or not self.tools.default_test_command:
             return name, arguments, None
         command = str(arguments.get("command", "")).strip()
@@ -1935,6 +2100,22 @@ class OllamaCodeAgent:
                 return f"Exit code: {result.get('exit_code')}. Output: {output}."
             return f"Exit code: {result.get('exit_code')}."
 
+        if name == "search" and result.get("ok") is True:
+            lowered = request_text.lower()
+            if "which file" in lowered or "file contains" in lowered or "files contain" in lowered:
+                output = str(result.get("output", ""))
+                for line in output.splitlines():
+                    match = re.match(r"(?P<path>.+):\d+:", line)
+                    if not match:
+                        continue
+                    raw_path = match.group("path").strip()
+                    try:
+                        path = Path(raw_path)
+                        label = self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
+                    except (OSError, ValueError):
+                        label = raw_path.replace("\\", "/")
+                    return f"{label} contains the match."
+
         if name == "run_test" and ("whether tests passed" in request_text.lower() or "tests passed" in request_text.lower()):
             output = str(result.get("output", ""))
             module_match = re.search(r"\b(test_[A-Za-z0-9_]+)\b", output)
@@ -1945,7 +2126,7 @@ class OllamaCodeAgent:
 
     def _record_synthesized_final(self, message: str, *, tool: str, round_number: int) -> AgentResult:
         payload = {"type": "final", "message": message}
-        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+        self._append_assistant_payload(payload)
         self._record_event(
             "assistant_synthesized",
             content=message,
@@ -1955,6 +2136,26 @@ class OllamaCodeAgent:
         self._record_event("assistant", content=message, rounds=round_number)
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
+
+    def _assistant_payload_content(self, payload: dict[str, Any]) -> str:
+        if payload.get("type") != "tool":
+            return json.dumps(payload, ensure_ascii=True)
+        arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+        compact_arguments: dict[str, Any] = {}
+        for key, value in arguments.items():
+            if isinstance(value, str) and key in {"content", "old", "new", "prompt"} and len(value) > 240:
+                compact_arguments[key] = self._truncate_text(value, limit=240)
+            else:
+                compact_arguments[key] = self._truncate_json_value(value, limit=240)
+        compact_payload = {
+            "type": "tool",
+            "name": payload.get("name", ""),
+            "arguments": compact_arguments,
+        }
+        return json.dumps(compact_payload, ensure_ascii=True, separators=(",", ":"))
+
+    def _append_assistant_payload(self, payload: dict[str, Any]) -> None:
+        self.messages.append({"role": "assistant", "content": self._assistant_payload_content(payload)})
 
     def _execute_controller_tool(
         self,
@@ -1971,7 +2172,7 @@ class OllamaCodeAgent:
         cache_hit = cached_result is not None
         payload = {"type": "tool", "name": name, "arguments": arguments}
         self.status_printer(f"tool {name} {json.dumps(arguments, ensure_ascii=True)}")
-        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+        self._append_assistant_payload(payload)
         self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
         tool_calls_this_turn.append({"name": name, "arguments": deepcopy(arguments)})
         result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
@@ -2328,6 +2529,8 @@ class OllamaCodeAgent:
         prefers_structured_file_tools = self._request_prefers_structured_file_tools(text)
         session_memory_request = self._request_targets_session_memory(text)
         mutation_allowed = self._request_allows_mutation(text)
+        mutation_required = self._request_requires_mutation(text)
+        test_run_required = self._request_requires_test_run(text)
         deterministic_result = self._try_handle_deterministic_turn(
             request_text=text,
             exact_file_write=exact_file_write,
@@ -2353,6 +2556,10 @@ class OllamaCodeAgent:
         assumption_audit_retries = 0
         verification_retries = 0
         verification_rewrite_attempts = 0
+        mutation_version = 0
+        last_failed_run_test_key: tuple[str, str, int] | None = None
+        last_successful_run_test_version: int | None = None
+        unresolved_syntax_diagnostics: dict[str, str] = {}
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
@@ -2428,7 +2635,7 @@ class OllamaCodeAgent:
             if response_type == "final":
                 missing_requested_tools = sorted(required_tool_names - satisfied_tool_names)
                 if missing_requested_tools:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2439,7 +2646,7 @@ class OllamaCodeAgent:
                     )
                     continue
                 if requires_tools and not tool_used_this_turn:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2447,9 +2654,41 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if mutation_required and not mutation_verified_this_turn:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The user asked for a workspace change. Do not finish until write_file, replace_in_file, or git_commit succeeds in this turn. Use the next JSON object only.",
+                        }
+                    )
+                    continue
+                if mutation_required and unresolved_syntax_diagnostics:
+                    self._append_assistant_payload(payload)
+                    diagnostics = "; ".join(
+                        f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_syntax_diagnostics.items())
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Python syntax errors remain after edits: "
+                            + self._truncate_text(diagnostics, limit=320)
+                            + ". Fix them before final answer. Next JSON only.",
+                        }
+                    )
+                    continue
+                if mutation_required and test_run_required and last_successful_run_test_version != mutation_version:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The user asked to run tests. Do not finish until run_test succeeds after the latest file edit. Next JSON only.",
+                        }
+                    )
+                    continue
                 assistant_text = str(payload.get("message", "")).strip()
                 if self._final_claims_file_mutation(assistant_text) and not mutation_verified_this_turn:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2472,7 +2711,7 @@ class OllamaCodeAgent:
                     if latest_read_result is not None:
                         latest_read_output = str(latest_read_result.get("output", ""))
                         if expected_exact_file_line not in latest_read_output:
-                            self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                            self._append_assistant_payload(payload)
                             self.messages.append(
                                 {
                                     "role": "user",
@@ -2499,7 +2738,7 @@ class OllamaCodeAgent:
                         self._record_event("assistant", content=expected_exact_reply_text, rounds=round_number)
                         self._flush_llm_call_events()
                         return AgentResult(message=expected_exact_reply_text, rounds=round_number, completed=True)
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2575,10 +2814,10 @@ class OllamaCodeAgent:
                         required_tool_names.update(retry_decision["required_tools"])
                         forbidden_tool_names.update(retry_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)
-                        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                        self._append_assistant_payload(payload)
                         self.messages.append({"role": "user", "content": self._verification_retry_message(retry_decision)})
                         continue
-                self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                self._append_assistant_payload(payload)
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
                 self._flush_llm_call_events()
                 return AgentResult(message=assistant_text, rounds=round_number, completed=True)
@@ -2627,7 +2866,7 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                 if name in forbidden_tool_names:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2636,7 +2875,7 @@ class OllamaCodeAgent:
                     )
                     continue
                 if session_memory_request:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2645,7 +2884,7 @@ class OllamaCodeAgent:
                     )
                     continue
                 if name in MUTATING_TOOL_NAMES and not mutation_allowed:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2658,7 +2897,7 @@ class OllamaCodeAgent:
                     and not mutation_allowed
                     and self._shell_looks_like_file_mutation(str(arguments.get("command", "")))
                 ):
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2671,7 +2910,7 @@ class OllamaCodeAgent:
                     and prefers_structured_file_tools
                     and self._shell_looks_like_file_mutation(str(arguments.get("command", "")))
                 ):
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2680,7 +2919,7 @@ class OllamaCodeAgent:
                     )
                     continue
                 if name == "git_diff" and requested_git_diff_mode == "working-tree" and arguments.get("cached") is True:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
@@ -2689,11 +2928,34 @@ class OllamaCodeAgent:
                     )
                     continue
                 if name == "git_diff" and requested_git_diff_mode == "staged" and arguments.get("cached") is not True:
-                    self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                    self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
                             "content": "For a staged diff, call git_diff with cached true. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if name == "run_test" and last_failed_run_test_key == self._run_test_repeat_key(arguments, mutation_version):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The same run_test already failed and no file changed since. Inspect evidence or edit files before rerunning that test. Next JSON only.",
+                        }
+                    )
+                    continue
+                if name == "run_test" and unresolved_syntax_diagnostics:
+                    self._append_assistant_payload(payload)
+                    diagnostics = "; ".join(
+                        f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_syntax_diagnostics.items())
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not run tests while Python syntax errors are already known: "
+                            + self._truncate_text(diagnostics, limit=320)
+                            + ". Fix the file first. Next JSON only.",
                         }
                     )
                     continue
@@ -2734,7 +2996,7 @@ class OllamaCodeAgent:
                             self._record_event("assistant", content=failure, rounds=round_number)
                             self._flush_llm_call_events()
                             return AgentResult(message=failure, rounds=round_number, completed=False)
-                        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                        self._append_assistant_payload(payload)
                         self.messages.append({"role": "user", "content": self._assumption_audit_retry_message(audit_decision)})
                         continue
                     accepted_assumption_audits.append(
@@ -2747,7 +3009,7 @@ class OllamaCodeAgent:
                         }
                     )
                 self.status_printer(f"tool {name} {json.dumps(arguments, ensure_ascii=True)}")
-                self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+                self._append_assistant_payload(payload)
                 self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
                 tool_calls_this_turn.append(
                     {
@@ -2767,6 +3029,7 @@ class OllamaCodeAgent:
                     satisfied_tool_names.add(name)
                     if name in MUTATING_TOOL_NAMES:
                         mutation_verified_this_turn = True
+                        mutation_version += 1
                 if self._counts_as_real_tool_use(name, result):
                     successful_tool_results.append(
                         {
@@ -2775,6 +3038,18 @@ class OllamaCodeAgent:
                             "result": deepcopy(result),
                         }
                     )
+                if name == "run_test":
+                    if result.get("ok") is True:
+                        last_failed_run_test_key = None
+                        last_successful_run_test_version = mutation_version
+                    else:
+                        last_failed_run_test_key = self._run_test_repeat_key(arguments, mutation_version)
+                result_path = str(result.get("path", "")).strip()
+                if name in MUTATING_TOOL_NAMES and result.get("ok") is True and result_path.endswith(".py"):
+                    if result.get("syntax_ok") is False:
+                        unresolved_syntax_diagnostics[result_path] = str(result.get("diagnostic") or result.get("summary") or "").strip()
+                    else:
+                        unresolved_syntax_diagnostics.pop(result_path, None)
                 self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit)
                 self.messages.append(
                     {
@@ -2814,7 +3089,7 @@ class OllamaCodeAgent:
                         self._flush_llm_call_events()
                         return AgentResult(message=failure_message, rounds=round_number, completed=True)
                 continue
-            self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+            self._append_assistant_payload(payload)
             self.messages.append(
                 {
                     "role": "user",

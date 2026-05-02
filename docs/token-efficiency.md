@@ -49,6 +49,32 @@ Public benchmark smoke from [Aider-AI/polyglot-benchmark](https://github.com/Aid
 
 The model still fails these public tasks, so this is not an accuracy claim. It is useful token profiling: normalizing accidental `run_shell "python -m unittest ..."` calls to configured `run_test` cut one public-smoke run by 30.6% without a pass-to-fail regression. Single-task reruns are noisy with 8B local models, so compare full JSON runs rather than one task.
 
+## Generic Controller Pass
+
+Latest pass targeted reusable waste patterns found from public Aider smoke and local coding benchmarks, not benchmark-specific solutions:
+
+- `run_test` output sent back to the model is now a compact failure digest: summary, first actionable traceback/assertion/syntax block, and key diagnostics.
+- Python writes/edits now report syntax diagnostics immediately; finals and test runs are blocked until known syntax errors are fixed.
+- Edit prompts that also request tests cannot finish until `run_test` succeeds after the latest file mutation.
+- Repeated identical failed `run_test` calls are blocked until a file changes.
+- Large `write_file`/`replace_in_file` arguments are compacted in assistant history while full raw arguments remain in event logs.
+- Common model waste is normalized: `test`/`pytest`/`unittest` tool aliases route to configured `run_test`, `code_outline` defaults to `.`, and `replace_in_file` strips `read_file` line-number prefixes.
+- Exact unquoted multiword file writes with required trailing newlines are normalized deterministically, and search questions like “which file contains X” synthesize the file answer from tool output.
+
+Public Aider smoke baseline before these changes (`granite4.1:8b`, debate off, `list-ops`, `pig-latin`, `wordy`) was `0/3` pass, 24 LLM calls, 34,015 tokens. Later public runs stayed `0/3` or timed out on the same 8B Granite model, so they were used for profiling failure modes rather than accuracy claims.
+
+Local-small Gemma 4B coding benchmark, comparing the pre-pass local profile (`scratch/coding-bench/after-history-compaction-gemma3-local-small.json`) to the final profile (`scratch/coding-bench/final-gemma3-local-small.json`):
+
+| Case | Status before -> after | Tokens before -> after | Delta |
+|---|---|---:|---:|
+| `issue_fix_hidden_tests` | pass -> pass | 4,533 -> 3,907 | -13.8% |
+| `instructed_edit` | pass -> pass | 9,497 -> 7,777 | -18.1% |
+| `test_repair_task` | fail -> pass | 14,384 -> 13,273 | -7.7% |
+| `multi_turn_session_task` | pass -> pass | 9,812 -> 8,793 | -10.4% |
+| Common passing median | pass -> pass | 2,266.5 -> 1,953.5 | -13.8% |
+
+Overall local-small accuracy improved from `6/8` to `7/8`. The remaining `multi_file_refactor` failure is model-quality instability; it passed in one intermediate run at 7,554 tokens and failed in the final full run after extra attempts.
+
 ## Second-Pass Direct Routing
 
 | Model | Verifier | Debate | First optimized prompt | Second-pass prompt | LLM calls before -> after | Pass before -> after |
@@ -164,10 +190,10 @@ After the fix, the same symbol-summary task passes on all tested models and deba
 
 ## Validation
 
-- `python -m unittest discover -v`: 169 passed, 3 skipped.
+- `python -m unittest discover -v`: 185 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
 - Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
 - Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.
 - `scripts/token_efficiency_eval.py --strict-accuracy`: 84/84 passed; no pass-to-fail regressions; explicit-tool and symbol-summary corpora are zero LLM calls.
 - `scripts/verification_eval.py --strict-on`: passed on `gemma3:4b`, `qwen3:8b`, and `granite4.1:8b`.
-- `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed.
+- `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed after adding deterministic search synthesis and exact-newline write normalization.

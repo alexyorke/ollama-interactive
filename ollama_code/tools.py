@@ -59,7 +59,7 @@ TOOL_DESCRIPTIONS = [
     },
     {
         "name": "code_outline",
-        "arguments": {"path": "file or directory", "max_symbols": "int, default 120"},
+        "arguments": {"path": "file or directory, default .", "max_symbols": "int, default 120"},
         "description": "Show compact code symbols and line ranges without function bodies.",
     },
     {
@@ -495,6 +495,8 @@ class ToolExecutor:
             command = ["rg", "-n", "--color", "never", "--max-count", str(limit), query, str(base)]
             result = self._run_process(command, cwd=self.workspace_root, timeout=30)
             output = result.stdout.strip() or result.stderr.strip() or "(no matches)"
+            if output != "(no matches)":
+                output = "\n".join(output.splitlines()[: max(1, limit)])
             return {
                 "ok": result.returncode in {0, 1},
                 "tool": "search",
@@ -673,7 +675,7 @@ class ToolExecutor:
                     return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches)}
         return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches) if matches else "(no symbols found)"}
 
-    def code_outline(self, path: str, max_symbols: int = 120) -> dict[str, Any]:
+    def code_outline(self, path: str = ".", max_symbols: int = 120) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
         files = self._iter_code_files(base, limit=80)
@@ -843,13 +845,31 @@ class ToolExecutor:
             return {"ok": False, "tool": "write_file", "path": relative_path, "summary": reason}
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return {
+        result = {
             "ok": True,
             "tool": "write_file",
             "path": relative_path,
             "summary": f"Wrote {relative_path}.",
             "diff": preview,
         }
+        diagnostic = self._python_syntax_diagnostic(target, content)
+        if diagnostic is not None:
+            result["syntax_ok"] = False
+            result["diagnostic"] = diagnostic
+            result["summary"] += f" {diagnostic}"
+        return result
+
+    def _python_syntax_diagnostic(self, target: Path, content: str) -> str | None:
+        if target.suffix.lower() != ".py":
+            return None
+        try:
+            ast.parse(content, filename=self.relative_label(target))
+        except SyntaxError as exc:
+            line = exc.lineno if exc.lineno is not None else "?"
+            offset = exc.offset if exc.offset is not None else "?"
+            near = f" near {exc.text.strip()[:80]!r}" if exc.text and exc.text.strip() else ""
+            return f"Python syntax error: {exc.__class__.__name__}: {exc.msg} at {self.relative_label(target)}:{line}:{offset}{near}."
+        return None
 
     def _looks_like_word_char(self, value: str) -> bool:
         return value.isalnum() or value == "_"
@@ -875,6 +895,28 @@ class ToolExecutor:
                 embedded_matches += 1
             start = index + len(old)
         return whole_word_matches > 0 and embedded_matches > 0
+
+    def _strip_read_file_line_prefixes(self, text: str) -> str:
+        lines = text.splitlines()
+        if not lines:
+            return text
+        converted: list[str] = []
+        matched = 0
+        for line in lines:
+            match = re.match(r"^\s*\d+\s+\|\s?(.*)$", line)
+            if match:
+                converted.append(match.group(1))
+                matched += 1
+                continue
+            if line.strip():
+                return text
+            converted.append("")
+        if matched == 0:
+            return text
+        result = "\n".join(converted)
+        if text.endswith("\n"):
+            result += "\n"
+        return result
 
     def _leading_whitespace_flexible_pattern(self, old: str) -> re.Pattern[str] | None:
         if not old.strip():
@@ -902,6 +944,10 @@ class ToolExecutor:
     ) -> dict[str, Any]:
         target = self.resolve_path(path, allow_missing=False)
         original = target.read_text(encoding="utf-8", errors="replace")
+        stripped_old = self._strip_read_file_line_prefixes(old)
+        if stripped_old != old:
+            old = stripped_old
+            new = self._strip_read_file_line_prefixes(new)
         if match_whole_word:
             pattern = re.compile(rf"\b{re.escape(old)}\b")
             count = len(pattern.findall(original))
@@ -945,13 +991,19 @@ class ToolExecutor:
             return {"ok": False, "tool": "replace_in_file", "path": relative_path, "summary": reason}
         target.write_text(updated, encoding="utf-8")
         replaced_count = count if replace_all else 1
-        return {
+        result = {
             "ok": True,
             "tool": "replace_in_file",
             "path": relative_path,
             "summary": f"Replaced {replaced_count} occurrence(s) in {relative_path}.",
             "diff": preview,
         }
+        diagnostic = self._python_syntax_diagnostic(target, updated)
+        if diagnostic is not None:
+            result["syntax_ok"] = False
+            result["diagnostic"] = diagnostic
+            result["summary"] += f" {diagnostic}"
+        return result
 
     def run_shell(self, command: str, cwd: str = ".", timeout: int = 30) -> dict[str, Any]:
         working_dir = self.resolve_path(cwd, allow_missing=False)

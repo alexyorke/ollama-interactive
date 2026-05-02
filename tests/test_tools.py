@@ -67,6 +67,30 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(replace["ok"])
         self.assertEqual(final_text, "goodbye\n")
 
+    def test_write_file_reports_python_syntax_error_without_blocking_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("bad.py", "def f():\nreturn 1\n")
+            final_text = (root / "bad.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["syntax_ok"])
+        self.assertIn("Python syntax error", result["summary"])
+        self.assertIn("bad.py:2", result["diagnostic"])
+        self.assertEqual(final_text, "def f():\nreturn 1\n")
+
+    def test_replace_in_file_reports_python_syntax_error_without_blocking_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sample.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_in_file("sample.py", "    return 1", "return 1")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["syntax_ok"])
+        self.assertIn("Python syntax error", result["summary"])
+
     def test_replace_rejects_ambiguous_short_snippet(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -94,6 +118,21 @@ class ToolExecutorTests(unittest.TestCase):
             sample.write_text("def f():\n    return 'old'\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file("sample.py", "   return 'old'", "    return 'new'")
+            final_text = sample.read_text(encoding="utf-8")
+        self.assertTrue(result["ok"])
+        self.assertEqual(final_text, "def f():\n    return 'new'\n")
+
+    def test_replace_strips_read_file_line_number_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "sample.py"
+            sample.write_text("def f():\n    return 'old'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_in_file(
+                "sample.py",
+                "   1 | def f():\n   2 |     return 'old'",
+                "   1 | def f():\n   2 |     return 'new'",
+            )
             final_text = sample.read_text(encoding="utf-8")
         self.assertTrue(result["ok"])
         self.assertEqual(final_text, "def f():\n    return 'new'\n")
@@ -164,6 +203,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("beta.txt:1:needle here", result["output"])
 
+    def test_search_limits_rg_output_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "many.txt").write_text("\n".join("needle" for _ in range(20)), encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.search("needle", limit=3)
+
+        self.assertTrue(result["ok"])
+        self.assertLessEqual(len(result["output"].splitlines()), 3)
+
     def test_code_outline_returns_python_symbols_without_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -187,6 +236,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("function helper", result["output"])
         self.assertIn("imports: import math", result["output"])
         self.assertNotIn("hidden_body_marker", result["output"])
+
+    def test_code_outline_defaults_to_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def meaning():\n    return 42\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.execute("code_outline", {})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["path"], ".")
+        self.assertIn("meaning", result["output"])
 
     def test_search_symbols_and_read_symbol_target_large_python_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

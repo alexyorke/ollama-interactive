@@ -659,6 +659,55 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "note.txt has been updated.")
 
+    def test_agent_rejects_final_before_required_workspace_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"final","message":"implement it by editing app.py"}',
+                    '{"type":"tool","name":"write_file","arguments":{"path":"app.py","content":"def f():\\n    return 1\\n"}}',
+                    '{"type":"final","message":"app.py updated"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Implement this by editing app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+
+    def test_agent_requires_successful_run_test_after_requested_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "print('ok')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": command}}),
+                    json.dumps({"type": "final", "message": "app.py updated and tests passed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit app.py, run tests, and summarize.")
+
+        self.assertEqual(result.message, "app.py updated and tests passed")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
+    def test_agent_allows_explanatory_implementation_question_without_mutation(self) -> None:
+        client = FakeClient(['{"type":"final","message":"explain plan"}'])
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("How should I implement this feature?")
+
+        self.assertEqual(result.message, "explain plan")
+
     def test_agent_retries_git_diff_with_working_tree_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -916,6 +965,27 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(assistant_synthesized[0]["content"], "APPROVED")
         self.assertFalse(any(event["type"] == "assumption_audit" for event in agent.events))
 
+    def test_agent_normalizes_unquoted_exact_text_write_with_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"scratch/repl.txt","content":"repl ok"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"scratch/repl.txt"}}',
+                    '{"type":"final","message":"repl ok"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Create scratch/repl.txt with exactly the text repl ok followed by a newline.")
+            final_content = (root / "scratch" / "repl.txt").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "repl ok")
+        self.assertEqual(final_content, "repl ok\n")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"], {"path": "scratch/repl.txt", "content": "repl ok\n"})
+
     def test_agent_synthesizes_exact_token_reply_after_read_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1000,6 +1070,20 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 0)
         self.assertTrue(artifact_exists)
 
+    def test_agent_synthesizes_file_from_search_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scratch").mkdir()
+            (root / "scratch" / "repl.txt").write_text("repl ok\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"search","arguments":{"query":"repl ok","path":"."}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use search to find repl ok and tell me which file contains it.")
+
+        self.assertEqual(result.message, "scratch/repl.txt contains the match.")
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
     def test_agent_audits_shell_tool_under_debate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1049,6 +1133,20 @@ class AgentTests(unittest.TestCase):
         self.assertIn("test_sample", result.message)
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_sample OK\')"')
+
+    def test_agent_normalizes_test_tool_alias_to_configured_run_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(['{"type":"tool","name":"test","arguments":{}}'])
+            tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_alias OK\')"')
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Run tests and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_test")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_alias OK\')"')
 
     def test_agent_normalizes_shell_test_to_configured_run_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1329,6 +1427,124 @@ class AgentTests(unittest.TestCase):
         tool_feedback = next(message["content"] for message in agent.messages if message["role"] == "user" and message["content"].startswith("Tool result:\n"))
         self.assertIn("... truncated ...", tool_feedback)
         self.assertNotIn(" 200 |", tool_feedback)
+
+    def test_agent_compacts_large_write_arguments_in_assistant_history_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            content = "\n".join(f"# line {index} TOKEN_FULL_EVENT" for index in range(80)) + "\n"
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "big.py", "content": content}}),
+                    json.dumps({"type": "final", "message": "big.py updated"}),
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Write big.py with generated content.")
+
+        self.assertEqual(result.message, "big.py updated")
+        assistant_tool = next(
+            message["content"]
+            for message in agent.messages
+            if message["role"] == "assistant" and '"name":"write_file"' in message["content"]
+        )
+        self.assertIn("... truncated ...", assistant_tool)
+        self.assertNotIn("line 79 TOKEN_FULL_EVENT", assistant_tool)
+        tool_call = next(event for event in agent.events if event["type"] == "tool_call")
+        self.assertIn("line 79 TOKEN_FULL_EVENT", tool_call["arguments"]["content"])
+
+    def test_agent_compacts_run_test_output_to_actionable_failure(self) -> None:
+        client = FakeClient([])
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        noisy_status = "\n".join(f"test_noise_{index} (suite.Case.test_noise_{index}) ... FAIL" for index in range(80))
+        output = (
+            noisy_status
+            + "\n"
+            + "-" * 70
+            + "\nFAIL: test_add_negative (tests.test_math.MathTests.test_add_negative)\n"
+            + "-" * 70
+            + "\nTraceback (most recent call last):\n"
+            + '  File "tests/test_math.py", line 42, in test_add_negative\n'
+            + "    self.assertEqual(add(-2, -3), -5)\n"
+            + "AssertionError: -4 != -5\n\n"
+            + "unhelpful tail " + ("x" * 3000) + "\n"
+            + "Ran 81 tests in 0.123s\nFAILED (failures=81)\n"
+        )
+
+        payload = agent._compact_tool_result_for_context("run_test", {"ok": False, "output": output})
+
+        compact = payload["output"]
+        self.assertIn("FAILED (failures=81)", compact)
+        self.assertIn("FAIL: test_add_negative", compact)
+        self.assertIn("AssertionError: -4 != -5", compact)
+        self.assertNotIn("test_noise_0", compact)
+        self.assertNotIn("unhelpful tail", compact)
+        self.assertLessEqual(len(compact), 700)
+
+    def test_agent_run_test_feedback_points_at_syntax_file_not_import_guess(self) -> None:
+        client = FakeClient([])
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        output = (
+            "ERROR: sample_test (unittest.loader._FailedTest.sample_test)\n"
+            "Traceback (most recent call last):\n"
+            "  File \"C:\\workspace\\sample.py\", line 2\n"
+            "    def f():\n"
+            "IndentationError: unexpected indent\n"
+        )
+
+        feedback = agent._tool_result_feedback_message("run_test", {"ok": False, "output": output}, real_tool_use=True)
+
+        self.assertIn("IndentationError: unexpected indent at sample.py:2", feedback)
+        self.assertIn("Do not blame imports unless error is ModuleNotFoundError", feedback)
+
+    def test_agent_blocks_repeated_failed_run_test_until_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fail_command = subprocess.list2cmdline([sys.executable, "-c", "import sys; sys.exit(1)"])
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('ok')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "changed app.py"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Fix app.py, run tests, and rerun tests after editing.")
+
+        self.assertEqual(result.message, "changed app.py")
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+
+    def test_agent_blocks_final_and_run_test_while_python_syntax_error_known(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "print('ok')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\nreturn 1\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": command}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Implement this by editing app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+        self.assertEqual(tools.execute_counts.get("write_file"), 2)
+        self.assertIsNone(tools.execute_counts.get("run_test"))
 
     def test_agent_compacts_primary_context_without_dropping_current_request(self) -> None:
         client = FakeClient(['{"type":"final","message":"done"}'])
