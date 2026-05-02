@@ -190,6 +190,25 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
 
+    def test_agent_skips_assumption_audit_for_explicit_subagent(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_agent","arguments":{"prompt":"Read note.txt and summarize it.","approval_mode":"read-only"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"helper saw helper data"}',
+                '{"type":"final","message":"parent got: helper saw helper data"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        result = agent.handle_user("Use run_agent to delegate this in read-only mode.")
+
+        self.assertEqual(result.message, "parent got: helper saw helper data")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 0)
+
     def test_agent_runs_verification_by_default_and_accepts_candidate(self) -> None:
         root = self._workspace_scratch()
         (root / "note.txt").write_text("hello\n", encoding="utf-8")
@@ -325,6 +344,45 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "updated sample.py")
         self.assertEqual((root / "sample.py").read_text(encoding="utf-8"), "def f():\n    return 'new'\n")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 0)
+
+    def test_agent_skips_assumption_audit_for_explicit_run_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "print('test_fast OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": command}}),
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user(f"Use run_test to execute {command} and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 0)
+
+    def test_agent_skips_assumption_audit_for_inspection_after_failed_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("failure clue\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-c", "import sys; sys.exit(1)"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": command}}),
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"inspected failure clue"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user(f"Run this failing test command: {command}. Then read note.txt and summarize.")
+
+        self.assertEqual(result.message, "inspected failure clue")
         audits = [event for event in agent.events if event["type"] == "assumption_audit"]
         self.assertEqual(len(audits), 0)
 

@@ -18,6 +18,28 @@ Metrics come from Ollama `/api/chat` response fields: `prompt_eval_count`, `eval
 
 Second pass adds controller-direct execution for explicit low-ambiguity requests and primary-context compaction for normal model turns. Compared with the first optimized run, the fixed 70-run explicit-tool corpus stayed 70/70 passing and dropped to `0` LLM calls, `0` prompt tokens, and `0` output tokens. These are not model shortcuts for broad coding work; they only fire when the controller can deterministically prove the required tool path and final answer.
 
+Latest compression pass reduced repeated model context without changing public CLI behavior:
+
+- Static primary, verifier, auditor, and rewriter prompts were shortened while preserving the same JSON contracts.
+- Verification/audit payloads now send fewer recent messages, fewer evidence rows, and shorter claim/tool-result snippets.
+- Explicit low-risk validation tools (`run_test`, `git_status`, `git_diff`) and explicit `run_agent` delegation skip assumption-audit calls unless there is a retry, forbidden-tool constraint, or unsafe context.
+- Failed-test turns now let read-only inspection proceed without an extra auditor call; repeated tests or ungrounded mutation stay guarded.
+- The benchmark runner writes partial raw JSON after each case, so long local model runs preserve token profiles even if interrupted.
+
+Current measured regression check on the strongest installed local coding model:
+
+| Case | Model | Debate | Status | Tokens before | Tokens after | Delta | Calls before -> after |
+|---|---|---|---|---:|---:|---:|---:|
+| `multi_file_refactor` | `batiai/qwen3.6-35b:iq4` | on | pass -> pass | 12,630 | 10,625 | -15.9% | 10 -> 10 |
+
+Additional live smoke:
+
+| Model | Suite slice | Status |
+|---|---|---|
+| `gemma3:4b` | 18 deterministic/token-efficiency cases | 18/18 pass, 0 LLM calls |
+| `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass |
+| `qwen3:8b` | 8 local coding smoke cases | 7/8 pass; debate-on `instructed_edit` timed out, so this model is not recommended for complex edit loops |
+
 ## Second-Pass Direct Routing
 
 | Model | Verifier | Debate | First optimized prompt | Second-pass prompt | LLM calls before -> after | Pass before -> after |
@@ -90,7 +112,7 @@ Profiling a realistic symbol-summary task found the main waste pattern: models o
 
 Fixes from that profile:
 
-- Compacted primary system prompt/tool schema; current full system prompt with tool list is 1,579 chars.
+- Compacted primary system prompt/tool schema; current full system prompt with tool list is about 1,557 chars for a benchmark workspace path.
 - Shortened tool-result feedback from verbose prose to compact `Tool result:` plus `Next JSON only.`
 - Added deterministic symbol return-value synthesis for prompts like “find function X in file Y and summarize what value it returns.”
 - Broadened deterministic symbol extraction to `find`, `locate`, `function`, `method`, `class`, and `symbol` wording.
@@ -133,7 +155,7 @@ After the fix, the same symbol-summary task passes on all tested models and deba
 
 ## Validation
 
-- `python -m unittest discover -v`: 146 passed, 3 skipped.
+- `python -m unittest discover -v`: 163 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
 - Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
 - Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.

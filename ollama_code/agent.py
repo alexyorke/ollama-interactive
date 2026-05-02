@@ -20,20 +20,20 @@ from ollama_code.sessions import (
 from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_compact_tool_help, format_tool_help
 
 
-SYSTEM_PROMPT_TEMPLATE = """Ollama Code: local terminal coding agent. Workspace: {workspace_root}
+SYSTEM_PROMPT_TEMPLATE = """Ollama Code. Workspace: {workspace_root}
 
-Return exactly one JSON object only:
+Reply as one JSON object only:
 {{"type":"tool","name":"read_file","arguments":{{"path":"README.md"}}}}
 {{"type":"final","message":"..."}}
 
 Rules:
-- One tool per reply. Use relative workspace paths. No markdown fences. No chain-of-thought.
-- Need workspace/file/git/command/edit/subagent facts? Use tools; do not guess.
-- Inspect before edits. New file: write_file. Edit: replace_in_file/write_file. Shell: run_shell. Tests: run_test. Git: git_status/git_diff/git_commit. Delegate: run_agent.
-- Code work: prefer search_symbols, code_outline, then read_symbol before broad read_file. Broad repo: search/list_files first. Narrow read_file ranges.
-- Reuse recent tool results; avoid repeat read-only calls unless state changed.
+- One tool call or one final. Relative paths. No fences. No chain-of-thought.
+- Need repo/file/git/shell/edit/subagent facts? Use tools; do not guess.
+- Inspect before edit. New/write: write_file. Edit: replace_in_file. Shell: run_shell. Tests: run_test. Git: git_status/git_diff/git_commit. Agents: run_agent.
+- Code nav: prefer search_symbols, code_outline, then read_symbol before broad read_file. Search/list before broad reads; use ranges.
+- Reuse results; avoid repeated read-only calls unless state changed.
 - Question your assumptions before acting; prove or disprove with tools when possible.
-- Never claim edit/command/helper success without successful current-turn tool result.
+- Never claim edit/command/test/agent success without successful current-turn tool result.
 - Style: caveman-lite concise; keep code, paths, commands, errors, JSON exact and syntactically complete.
 
 Tools:
@@ -77,90 +77,84 @@ class SymbolReadSpec:
 
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
-VERIFICATION_HISTORY_LIMIT = 2
-VERIFICATION_CONTENT_LIMIT = 3000
-PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT = 14
-PRIMARY_CONTEXT_CONTENT_LIMIT = 1200
+VERIFICATION_HISTORY_LIMIT = 1
+VERIFICATION_CONTENT_LIMIT = 2200
+PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT = 12
+PRIMARY_CONTEXT_CONTENT_LIMIT = 900
 MAX_VERIFICATION_RETRIES = 2
 MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
 AUDIT_LIST_ITEM_LIMIT = 3
-AUDIT_TEXT_ITEM_LIMIT = 180
-CANDIDATE_CLAIM_LIMIT = 6
-CANDIDATE_CLAIM_TEXT_LIMIT = 220
-VERIFICATION_EVIDENCE_LIMIT = 4
-VERIFICATION_EVIDENCE_TEXT_LIMIT = 180
+AUDIT_TEXT_ITEM_LIMIT = 140
+CANDIDATE_CLAIM_LIMIT = 5
+CANDIDATE_CLAIM_TEXT_LIMIT = 180
+VERIFICATION_EVIDENCE_LIMIT = 3
+VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
 MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "git_commit"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "git_status", "git_diff"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 MODEL_TOOL_RESULT_LIMITS = {
-    "list_files": 700,
-    "read_file": 1200,
-    "search": 900,
-    "search_symbols": 900,
-    "code_outline": 1200,
-    "read_symbol": 1400,
-    "git_status": 1000,
-    "git_diff": 1200,
-    "run_shell": 900,
-    "run_test": 900,
-    "run_agent": 1200,
+    "list_files": 500,
+    "read_file": 1000,
+    "search": 700,
+    "search_symbols": 700,
+    "code_outline": 900,
+    "read_symbol": 1100,
+    "git_status": 700,
+    "git_diff": 900,
+    "run_shell": 700,
+    "run_test": 700,
+    "run_agent": 900,
 }
-MODEL_TOOL_DIFF_LIMIT = 900
-VERIFICATION_TOOL_RESULT_LIMIT = 700
-VERIFICATION_TOOL_DIFF_LIMIT = 700
+MODEL_TOOL_DIFF_LIMIT = 700
+VERIFICATION_TOOL_RESULT_LIMIT = 450
+VERIFICATION_TOOL_DIFF_LIMIT = 450
 
 FINAL_VERIFIER_SYSTEM_PROMPT = """You are a grounded final verifier for a coding CLI controller.
 
-Check candidate final against evidence/constraints. Return exactly one JSON object.
+Check final vs evidence/constraints. JSON only.
 
-Valid replies:
+Replies:
 {"verdict":"accept","claim_checks":[{"claim":"...","status":"supported","evidence":"E1"}]}
 {"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"],"claim_checks":[{"claim":"...","status":"contradicted","evidence":"E2","correction":"..."}],"rewrite_guidance":["..."],"rewrite_from_evidence":true}
 
 Rules:
-- Prefer accept when the candidate already matches the tool results and request.
-- Return retry if the candidate contradicts tool results, ignores required tools, violates forbidden-tool constraints, hallucinates workspace state, or needs another tool/result first.
-- Treat accepted assumption-audit events as grounding context.
-- Use candidate_claims when present; assess concrete claims in claim_checks.
-- claim_checks entries must use status supported, contradicted, or unverified.
-- evidence should cite evidence ids like E1, E2 when possible.
-- correction must be brief and must come directly from the supplied evidence table.
-- Set rewrite_from_evidence true only when the existing evidence is sufficient to rewrite a correct final answer without another tool call.
-- Do not rewrite the final answer yourself.
-- required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
+- Accept if candidate matches request, constraints, tool results, and accepted audits.
+- Retry if contradiction, unsupported workspace claim, missing/forbidden tool, or another tool is needed.
+- claim_checks status: supported, contradicted, unverified. Cite evidence ids when possible.
+- correction/rewrite_guidance must come only from evidence.
+- rewrite_from_evidence true only if evidence can fully fix final without another tool.
+- Do not write the final answer. Tool arrays: known names only or [].
 """
 
 FINAL_REWRITER_SYSTEM_PROMPT = """You are an evidence-backed final rewriter for a coding CLI controller.
 
-You will receive the original user request, the rejected candidate final answer, extracted candidate claims, a compact evidence table derived from successful tool results, verifier claim checks, and rewrite guidance.
-Return exactly one JSON object and nothing else.
+Return exactly one JSON object only.
 
-Valid reply:
+Reply:
 {"type":"final","message":"Accurate final answer grounded only in the supplied evidence."}
 
 Rules:
-- Rewrite only from the supplied evidence table and verifier claim checks.
-- Do not invent claims, files, commands, diffs, or outcomes that are not directly supported by evidence.
-- If a claim was contradicted and a correction is supplied, use the correction or omit that claim.
-- If some requested detail is unsupported, answer with the narrowest accurate statement from the evidence instead of guessing.
-- Keep the final answer concise and directly useful.
+- Use only evidence table, claim checks, and rewrite guidance.
+- Do not invent files, commands, diffs, outcomes, or unsupported details.
+- Use supplied corrections for contradicted claims, or omit those claims.
+- Keep final concise and useful.
 """
 
 TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT = """You are a tool-step assumption auditor for a coding CLI controller.
 
-Check whether proposed tool is grounded next step. Return exactly one JSON object.
+Decide if proposed tool is grounded next step. JSON only.
 
-Valid replies:
+Replies:
 {"verdict":"accept","reason":"","assumptions":["..."],"validation_steps":["..."],"required_tools":[],"forbidden_tools":[]}
 {"verdict":"retry","reason":"brief concrete reason","assumptions":["..."],"validation_steps":["..."],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
 
 Rules:
-- assumptions and validation_steps must be short.
-- Prefer accept when the proposed tool is a reasonable next validation step, even if the tool may fail and the user explicitly asked for that exact tool error or boundary failure.
-- Return retry if the tool is redundant, too broad, violates required/forbidden-tool constraints, mutates when inspection should happen first, skips a needed validation step, or fails to test the key assumption behind the next step.
-- Do not rewrite the tool call yourself.
-- required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
+- Keep assumptions/validation_steps short.
+- Accept reasonable validation steps, including expected failures/boundary probes.
+- Accept read/inspect steps after failed tests; repair needs fresh evidence more than another audit.
+- Retry if redundant, too broad, constraint-violating, mutating before inspection, or not validating the key assumption.
+- Do not rewrite the tool. Tool arrays: known names only or [].
 """
 
 
@@ -624,7 +618,7 @@ class OllamaCodeAgent:
             row: dict[str, Any] = {
                 "id": f"E{index}",
                 "tool": name,
-                "arguments": self._truncate_json_value(arguments, limit=240),
+                "arguments": self._truncate_json_value(arguments, limit=180),
                 "observation": self._evidence_observation_for_result(name, result),
             }
             path = result.get("path")
@@ -650,8 +644,8 @@ class OllamaCodeAgent:
                 {
                     "claim": self._truncate_text(claim, limit=CANDIDATE_CLAIM_TEXT_LIMIT),
                     "status": status,
-                    "evidence": self._truncate_text(str(item.get("evidence", "")).strip(), limit=120),
-                    "correction": self._truncate_text(str(item.get("correction", "")).strip(), limit=180),
+                    "evidence": self._truncate_text(str(item.get("evidence", "")).strip(), limit=80),
+                    "correction": self._truncate_text(str(item.get("correction", "")).strip(), limit=140),
                 }
             )
             if len(claim_checks) >= CANDIDATE_CLAIM_LIMIT:
@@ -709,7 +703,7 @@ class OllamaCodeAgent:
         recent_messages = [
             {
                 "role": message["role"],
-                "content": self._truncate_text(message["content"], limit=360),
+                "content": self._truncate_text(message["content"], limit=220),
             }
             for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
             if message.get("role") != "system"
@@ -721,9 +715,9 @@ class OllamaCodeAgent:
             "model": self.model,
             "verifier_model": self.verification_model(),
             "workspace_root": self.tools.workspace_root.as_posix(),
-            "original_user_request": self._truncate_text(request_text, limit=600),
+            "original_user_request": self._truncate_text(request_text, limit=420),
             "recent_messages": recent_messages,
-            "candidate_final_answer": self._truncate_text(candidate_message, limit=800),
+            "candidate_final_answer": self._truncate_text(candidate_message, limit=520),
             "candidate_claims": candidate_claims,
             "required_tools": sorted(required_tool_names),
             "forbidden_tools": sorted(forbidden_tool_names),
@@ -888,7 +882,7 @@ class OllamaCodeAgent:
         return {
             "tool": str(audit.get("tool", "")).strip(),
             "verdict": str(audit.get("verdict", "")).strip(),
-            "reason": self._truncate_text(str(audit.get("reason", "")).strip(), limit=240),
+            "reason": self._truncate_text(str(audit.get("reason", "")).strip(), limit=120),
             "assumptions": self._normalize_audit_text_items(audit.get("assumptions")),
             "validation_steps": self._normalize_audit_text_items(audit.get("validation_steps")),
         }
@@ -912,7 +906,7 @@ class OllamaCodeAgent:
         recent_messages = [
             {
                 "role": message["role"],
-                "content": self._truncate_text(message["content"], limit=360),
+                "content": self._truncate_text(message["content"], limit=220),
             }
             for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
             if message.get("role") != "system"
@@ -926,11 +920,11 @@ class OllamaCodeAgent:
             "round": round_number,
             "model": self.model,
             "workspace_root": self.tools.workspace_root.as_posix(),
-            "original_user_request": self._truncate_text(request_text, limit=600),
+            "original_user_request": self._truncate_text(request_text, limit=420),
             "recent_messages": recent_messages,
             "proposed_tool": {
                 "name": proposed_tool_name,
-                "arguments": self._truncate_json_value(proposed_arguments, limit=360),
+                "arguments": self._truncate_json_value(proposed_arguments, limit=220),
             },
             "required_tools": sorted(required_tool_names),
             "forbidden_tools": sorted(forbidden_tool_names),
@@ -1214,7 +1208,7 @@ class OllamaCodeAgent:
         arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
         return {
             "name": name,
-            "arguments": self._truncate_json_value(arguments, limit=240),
+            "arguments": self._truncate_json_value(arguments, limit=180),
         }
 
     def _compact_successful_tool_result_for_verification(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -1223,7 +1217,7 @@ class OllamaCodeAgent:
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         return {
             "name": name,
-            "arguments": self._truncate_json_value(arguments, limit=240),
+            "arguments": self._truncate_json_value(arguments, limit=180),
             "result": self._compact_tool_result_for_context(name, result, for_verification=True),
         }
 
@@ -1232,6 +1226,8 @@ class OllamaCodeAgent:
         follow_up = "Next JSON only."
         if not real_tool_use:
             follow_up = "Tool failed; it does not satisfy required tool use. Fix or choose another tool. Next JSON only."
+        elif name == "run_test" and result.get("ok") is not True:
+            follow_up = "Tests failed. Inspect failing file/source or edit from evidence before rerunning. Next JSON only."
         return "Tool result:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
 
     def _final_requires_verification(
@@ -1790,8 +1786,30 @@ class OllamaCodeAgent:
         ):
             return False
         if failed_tool_this_turn:
+            if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol"}:
+                return False
+            if name == "run_test":
+                return True
+            if not forbidden_tool_names and self._tool_call_grounded_by_successful_evidence(
+                name=name,
+                arguments=arguments,
+                successful_tool_results=successful_tool_results,
+            ):
+                return False
             return True
-        if name in MUTATING_TOOL_NAMES or name in {"run_shell", "run_test", "run_agent", "git_status", "git_diff"}:
+        if name in MUTATING_TOOL_NAMES or name == "run_shell":
+            return True
+        if name == "run_agent":
+            if forbidden_tool_names:
+                return True
+            return not self._request_explicitly_requests_tool(request_text, name)
+        if name in {"run_test", "git_status", "git_diff"}:
+            if forbidden_tool_names:
+                return True
+            if self._request_explicitly_requests_tool(request_text, name):
+                return False
+            if name == "run_test" and re.search(r"\b(?:run|rerun|execute)\b[^.?!\n]{0,80}\b(?:test|tests|pytest|unittest)\b", request_text, flags=re.IGNORECASE):
+                return False
             return True
         if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol"}:
             if self._request_explicitly_requests_tool(request_text, name):

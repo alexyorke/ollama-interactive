@@ -1027,6 +1027,31 @@ def _git_commit(repo_root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
+def write_results_payload(
+    output: Path,
+    *,
+    repo_root: Path,
+    suite: str,
+    results: list[dict[str, Any]],
+    comparisons: list[dict[str, Any]] | None = None,
+    accuracy_regressions: list[dict[str, Any]] | None = None,
+    budget_failures: list[dict[str, Any]] | None = None,
+    partial: bool = False,
+) -> None:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit(repo_root),
+        "suite": suite,
+        "partial": partial,
+        "summary": summarize(results),
+        "results": results,
+        "comparisons": comparisons or [],
+        "accuracy_regressions": accuracy_regressions or [],
+        "budget_failures": budget_failures or [],
+    }
+    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial coding accuracy + token-efficiency benchmarks.")
     parser.add_argument("--suite", choices=["local-small", "local-full", "external-smoke"], default="local-small")
@@ -1083,6 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
                     outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout)
                     results.append(outcome)
                     print_table([outcome], [])
+                    write_results_payload(output, repo_root=repo_root, suite=args.suite, results=results, partial=True)
             unload_model(model)
             _LOADED_MODELS.discard(model)
             if verifier_model:
@@ -1107,17 +1133,16 @@ def main(argv: list[str] | None = None) -> int:
         if comparisons:
             print_table([], comparisons)
 
-    payload = {
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "git_commit": _git_commit(repo_root),
-        "suite": args.suite,
-        "summary": summarize(results),
-        "results": results,
-        "comparisons": comparisons,
-        "accuracy_regressions": accuracy_regressions,
-        "budget_failures": budget_failures,
-    }
-    output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    write_results_payload(
+        output,
+        repo_root=repo_root,
+        suite=args.suite,
+        results=results,
+        comparisons=comparisons,
+        accuracy_regressions=accuracy_regressions,
+        budget_failures=budget_failures,
+        partial=False,
+    )
 
     failures: list[Any] = []
     if args.strict_accuracy:
