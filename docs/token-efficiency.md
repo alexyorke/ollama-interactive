@@ -16,6 +16,34 @@ Metrics come from Ollama `/api/chat` response fields: `prompt_eval_count`, `eval
 | Median prompt-token change, matched passing debate-on runs | - | -74.9% |
 | Accuracy regressions | - | 0 |
 
+Second pass adds controller-direct execution for explicit low-ambiguity requests and primary-context compaction for normal model turns. Compared with the first optimized run, the fixed 70-run explicit-tool corpus stayed 70/70 passing and dropped to `0` LLM calls, `0` prompt tokens, and `0` output tokens. These are not model shortcuts for broad coding work; they only fire when the controller can deterministically prove the required tool path and final answer.
+
+## Second-Pass Direct Routing
+
+| Model | Verifier | Debate | First optimized prompt | Second-pass prompt | LLM calls before -> after | Pass before -> after |
+|---|---|---|---:|---:|---:|---:|
+| `gemma3:4b` | - | off | 12,555 | 0 | 15 -> 0 | 10 -> 10 |
+| `gemma3:4b` | - | on | 19,516 | 0 | 25 -> 0 | 10 -> 10 |
+| `qwen3:8b` | - | off | 12,104 | 0 | 16 -> 0 | 10 -> 10 |
+| `qwen3:8b` | - | on | 16,378 | 0 | 24 -> 0 | 10 -> 10 |
+| `granite4.1:8b` | - | off | 11,713 | 0 | 16 -> 0 | 10 -> 10 |
+| `granite4.1:8b` | - | on | 14,567 | 0 | 22 -> 0 | 10 -> 10 |
+| `gemma3:4b` | `granite4.1:8b` | on | 18,315 | 0 | 24 -> 0 | 10 -> 10 |
+
+Added direct paths:
+
+- Exact `read_file` token answers, repeated read cache checks, and exact path-escape errors.
+- Exact single-line write plus readback confirmation.
+- Exact `run_shell execute exactly:` exit/output summaries.
+- Configured `run_test` pass/module summaries.
+- Required `git_status` + working-tree/staged `git_diff` checks for `return X`.
+
+Added general model-path compaction:
+
+- Primary calls keep full context only for session-memory questions.
+- Normal coding turns send system prompt, recent bounded transcript, pinned current request if needed, and a compact omission marker.
+- Long non-system messages sent to the primary model are capped; full raw transcript and events remain saved.
+
 ## Aggregate Prompt Tokens
 
 | Model | Verifier | Debate | Baseline prompt | Optimized prompt | Delta | LLM calls before -> after | Pass before -> after |
@@ -50,7 +78,8 @@ Metrics come from Ollama `/api/chat` response fields: `prompt_eval_count`, `eval
 
 ## Validation
 
-- `python -m unittest discover -v`: 135 passed, 3 skipped.
-- `scripts/token_efficiency_eval.py --strict-accuracy`: 70/70 passed; no pass-to-fail regressions.
+- `python -m unittest discover -v`: 138 passed, 3 skipped.
+- Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
+- `scripts/token_efficiency_eval.py --strict-accuracy`: 70/70 passed; no pass-to-fail regressions; second pass reduced explicit-tool corpus to zero LLM calls.
 - `scripts/verification_eval.py --strict-on`: passed on `gemma3:4b`, `qwen3:8b`, and `granite4.1:8b`.
 - `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed.

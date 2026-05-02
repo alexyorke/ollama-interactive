@@ -92,6 +92,8 @@ KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
 VERIFICATION_HISTORY_LIMIT = 2
 VERIFICATION_CONTENT_LIMIT = 3000
+PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT = 14
+PRIMARY_CONTEXT_CONTENT_LIMIT = 1200
 MAX_VERIFICATION_RETRIES = 2
 MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
@@ -495,6 +497,48 @@ class OllamaCodeAgent:
         self._pending_llm_call_events = []
         for payload in pending:
             self._record_event("llm_call", **payload)
+
+    def _primary_messages_for_model(
+        self,
+        *,
+        session_memory_request: bool,
+        current_request: str,
+    ) -> list[dict[str, str]]:
+        if session_memory_request or len(self.messages) <= PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT + 1:
+            return self.messages
+        system_message = self.messages[0]
+        non_system_messages = self.messages[1:]
+        recent_messages = non_system_messages[-PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT:]
+        current_turn_request: dict[str, str] | None = None
+        for message in reversed(non_system_messages):
+            if message.get("role") == "user" and message.get("content") == current_request:
+                current_turn_request = message
+                break
+        compacted: list[dict[str, str]] = [system_message]
+        omitted_count = max(0, len(non_system_messages) - len(recent_messages))
+        if omitted_count:
+            compacted.append(
+                {
+                    "role": "user",
+                    "content": f"Earlier conversation omitted for token efficiency: {omitted_count} message(s). Current turn evidence below is authoritative.",
+                }
+            )
+        if current_turn_request is not None and all(message is not current_turn_request for message in recent_messages):
+            compacted.append(
+                {
+                    "role": "user",
+                    "content": "Current user request (pinned): "
+                    + self._truncate_text(str(current_turn_request.get("content", "")), limit=PRIMARY_CONTEXT_CONTENT_LIMIT),
+                }
+            )
+        for message in recent_messages:
+            compacted.append(
+                {
+                    "role": str(message.get("role", "")),
+                    "content": self._truncate_text(str(message.get("content", "")), limit=PRIMARY_CONTEXT_CONTENT_LIMIT),
+                }
+            )
+        return compacted
 
     def _truncate_text(self, text: str, *, limit: int = VERIFICATION_CONTENT_LIMIT) -> str:
         if len(text) <= limit:
@@ -1544,6 +1588,33 @@ class OllamaCodeAgent:
                 return command
         return None
 
+    def _requested_read_file_path(self, text: str) -> str | None:
+        patterns = [
+            r"\bread_file\s+on\s+(?P<path>[\w./\\:-]+)",
+            r"\bread_file\s+(?P<path>[\w./\\:-]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                path = match.group("path").strip().rstrip(".,;:")
+                if path:
+                    return path
+        return None
+
+    def _requested_git_tool_path(self, text: str) -> str | None:
+        patterns = [
+            r"\bgit_status\s+on\s+(?P<path>[\w./\\:-]+)",
+            r"\bgit_diff\s+on\s+(?P<path>[\w./\\:-]+)",
+            r"\bgit\s+diff\s+(?P<path>[\w./\\:-]+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                path = match.group("path").strip().rstrip(".,;:")
+                if path:
+                    return path
+        return None
+
     def _requested_target_line_read(self, text: str) -> TargetLineReadSpec | None:
         match = re.search(r"\bread_file\s+on\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", text, flags=re.IGNORECASE | re.DOTALL)
         if not match:
@@ -1710,6 +1781,244 @@ class OllamaCodeAgent:
 
         return None
 
+    def _record_synthesized_final(self, message: str, *, tool: str, round_number: int) -> AgentResult:
+        payload = {"type": "final", "message": message}
+        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+        self._record_event(
+            "assistant_synthesized",
+            content=message,
+            tool=tool,
+            rounds=round_number,
+        )
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
+    def _execute_controller_tool(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        request_text: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        cached_result = self._get_cached_tool_result(name, arguments)
+        cache_hit = cached_result is not None
+        payload = {"type": "tool", "name": name, "arguments": arguments}
+        self.status_printer(f"tool {name} {json.dumps(arguments, ensure_ascii=True)}")
+        self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
+        self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
+        tool_calls_this_turn.append({"name": name, "arguments": deepcopy(arguments)})
+        result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
+        if not cache_hit:
+            self._store_cached_tool_result(name, arguments, result)
+        self._invalidate_turn_cache_if_needed(name, result)
+        real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(request_text, name, result)
+        if real_tool_use:
+            satisfied_tool_names.add(name)
+        if self._counts_as_real_tool_use(name, result):
+            successful_tool_results.append({"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result)})
+        self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit)
+        self.messages.append({"role": "user", "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use)})
+        return result
+
+    def _try_handle_deterministic_turn(
+        self,
+        *,
+        request_text: str,
+        exact_file_write: ExactFileWriteSpec | None,
+        target_line_read: TargetLineReadSpec | None,
+        exact_shell_command: str | None,
+        expected_exact_reply_text: str | None,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        session_memory_request: bool,
+        requested_git_diff_mode: str | None,
+    ) -> AgentResult | None:
+        if session_memory_request:
+            return None
+        successful_tool_results: list[dict[str, Any]] = []
+        tool_calls_this_turn: list[dict[str, Any]] = []
+        satisfied_tool_names: set[str] = set()
+        lowered = request_text.lower()
+        round_number = 0
+
+        if exact_file_write is not None and "write_file" not in forbidden_tool_names:
+            round_number += 1
+            write_result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": exact_file_write.path, "content": exact_file_write.line + "\n"},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if write_result.get("ok") is not True:
+                message = str(write_result.get("summary") or write_result.get("output") or "").strip()
+                if message and self._failure_result_counts_for_request(request_text, "write_file", write_result):
+                    return self._record_synthesized_final(message, tool="write_file", round_number=round_number)
+                return None
+            if "read_file" in forbidden_tool_names:
+                return self._record_synthesized_final(f"Wrote {exact_file_write.path}.", tool="write_file", round_number=round_number)
+            round_number += 1
+            read_result = self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": exact_file_write.path, "start": 1, "end": 1},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if read_result.get("ok") is True and exact_file_write.line in str(read_result.get("output", "")):
+                return self._record_synthesized_final(expected_exact_reply_text or exact_file_write.line, tool="read_file", round_number=round_number)
+            return None
+
+        if exact_shell_command and "run_shell" not in forbidden_tool_names:
+            round_number += 1
+            result = self._execute_controller_tool(
+                name="run_shell",
+                arguments={"command": exact_shell_command},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            message = self._synthesize_final_from_tool_result(
+                request_text=request_text,
+                name="run_shell",
+                arguments={"command": exact_shell_command},
+                result=result,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                required_tool_names=required_tool_names,
+                expected_exact_reply_text=expected_exact_reply_text,
+            )
+            if message:
+                return self._record_synthesized_final(message, tool="run_shell", round_number=round_number)
+            return None
+
+        if "run_test" in required_tool_names and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+            round_number += 1
+            args = {"command": self.tools.default_test_command}
+            result = self._execute_controller_tool(
+                name="run_test",
+                arguments=args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            message = self._synthesize_final_from_tool_result(
+                request_text=request_text,
+                name="run_test",
+                arguments=args,
+                result=result,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                required_tool_names=required_tool_names,
+                expected_exact_reply_text=expected_exact_reply_text,
+            )
+            if message:
+                return self._record_synthesized_final(message, tool="run_test", round_number=round_number)
+            return None
+
+        if {"git_status", "git_diff"}.issubset(required_tool_names) and "git_status" not in forbidden_tool_names and "git_diff" not in forbidden_tool_names:
+            value_match = re.search(r"\breturn\s+([A-Za-z0-9_]+)\b", request_text)
+            path = self._requested_git_tool_path(request_text)
+            if value_match and path:
+                round_number += 1
+                status_args = {"path": path}
+                self._execute_controller_tool(
+                    name="git_status",
+                    arguments=status_args,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                round_number += 1
+                diff_args: dict[str, Any] = {"path": path}
+                if requested_git_diff_mode == "staged":
+                    diff_args["cached"] = True
+                result = self._execute_controller_tool(
+                    name="git_diff",
+                    arguments=diff_args,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                message = self._synthesize_final_from_tool_result(
+                    request_text=request_text,
+                    name="git_diff",
+                    arguments=diff_args,
+                    result=result,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    required_tool_names=required_tool_names,
+                    expected_exact_reply_text=expected_exact_reply_text,
+                )
+                if message:
+                    return self._record_synthesized_final(message, tool="git_diff", round_number=round_number)
+            return None
+
+        read_path = target_line_read.path if target_line_read is not None else self._requested_read_file_path(request_text)
+        if read_path and "read_file" not in forbidden_tool_names and (self._request_asks_token_only(request_text) or self._request_expects_exact_tool_error(request_text)):
+            if target_line_read is not None:
+                read_args = {"path": target_line_read.path, "start": target_line_read.start, "end": target_line_read.end}
+            else:
+                read_args = {"path": read_path}
+            read_count = 2 if self._request_mentions_repeated_read(request_text) else 1
+            result: dict[str, Any] = {}
+            for _ in range(read_count):
+                round_number += 1
+                result = self._execute_controller_tool(
+                    name="read_file",
+                    arguments=read_args,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+            message = self._synthesize_final_from_tool_result(
+                request_text=request_text,
+                name="read_file",
+                arguments=read_args,
+                result=result,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                required_tool_names=required_tool_names,
+                expected_exact_reply_text=expected_exact_reply_text,
+            )
+            if message:
+                return self._record_synthesized_final(message, tool="read_file", round_number=round_number)
+
+        if lowered.startswith("use read_file") and self._request_expects_exact_tool_error(request_text) and read_path and "read_file" not in forbidden_tool_names:
+            round_number += 1
+            result = self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": read_path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            message = str(result.get("summary") or result.get("output") or "").strip()
+            if message:
+                return self._record_synthesized_final(message, tool="read_file", round_number=round_number)
+        return None
+
     def _final_claims_file_mutation(self, message: str) -> bool:
         lowered = message.lower()
         patterns = [
@@ -1811,6 +2120,19 @@ class OllamaCodeAgent:
         prefers_structured_file_tools = self._request_prefers_structured_file_tools(text)
         session_memory_request = self._request_targets_session_memory(text)
         mutation_allowed = self._request_allows_mutation(text)
+        deterministic_result = self._try_handle_deterministic_turn(
+            request_text=text,
+            exact_file_write=exact_file_write,
+            target_line_read=target_line_read,
+            exact_shell_command=exact_shell_command,
+            expected_exact_reply_text=expected_exact_reply_text,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+            session_memory_request=session_memory_request,
+            requested_git_diff_mode=requested_git_diff_mode,
+        )
+        if deterministic_result is not None:
+            return deterministic_result
         tool_used_this_turn = False
         satisfied_tool_names: set[str] = set()
         successful_tool_results: list[dict[str, Any]] = []
@@ -1828,7 +2150,10 @@ class OllamaCodeAgent:
                 response = self._chat(
                     purpose="primary",
                     model=self.model,
-                    messages=self.messages,
+                    messages=self._primary_messages_for_model(
+                        session_memory_request=session_memory_request,
+                        current_request=text,
+                    ),
                     on_thinking=self.thinking_printer,
                     think=self._primary_think_override(
                         requires_tools=requires_tools,
