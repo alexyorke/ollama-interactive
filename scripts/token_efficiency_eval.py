@@ -104,6 +104,19 @@ def prepare_large_file_case(workspace: Path) -> None:
     (workspace / "docs" / "large.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def prepare_code_symbol_case(workspace: Path) -> None:
+    before = "\n\n".join(f"def helper_before_{index}():\n    return {index}" for index in range(220))
+    after = "\n\n".join(f"def helper_after_{index}():\n    return {index}" for index in range(220))
+    target = (
+        "def calculate_discount(cart, percentage):\n"
+        "    subtotal = sum(item['price'] for item in cart)\n"
+        "    marker = 'TOKEN_SYMBOL_750'\n"
+        "    discount = subtotal * percentage\n"
+        "    return marker if discount >= 0 else 'BAD'\n"
+    )
+    (workspace / "src" / "large_pricing.py").write_text(f"{before}\n\n{target}\n\n{after}\n", encoding="utf-8")
+
+
 def validate_token_read(stdout: str, session: dict[str, Any], workspace: Path) -> str:
     reads = tool_results(session, "read_file")
     return "pass" if any(item.get("ok") for item in reads) and "TOKEN_42" in stdout else "fail"
@@ -182,6 +195,18 @@ def validate_large_file(stdout: str, session: dict[str, Any], workspace: Path) -
     return "pass" if targeted and any("NEEDLE_FAST_250" in str(item.get("output", "")) for item in reads) and "NEEDLE_FAST_250" in stdout else "fail"
 
 
+def validate_code_symbol_navigation(stdout: str, session: dict[str, Any], workspace: Path) -> str:
+    calls = tool_calls(session)
+    symbol_reads = tool_results(session, "read_symbol")
+    if "read_file" in calls:
+        return "fail"
+    if "search_symbols" not in calls or "read_symbol" not in calls:
+        return "fail"
+    if not any(item.get("ok") and "TOKEN_SYMBOL_750" in str(item.get("output", "")) for item in symbol_reads):
+        return "fail"
+    return "pass" if "TOKEN_SYMBOL_750" in stdout else "fail"
+
+
 @dataclass(frozen=True)
 class EvalCase:
     name: str
@@ -243,6 +268,12 @@ CASES = [
         prompt="Use read_file on docs/large.md with the smallest useful line range around line 250, then reply with the exact marker token on that line only.",
         validate=validate_large_file,
         prepare=prepare_large_file_case,
+    ),
+    EvalCase(
+        name="large_code_symbol_navigation",
+        prompt="Use search_symbols to find calculate_discount in src/large_pricing.py. Then use read_symbol on the exact match. Do not use read_file. Reply with the uppercase TOKEN_SYMBOL marker from that symbol only.",
+        validate=validate_code_symbol_navigation,
+        prepare=prepare_code_symbol_case,
     ),
     EvalCase(
         name="verifier_rewrite_recovery",

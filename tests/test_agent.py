@@ -98,7 +98,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
             result = agent.handle_user("Summarize note.txt")
 
         self.assertEqual(result.message, "The file says hello world.")
@@ -139,12 +139,13 @@ class AgentTests(unittest.TestCase):
             root = Path(tmp)
             client = FakeClient([])
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         prompt = agent.messages[0]["content"]
         self.assertIn("Question your assumptions before acting.", prompt)
         self.assertIn("prove or disprove it with the available tools", prompt)
         self.assertIn("Do not guess about workspace contents", prompt)
+        self.assertIn("prefer search_symbols, code_outline, then read_symbol before broad read_file", prompt)
 
     def test_system_prompt_enables_caveman_lite_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -859,7 +860,7 @@ class AgentTests(unittest.TestCase):
             (root / "docs" / "large.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
             client = FakeClient(['{"type":"tool","name":"read_file","arguments":{"path":"docs/large.md"}}'])
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
             result = agent.handle_user(
                 "Use read_file on docs/large.md with the smallest useful line range around line 250, then reply with the exact marker token on that line only."
@@ -880,7 +881,7 @@ class AgentTests(unittest.TestCase):
                 ]
             )
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
             exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
 
             result = agent.handle_user(
@@ -1315,3 +1316,39 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(run_test_results[0]["result"]["ok"])
         diff_results = [event for event in events if event["type"] == "tool_result" and event["name"] == "git_diff"]
         self.assertIn("multiply", diff_results[0]["result"]["output"])
+
+    def test_agent_can_use_symbol_tools_instead_of_full_file_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            filler = "\n\n".join(f"def filler_{index}():\n    return {index}" for index in range(160))
+            (root / "src" / "large_pricing.py").write_text(
+                f"{filler}\n\n"
+                "def calculate_discount(cart, percentage):\n"
+                "    marker = 'TOKEN_SYMBOL_750'\n"
+                "    return marker\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"search_symbols","arguments":{"query":"calculate_discount","path":"src"}}',
+                    '{"type":"tool","name":"read_symbol","arguments":{"path":"src/large_pricing.py","symbol":"calculate_discount","include_context":0}}',
+                    '{"type":"final","message":"TOKEN_SYMBOL_750"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Use search_symbols to find calculate_discount in src/large_pricing.py. Then use read_symbol on the exact match. Do not use read_file. Reply with the uppercase TOKEN_SYMBOL marker from that symbol only."
+            )
+
+        self.assertEqual(result.message, "TOKEN_SYMBOL_750")
+        self.assertEqual(len(client.calls), 2)
+        self.assertFalse(any(event["type"] == "assumption_audit" for event in agent.events))
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search_symbols", "read_symbol"])
+        symbol_results = [event for event in agent.events if event["type"] == "tool_result" and event["name"] == "read_symbol"]
+        self.assertIn("TOKEN_SYMBOL_750", symbol_results[0]["result"]["output"])
+        self.assertNotIn("filler_0", symbol_results[0]["result"]["output"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))

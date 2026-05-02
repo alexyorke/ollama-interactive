@@ -44,6 +44,31 @@ Added general model-path compaction:
 - Normal coding turns send system prompt, recent bounded transcript, pinned current request if needed, and a compact omission marker.
 - Long non-system messages sent to the primary model are capped; full raw transcript and events remain saved.
 
+## Code-Aware Navigation
+
+Added code navigation tools so broad code work can avoid `grep` plus full-file reads:
+
+- `search_symbols(query, path='.', limit=50)` finds definitions by symbol name.
+- `code_outline(path, max_symbols=120)` returns imports plus symbol names and line ranges, not bodies.
+- `read_symbol(path, symbol, include_context=2)` reads one function/class/method body by AST range for Python, with generic regex fallback for JS/TS-like files.
+- Symbol scans prune dependency/cache folders such as `node_modules`, `.git`, `dist`, `build`, `.venv`, and `__pycache__`.
+- Extra hallucinated tool arguments are ignored when required arguments are present; this fixed a real `gemma3:4b` loop where `read_symbol` was called repeatedly with unused `start/end`.
+- Exact uppercase token answers from `read_symbol` are synthesized by the controller, avoiding a final model call after the relevant symbol body is already proven.
+- Explicit low-risk symbol tools skip assumption auditing even when the prompt forbids unrelated tools such as `read_file`; deterministic forbidden-tool enforcement still runs first.
+
+Large code symbol eval uses a synthetic `src/large_pricing.py` with 440 filler functions around the target function. Prompt requires `search_symbols` then `read_symbol`, forbids `read_file`, and asks for a marker inside the target symbol only.
+
+| Model | Debate | Status | LLM calls | Prompt tokens | Output tokens | Latency |
+|---|---|---|---:|---:|---:|---:|
+| `gemma3:4b` | off | pass | 2 | 1,902 | 83 | 15.67s |
+| `gemma3:4b` | on | pass | 2 | 1,898 | 83 | 13.23s |
+| `qwen3:8b` | off | pass | 2 | 1,668 | 63 | 21.93s |
+| `qwen3:8b` | on | pass | 2 | 1,686 | 113 | 26.22s |
+| `granite4.1:8b` | off | pass | 2 | 1,622 | 63 | 27.88s |
+| `granite4.1:8b` | on | pass | 2 | 1,624 | 58 | 20.98s |
+
+Regression caught during development: before extra-argument recovery and `read_symbol` synthesis, `gemma3:4b` debate-off failed after 12 LLM calls and 18,379 prompt tokens on this same symbol task. After the fix it passes in 2 calls and 1,902 prompt tokens.
+
 ## Aggregate Prompt Tokens
 
 | Model | Verifier | Debate | Baseline prompt | Optimized prompt | Delta | LLM calls before -> after | Pass before -> after |
@@ -71,15 +96,18 @@ Added general model-path compaction:
 
 - Added `llm_call` events with Ollama token/duration metrics and purpose-level aggregation.
 - Added deterministic grounded finalizers for exact token reads, path errors, exact shell summaries, git diff `return X`, `run_test`, and targeted line reads.
+- Added symbol-aware navigation and exact-token synthesis from symbol bodies.
 - Added recovery for JSON-string-wrapped payloads and exact `run_shell execute exactly:` prompts.
+- Added recovery for extra hallucinated tool arguments when required arguments are valid.
 - Normalized vague `run_test` calls to configured test command.
 - Compressed system/tool/verifier/auditor prompts and tool-result feedback.
-- Switched debate-on audit gating to skip explicit low-risk reads while still auditing shell, tests, git, subagents, mutations, failures, and constrained turns.
+- Switched debate-on audit gating to skip explicit low-risk reads and symbol tools while still auditing shell, tests, git, subagents, mutations, failures, and ambiguous turns.
 
 ## Validation
 
-- `python -m unittest discover -v`: 138 passed, 3 skipped.
+- `python -m unittest discover -v`: 145 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
-- `scripts/token_efficiency_eval.py --strict-accuracy`: 70/70 passed; no pass-to-fail regressions; second pass reduced explicit-tool corpus to zero LLM calls.
+- Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
+- `scripts/token_efficiency_eval.py --strict-accuracy`: 77/77 passed; no pass-to-fail regressions; explicit-tool corpus remains zero LLM calls and large-code symbol navigation passes in 2 LLM calls.
 - `scripts/verification_eval.py --strict-on`: passed on `gemma3:4b`, `qwen3:8b`, and `granite4.1:8b`.
 - `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed.

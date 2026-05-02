@@ -7,6 +7,7 @@ It gives the model a guarded tool loop for:
 - listing files
 - reading files
 - searching the workspace
+- searching code symbols, showing compact code outlines, and reading exact function/class bodies
 - writing or replacing file content
 - running shell commands
 - running a configured test command
@@ -302,6 +303,7 @@ git push origin v0.1.0
 - Explicit forbidden-tool constraints such as `do not use read_file` are enforced before tool execution.
 - Tool-heavy turns run with thinking disabled by default to cut latency and token use. Simple non-tool turns still use the normal Ollama thinking path.
 - Repeated read-only tool calls in one user turn are cached, and only compact tool-result summaries are fed back into the model. Full raw tool results still stay in the transcript and event log.
+- Code navigation tools (`search_symbols`, `code_outline`, `read_symbol`) let the model inspect relevant functions/classes instead of reading full files. Python uses AST ranges; other common code files use a lightweight definition fallback.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
 - The recommended serial eval order is `gemma3:4b`, `qwen3:8b`, `granite4.1:8b`, then `gemma4:e4b`.

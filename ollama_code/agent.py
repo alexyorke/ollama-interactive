@@ -34,6 +34,7 @@ Rules:
 - Use at most one tool call per response.
 - Prefer inspecting files before editing them.
 - For broad repo questions, prefer search or list_files before read_file.
+- For code questions/edits, prefer search_symbols, code_outline, then read_symbol before broad read_file.
 - For read_file, request narrow start/end ranges.
 - Reuse recent tool results already in the conversation when they still answer the question. Avoid repeating identical read-only tools unless state changed.
 - Question your assumptions before acting.
@@ -104,12 +105,15 @@ CANDIDATE_CLAIM_TEXT_LIMIT = 220
 VERIFICATION_EVIDENCE_LIMIT = 4
 VERIFICATION_EVIDENCE_TEXT_LIMIT = 180
 MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "git_commit"}
-READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "git_status", "git_diff"}
+READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "git_status", "git_diff"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 MODEL_TOOL_RESULT_LIMITS = {
     "list_files": 700,
     "read_file": 1200,
     "search": 900,
+    "search_symbols": 900,
+    "code_outline": 1200,
+    "read_symbol": 1400,
     "git_status": 1000,
     "git_diff": 1200,
     "run_shell": 900,
@@ -1306,6 +1310,9 @@ class OllamaCodeAgent:
             "helper agent",
             "run_agent",
             "run_test",
+            "code_outline",
+            "read_symbol",
+            "search_symbols",
         ]
         if any(phrase in lowered for phrase in tool_phrases):
             return True
@@ -1713,14 +1720,16 @@ class OllamaCodeAgent:
             return True
         if name in MUTATING_TOOL_NAMES or name in {"run_shell", "run_test", "run_agent", "git_status", "git_diff"}:
             return True
-        if forbidden_tool_names:
-            return True
-        if name in {"read_file", "list_files", "search"}:
+        if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol"}:
             if self._request_explicitly_requests_tool(request_text, name):
                 return False
+            if forbidden_tool_names:
+                return True
             if re.search(r"\bread\b", request_text, flags=re.IGNORECASE) and name != "read_file":
                 return True
             return self._request_is_broad_or_ambiguous(request_text)
+        if forbidden_tool_names:
+            return True
         return True
 
     def _synthesize_final_from_tool_result(
@@ -1742,12 +1751,14 @@ class OllamaCodeAgent:
         if missing_required:
             return None
 
-        if name == "read_file" and result.get("ok") is True:
+        if name in {"read_file", "read_symbol"} and result.get("ok") is True:
             output = str(result.get("output", ""))
             if expected_exact_reply_text is not None and expected_exact_reply_text in output:
                 return expected_exact_reply_text
             if self._request_asks_token_only(request_text):
                 if self._request_mentions_repeated_read(request_text):
+                    if name != "read_file":
+                        return None
                     read_count = sum(1 for item in successful_tool_results if item.get("name") == "read_file")
                     if read_count < 2:
                         return None

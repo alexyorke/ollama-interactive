@@ -138,6 +138,131 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("beta.txt:1:needle here", result["output"])
 
+    def test_code_outline_returns_python_symbols_without_bodies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "service.py").write_text(
+                "import math\n\n"
+                "class PricingService:\n"
+                "    def calculate_total(self, subtotal, tax):\n"
+                "        hidden_body_marker = subtotal + tax\n"
+                "        return hidden_body_marker\n\n"
+                "def helper(value):\n"
+                "    return math.ceil(value)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.code_outline("src/service.py")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("class PricingService", result["output"])
+        self.assertIn("PricingService.calculate_total", result["output"])
+        self.assertIn("function helper", result["output"])
+        self.assertIn("imports: import math", result["output"])
+        self.assertNotIn("hidden_body_marker", result["output"])
+
+    def test_search_symbols_and_read_symbol_target_large_python_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            filler = "\n\n".join(f"def filler_{index}():\n    return {index}" for index in range(120))
+            target_body = (
+                "def calculate_discount(cart, percentage):\n"
+                "    subtotal = sum(item['price'] for item in cart)\n"
+                "    discount = subtotal * percentage\n"
+                "    return max(0, subtotal - discount)\n"
+            )
+            (root / "src" / "pricing.py").write_text(f"{filler}\n\n{target_body}\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            search = tools.search_symbols("calculate_discount", path="src")
+            read = tools.read_symbol("src/pricing.py", "calculate_discount", include_context=0)
+
+        self.assertTrue(search["ok"])
+        self.assertIn("src/pricing.py", search["output"])
+        self.assertIn("calculate_discount", search["output"])
+        self.assertTrue(read["ok"])
+        self.assertIn("subtotal = sum", read["output"])
+        self.assertNotIn("filler_0", read["output"])
+        self.assertLess(len(read["output"]), 400)
+
+    def test_symbol_search_prunes_dependency_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "node_modules" / "pkg").mkdir(parents=True)
+            (root / "src" / "app.py").write_text("def real_target():\n    return 1\n", encoding="utf-8")
+            (root / "node_modules" / "pkg" / "bad.py").write_text("def real_target_dependency():\n    return 2\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.search_symbols("real_target")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("src/app.py", result["output"])
+        self.assertNotIn("node_modules", result["output"])
+
+    def test_read_symbol_reports_ambiguous_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "models.py").write_text(
+                "class Alpha:\n"
+                "    def save(self):\n"
+                "        return 'a'\n\n"
+                "class Beta:\n"
+                "    def save(self):\n"
+                "        return 'b'\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            ambiguous = tools.read_symbol("models.py", "save")
+            precise = tools.read_symbol("models.py", "Beta.save", include_context=0)
+
+        self.assertFalse(ambiguous["ok"])
+        self.assertIn("Ambiguous", ambiguous["summary"])
+        self.assertIn("Alpha.save", ambiguous["matches"])
+        self.assertTrue(precise["ok"])
+        self.assertIn("return 'b'", precise["output"])
+
+    def test_execute_ignores_extra_tool_arguments_when_required_args_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pricing.py").write_text(
+                "def calculate_discount():\n"
+                "    return 'TOKEN_SYMBOL_750'\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.execute(
+                "read_symbol",
+                {"path": "pricing.py", "symbol": "calculate_discount", "start": 1, "end": 20},
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("TOKEN_SYMBOL_750", result["output"])
+
+    def test_code_outline_supports_generic_javascript_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "web.js").write_text(
+                "export class Widget {\n"
+                "  render() { return '<div></div>'; }\n"
+                "}\n\n"
+                "export function hydrateWidget() {\n"
+                "  return new Widget();\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            outline = tools.code_outline("web.js")
+            symbol = tools.read_symbol("web.js", "hydrateWidget", include_context=0)
+
+        self.assertTrue(outline["ok"])
+        self.assertIn("class Widget", outline["output"])
+        self.assertIn("function hydrateWidget", outline["output"])
+        self.assertTrue(symbol["ok"])
+        self.assertIn("new Widget", symbol["output"])
+
     def test_run_shell_returns_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")

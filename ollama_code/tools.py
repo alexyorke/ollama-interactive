@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import difflib
+import inspect
 import json
 import os
 import re
@@ -18,6 +20,20 @@ ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
 WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
+CODE_FILE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".cs", ".rb", ".php"}
+SKIP_CODE_DIRS = {
+    ".git",
+    ".hg",
+    ".svn",
+    ".mypy_cache",
+    ".pytest_cache",
+    "__pycache__",
+    "node_modules",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+}
 
 
 TOOL_DESCRIPTIONS = [
@@ -35,6 +51,21 @@ TOOL_DESCRIPTIONS = [
         "name": "search",
         "arguments": {"query": "regex or plain text", "path": "relative path, default .", "limit": "int, default 100"},
         "description": "Search text in the workspace.",
+    },
+    {
+        "name": "search_symbols",
+        "arguments": {"query": "symbol name regex/text", "path": "relative path, default .", "limit": "int, default 50"},
+        "description": "Search code symbols by name without reading full files.",
+    },
+    {
+        "name": "code_outline",
+        "arguments": {"path": "file or directory", "max_symbols": "int, default 120"},
+        "description": "Show compact code symbols and line ranges without function bodies.",
+    },
+    {
+        "name": "read_symbol",
+        "arguments": {"path": "code file", "symbol": "name or qualified name", "include_context": "lines around symbol, default 2"},
+        "description": "Read one code symbol body by AST/definition range.",
     },
     {
         "name": "write_file",
@@ -107,6 +138,9 @@ def format_compact_tool_help() -> str:
         "list_files": "list_files(path='.', max_depth=4, limit=200)",
         "read_file": "read_file(path, start=1, end=200)",
         "search": "search(query, path='.', limit=100)",
+        "search_symbols": "search_symbols(query, path='.', limit=50)",
+        "code_outline": "code_outline(path, max_symbols=120)",
+        "read_symbol": "read_symbol(path, symbol, include_context=2)",
         "write_file": "write_file(path, content)",
         "replace_in_file": "replace_in_file(path, old, new, replace_all=false, match_whole_word=false)",
         "run_shell": "run_shell(command, cwd='.', timeout=30)",
@@ -146,6 +180,18 @@ class ToolExecutor:
     def set_test_command(self, command: str | None) -> None:
         self.default_test_command = command.strip() if isinstance(command, str) and command.strip() else None
 
+    def _call_tool_handler(self, handler: Callable[..., dict[str, Any]], arguments: dict[str, Any]) -> dict[str, Any]:
+        signature = inspect.signature(handler)
+        if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+            return handler(**arguments)
+        accepted = {
+            name
+            for name, parameter in signature.parameters.items()
+            if parameter.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+        }
+        filtered = {key: value for key, value in arguments.items() if key in accepted}
+        return handler(**filtered)
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name == "run_agent":
             if self.agent_runner is None:
@@ -162,6 +208,9 @@ class ToolExecutor:
             "list_files": self.list_files,
             "read_file": self.read_file,
             "search": self.search,
+            "search_symbols": self.search_symbols,
+            "code_outline": self.code_outline,
+            "read_symbol": self.read_symbol,
             "write_file": self.write_file,
             "replace_in_file": self.replace_in_file,
             "run_shell": self.run_shell,
@@ -174,7 +223,7 @@ class ToolExecutor:
         if handler is None:
             return {"ok": False, "tool": name, "summary": f"Unknown tool: {name}"}
         try:
-            return handler(**arguments)
+            return self._call_tool_handler(handler, arguments)
         except OperationInterrupted:
             return {"ok": False, "tool": name, "summary": "Interrupted by user.", "interrupted": True}
         except TypeError as exc:
@@ -475,6 +524,224 @@ class ToolExecutor:
             "tool": "search",
             "path": self.relative_label(base),
             "output": "\n".join(matches) if matches else "(no matches)",
+        }
+
+    def _is_code_file(self, path: Path) -> bool:
+        return path.suffix.lower() in CODE_FILE_SUFFIXES and not any(part in SKIP_CODE_DIRS for part in path.parts)
+
+    def _iter_code_files(self, base: Path, *, limit: int = 200) -> list[Path]:
+        if base.is_file():
+            return [base] if self._is_code_file(base) else []
+        files: list[Path] = []
+        for root, dirs, names in os.walk(base):
+            self._check_interrupted()
+            dirs[:] = sorted(directory for directory in dirs if directory not in SKIP_CODE_DIRS)
+            if len(files) >= limit:
+                break
+            root_path = Path(root)
+            for name in sorted(names):
+                if len(files) >= limit:
+                    break
+                file_path = root_path / name
+                if not self._is_code_file(file_path):
+                    continue
+                files.append(file_path)
+        return files
+
+    def _python_signature(self, lines: list[str], start: int) -> str:
+        collected: list[str] = []
+        paren_balance = 0
+        for line in lines[start - 1 : min(len(lines), start + 6)]:
+            stripped = line.strip()
+            collected.append(stripped)
+            paren_balance += stripped.count("(") - stripped.count(")")
+            if stripped.endswith(":") and paren_balance <= 0:
+                break
+        signature = " ".join(collected)
+        return signature[:180] + ("..." if len(signature) > 180 else "")
+
+    def _python_symbols(self, target: Path, text: str) -> list[dict[str, Any]]:
+        lines = text.splitlines()
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:
+            return []
+        symbols: list[dict[str, Any]] = []
+
+        def visit(node: ast.AST, stack: list[str]) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    kind = "class" if isinstance(child, ast.ClassDef) else ("method" if stack and stack[-1][:1].isupper() else "function")
+                    qualname = ".".join([*stack, child.name])
+                    symbols.append(
+                        {
+                            "name": child.name,
+                            "qualname": qualname,
+                            "kind": kind,
+                            "start": int(getattr(child, "lineno", 1)),
+                            "end": int(getattr(child, "end_lineno", getattr(child, "lineno", 1))),
+                            "signature": self._python_signature(lines, int(getattr(child, "lineno", 1))),
+                            "doc": (ast.get_docstring(child) or "").strip().splitlines()[0][:120] if ast.get_docstring(child) else "",
+                        }
+                    )
+                    visit(child, [*stack, child.name])
+                else:
+                    visit(child, stack)
+        visit(tree, [])
+        return symbols
+
+    def _generic_symbol_end(self, lines: list[str], start_index: int, indent: int) -> int:
+        first = lines[start_index]
+        if "{" in first:
+            balance = 0
+            for index in range(start_index, min(len(lines), start_index + 220)):
+                balance += lines[index].count("{") - lines[index].count("}")
+                if index > start_index and balance <= 0:
+                    return index + 1
+        for index in range(start_index + 1, min(len(lines), start_index + 220)):
+            line = lines[index]
+            if not line.strip():
+                continue
+            current_indent = len(line) - len(line.lstrip())
+            if current_indent <= indent and re.match(r"\s*(?:def|class|function|async function|export |const |let |var )", line):
+                return index
+        return min(len(lines), start_index + 80)
+
+    def _generic_symbols(self, target: Path, text: str) -> list[dict[str, Any]]:
+        patterns = [
+            ("class", re.compile(r"^\s*(?:export\s+)?class\s+(?P<name>[A-Za-z_][\w]*)")),
+            ("function", re.compile(r"^\s*(?:export\s+)?(?:async\s+)?function\s+(?P<name>[A-Za-z_][\w]*)")),
+            ("function", re.compile(r"^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name>[A-Za-z_][\w]*)\s*=\s*(?:async\s*)?\(")),
+            ("function", re.compile(r"^\s*def\s+(?P<name>[A-Za-z_][\w]*)\s*\(")),
+            ("class", re.compile(r"^\s*class\s+(?P<name>[A-Za-z_][\w]*)")),
+        ]
+        lines = text.splitlines()
+        symbols: list[dict[str, Any]] = []
+        for index, line in enumerate(lines):
+            for kind, pattern in patterns:
+                match = pattern.search(line)
+                if not match:
+                    continue
+                indent = len(line) - len(line.lstrip())
+                name = match.group("name")
+                symbols.append(
+                    {
+                        "name": name,
+                        "qualname": name,
+                        "kind": kind,
+                        "start": index + 1,
+                        "end": self._generic_symbol_end(lines, index, indent),
+                        "signature": line.strip()[:180],
+                        "doc": "",
+                    }
+                )
+                break
+        return symbols
+
+    def _code_symbols(self, target: Path) -> tuple[list[dict[str, Any]], str, str | None]:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        if target.suffix.lower() == ".py":
+            symbols = self._python_symbols(target, text)
+            if symbols:
+                return symbols, text, None
+        symbols = self._generic_symbols(target, text)
+        return symbols, text, None
+
+    def search_symbols(self, query: str, path: str = ".", limit: int = 50) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        try:
+            pattern = re.compile(query, flags=re.IGNORECASE)
+            matcher = lambda text: bool(pattern.search(text))
+        except re.error:
+            lowered = query.lower()
+            matcher = lambda text: lowered in text.lower()
+        matches: list[str] = []
+        for file_path in self._iter_code_files(base):
+            symbols, _, _ = self._code_symbols(file_path)
+            for symbol in symbols:
+                haystack = " ".join(
+                    str(symbol.get(key, ""))
+                    for key in ("name", "qualname", "kind", "signature")
+                )
+                if not matcher(haystack):
+                    continue
+                matches.append(
+                    f"{self.relative_label(file_path)}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']} {symbol['signature']}"
+                )
+                if len(matches) >= limit:
+                    return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches)}
+        return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches) if matches else "(no symbols found)"}
+
+    def code_outline(self, path: str, max_symbols: int = 120) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        files = self._iter_code_files(base, limit=80)
+        output: list[str] = []
+        count = 0
+        for file_path in files:
+            symbols, text, _ = self._code_symbols(file_path)
+            imports: list[str] = []
+            if file_path.suffix.lower() == ".py":
+                for line in text.splitlines()[:80]:
+                    stripped = line.strip()
+                    if stripped.startswith(("import ", "from ")):
+                        imports.append(stripped)
+                    if len(imports) >= 8:
+                        break
+            output.append(f"{self.relative_label(file_path)}")
+            if imports:
+                output.append("  imports: " + "; ".join(imports))
+            for symbol in symbols:
+                output.append(
+                    f"  {symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']}: {symbol['signature']}"
+                )
+                count += 1
+                if count >= max_symbols:
+                    output.append("  ... symbols truncated ...")
+                    return {"ok": True, "tool": "code_outline", "path": self.relative_label(base), "count": count, "output": "\n".join(output)}
+            if not symbols:
+                output.append("  (no symbols found)")
+        return {"ok": True, "tool": "code_outline", "path": self.relative_label(base), "count": count, "output": "\n".join(output) if output else "(no code files found)"}
+
+    def read_symbol(self, path: str, symbol: str, include_context: int = 2) -> dict[str, Any]:
+        self._check_interrupted()
+        target = self.resolve_path(path, allow_missing=False)
+        if target.is_dir():
+            return {"ok": False, "tool": "read_symbol", "summary": f"{path} is a directory."}
+        if not self._is_code_file(target):
+            return {"ok": False, "tool": "read_symbol", "summary": f"{path} is not a supported code file."}
+        symbols, text, _ = self._code_symbols(target)
+        needle = symbol.strip()
+        exact = [
+            item
+            for item in symbols
+            if item["qualname"] == needle or item["name"] == needle
+        ]
+        if not exact:
+            lowered = needle.lower()
+            exact = [item for item in symbols if lowered in str(item["qualname"]).lower() or lowered in str(item["name"]).lower()]
+        if not exact:
+            return {"ok": False, "tool": "read_symbol", "path": self.relative_label(target), "summary": f"Symbol not found: {symbol}"}
+        if len(exact) > 1:
+            matches = "\n".join(f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}" for item in exact[:20])
+            return {"ok": False, "tool": "read_symbol", "path": self.relative_label(target), "summary": f"Ambiguous symbol: {symbol}", "matches": matches}
+        found = exact[0]
+        lines = text.splitlines()
+        context = max(0, int(include_context))
+        start = max(1, int(found["start"]) - context)
+        end = min(len(lines), int(found["end"]) + context)
+        selected = lines[start - 1 : end]
+        rendered = [f"{index:4d} | {line}" for index, line in enumerate(selected, start=start)]
+        return {
+            "ok": True,
+            "tool": "read_symbol",
+            "path": self.relative_label(target),
+            "symbol": found["qualname"],
+            "kind": found["kind"],
+            "start": start,
+            "end": end,
+            "output": "\n".join(rendered) if rendered else "(empty symbol)",
         }
 
     def git_status(self, path: str | None = None) -> dict[str, Any]:
