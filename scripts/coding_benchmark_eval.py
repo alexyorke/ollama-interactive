@@ -738,6 +738,8 @@ def evaluate_case(
         started = time.perf_counter()
         for index, prompt in enumerate(case.turns):
             extra_args = ["--debate", mode, "--quiet"]
+            if mode == "on":
+                extra_args.extend(["--max-tool-rounds", "24"])
             if verifier_model:
                 extra_args.extend(["--verifier-model", verifier_model])
             if case.test_cmd:

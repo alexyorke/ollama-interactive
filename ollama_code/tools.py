@@ -876,6 +876,22 @@ class ToolExecutor:
             start = index + len(old)
         return whole_word_matches > 0 and embedded_matches > 0
 
+    def _leading_whitespace_flexible_pattern(self, old: str) -> re.Pattern[str] | None:
+        if not old.strip():
+            return None
+        lines = old.split("\n")
+        if not any(re.match(r"^[ \t]+\S", line) for line in lines):
+            return None
+        parts: list[str] = []
+        for index, line in enumerate(lines):
+            match = re.match(r"^[ \t]+(\S.*)$", line)
+            if match:
+                prefix = r"(?m)^" if index == 0 else ""
+                parts.append(prefix + r"[ \t]*" + re.escape(match.group(1)))
+            else:
+                parts.append(re.escape(line))
+        return re.compile("\n".join(parts))
+
     def replace_in_file(
         self,
         path: str,
@@ -890,7 +906,14 @@ class ToolExecutor:
             pattern = re.compile(rf"\b{re.escape(old)}\b")
             count = len(pattern.findall(original))
         else:
-            count = original.count(old)
+            pattern = self._leading_whitespace_flexible_pattern(old)
+            if pattern is not None:
+                count = len(pattern.findall(original))
+                if count == 0:
+                    pattern = None
+                    count = original.count(old)
+            else:
+                count = original.count(old)
         if count == 0:
             return {"ok": False, "tool": "replace_in_file", "path": self.relative_label(target), "summary": "Target text was not found."}
         if not replace_all and count != 1:
@@ -909,7 +932,10 @@ class ToolExecutor:
             }
         if match_whole_word:
             limit = 0 if replace_all else 1
-            updated = pattern.sub(new, original, count=limit)
+            updated = pattern.sub(lambda _match: new, original, count=limit)
+        elif pattern is not None:
+            limit = 0 if replace_all else 1
+            updated = pattern.sub(lambda _match: new, original, count=limit)
         else:
             updated = original.replace(old, new) if replace_all else original.replace(old, new, 1)
         relative_path = self.relative_label(target)

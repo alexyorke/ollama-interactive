@@ -308,6 +308,26 @@ class AgentTests(unittest.TestCase):
         audits = [event for event in agent.events if event["type"] == "assumption_audit"]
         self.assertEqual(len(audits), 0)
 
+    def test_agent_skips_assumption_audit_for_grounded_replacement(self) -> None:
+        root = self._workspace_scratch()
+        (root / "sample.py").write_text("def f():\n    return 'old'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"sample.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"sample.py","old":"   return \'old\'","new":"    return \'new\'"}}',
+                '{"type":"final","message":"updated sample.py"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Inspect sample.py, change f to return 'new', and summarize.")
+
+        self.assertEqual(result.message, "updated sample.py")
+        self.assertEqual((root / "sample.py").read_text(encoding="utf-8"), "def f():\n    return 'new'\n")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 0)
+
     def test_final_verifier_receives_evidence_without_low_risk_audit(self) -> None:
         root = self._workspace_scratch()
         (root / "note.txt").write_text("hello\n", encoding="utf-8")

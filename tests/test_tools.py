@@ -87,6 +87,32 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(final_text, "live smoke passed\n")
 
+    def test_replace_tolerates_leading_whitespace_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "sample.py"
+            sample.write_text("def f():\n    return 'old'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_in_file("sample.py", "   return 'old'", "    return 'new'")
+            final_text = sample.read_text(encoding="utf-8")
+        self.assertTrue(result["ok"])
+        self.assertEqual(final_text, "def f():\n    return 'new'\n")
+
+    def test_replace_regex_fallback_inserts_backslashes_literally(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "sample.py"
+            sample.write_text("def f(value):\n    return value.strip().lower()\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_in_file(
+                "sample.py",
+                "   return value.strip().lower()",
+                "    return re.sub(r'\\s+', '-', value.strip().lower())",
+            )
+            final_text = sample.read_text(encoding="utf-8")
+        self.assertTrue(result["ok"])
+        self.assertIn("r'\\s+'", final_text)
+
     def test_read_only_blocks_mutations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="read-only")

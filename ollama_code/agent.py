@@ -1731,18 +1731,63 @@ class OllamaCodeAgent:
             return True
         return "repo" in lowered and not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)
 
+    def _tool_output_without_line_prefixes(self, text: str) -> str:
+        return "\n".join(re.sub(r"^\s*\d+\s+\|\s?", "", line) for line in text.splitlines())
+
+    def _leading_whitespace_insensitive_contains(self, haystack: str, needle: str) -> bool:
+        if needle in haystack:
+            return True
+        stripped_haystack = self._tool_output_without_line_prefixes(haystack)
+        if needle in stripped_haystack:
+            return True
+        normalized_haystack = "\n".join(line.lstrip() for line in stripped_haystack.splitlines())
+        normalized_needle = "\n".join(line.lstrip() for line in needle.splitlines())
+        return bool(normalized_needle.strip()) and normalized_needle in normalized_haystack
+
+    def _tool_call_grounded_by_successful_evidence(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        if name != "replace_in_file":
+            return False
+        path = str(arguments.get("path", "")).strip().replace("\\", "/")
+        old = str(arguments.get("old", ""))
+        if not path or not old.strip():
+            return False
+        for item in reversed(successful_tool_results):
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if item.get("name") not in {"read_file", "read_symbol"} or result.get("ok") is not True:
+                continue
+            result_path = str(result.get("path") or item.get("arguments", {}).get("path") or "").strip().replace("\\", "/")
+            if result_path and result_path != path:
+                continue
+            if self._leading_whitespace_insensitive_contains(str(result.get("output", "")), old):
+                return True
+        return False
+
     def _tool_call_needs_assumption_audit(
         self,
         *,
         request_text: str,
         name: str,
+        arguments: dict[str, Any],
         normalization_reason: str | None,
         cache_hit: bool,
         failed_tool_this_turn: bool,
         session_memory_request: bool,
         forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
     ) -> bool:
         if not self.debate_enabled or normalization_reason is not None or cache_hit or session_memory_request:
+            return False
+        if not forbidden_tool_names and self._tool_call_grounded_by_successful_evidence(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results,
+        ):
             return False
         if failed_tool_this_turn:
             return True
@@ -2592,11 +2637,13 @@ class OllamaCodeAgent:
                 if self._tool_call_needs_assumption_audit(
                     request_text=text,
                     name=name,
+                    arguments=arguments,
                     normalization_reason=normalization_reason,
                     cache_hit=cache_hit,
                     failed_tool_this_turn=failed_tool_this_turn,
                     session_memory_request=session_memory_request,
                     forbidden_tool_names=forbidden_tool_names,
+                    successful_tool_results=successful_tool_results,
                 ):
                     audit_decision = self._audit_tool_candidate(
                         request_text=text,
