@@ -42,3 +42,11 @@ class ParserTests(unittest.TestCase):
                 "rewrite_from_evidence": True,
             },
         )
+
+    def test_extracts_json_string_wrapped_agent_payload(self) -> None:
+        payload = extract_json_response('"{\\"type\\":\\"tool\\",\\"name\\":\\"run_shell\\",\\"arguments\\":{\\"command\\":\\"echo hi\\"}}"')
+        self.assertEqual(payload, {"type": "tool", "name": "run_shell", "arguments": {"command": "echo hi"}})
+
+    def test_extracts_json_string_wrapped_verifier_payload(self) -> None:
+        payload = extract_json_response('"{\\"verdict\\":\\"accept\\"}"')
+        self.assertEqual(payload, {"verdict": "accept"})

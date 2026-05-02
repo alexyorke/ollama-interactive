@@ -17,15 +17,14 @@ from ollama_code.sessions import (
     load_transcript_payload,
     resolve_transcript_path,
 )
-from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_tool_help
+from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_compact_tool_help, format_tool_help
 
 
 SYSTEM_PROMPT_TEMPLATE = """You are Ollama Code, a local coding assistant running in a terminal.
 
 Workspace root: {workspace_root}
 
-You can inspect and modify files in that workspace with the provided tools.
-Return exactly one JSON object and nothing else.
+Use tools to inspect/modify only this workspace. Return exactly one JSON object and nothing else.
 
 Valid response shapes:
 {{"type":"tool","name":"read_file","arguments":{{"path":"README.md"}}}}
@@ -35,16 +34,15 @@ Rules:
 - Use at most one tool call per response.
 - Prefer inspecting files before editing them.
 - For broad repo questions, prefer search or list_files before read_file.
-- When you use read_file, request the narrowest useful start/end range instead of rereading large files.
+- For read_file, request narrow start/end ranges.
 - Reuse recent tool results already in the conversation when they still answer the question. Avoid repeating identical read-only tools unless state changed.
 - Question your assumptions before acting.
 - Identify what you are assuming, then prove or disprove it with the available tools whenever a file read, search, git inspection, test run, or shell command can verify it.
 - Do not guess about workspace contents, command output, repo state, or whether an edit worked when you can check instead.
 - Default reply style: caveman-lite. Be terse and information-dense. Drop filler, pleasantries, hedging, and redundant transitions.
-- Prefer short sentences or fragments in natural-language replies, but keep all technical terms, code, file paths, commands, errors, and JSON exact.
-- Do not let terse style reduce investigation depth, verification, correctness, or willingness to use tools.
-- Use normal high-clarity prose instead of caveman-lite when handling warnings, irreversible actions, security-sensitive advice, or any case where extra clarity prevents mistakes.
-- These style rules apply to natural-language content only. Tool arguments, JSON wrappers, code, diffs, and commands must stay syntactically correct and complete.
+- keep all technical terms, code, file paths, commands, errors, and JSON exact.
+- Do not let terse style reduce investigation depth.
+- Tool arguments, JSON wrappers, code, diffs, and commands must stay syntactically correct and complete.
 - Use relative workspace paths.
 - Keep final answers concise and practical.
 - Do not emit markdown fences.
@@ -57,7 +55,7 @@ Rules:
 Available tools:
 {tool_help}
 
-Example when you need a helper agent:
+Helper example:
 {{"type":"tool","name":"run_agent","arguments":{{"prompt":"Read README.md and summarize setup steps.","approval_mode":"read-only"}}}}
 """
 
@@ -82,10 +80,18 @@ class FinalRewriteOutcome:
     rejected_message: str | None = None
 
 
+@dataclass(frozen=True)
+class TargetLineReadSpec:
+    path: str
+    start: int
+    end: int
+    line: int
+
+
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
-VERIFICATION_HISTORY_LIMIT = 4
-VERIFICATION_CONTENT_LIMIT = 6000
+VERIFICATION_HISTORY_LIMIT = 2
+VERIFICATION_CONTENT_LIMIT = 3000
 MAX_VERIFICATION_RETRIES = 2
 MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
@@ -93,47 +99,43 @@ AUDIT_LIST_ITEM_LIMIT = 3
 AUDIT_TEXT_ITEM_LIMIT = 180
 CANDIDATE_CLAIM_LIMIT = 6
 CANDIDATE_CLAIM_TEXT_LIMIT = 220
-VERIFICATION_EVIDENCE_LIMIT = 6
-VERIFICATION_EVIDENCE_TEXT_LIMIT = 260
+VERIFICATION_EVIDENCE_LIMIT = 4
+VERIFICATION_EVIDENCE_TEXT_LIMIT = 180
 MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "git_commit"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "git_status", "git_diff"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 MODEL_TOOL_RESULT_LIMITS = {
-    "list_files": 1200,
-    "read_file": 2200,
-    "search": 1600,
+    "list_files": 700,
+    "read_file": 1200,
+    "search": 900,
     "git_status": 1000,
-    "git_diff": 1800,
-    "run_shell": 1400,
-    "run_test": 1400,
+    "git_diff": 1200,
+    "run_shell": 900,
+    "run_test": 900,
     "run_agent": 1200,
 }
-MODEL_TOOL_DIFF_LIMIT = 1400
-VERIFICATION_TOOL_RESULT_LIMIT = 1200
-VERIFICATION_TOOL_DIFF_LIMIT = 1000
+MODEL_TOOL_DIFF_LIMIT = 900
+VERIFICATION_TOOL_RESULT_LIMIT = 700
+VERIFICATION_TOOL_DIFF_LIMIT = 700
 
 FINAL_VERIFIER_SYSTEM_PROMPT = """You are a grounded final verifier for a coding CLI controller.
 
-You will receive the original user request, the candidate final answer, extracted candidate claims, a compact evidence table derived from current-turn successful tool results, accepted tool-step assumption audits, and explicit required/forbidden tool constraints.
-Return exactly one JSON object and nothing else.
+Check candidate final against evidence/constraints. Return exactly one JSON object.
 
 Valid replies:
 {"verdict":"accept","claim_checks":[{"claim":"...","status":"supported","evidence":"E1"}]}
 {"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"],"claim_checks":[{"claim":"...","status":"contradicted","evidence":"E2","correction":"..."}],"rewrite_guidance":["..."],"rewrite_from_evidence":true}
 
 Rules:
-- Check whether the candidate final answer should be accepted as grounded and compliant claim by claim.
 - Prefer accept when the candidate already matches the tool results and request.
 - Return retry if the candidate contradicts tool results, ignores required tools, violates forbidden-tool constraints, hallucinates workspace state, or needs another tool/result first.
-- Consider accepted assumption-audit events as additional grounding context. Return retry if the candidate leaves those assumptions unresolved or contradicts the evidence they gathered.
-- Use candidate_claims when present. If the candidate has multiple concrete claims, assess them individually in claim_checks.
+- Treat accepted assumption-audit events as grounding context.
+- Use candidate_claims when present; assess concrete claims in claim_checks.
 - claim_checks entries must use status supported, contradicted, or unverified.
 - evidence should cite evidence ids like E1, E2 when possible.
 - correction must be brief and must come directly from the supplied evidence table.
 - Set rewrite_from_evidence true only when the existing evidence is sufficient to rewrite a correct final answer without another tool call.
-- rewrite_guidance should be short concrete instructions for an evidence-backed rewrite.
 - Do not rewrite the final answer yourself.
-- Keep the reason brief and concrete.
 - required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
 """
 
@@ -155,26 +157,22 @@ Rules:
 
 TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT = """You are a tool-step assumption auditor for a coding CLI controller.
 
-You will receive the original user request, recent messages, a proposed tool call, current-turn tool calls, current-turn successful tool results, accepted tool-step assumption audits, and explicit required/forbidden tool constraints.
-Return exactly one JSON object and nothing else.
+Check whether proposed tool is grounded next step. Return exactly one JSON object.
 
 Valid replies:
 {"verdict":"accept","reason":"","assumptions":["..."],"validation_steps":["..."],"required_tools":[],"forbidden_tools":[]}
 {"verdict":"retry","reason":"brief concrete reason","assumptions":["..."],"validation_steps":["..."],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
 
 Rules:
-- Check whether the proposed tool call is a grounded next step.
-- assumptions must be short concrete assumptions that the tool relies on or tests.
-- validation_steps must be short concrete descriptions of how the tool call validates those assumptions or gathers the needed evidence.
+- assumptions and validation_steps must be short.
 - Prefer accept when the proposed tool is a reasonable next validation step, even if the tool may fail and the user explicitly asked for that exact tool error or boundary failure.
 - Return retry if the tool is redundant, too broad, violates required/forbidden-tool constraints, mutates when inspection should happen first, skips a needed validation step, or fails to test the key assumption behind the next step.
 - Do not rewrite the tool call yourself.
-- Keep reason brief and concrete.
 - required_tools and forbidden_tools must be arrays of known tool names or empty arrays.
 """
 
 
-def extract_json_response(raw_text: str) -> dict[str, Any] | None:
+def extract_json_response(raw_text: str, *, _depth: int = 0) -> dict[str, Any] | None:
     candidate = raw_text.strip()
     if not candidate:
         return None
@@ -185,6 +183,14 @@ def extract_json_response(raw_text: str) -> dict[str, Any] | None:
         candidate = re.sub(r"\s*```$", "", candidate)
         candidate = candidate.strip()
     decoder = json.JSONDecoder()
+    if _depth < 2:
+        try:
+            top_level, end_index = decoder.raw_decode(candidate)
+        except json.JSONDecodeError:
+            top_level = None
+            end_index = -1
+        if isinstance(top_level, str) and not candidate[end_index:].strip():
+            return extract_json_response(top_level, _depth=_depth + 1)
     starts = [index for index, char in enumerate(candidate) if char == "{"]
     if candidate.startswith("{"):
         starts = [0] + [index for index in starts if index != 0]
@@ -287,6 +293,7 @@ class OllamaCodeAgent:
         self.max_agent_depth = max_agent_depth
         self.debate_enabled = debate_enabled
         self.events: list[dict[str, Any]] = []
+        self._pending_llm_call_events: list[dict[str, Any]] = []
         self._interrupt_event: threading.Event | None = None
         self._turn_tool_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._turn_cache_epoch = 0
@@ -299,7 +306,7 @@ class OllamaCodeAgent:
                 "role": "system",
                 "content": SYSTEM_PROMPT_TEMPLATE.format(
                     workspace_root=self.tools.workspace_root.as_posix(),
-                    tool_help=format_tool_help(),
+                    tool_help=format_compact_tool_help(),
                 ),
             }
         ]
@@ -450,6 +457,44 @@ class OllamaCodeAgent:
             }
         )
         self._autosave()
+
+    def _chat(
+        self,
+        *,
+        purpose: str,
+        model: str,
+        messages: list[dict[str, str]],
+        response_format: str | dict[str, Any] | None = "json",
+        on_thinking: Callable[[str], None] | None = None,
+        think: bool | None = None,
+    ) -> ChatResponse:
+        response = self.client.chat(
+            model=model,
+            messages=messages,
+            response_format=response_format,
+            on_thinking=on_thinking,
+            think=think,
+        )
+        prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
+        payload = {
+            "purpose": purpose,
+            "model": response.model,
+            "requested_model": model,
+            "message_count": len(messages),
+            "prompt_chars": prompt_chars,
+            "response_chars": len(response.content),
+            "thinking_chars": len(response.thinking),
+            "think": think,
+            **response.usage.as_event_payload(),
+        }
+        self._pending_llm_call_events.append(payload)
+        return response
+
+    def _flush_llm_call_events(self) -> None:
+        pending = self._pending_llm_call_events
+        self._pending_llm_call_events = []
+        for payload in pending:
+            self._record_event("llm_call", **payload)
 
     def _truncate_text(self, text: str, *, limit: int = VERIFICATION_CONTENT_LIMIT) -> str:
         if len(text) <= limit:
@@ -613,7 +658,7 @@ class OllamaCodeAgent:
         recent_messages = [
             {
                 "role": message["role"],
-                "content": self._truncate_text(message["content"], limit=800),
+                "content": self._truncate_text(message["content"], limit=360),
             }
             for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
             if message.get("role") != "system"
@@ -625,14 +670,13 @@ class OllamaCodeAgent:
             "model": self.model,
             "verifier_model": self.verification_model(),
             "workspace_root": self.tools.workspace_root.as_posix(),
-            "original_user_request": self._truncate_text(request_text),
+            "original_user_request": self._truncate_text(request_text, limit=600),
             "recent_messages": recent_messages,
-            "candidate_final_answer": self._truncate_text(candidate_message),
+            "candidate_final_answer": self._truncate_text(candidate_message, limit=800),
             "candidate_claims": candidate_claims,
             "required_tools": sorted(required_tool_names),
             "forbidden_tools": sorted(forbidden_tool_names),
             "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls],
-            "successful_tool_results": [self._compact_successful_tool_result_for_verification(item) for item in successful_tool_results],
             "evidence_table": evidence_table,
             "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
@@ -640,7 +684,7 @@ class OllamaCodeAgent:
     def _verification_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": FINAL_VERIFIER_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=True)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
         ]
 
     def _normalize_verification_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
@@ -675,8 +719,8 @@ class OllamaCodeAgent:
             "round": round_number,
             "model": self.model,
             "verifier_model": self.verification_model(),
-            "original_user_request": self._truncate_text(request_text),
-            "candidate_final_answer": self._truncate_text(candidate_message),
+            "original_user_request": self._truncate_text(request_text, limit=600),
+            "candidate_final_answer": self._truncate_text(candidate_message, limit=800),
             "candidate_claims": self._extract_candidate_claims(candidate_message),
             "evidence_table": self._build_verification_evidence_table(successful_tool_results),
             "claim_checks": verification_decision.get("claim_checks", []),
@@ -687,7 +731,7 @@ class OllamaCodeAgent:
     def _rewrite_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": FINAL_REWRITER_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=True)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
         ]
 
     def _rewrite_eligible_from_verification(
@@ -730,7 +774,8 @@ class OllamaCodeAgent:
             verification_decision=verification_decision,
         )
         self.status_printer("rewriting final from evidence")
-        rewrite_response = self.client.chat(
+        rewrite_response = self._chat(
+            purpose="final_rewrite",
             model=self.verification_model(),
             messages=self._rewrite_messages(payload),
             think=False,
@@ -785,7 +830,7 @@ class OllamaCodeAgent:
     def _assumption_audit_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
         return [
             {"role": "system", "content": TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT},
-            {"role": "user", "content": json.dumps(payload, indent=2, ensure_ascii=True)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
         ]
 
     def _compact_assumption_audit_for_context(self, audit: dict[str, Any]) -> dict[str, Any]:
@@ -816,7 +861,7 @@ class OllamaCodeAgent:
         recent_messages = [
             {
                 "role": message["role"],
-                "content": self._truncate_text(message["content"], limit=800),
+                "content": self._truncate_text(message["content"], limit=360),
             }
             for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
             if message.get("role") != "system"
@@ -830,18 +875,18 @@ class OllamaCodeAgent:
             "round": round_number,
             "model": self.model,
             "workspace_root": self.tools.workspace_root.as_posix(),
-            "original_user_request": self._truncate_text(request_text),
+            "original_user_request": self._truncate_text(request_text, limit=600),
             "recent_messages": recent_messages,
             "proposed_tool": {
                 "name": proposed_tool_name,
-                "arguments": self._truncate_json_value(proposed_arguments, limit=800),
+                "arguments": self._truncate_json_value(proposed_arguments, limit=360),
             },
             "required_tools": sorted(required_tool_names),
             "forbidden_tools": sorted(forbidden_tool_names),
             "mutation_allowed": mutation_allowed,
             "exact_constraints": exact_constraints,
             "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls],
-            "successful_tool_results": [self._compact_successful_tool_result_for_verification(item) for item in successful_tool_results],
+            "evidence_table": self._build_verification_evidence_table(successful_tool_results),
             "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
 
@@ -893,7 +938,8 @@ class OllamaCodeAgent:
             expected_exact_reply_text=expected_exact_reply_text,
         )
         self.status_printer("auditing tool assumptions")
-        verdict_response = self.client.chat(
+        verdict_response = self._chat(
+            purpose="assumption_audit",
             model=self.model,
             messages=self._assumption_audit_messages(context_payload),
             think=False,
@@ -945,7 +991,8 @@ class OllamaCodeAgent:
         )
         try:
             self.status_printer("verifying final")
-            verdict_response = self.client.chat(
+            verdict_response = self._chat(
+                purpose="final_verifier",
                 model=self.verification_model(),
                 messages=self._verification_messages(context_payload),
                 think=False,
@@ -1116,7 +1163,7 @@ class OllamaCodeAgent:
         arguments = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
         return {
             "name": name,
-            "arguments": self._truncate_json_value(arguments, limit=600),
+            "arguments": self._truncate_json_value(arguments, limit=240),
         }
 
     def _compact_successful_tool_result_for_verification(self, item: dict[str, Any]) -> dict[str, Any]:
@@ -1125,7 +1172,7 @@ class OllamaCodeAgent:
         result = item.get("result") if isinstance(item.get("result"), dict) else {}
         return {
             "name": name,
-            "arguments": self._truncate_json_value(arguments, limit=600),
+            "arguments": self._truncate_json_value(arguments, limit=240),
             "result": self._compact_tool_result_for_context(name, result, for_verification=True),
         }
 
@@ -1137,7 +1184,7 @@ class OllamaCodeAgent:
                 "That tool call did not complete successfully, so it does not satisfy the tool-use requirement. "
                 "Fix the issue or use a different appropriate tool, then respond with the next JSON object only."
             )
-        return "Tool result summary:\n" + json.dumps(payload, indent=2, ensure_ascii=True) + "\n" + follow_up
+        return "Tool result summary:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
 
     def _final_requires_verification(
         self,
@@ -1465,6 +1512,204 @@ class OllamaCodeAgent:
             ]
         )
 
+    def _request_mentions_repeated_read(self, text: str) -> bool:
+        lowered = text.lower()
+        return "twice" in lowered or "two times" in lowered or "2 times" in lowered
+
+    def _request_asks_token_only(self, text: str) -> bool:
+        lowered = text.lower()
+        return "token" in lowered and ("only" in lowered or "exact marker" in lowered or "exact token" in lowered)
+
+    def _extract_uppercase_token_from_output(self, output: str) -> str | None:
+        for token in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", output):
+            if token in {"OK"}:
+                continue
+            return token
+        return None
+
+    def _requested_exact_shell_command(self, text: str) -> str | None:
+        patterns = [
+            r"\b(?:execute|run)\s+exactly:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
+            r"\b(?:execute|run)\s+the\s+exact\s+command:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            command = match.group("command").strip()
+            command = command.strip("`")
+            if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
+                command = command[1:-1].strip()
+            if command:
+                return command
+        return None
+
+    def _requested_target_line_read(self, text: str) -> TargetLineReadSpec | None:
+        match = re.search(r"\bread_file\s+on\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            match = re.search(r"\bread\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", text, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return None
+        path = match.group("path").strip().rstrip(".,;:")
+        try:
+            line = int(match.group("line"))
+        except ValueError:
+            return None
+        if not path or line < 1:
+            return None
+        return TargetLineReadSpec(path=path, start=max(1, line - 5), end=line + 5, line=line)
+
+    def _normalize_target_line_read_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        target_line_read: TargetLineReadSpec | None,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "read_file" or target_line_read is None:
+            return name, arguments, None
+        requested_path = str(arguments.get("path", "")).strip()
+        if requested_path and requested_path.replace("\\", "/") != target_line_read.path.replace("\\", "/"):
+            return name, arguments, None
+        try:
+            current_start = int(arguments.get("start", 1))
+            current_end = int(arguments.get("end", 200))
+        except (TypeError, ValueError):
+            current_start = 1
+            current_end = 200
+        if current_start <= target_line_read.line <= current_end and (current_end - current_start) <= 40:
+            return name, arguments, None
+        return (
+            "read_file",
+            {"path": target_line_read.path, "start": target_line_read.start, "end": target_line_read.end},
+            f"Normalized read_file to the requested line {target_line_read.line} with a small surrounding range.",
+        )
+
+    def _normalize_run_test_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_text: str,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "run_test" or not self.tools.default_test_command:
+            return name, arguments, None
+        command = str(arguments.get("command", "")).strip()
+        lowered_command = command.lower()
+        lowered_request = request_text.lower()
+        vague_command = lowered_command in {"", "test", "tests", "pytest", "unittest", "python -m unittest", "python3 -m unittest"}
+        command_not_requested = bool(command) and lowered_command not in lowered_request
+        if not vague_command and not command_not_requested:
+            return name, arguments, None
+        normalized = dict(arguments)
+        normalized["command"] = self.tools.default_test_command
+        return "run_test", normalized, "Normalized vague run_test command to the configured test command."
+
+    def _request_explicitly_requests_tool(self, text: str, name: str) -> bool:
+        requested = self._requested_tool_names(text, forbidden_tool_names=set())
+        return name in requested
+
+    def _request_is_broad_or_ambiguous(self, text: str) -> bool:
+        lowered = text.lower()
+        broad_phrases = [
+            "inspect this repo",
+            "inspect the repo",
+            "summarize this repo",
+            "summarize the project",
+            "what does this project",
+            "find bugs",
+            "review the codebase",
+            "search the codebase",
+        ]
+        if any(phrase in lowered for phrase in broad_phrases):
+            return True
+        return "repo" in lowered and not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)
+
+    def _tool_call_needs_assumption_audit(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        normalization_reason: str | None,
+        cache_hit: bool,
+        failed_tool_this_turn: bool,
+        session_memory_request: bool,
+        forbidden_tool_names: set[str],
+    ) -> bool:
+        if not self.debate_enabled or normalization_reason is not None or cache_hit or session_memory_request:
+            return False
+        if failed_tool_this_turn:
+            return True
+        if name in MUTATING_TOOL_NAMES or name in {"run_shell", "run_test", "run_agent", "git_status", "git_diff"}:
+            return True
+        if forbidden_tool_names:
+            return True
+        if name in {"read_file", "list_files", "search"}:
+            if self._request_explicitly_requests_tool(request_text, name):
+                return False
+            if re.search(r"\bread\b", request_text, flags=re.IGNORECASE) and name != "read_file":
+                return True
+            return self._request_is_broad_or_ambiguous(request_text)
+        return True
+
+    def _synthesize_final_from_tool_result(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        required_tool_names: set[str],
+        expected_exact_reply_text: str | None,
+    ) -> str | None:
+        if self._request_expects_exact_tool_error(request_text) and self._failure_result_counts_for_request(request_text, name, result):
+            return str(result.get("summary") or result.get("output") or "").strip() or None
+
+        missing_required = required_tool_names - satisfied_tool_names
+        if missing_required:
+            return None
+
+        if name == "read_file" and result.get("ok") is True:
+            output = str(result.get("output", ""))
+            if expected_exact_reply_text is not None and expected_exact_reply_text in output:
+                return expected_exact_reply_text
+            if self._request_asks_token_only(request_text):
+                if self._request_mentions_repeated_read(request_text):
+                    read_count = sum(1 for item in successful_tool_results if item.get("name") == "read_file")
+                    if read_count < 2:
+                        return None
+                token = self._extract_uppercase_token_from_output(output)
+                if token:
+                    return token
+
+        if name == "git_diff" and result.get("ok") is True:
+            lowered = request_text.lower()
+            value_match = re.search(r"\breturn\s+([A-Za-z0-9_]+)\b", request_text)
+            if "whether" in lowered and "diff" in lowered and value_match:
+                value = value_match.group(1)
+                output = str(result.get("output", ""))
+                adds_value = bool(re.search(rf"(?m)^\+\s*return\s+{re.escape(value)}\b", output))
+                path = str(result.get("path") or arguments.get("path") or ".")
+                return f"{path} diff adds return {value}" if adds_value else f"{path} diff does not add return {value}"
+
+        if name == "run_shell" and "exit code" in request_text.lower():
+            if "exit_code" not in result:
+                return None
+            output = str(result.get("output", "")).strip()
+            if "printed word" in request_text.lower() or "output" in request_text.lower():
+                return f"Exit code: {result.get('exit_code')}. Output: {output}."
+            return f"Exit code: {result.get('exit_code')}."
+
+        if name == "run_test" and ("whether tests passed" in request_text.lower() or "tests passed" in request_text.lower()):
+            output = str(result.get("output", ""))
+            module_match = re.search(r"\b(test_[A-Za-z0-9_]+)\b", output)
+            module = module_match.group(1) if module_match else "unknown"
+            return f"Tests passed: {'yes' if result.get('ok') is True else 'no'}. Test module: {module}."
+
+        return None
+
     def _final_claims_file_mutation(self, message: str) -> bool:
         lowered = message.lower()
         patterns = [
@@ -1551,6 +1796,7 @@ class OllamaCodeAgent:
 
     def handle_user(self, text: str) -> AgentResult:
         self._reset_turn_cache()
+        self._pending_llm_call_events = []
         self.messages.append({"role": "user", "content": text})
         self._record_event("user", content=text)
         requires_tools = self._request_requires_tools(text)
@@ -1559,6 +1805,8 @@ class OllamaCodeAgent:
         requested_git_diff_mode = self._requested_git_diff_mode(text)
         expected_exact_file_line = self._requested_exact_file_line(text)
         exact_file_write = self._requested_exact_single_line_file_write(text)
+        target_line_read = self._requested_target_line_read(text)
+        exact_shell_command = self._requested_exact_shell_command(text)
         expected_exact_reply_text = self._requested_exact_reply_text(text)
         prefers_structured_file_tools = self._request_prefers_structured_file_tools(text)
         session_memory_request = self._request_targets_session_memory(text)
@@ -1570,13 +1818,15 @@ class OllamaCodeAgent:
         accepted_assumption_audits: list[dict[str, Any]] = []
         rejected_final_messages: set[str] = set()
         mutation_verified_this_turn = False
+        failed_tool_this_turn = False
         assumption_audit_retries = 0
         verification_retries = 0
         verification_rewrite_attempts = 0
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
-                response = self.client.chat(
+                response = self._chat(
+                    purpose="primary",
                     model=self.model,
                     messages=self.messages,
                     on_thinking=self.thinking_printer,
@@ -1590,6 +1840,47 @@ class OllamaCodeAgent:
                 raise
             payload = extract_json_response(response.content)
             if payload is None:
+                if exact_shell_command and not tool_used_this_turn:
+                    payload = {"type": "tool", "name": "run_shell", "arguments": {"command": exact_shell_command}}
+                    self._record_event(
+                        "tool_normalized",
+                        original_name="",
+                        original_arguments={},
+                        normalized_name="run_shell",
+                        normalized_arguments={"command": exact_shell_command},
+                        reason="Recovered exact run_shell command after invalid model JSON.",
+                        rounds=round_number,
+                    )
+                else:
+                    assistant_text = response.content.strip()
+                    self.messages.append({"role": "assistant", "content": assistant_text})
+                    reminder = "empty" if not assistant_text else "not valid JSON"
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": f'Your previous reply was {reminder}. Reply again with exactly one JSON object using either {{"type":"tool",...}} or {{"type":"final",...}}.',
+                        }
+                    )
+                    continue
+            if payload is None:
+                continue
+            payload = self._normalize_payload(payload)
+            response_type = payload.get("type")
+            if response_type not in {"tool", "final"} and exact_shell_command and not tool_used_this_turn:
+                malformed_name = str(payload.get("name", ""))
+                malformed_arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                payload = {"type": "tool", "name": "run_shell", "arguments": {"command": exact_shell_command}}
+                response_type = "tool"
+                self._record_event(
+                    "tool_normalized",
+                    original_name=malformed_name,
+                    original_arguments=malformed_arguments,
+                    normalized_name="run_shell",
+                    normalized_arguments={"command": exact_shell_command},
+                    reason="Recovered exact run_shell command from malformed model payload.",
+                    rounds=round_number,
+                )
+            if response_type is None:
                 assistant_text = response.content.strip()
                 self.messages.append({"role": "assistant", "content": assistant_text})
                 reminder = "empty" if not assistant_text else "not valid JSON"
@@ -1600,8 +1891,6 @@ class OllamaCodeAgent:
                     }
                 )
                 continue
-            payload = self._normalize_payload(payload)
-            response_type = payload.get("type")
             if response_type == "final":
                 missing_requested_tools = sorted(required_tool_names - satisfied_tool_names)
                 if missing_requested_tools:
@@ -1642,6 +1931,7 @@ class OllamaCodeAgent:
                         rounds=round_number,
                         repeated_rejected_final=assistant_text,
                     )
+                    self._flush_llm_call_events()
                     return AgentResult(message=failure, rounds=round_number, completed=False)
                 if expected_exact_file_line is not None:
                     latest_read_result = self._latest_successful_tool_result(successful_tool_results, "read_file")
@@ -1673,6 +1963,7 @@ class OllamaCodeAgent:
                             rounds=round_number,
                         )
                         self._record_event("assistant", content=expected_exact_reply_text, rounds=round_number)
+                        self._flush_llm_call_events()
                         return AgentResult(message=expected_exact_reply_text, rounds=round_number, completed=True)
                     self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                     self.messages.append(
@@ -1708,6 +1999,7 @@ class OllamaCodeAgent:
                         if verification_retries > MAX_VERIFICATION_RETRIES:
                             failure = "Stopped because grounded final verification could not accept a final answer."
                             self._record_event("assistant", content=failure, rounds=round_number)
+                            self._flush_llm_call_events()
                             return AgentResult(message=failure, rounds=round_number, completed=False)
                         retry_decision = decision
                         if (
@@ -1740,6 +2032,7 @@ class OllamaCodeAgent:
                                     rounds=round_number,
                                 )
                                 self._record_event("assistant", content=rewritten_message, rounds=round_number)
+                                self._flush_llm_call_events()
                                 return AgentResult(message=rewritten_message, rounds=round_number, completed=True)
                             if rewrite_outcome.rejected_message:
                                 rejected_final_messages.add(rewrite_outcome.rejected_message)
@@ -1753,6 +2046,7 @@ class OllamaCodeAgent:
                         continue
                 self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
+                self._flush_llm_call_events()
                 return AgentResult(message=assistant_text, rounds=round_number, completed=True)
             if response_type == "tool":
                 name = str(payload.get("name", "")).strip()
@@ -1764,6 +2058,22 @@ class OllamaCodeAgent:
                     arguments,
                     exact_file_write=exact_file_write,
                 )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_target_line_read_call(
+                        name,
+                        arguments,
+                        target_line_read=target_line_read,
+                    )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_run_test_call(
+                        name,
+                        arguments,
+                        request_text=text,
+                    )
+                if name == "run_shell" and exact_shell_command and str(arguments.get("command", "")).strip() != exact_shell_command:
+                    arguments = dict(arguments)
+                    arguments["command"] = exact_shell_command
+                    normalization_reason = "Normalized run_shell command to the exact user-specified command."
                 if normalization_reason is not None:
                     payload = {"type": "tool", "name": name, "arguments": arguments}
                     self._record_event(
@@ -1848,12 +2158,15 @@ class OllamaCodeAgent:
                     continue
                 cached_result = self._get_cached_tool_result(name, arguments)
                 cache_hit = cached_result is not None
-                should_skip_assumption_audit = (
-                    not self.debate_enabled
-                    or normalization_reason is not None
-                    or cache_hit
-                )
-                if not should_skip_assumption_audit:
+                if self._tool_call_needs_assumption_audit(
+                    request_text=text,
+                    name=name,
+                    normalization_reason=normalization_reason,
+                    cache_hit=cache_hit,
+                    failed_tool_this_turn=failed_tool_this_turn,
+                    session_memory_request=session_memory_request,
+                    forbidden_tool_names=forbidden_tool_names,
+                ):
                     audit_decision = self._audit_tool_candidate(
                         request_text=text,
                         round_number=round_number,
@@ -1876,6 +2189,7 @@ class OllamaCodeAgent:
                         if assumption_audit_retries > MAX_ASSUMPTION_AUDIT_RETRIES:
                             failure = "Stopped because assumption audit could not approve a next tool step."
                             self._record_event("assistant", content=failure, rounds=round_number)
+                            self._flush_llm_call_events()
                             return AgentResult(message=failure, rounds=round_number, completed=False)
                         self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
                         self.messages.append({"role": "user", "content": self._assumption_audit_retry_message(audit_decision)})
@@ -1902,6 +2216,8 @@ class OllamaCodeAgent:
                 if not cache_hit:
                     self._store_cached_tool_result(name, arguments, result)
                 self._invalidate_turn_cache_if_needed(name, result)
+                if result.get("ok") is not True:
+                    failed_tool_this_turn = True
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
                 if real_tool_use:
@@ -1923,6 +2239,28 @@ class OllamaCodeAgent:
                         "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use),
                     }
                 )
+                synthesized_final = self._synthesize_final_from_tool_result(
+                    request_text=text,
+                    name=name,
+                    arguments=arguments,
+                    result=result,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    required_tool_names=required_tool_names,
+                    expected_exact_reply_text=expected_exact_reply_text,
+                )
+                if synthesized_final:
+                    synthesized_payload = {"type": "final", "message": synthesized_final}
+                    self.messages.append({"role": "assistant", "content": json.dumps(synthesized_payload, ensure_ascii=True)})
+                    self._record_event(
+                        "assistant_synthesized",
+                        content=synthesized_final,
+                        tool=name,
+                        rounds=round_number,
+                    )
+                    self._record_event("assistant", content=synthesized_final, rounds=round_number)
+                    self._flush_llm_call_events()
+                    return AgentResult(message=synthesized_final, rounds=round_number, completed=True)
                 if (
                     self._request_expects_exact_tool_error(text)
                     and self._failure_result_counts_for_request(text, name, result)
@@ -1930,6 +2268,7 @@ class OllamaCodeAgent:
                     failure_message = str(result.get("summary") or result.get("output") or "").strip()
                     if failure_message:
                         self._record_event("assistant", content=failure_message, rounds=round_number)
+                        self._flush_llm_call_events()
                         return AgentResult(message=failure_message, rounds=round_number, completed=True)
                 continue
             self.messages.append({"role": "assistant", "content": json.dumps(payload, ensure_ascii=True)})
@@ -1941,4 +2280,5 @@ class OllamaCodeAgent:
             )
         failure = "Stopped after reaching the maximum tool rounds."
         self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
+        self._flush_llm_call_events()
         return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)

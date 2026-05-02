@@ -113,6 +113,27 @@ class OllamaClientTests(unittest.TestCase):
 
         self.assertTrue(payload["think"])
 
+    def test_chat_extracts_token_usage(self) -> None:
+        body = (
+            b'{"message":{"content":"ok"},"prompt_eval_count":11,"eval_count":3,'
+            b'"total_duration":100,"load_duration":5,"prompt_eval_duration":40,"eval_duration":55}'
+        )
+        client, server, thread = self._with_server(body)
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.usage.prompt_tokens, 11)
+        self.assertEqual(response.usage.output_tokens, 3)
+        self.assertEqual(response.usage.total_tokens, 14)
+        self.assertEqual(response.usage.total_duration_ns, 100)
+        self.assertEqual(response.usage.load_duration_ns, 5)
+        self.assertEqual(response.usage.prompt_eval_duration_ns, 40)
+        self.assertEqual(response.usage.eval_duration_ns, 55)
+
     def test_chat_retries_without_thinking_when_model_rejects_it(self) -> None:
         client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
         _MalformedResponseHandler.response_sequence = [
@@ -162,6 +183,26 @@ class OllamaClientTests(unittest.TestCase):
         self.assertEqual(updates[-1], "alpha beta")
         self.assertEqual(response.thinking, "alpha beta")
         self.assertEqual(response.content, "ok")
+
+    def test_chat_stream_extracts_final_token_usage(self) -> None:
+        body = (
+            b'{"message":{"content":"o","thinking":""},"done":false}\n'
+            b'{"message":{"content":"ok","thinking":""},"done":true,'
+            b'"prompt_eval_count":7,"eval_count":2,"total_duration":90,'
+            b'"load_duration":4,"prompt_eval_duration":30,"eval_duration":56}\n'
+        )
+        client, server, thread = self._with_server(body)
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}], on_thinking=lambda _: None)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.content, "ok")
+        self.assertEqual(response.usage.prompt_tokens, 7)
+        self.assertEqual(response.usage.output_tokens, 2)
+        self.assertEqual(response.usage.total_tokens, 9)
 
     def test_chat_stream_deduplicates_cumulative_thinking_chunks(self) -> None:
         body = (

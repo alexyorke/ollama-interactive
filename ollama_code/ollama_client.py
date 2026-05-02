@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -17,11 +17,52 @@ class OllamaError(RuntimeError):
 
 
 @dataclass
+class TokenUsage:
+    prompt_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+    total_duration_ns: int = 0
+    load_duration_ns: int = 0
+    prompt_eval_duration_ns: int = 0
+    eval_duration_ns: int = 0
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "TokenUsage":
+        def int_field(name: str) -> int:
+            value = raw.get(name)
+            return value if isinstance(value, int) else 0
+
+        prompt_tokens = int_field("prompt_eval_count")
+        output_tokens = int_field("eval_count")
+        return cls(
+            prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens,
+            total_tokens=prompt_tokens + output_tokens,
+            total_duration_ns=int_field("total_duration"),
+            load_duration_ns=int_field("load_duration"),
+            prompt_eval_duration_ns=int_field("prompt_eval_duration"),
+            eval_duration_ns=int_field("eval_duration"),
+        )
+
+    def as_event_payload(self) -> dict[str, int]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "total_duration_ns": self.total_duration_ns,
+            "load_duration_ns": self.load_duration_ns,
+            "prompt_eval_duration_ns": self.prompt_eval_duration_ns,
+            "eval_duration_ns": self.eval_duration_ns,
+        }
+
+
+@dataclass
 class ChatResponse:
     content: str
     model: str
     raw: dict[str, Any]
     thinking: str = ""
+    usage: TokenUsage = field(default_factory=TokenUsage)
 
 
 class OllamaClient:
@@ -141,6 +182,7 @@ class OllamaClient:
             thinking=str(message.get("thinking", "")),
             model=str(raw.get("model") or model),
             raw=raw,
+            usage=TokenUsage.from_raw(raw),
         )
 
     def _request_chat_stream(

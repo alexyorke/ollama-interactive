@@ -9,7 +9,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from ollama_code.agent import OllamaCodeAgent, _workspace_roots_match
-from ollama_code.ollama_client import ChatResponse
+from ollama_code.ollama_client import ChatResponse, TokenUsage
 from ollama_code.tools import ToolExecutor
 
 
@@ -106,6 +106,34 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["type"], "tool_call")
         self.assertEqual(agent.events[2]["type"], "tool_result")
 
+    def test_agent_records_llm_call_usage_events(self) -> None:
+        class UsageClient(FakeClient):
+            def chat(self, **kwargs: object) -> ChatResponse:
+                response = super().chat(**kwargs)  # type: ignore[arg-type]
+                return ChatResponse(
+                    content=response.content,
+                    model=response.model,
+                    raw=response.raw,
+                    thinking=response.thinking,
+                    usage=TokenUsage(prompt_tokens=10, output_tokens=2, total_tokens=12, total_duration_ns=100),
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = UsageClient(['{"type":"final","message":"done"}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        llm_calls = [event for event in agent.events if event["type"] == "llm_call"]
+        self.assertEqual(len(llm_calls), 1)
+        self.assertEqual(llm_calls[0]["purpose"], "primary")
+        self.assertEqual(llm_calls[0]["prompt_tokens"], 10)
+        self.assertEqual(llm_calls[0]["output_tokens"], 2)
+        self.assertEqual(llm_calls[0]["total_tokens"], 12)
+        self.assertGreater(llm_calls[0]["message_count"], 0)
+
     def test_system_prompt_requires_assumption_checking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -176,14 +204,12 @@ class AgentTests(unittest.TestCase):
         result = agent.handle_user("Use read_file on note.txt and tell me line 1.")
 
         self.assertEqual(result.message, "line 1 is hello")
-        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(len(client.calls), 3)
         self.assertFalse(client.calls[0]["think"])
         self.assertFalse(client.calls[1]["think"])
         self.assertFalse(client.calls[2]["think"])
-        self.assertFalse(client.calls[3]["think"])
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(assumption_audits), 1)
-        self.assertEqual(assumption_audits[0]["verdict"], "accept")
+        self.assertEqual(len(assumption_audits), 0)
         verification_events = [event for event in agent.events if event["type"] == "verification"]
         self.assertEqual(len(verification_events), 1)
         self.assertEqual(verification_events[0]["verdict"], "accept")
@@ -228,7 +254,7 @@ class AgentTests(unittest.TestCase):
         tools = ToolExecutor(root, approval_mode="auto")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
 
-        result = agent.handle_user("Read note.txt and tell me what line 1 says.")
+        result = agent.handle_user("Read note.txt and tell me what it says.")
 
         self.assertEqual(result.message, "line 1 is hello")
         audits = [event for event in agent.events if event["type"] == "assumption_audit"]
@@ -277,9 +303,9 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "done")
         audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(audits), 1)
+        self.assertEqual(len(audits), 0)
 
-    def test_final_verifier_receives_accepted_assumption_audits(self) -> None:
+    def test_final_verifier_receives_evidence_without_low_risk_audit(self) -> None:
         root = self._workspace_scratch()
         (root / "note.txt").write_text("hello\n", encoding="utf-8")
         client = FakeClient(
@@ -297,8 +323,7 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "line 1 is hello")
         verifier_payload = json.loads(str(client.calls[-1]["messages"][1]["content"]))
-        self.assertEqual(len(verifier_payload["accepted_assumption_audits"]), 1)
-        self.assertEqual(verifier_payload["accepted_assumption_audits"][0]["tool"], "read_file")
+        self.assertEqual(len(verifier_payload["accepted_assumption_audits"]), 0)
         self.assertEqual(verifier_payload["candidate_claims"], ["line 1 is hello"])
         self.assertEqual(len(verifier_payload["evidence_table"]), 1)
         self.assertEqual(verifier_payload["evidence_table"][0]["tool"], "read_file")
@@ -327,7 +352,7 @@ class AgentTests(unittest.TestCase):
         rewrite_events = [event for event in agent.events if event["type"] == "verification_rewrite"]
         self.assertEqual(len(rewrite_events), 1)
         self.assertEqual(rewrite_events[0]["verdict"], "accept")
-        self.assertEqual(client.calls[4]["messages"][0]["content"].splitlines()[0], "You are an evidence-backed final rewriter for a coding CLI controller.")
+        self.assertEqual(client.calls[3]["messages"][0]["content"].splitlines()[0], "You are an evidence-backed final rewriter for a coding CLI controller.")
 
     def test_agent_uses_verifier_model_for_verification_and_rewrite(self) -> None:
         root = self._workspace_scratch()
@@ -351,10 +376,9 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "line 1 is hello")
         self.assertEqual(client.calls[0]["model"], "base-model")
         self.assertEqual(client.calls[1]["model"], "base-model")
-        self.assertEqual(client.calls[2]["model"], "base-model")
+        self.assertEqual(client.calls[2]["model"], "judge-model")
         self.assertEqual(client.calls[3]["model"], "judge-model")
         self.assertEqual(client.calls[4]["model"], "judge-model")
-        self.assertEqual(client.calls[5]["model"], "judge-model")
 
     def test_agent_retries_after_verifier_rejects_candidate_and_recovers(self) -> None:
         root = self._workspace_scratch()
@@ -376,19 +400,18 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "line 1 is hello")
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(assumption_audits), 1)
-        self.assertEqual(assumption_audits[0]["verdict"], "accept")
+        self.assertEqual(len(assumption_audits), 0)
         verification_events = [event for event in agent.events if event["type"] == "verification"]
         self.assertEqual(len(verification_events), 2)
         self.assertEqual(verification_events[0]["verdict"], "retry")
         self.assertEqual(verification_events[1]["verdict"], "accept")
-        self.assertEqual(agent.events[2]["name"], "read_file")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "read_file")
         self.assertFalse(client.calls[0]["think"])
         self.assertFalse(client.calls[1]["think"])
         self.assertFalse(client.calls[2]["think"])
         self.assertFalse(client.calls[3]["think"])
         self.assertFalse(client.calls[4]["think"])
-        self.assertFalse(client.calls[5]["think"])
 
     def test_agent_fails_closed_after_verification_retry_cap(self) -> None:
         root = self._workspace_scratch()
@@ -413,7 +436,7 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertIn("grounded final verification", result.message)
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(assumption_audits), 1)
+        self.assertEqual(len(assumption_audits), 0)
         verification_events = [event for event in agent.events if event["type"] == "verification"]
         self.assertEqual(len(verification_events), 3)
 
@@ -437,7 +460,7 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertIn("grounded final verification", result.message)
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(assumption_audits), 1)
+        self.assertEqual(len(assumption_audits), 0)
         verification_events = [event for event in agent.events if event["type"] == "verification"]
         self.assertEqual(len(verification_events), 1)
 
@@ -458,10 +481,11 @@ class AgentTests(unittest.TestCase):
         result = agent.handle_user("Use read_file on note.txt and then tell me when you are done.")
 
         self.assertEqual(result.message, "done")
-        self.assertEqual(agent.events[2]["name"], "read_file")
-        self.assertEqual(len(client.calls), 4)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "read_file")
+        self.assertEqual(len(client.calls), 3)
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(assumption_audits), 1)
+        self.assertEqual(len(assumption_audits), 0)
         verification_events = [event for event in agent.events if event["type"] == "verification"]
         self.assertEqual(len(verification_events), 1)
         self.assertEqual(verification_events[0]["verdict"], "accept")
@@ -513,9 +537,9 @@ class AgentTests(unittest.TestCase):
         result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
 
         self.assertIn("escapes the workspace", result.message)
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 1)
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
-        self.assertEqual(len(assumption_audits), 1)
+        self.assertEqual(len(assumption_audits), 0)
 
     def test_agent_retries_after_unverified_file_mutation_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -805,10 +829,138 @@ class AgentTests(unittest.TestCase):
         normalized_events = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(len(normalized_events), 2)
         self.assertEqual(normalized_events[0]["normalized_arguments"]["content"], "APPROVED\n")
-        assistant_normalized = [event for event in agent.events if event["type"] == "assistant_normalized"]
-        self.assertEqual(len(assistant_normalized), 1)
-        self.assertEqual(assistant_normalized[0]["normalized"], "APPROVED")
+        assistant_synthesized = [event for event in agent.events if event["type"] == "assistant_synthesized"]
+        self.assertEqual(len(assistant_synthesized), 1)
+        self.assertEqual(assistant_synthesized[0]["content"], "APPROVED")
         self.assertFalse(any(event["type"] == "assumption_audit" for event in agent.events))
+
+    def test_agent_synthesizes_exact_token_reply_after_read_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"read_file","arguments":{"path":"docs/guide.md"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Use read_file on docs/guide.md and reply with the uppercase token only.")
+
+        self.assertEqual(result.message, "TOKEN_42")
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_normalizes_target_line_read_and_synthesizes_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            lines = [f"line {index}: filler" for index in range(1, 501)]
+            lines[249] = "line 250: NEEDLE_FAST_250"
+            (root / "docs" / "large.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"read_file","arguments":{"path":"docs/large.md"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user(
+                "Use read_file on docs/large.md with the smallest useful line range around line 250, then reply with the exact marker token on that line only."
+            )
+
+        self.assertEqual(result.message, "NEEDLE_FAST_250")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"], {"path": "docs/large.md", "start": 245, "end": 255})
+        self.assertTrue(any(event["type"] == "tool_normalized" for event in agent.events))
+
+    def test_agent_normalizes_exact_shell_command_and_synthesizes_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"python -c \\"print(1)\\""}}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
+            )
+
+        self.assertIn("Exit code: 5", result.message)
+        self.assertIn("boom", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], exact_command)
+        normalized = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(len(normalized), 1)
+
+    def test_agent_audits_shell_tool_under_debate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"python -c \\"print(123)\\""}}',
+                    '{"type":"final","message":"done"}',
+                    '{"verdict":"accept"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user('Use run_shell to execute python -c "print(123)" and then say done.')
+
+        self.assertEqual(result.message, "done")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["tool"], "run_shell")
+
+    def test_agent_recovers_exact_shell_command_after_invalid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(["not json"])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
+            )
+
+        self.assertIn("Exit code: 5", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], exact_command)
+
+    def test_agent_normalizes_vague_run_test_to_configured_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(['{"type":"tool","name":"run_test","arguments":{"command":"test"}}'])
+            tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_sample OK\')"')
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Use run_test and tell me whether tests passed and which test module ran.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        self.assertIn("test_sample", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_sample OK\')"')
+
+    def test_agent_audits_mutating_tool_under_debate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("old\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"replace_in_file","arguments":{"path":"note.txt","old":"old","new":"new"}}',
+                    '{"type":"final","message":"updated"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Update note.txt by replacing old with new.")
+
+        self.assertEqual(result.message, "updated")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["tool"], "replace_in_file")
 
     def test_agent_retries_after_bad_tool_arguments_do_not_count_as_real_tool_use(self) -> None:
         client = FakeClient(

@@ -242,6 +242,13 @@ export OLLAMA_HOST=127.0.0.1:11434
 python3 scripts/verification_eval.py --models gemma3:4b --verifier-model granite4.1:8b --strict-on
 ```
 
+For serial token-efficiency A/B runs, write raw ignored JSON under `scratch/` and compare against a prior run:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+python3 scripts/token_efficiency_eval.py --output scratch/token-efficiency/after.json --compare scratch/token-efficiency/baseline.json --strict-accuracy
+```
+
 Containerized end-to-end check against the host Ollama daemon:
 
 ```bash
