@@ -135,22 +135,22 @@ def format_tool_help() -> str:
 
 def format_compact_tool_help() -> str:
     signatures = {
-        "list_files": "list_files(path='.', max_depth=4, limit=200)",
-        "read_file": "read_file(path, start=1, end=200)",
-        "search": "search(query, path='.', limit=100)",
-        "search_symbols": "search_symbols(query, path='.', limit=50)",
-        "code_outline": "code_outline(path, max_symbols=120)",
-        "read_symbol": "read_symbol(path, symbol, include_context=2)",
-        "write_file": "write_file(path, content)",
-        "replace_in_file": "replace_in_file(path, old, new, replace_all=false, match_whole_word=false)",
-        "run_shell": "run_shell(command, cwd='.', timeout=30)",
-        "run_test": "run_test(command?, cwd='.', timeout=1200)",
+        "list_files": "list_files(path='.',depth=4,limit=200)",
+        "read_file": "read_file(path,start=1,end=200)",
+        "search": "search(query,path='.',limit=100)",
+        "search_symbols": "search_symbols(query,path='.',limit=50)",
+        "code_outline": "code_outline(path,max_symbols=120)",
+        "read_symbol": "read_symbol(path,symbol,context=2)",
+        "write_file": "write_file(path,content)",
+        "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
+        "run_shell": "run_shell(command,cwd='.',timeout=30)",
+        "run_test": "run_test(command?,cwd='.',timeout=1200)",
         "git_status": "git_status(path?)",
-        "git_diff": "git_diff(path?, cached=false, context=3)",
-        "git_commit": "git_commit(message, add_all=true)",
-        "run_agent": "run_agent(prompt, model?, approval_mode?, max_tool_rounds?)",
+        "git_diff": "git_diff(path?,cached=false,context=3)",
+        "git_commit": "git_commit(message,add_all=true)",
+        "run_agent": "run_agent(prompt,model?,approval?,rounds?)",
     }
-    return "\n".join(f"- {signatures[tool['name']]}" for tool in TOOL_DESCRIPTIONS)
+    return "\n".join(signatures[tool["name"]] for tool in TOOL_DESCRIPTIONS)
 
 
 class ToolExecutor:

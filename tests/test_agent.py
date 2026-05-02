@@ -133,6 +133,8 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(llm_calls[0]["output_tokens"], 2)
         self.assertEqual(llm_calls[0]["total_tokens"], 12)
         self.assertGreater(llm_calls[0]["message_count"], 0)
+        self.assertIn("system", llm_calls[0]["prompt_chars_by_role"])
+        self.assertGreater(llm_calls[0]["top_prompt_messages"][0]["chars"], 0)
 
     def test_system_prompt_requires_assumption_checking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -142,9 +144,9 @@ class AgentTests(unittest.TestCase):
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         prompt = agent.messages[0]["content"]
-        self.assertIn("Question your assumptions before acting.", prompt)
-        self.assertIn("prove or disprove it with the available tools", prompt)
-        self.assertIn("Do not guess about workspace contents", prompt)
+        self.assertIn("Question your assumptions before acting", prompt)
+        self.assertIn("prove or disprove with tools", prompt)
+        self.assertIn("do not guess", prompt)
         self.assertIn("prefer search_symbols, code_outline, then read_symbol before broad read_file", prompt)
 
     def test_system_prompt_enables_caveman_lite_default(self) -> None:
@@ -155,10 +157,9 @@ class AgentTests(unittest.TestCase):
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
 
         prompt = agent.messages[0]["content"]
-        self.assertIn("Default reply style: caveman-lite.", prompt)
-        self.assertIn("keep all technical terms, code, file paths, commands, errors, and JSON exact", prompt)
-        self.assertIn("Do not let terse style reduce investigation depth", prompt)
-        self.assertIn("Tool arguments, JSON wrappers, code, diffs, and commands must stay syntactically correct and complete.", prompt)
+        self.assertIn("caveman-lite concise", prompt)
+        self.assertIn("keep code, paths, commands, errors, JSON exact", prompt)
+        self.assertIn("syntactically complete", prompt)
 
     def test_agent_stops_after_max_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1191,7 +1192,7 @@ class AgentTests(unittest.TestCase):
             result = agent.handle_user("Summarize big.txt.")
 
         self.assertEqual(result.message, "done")
-        tool_feedback = next(message["content"] for message in agent.messages if message["role"] == "user" and message["content"].startswith("Tool result summary:\n"))
+        tool_feedback = next(message["content"] for message in agent.messages if message["role"] == "user" and message["content"].startswith("Tool result:\n"))
         self.assertIn("... truncated ...", tool_feedback)
         self.assertNotIn(" 200 |", tool_feedback)
 
@@ -1344,11 +1345,30 @@ class AgentTests(unittest.TestCase):
             )
 
         self.assertEqual(result.message, "TOKEN_SYMBOL_750")
-        self.assertEqual(len(client.calls), 2)
+        self.assertEqual(len(client.calls), 0)
         self.assertFalse(any(event["type"] == "assumption_audit" for event in agent.events))
         tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_names, ["search_symbols", "read_symbol"])
         symbol_results = [event for event in agent.events if event["type"] == "tool_result" and event["name"] == "read_symbol"]
         self.assertIn("TOKEN_SYMBOL_750", symbol_results[0]["result"]["output"])
         self.assertNotIn("filler_0", symbol_results[0]["result"]["output"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_synthesizes_symbol_return_value_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("def meaning() -> int:\n    return 42\n", encoding="utf-8")
+            client = FakeClient(['{"type":"final","message":"wrong"}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user(
+                "Use search_symbols to locate meaning in src/app.py, then use read_symbol on the exact match. Do not use read_file. Summarize what value it returns."
+            )
+
+        self.assertEqual(result.message, "meaning returns 42.")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search_symbols", "read_symbol"])
         self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))

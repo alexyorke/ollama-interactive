@@ -69,6 +69,34 @@ Large code symbol eval uses a synthetic `src/large_pricing.py` with 440 filler f
 
 Regression caught during development: before extra-argument recovery and `read_symbol` synthesis, `gemma3:4b` debate-off failed after 12 LLM calls and 18,379 prompt tokens on this same symbol task. After the fix it passes in 2 calls and 1,902 prompt tokens.
 
+## Profiling Pass
+
+Added per-call prompt profiling to every `llm_call` event:
+
+- `prompt_chars_by_role` shows how much input came from system, user, and assistant messages.
+- `top_prompt_messages` records the largest prompt messages by purpose/role/char count.
+- `scripts/token_efficiency_eval.py` now aggregates those fields into raw JSON so token waste can be tied to prompt components, not only total Ollama token counts.
+
+Profiling a realistic symbol-summary task found the main waste pattern: models often looped after `search_symbols` instead of calling `read_symbol`, repeatedly resending the system prompt and growing transcript. Example before the fix:
+
+| Model | Debate | Status before | Calls before | Prompt tokens before | Dominant prompt component |
+|---|---|---|---:|---:|---|
+| `gemma3:4b` | off | fail | 12 | 11,421 | system prompt repeated 12x |
+| `gemma3:4b` | on | fail | 16 | 14,926 | auditor payloads plus system prompt |
+| `qwen3:8b` | off | fail | 12 | 10,118 | system prompt repeated 12x |
+| `qwen3:8b` | on | fail | 12 | 10,151 | system prompt repeated 12x |
+| `granite4.1:8b` | off | pass | 9 | 6,666 | repeated search attempts |
+| `granite4.1:8b` | on | fail | 13 | 11,532 | auditor payloads plus system prompt |
+
+Fixes from that profile:
+
+- Compacted primary system prompt/tool schema; current full system prompt with tool list is 1,579 chars.
+- Shortened tool-result feedback from verbose prose to compact `Tool result:` plus `Next JSON only.`
+- Added deterministic symbol return-value synthesis for prompts like “find function X in file Y and summarize what value it returns.”
+- Broadened deterministic symbol extraction to `find`, `locate`, `function`, `method`, `class`, and `symbol` wording.
+
+After the fix, the same symbol-summary task passes on all tested models and debate modes with `0` LLM calls, `0` prompt tokens, and `0` output tokens.
+
 ## Aggregate Prompt Tokens
 
 | Model | Verifier | Debate | Baseline prompt | Optimized prompt | Delta | LLM calls before -> after | Pass before -> after |
@@ -105,9 +133,10 @@ Regression caught during development: before extra-argument recovery and `read_s
 
 ## Validation
 
-- `python -m unittest discover -v`: 145 passed, 3 skipped.
+- `python -m unittest discover -v`: 146 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
 - Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
-- `scripts/token_efficiency_eval.py --strict-accuracy`: 77/77 passed; no pass-to-fail regressions; explicit-tool corpus remains zero LLM calls and large-code symbol navigation passes in 2 LLM calls.
+- Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.
+- `scripts/token_efficiency_eval.py --strict-accuracy`: 84/84 passed; no pass-to-fail regressions; explicit-tool and symbol-summary corpora are zero LLM calls.
 - `scripts/verification_eval.py --strict-on`: passed on `gemma3:4b`, `qwen3:8b`, and `granite4.1:8b`.
 - `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed.

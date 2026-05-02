@@ -76,6 +76,8 @@ def usage_totals(session: dict[str, Any]) -> dict[str, Any]:
         "prompt_chars": 0,
         "response_chars": 0,
     }
+    prompt_chars_by_role: dict[str, int] = {}
+    top_prompt_messages: list[dict[str, Any]] = []
     for event in events:
         purpose = str(event.get("purpose", "unknown"))
         bucket = purposes.setdefault(purpose, {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0})
@@ -89,7 +91,30 @@ def usage_totals(session: dict[str, Any]) -> dict[str, Any]:
             value = event.get(key)
             if isinstance(value, int):
                 totals[key] += value
+        role_chars = event.get("prompt_chars_by_role")
+        if isinstance(role_chars, dict):
+            for role, value in role_chars.items():
+                if isinstance(role, str) and isinstance(value, int):
+                    prompt_chars_by_role[role] = prompt_chars_by_role.get(role, 0) + value
+        event_top = event.get("top_prompt_messages")
+        if isinstance(event_top, list):
+            for item in event_top:
+                if not isinstance(item, dict):
+                    continue
+                chars = item.get("chars")
+                if not isinstance(chars, int):
+                    continue
+                top_prompt_messages.append(
+                    {
+                        "purpose": purpose,
+                        "role": str(item.get("role", "")),
+                        "chars": chars,
+                        "preview": str(item.get("preview", ""))[:80],
+                    }
+                )
     totals["purposes"] = purposes
+    totals["prompt_chars_by_role"] = dict(sorted(prompt_chars_by_role.items()))
+    totals["top_prompt_messages"] = sorted(top_prompt_messages, key=lambda item: int(item["chars"]), reverse=True)[:8]
     return totals
 
 
@@ -207,6 +232,18 @@ def validate_code_symbol_navigation(stdout: str, session: dict[str, Any], worksp
     return "pass" if "TOKEN_SYMBOL_750" in stdout else "fail"
 
 
+def validate_code_symbol_summary(stdout: str, session: dict[str, Any], workspace: Path) -> str:
+    calls = tool_calls(session)
+    symbol_reads = tool_results(session, "read_symbol")
+    if "read_file" in calls:
+        return "fail"
+    if "search_symbols" not in calls or "read_symbol" not in calls:
+        return "fail"
+    if not any(item.get("ok") and "return 42" in str(item.get("output", "")) for item in symbol_reads):
+        return "fail"
+    return "pass" if "42" in stdout else "fail"
+
+
 @dataclass(frozen=True)
 class EvalCase:
     name: str
@@ -274,6 +311,11 @@ CASES = [
         prompt="Use search_symbols to find calculate_discount in src/large_pricing.py. Then use read_symbol on the exact match. Do not use read_file. Reply with the uppercase TOKEN_SYMBOL marker from that symbol only.",
         validate=validate_code_symbol_navigation,
         prepare=prepare_code_symbol_case,
+    ),
+    EvalCase(
+        name="code_symbol_summary",
+        prompt="Use search_symbols to locate meaning in src/app.py, then use read_symbol on the exact match. Do not use read_file. Summarize what value it returns.",
+        validate=validate_code_symbol_summary,
     ),
     EvalCase(
         name="verifier_rewrite_recovery",

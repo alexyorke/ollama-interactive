@@ -20,44 +20,24 @@ from ollama_code.sessions import (
 from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_compact_tool_help, format_tool_help
 
 
-SYSTEM_PROMPT_TEMPLATE = """You are Ollama Code, a local coding assistant running in a terminal.
+SYSTEM_PROMPT_TEMPLATE = """Ollama Code: local terminal coding agent. Workspace: {workspace_root}
 
-Workspace root: {workspace_root}
-
-Use tools to inspect/modify only this workspace. Return exactly one JSON object and nothing else.
-
-Valid response shapes:
+Return exactly one JSON object only:
 {{"type":"tool","name":"read_file","arguments":{{"path":"README.md"}}}}
-{{"type":"final","message":"Your final answer to the user."}}
+{{"type":"final","message":"..."}}
 
 Rules:
-- Use at most one tool call per response.
-- Prefer inspecting files before editing them.
-- For broad repo questions, prefer search or list_files before read_file.
-- For code questions/edits, prefer search_symbols, code_outline, then read_symbol before broad read_file.
-- For read_file, request narrow start/end ranges.
-- Reuse recent tool results already in the conversation when they still answer the question. Avoid repeating identical read-only tools unless state changed.
-- Question your assumptions before acting.
-- Identify what you are assuming, then prove or disprove it with the available tools whenever a file read, search, git inspection, test run, or shell command can verify it.
-- Do not guess about workspace contents, command output, repo state, or whether an edit worked when you can check instead.
-- Default reply style: caveman-lite. Be terse and information-dense. Drop filler, pleasantries, hedging, and redundant transitions.
-- keep all technical terms, code, file paths, commands, errors, and JSON exact.
-- Do not let terse style reduce investigation depth.
-- Tool arguments, JSON wrappers, code, diffs, and commands must stay syntactically correct and complete.
-- Use relative workspace paths.
-- Keep final answers concise and practical.
-- Do not emit markdown fences.
-- Do not emit chain-of-thought.
-- If the user asks about filesystem state, search results, command output, file edits, or helper agents, you must use the relevant tool instead of guessing.
-- Never claim a file was changed, a command was run, or a helper agent replied unless you have a successful tool result for it in the current turn.
-- For new files use write_file. For edits use replace_in_file or write_file. For shell work use run_shell. For project tests prefer run_test when available. For delegated work use run_agent.
-- For git inspection prefer git_status and git_diff. For git commits use git_commit.
+- One tool per reply. Use relative workspace paths. No markdown fences. No chain-of-thought.
+- Need workspace/file/git/command/edit/subagent facts? Use tools; do not guess.
+- Inspect before edits. New file: write_file. Edit: replace_in_file/write_file. Shell: run_shell. Tests: run_test. Git: git_status/git_diff/git_commit. Delegate: run_agent.
+- Code work: prefer search_symbols, code_outline, then read_symbol before broad read_file. Broad repo: search/list_files first. Narrow read_file ranges.
+- Reuse recent tool results; avoid repeat read-only calls unless state changed.
+- Question your assumptions before acting; prove or disprove with tools when possible.
+- Never claim edit/command/helper success without successful current-turn tool result.
+- Style: caveman-lite concise; keep code, paths, commands, errors, JSON exact and syntactically complete.
 
-Available tools:
+Tools:
 {tool_help}
-
-Helper example:
-{{"type":"tool","name":"run_agent","arguments":{{"prompt":"Read README.md and summarize setup steps.","approval_mode":"read-only"}}}}
 """
 
 
@@ -87,6 +67,12 @@ class TargetLineReadSpec:
     start: int
     end: int
     line: int
+
+
+@dataclass(frozen=True)
+class SymbolReadSpec:
+    path: str
+    symbol: str
 
 
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
@@ -482,12 +468,29 @@ class OllamaCodeAgent:
             think=think,
         )
         prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
+        prompt_chars_by_role: dict[str, int] = {}
+        top_messages: list[dict[str, Any]] = []
+        for index, message in enumerate(messages):
+            role = str(message.get("role", ""))
+            content = str(message.get("content", ""))
+            prompt_chars_by_role[role] = prompt_chars_by_role.get(role, 0) + len(content)
+            top_messages.append(
+                {
+                    "index": index,
+                    "role": role,
+                    "chars": len(content),
+                    "preview": content.replace("\n", " ")[:80],
+                }
+            )
+        top_messages = sorted(top_messages, key=lambda item: int(item["chars"]), reverse=True)[:5]
         payload = {
             "purpose": purpose,
             "model": response.model,
             "requested_model": model,
             "message_count": len(messages),
             "prompt_chars": prompt_chars,
+            "prompt_chars_by_role": prompt_chars_by_role,
+            "top_prompt_messages": top_messages,
             "response_chars": len(response.content),
             "thinking_chars": len(response.thinking),
             "think": think,
@@ -1226,13 +1229,10 @@ class OllamaCodeAgent:
 
     def _tool_result_feedback_message(self, name: str, result: dict[str, Any], *, real_tool_use: bool) -> str:
         payload = self._compact_tool_result_for_context(name, result, for_verification=False)
-        follow_up = "Respond with the next JSON object only."
+        follow_up = "Next JSON only."
         if not real_tool_use:
-            follow_up = (
-                "That tool call did not complete successfully, so it does not satisfy the tool-use requirement. "
-                "Fix the issue or use a different appropriate tool, then respond with the next JSON object only."
-            )
-        return "Tool result summary:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
+            follow_up = "Tool failed; it does not satisfy required tool use. Fix or choose another tool. Next JSON only."
+        return "Tool result:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
 
     def _final_requires_verification(
         self,
@@ -1578,6 +1578,16 @@ class OllamaCodeAgent:
             return token
         return None
 
+    def _extract_return_value_from_symbol_output(self, output: str) -> str | None:
+        for line in output.splitlines():
+            match = re.search(r"\|\s*return\s+(.+?)\s*$", line)
+            if not match:
+                continue
+            value = match.group(1).strip()
+            if value:
+                return value
+        return None
+
     def _requested_exact_shell_command(self, text: str) -> str | None:
         patterns = [
             r"\b(?:execute|run)\s+exactly:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
@@ -1636,6 +1646,24 @@ class OllamaCodeAgent:
         if not path or line < 1:
             return None
         return TargetLineReadSpec(path=path, start=max(1, line - 5), end=line + 5, line=line)
+
+    def _requested_symbol_read(self, text: str) -> SymbolReadSpec | None:
+        symbol_pattern = r"[A-Za-z_][\w.]*"
+        path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
+        patterns = [
+            rf"\b(?:function|method|class|symbol)\s+(?P<symbol>{symbol_pattern})\s+(?:in|from)\s+(?P<path>{path_pattern})",
+            rf"\b(?:find|locate|search(?:_symbols)?(?:\s+for)?)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})",
+            rf"\bread_symbol\b.*?\b(?:on|in)\s+(?P<path>{path_pattern}).*?\bsymbol\s+(?P<symbol>{symbol_pattern})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            path = match.group("path").strip().rstrip(".,;:")
+            symbol = match.group("symbol").strip().rstrip(".,;:")
+            if path and symbol:
+                return SymbolReadSpec(path=path, symbol=symbol)
+        return None
 
     def _normalize_target_line_read_call(
         self,
@@ -1765,6 +1793,11 @@ class OllamaCodeAgent:
                 token = self._extract_uppercase_token_from_output(output)
                 if token:
                     return token
+            if name == "read_symbol" and "return" in request_text.lower() and "value" in request_text.lower():
+                value = self._extract_return_value_from_symbol_output(output)
+                if value:
+                    symbol = str(result.get("symbol") or arguments.get("symbol") or "symbol")
+                    return f"{symbol} returns {value}."
 
         if name == "git_diff" and result.get("ok") is True:
             lowered = request_text.lower()
@@ -1842,6 +1875,7 @@ class OllamaCodeAgent:
         request_text: str,
         exact_file_write: ExactFileWriteSpec | None,
         target_line_read: TargetLineReadSpec | None,
+        symbol_read: SymbolReadSpec | None,
         exact_shell_command: str | None,
         expected_exact_reply_text: str | None,
         required_tool_names: set[str],
@@ -1938,6 +1972,50 @@ class OllamaCodeAgent:
             )
             if message:
                 return self._record_synthesized_final(message, tool="run_test", round_number=round_number)
+            return None
+
+        if (
+            symbol_read is not None
+            and "search_symbols" not in forbidden_tool_names
+            and "read_symbol" not in forbidden_tool_names
+            and ("token" in lowered or "marker" in lowered or ("return" in lowered and "value" in lowered))
+        ):
+            round_number += 1
+            search_args = {"query": symbol_read.symbol, "path": symbol_read.path}
+            search_result = self._execute_controller_tool(
+                name="search_symbols",
+                arguments=search_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if search_result.get("ok") is not True:
+                return None
+            round_number += 1
+            read_args = {"path": symbol_read.path, "symbol": symbol_read.symbol, "include_context": 0}
+            result = self._execute_controller_tool(
+                name="read_symbol",
+                arguments=read_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            message = self._synthesize_final_from_tool_result(
+                request_text=request_text,
+                name="read_symbol",
+                arguments=read_args,
+                result=result,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                required_tool_names=required_tool_names,
+                expected_exact_reply_text=expected_exact_reply_text,
+            )
+            if message:
+                return self._record_synthesized_final(message, tool="read_symbol", round_number=round_number)
             return None
 
         if {"git_status", "git_diff"}.issubset(required_tool_names) and "git_status" not in forbidden_tool_names and "git_diff" not in forbidden_tool_names:
@@ -2126,6 +2204,7 @@ class OllamaCodeAgent:
         expected_exact_file_line = self._requested_exact_file_line(text)
         exact_file_write = self._requested_exact_single_line_file_write(text)
         target_line_read = self._requested_target_line_read(text)
+        symbol_read = self._requested_symbol_read(text)
         exact_shell_command = self._requested_exact_shell_command(text)
         expected_exact_reply_text = self._requested_exact_reply_text(text)
         prefers_structured_file_tools = self._request_prefers_structured_file_tools(text)
@@ -2135,6 +2214,7 @@ class OllamaCodeAgent:
             request_text=text,
             exact_file_write=exact_file_write,
             target_line_read=target_line_read,
+            symbol_read=symbol_read,
             exact_shell_command=exact_shell_command,
             expected_exact_reply_text=expected_exact_reply_text,
             required_tool_names=required_tool_names,
