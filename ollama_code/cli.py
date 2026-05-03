@@ -17,9 +17,11 @@ from ollama_code.config import (
     DEFAULT_MAX_AGENT_DEPTH,
     DEFAULT_MAX_TOOL_ROUNDS,
     DEFAULT_MODEL,
+    DEFAULT_RECONCILE_MODE,
     DEFAULT_TIMEOUT,
     ENV_OLLAMA_CODE_DEBATE,
     ENV_OLLAMA_CODE_MODEL,
+    ENV_OLLAMA_CODE_RECONCILE,
     ENV_OLLAMA_CODE_TEST_CMD,
     ENV_OLLAMA_CODE_VERIFIER_MODEL,
     ENV_OLLAMA_HOST,
@@ -147,6 +149,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=None, help="Ollama request timeout in seconds.")
     parser.add_argument("--test-cmd", default=None, help="Optional default test command for the run_test tool and /test.")
     parser.add_argument("--debate", choices=["on", "off"], default=None, help="Enable or disable tool-step assumption auditing plus grounded risky-final verification.")
+    parser.add_argument("--reconcile", choices=["off", "on", "auto"], default=None, help="Artifact reconciliation after failed tests/edits. Default: auto.")
     parser.add_argument("--verifier-model", default=None, help="Optional model override for grounded final verification and evidence-backed rewrite.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
@@ -169,6 +172,13 @@ def _bool_from_text(value: str | None) -> bool | None:
     if lowered in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _reconcile_from_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    lowered = value.strip().lower()
+    return lowered if lowered in {"off", "on", "auto"} else None
 
 
 def build_agent(
@@ -233,6 +243,17 @@ def build_agent(
         debate_enabled = env_debate
     if args.debate is not None:
         debate_enabled = args.debate == "on"
+    reconcile_mode = config.reconcile or DEFAULT_RECONCILE_MODE
+    env_reconcile = _reconcile_from_text(_non_empty_string(os.environ.get(ENV_OLLAMA_CODE_RECONCILE)))
+    if env_reconcile is not None:
+        reconcile_mode = env_reconcile
+    explicit_reconcile = _reconcile_from_text(args.reconcile)
+    if restored_payload is not None:
+        saved_reconcile = restored_payload.get("reconcile_mode")
+        if explicit_reconcile is None and env_reconcile is None and isinstance(saved_reconcile, str):
+            reconcile_mode = _reconcile_from_text(saved_reconcile) or reconcile_mode
+    if explicit_reconcile is not None:
+        reconcile_mode = explicit_reconcile
     max_tool_rounds = args.max_tool_rounds if args.max_tool_rounds is not None else (config.max_tool_rounds or DEFAULT_MAX_TOOL_ROUNDS)
     max_agent_depth = args.max_agent_depth if args.max_agent_depth is not None else (config.max_agent_depth or DEFAULT_MAX_AGENT_DEPTH)
     timeout = args.timeout if args.timeout is not None else (config.timeout or DEFAULT_TIMEOUT)
@@ -266,6 +287,7 @@ def build_agent(
         max_agent_depth=max_agent_depth,
         debate_enabled=debate_enabled,
         verifier_model=verifier_model,
+        reconcile_mode=reconcile_mode,
     )
     if restored_payload is not None:
         agent.restore_transcript(restored_payload)
@@ -329,12 +351,13 @@ def print_banner(agent: OllamaCodeAgent) -> None:
     print(f"model: {agent.model}")
     print(f"approval: {agent.approval_mode()}")
     print(f"debate: {'on' if agent.debate_mode() else 'off'}")
+    print(f"reconcile: {agent.reconcile_mode()}")
     if agent.configured_test_command():
         print(f"test_cmd: {agent.configured_test_command()}")
     if agent.session_path() is not None:
         print(f"session: {agent.session_path().as_posix()}")
     print("press Esc to interrupt the current model or tool call")
-    print("commands: /help /status /models /model /approval /debate /reset /save /sessions /load /git /diff /commit /test /tools /quit")
+    print("commands: /help /status /models /model /approval /debate /reconcile /reset /save /sessions /load /git /diff /commit /test /tools /quit")
 
 
 def _strip_matching_quotes(text: str) -> str:
@@ -354,7 +377,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         return False
     if action == "/help":
         writer(
-            "Slash commands: /help /status /models /model <name> /approval <mode> /debate on|off /reset /save [path] /sessions [limit] "
+            "Slash commands: /help /status /models /model <name> /approval <mode> /debate on|off /reconcile off|on|auto /reset /save [path] /sessions [limit] "
             "/load <path> /git /diff [--cached] [path] /commit <message> /test [command] /tools /quit\nPress Esc during model "
             "or tool execution to interrupt the current task."
         )
@@ -363,7 +386,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
         test_command = agent.configured_test_command() or "(none)"
         writer(
-            f"workspace={agent.workspace_root().as_posix()} model={agent.model} verifier_model={agent.verifier_model_name() or '-'} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
+            f"workspace={agent.workspace_root().as_posix()} model={agent.model} verifier_model={agent.verifier_model_name() or '-'} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} reconcile={agent.reconcile_mode()} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
         )
         return True
     if action == "/models":
@@ -393,6 +416,14 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
             return True
         agent.set_debate_enabled(mode == "on")
         writer(f"debate set to {'on' if agent.debate_mode() else 'off'}")
+        return True
+    if action == "/reconcile":
+        mode = _strip_matching_quotes(remainder)
+        if mode not in {"off", "on", "auto"}:
+            writer("Usage: /reconcile off|on|auto")
+            return True
+        agent.set_reconcile_mode(mode)
+        writer(f"reconcile set to {agent.reconcile_mode()}")
         return True
     if action == "/reset":
         agent.reset()

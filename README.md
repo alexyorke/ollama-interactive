@@ -15,6 +15,7 @@ It gives the model a guarded tool loop for:
 - creating guarded git commits
 - running nested sub-agents for scoped subtasks
 - running default-on tool-step assumption audits plus claim-aware risky final verification and evidence-backed rewrite
+- running artifact reconciliation after failed tests or validator-like tools
 
 By default it asks before edits or shell commands. You can switch to `--approval auto` for hands-off runs.
 Sessions are also auto-saved locally under `.ollama-code/sessions`, so you can continue or resume prior work.
@@ -58,6 +59,7 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
   "verifier_model": "granite4.1:8b",
   "approval": "ask",
   "debate": true,
+  "reconcile": "auto",
   "max_tool_rounds": 100,
   "max_agent_depth": 2,
   "timeout": 300,
@@ -75,7 +77,7 @@ Precedence:
 
 - CLI flags override everything else
 - when resuming a saved session, the saved model wins unless `--model` is provided
-- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_VERIFIER_MODEL`, `OLLAMA_CODE_TEST_CMD`, `OLLAMA_CODE_DEBATE`, and `OLLAMA_CODE_NUM_CTX` override the config file for one-off runs
+- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_VERIFIER_MODEL`, `OLLAMA_CODE_TEST_CMD`, `OLLAMA_CODE_DEBATE`, `OLLAMA_CODE_RECONCILE`, and `OLLAMA_CODE_NUM_CTX` override the config file for one-off runs
 - otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
 
 ## Run
@@ -115,6 +117,13 @@ export OLLAMA_HOST=127.0.0.1:11434
 ollama-code --debate off
 ```
 
+Artifact reconciliation defaults to `auto`. It runs a cheap serial critic after failed tests/validator-like tools to force a focused repair plan before the agent keeps going. Use `off` for fastest literal runs or `on` for stricter failed-edit handling too:
+
+```bash
+export OLLAMA_HOST=127.0.0.1:11434
+ollama-code --reconcile on
+```
+
 Use a stronger serial verifier/rewrite model while keeping the main working model smaller:
 
 ```bash
@@ -139,6 +148,7 @@ export OLLAMA_HOST=http://127.0.0.1:11434
 
 You can also set the default test command with `OLLAMA_CODE_TEST_CMD`.
 You can disable assumption auditing and grounded verification with `OLLAMA_CODE_DEBATE=off`.
+You can set failed-artifact reconciliation with `OLLAMA_CODE_RECONCILE=off|on|auto`.
 You can override the verifier/rewrite model with `OLLAMA_CODE_VERIFIER_MODEL`.
 The client sends an adaptive `num_ctx` option for normal compact turns so large-context models do not allocate 40K-131K context for tiny prompts. Set `OLLAMA_CODE_NUM_CTX=off` to use the model default, or set an integer such as `8192` to force a fixed context.
 
@@ -298,6 +308,7 @@ git push origin v0.1.0
 - `/model <name>`
 - `/approval ask|auto|read-only`
 - `/debate on|off`
+- `/reconcile off|on|auto`
 - `/reset`
 - `/save [path]`
 - `/sessions [limit]`
@@ -315,6 +326,7 @@ git push origin v0.1.0
 - File mutations are limited to that workspace.
 - Session history is auto-saved under `.ollama-code/sessions` in the workspace.
 - Debate mode now means two controller checks with `think=false`: a pre-tool assumption auditor on tool turns, plus claim-aware grounded verification on risky final replies. The auditor can accept or force up to two corrective retries before a tool runs. The verifier now receives extracted candidate claims and a compact evidence table, can return structured claim corrections, and can trigger one evidence-backed rewrite before the controller falls back to another primary-model retry or fails closed. Low-risk finals still skip verification, cached read-only tool repeats skip the auditor, and exact tool-error requests can return directly from the tool result.
+- Reconciliation mode is separate from debate. `auto` runs only after failed tests/validator-like tools that matter to the request, `on` also checks failed edits/shell/subagents, and `off` disables it.
 - `verifier_model` is optional. When set, it is used for final verification and evidence-backed rewrite only; the primary model still handles the normal tool loop and tool-step assumption audits.
 - Explicit forbidden-tool constraints such as `do not use read_file` are enforced before tool execution.
 - Tool-heavy turns run with thinking disabled by default to cut latency and token use. Simple non-tool turns still use the normal Ollama thinking path.

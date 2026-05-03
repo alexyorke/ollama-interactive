@@ -69,6 +69,7 @@ def evaluate_polyglot_python_task(
     task: str,
     model: str,
     debate: str,
+    reconcile: str,
     timeout: int,
 ) -> dict[str, Any]:
     source = polyglot_task_path(polyglot_root, task)
@@ -94,6 +95,8 @@ def evaluate_polyglot_python_task(
             "auto",
             "--debate",
             debate,
+            "--reconcile",
+            reconcile,
             "--quiet",
             "--max-tool-rounds",
             "16",
@@ -121,6 +124,7 @@ def evaluate_polyglot_python_task(
             "model": model,
             "verifier_model": None,
             "debate": debate,
+            "reconcile": reconcile,
             "status": status,
             "acceptable": ["pass"],
             "latency_s": round(time.perf_counter() - started, 2),
@@ -170,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial public coding benchmark smoke tests.")
     parser.add_argument("--models", nargs="+", default=["granite4.1:8b"])
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off"])
+    parser.add_argument("--reconcile-modes", nargs="+", choices=["off", "on", "auto"], default=["auto"])
     parser.add_argument("--tasks", nargs="+", default=list(DEFAULT_POLYGLOT_TASKS))
     parser.add_argument("--cache-dir", default="scratch/external")
     parser.add_argument("--output", default="scratch/public-bench/aider-polyglot-python-smoke.json")
@@ -186,24 +191,26 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     for model in args.models:
         for mode in args.modes:
-            for task in args.tasks:
-                outcome = evaluate_polyglot_python_task(
-                    project_root=project_root,
-                    polyglot_root=polyglot_root,
-                    task=task,
-                    model=model,
-                    debate=mode,
-                    timeout=args.timeout,
-                )
-                results.append(outcome)
-                write_payload(output, results=results, partial=True)
-                usage = outcome["usage"]
-                print(
-                    "[public-bench]"
-                    f" model={model} debate={mode} case={task} status={outcome['status']}"
-                    f" calls={usage['llm_calls']} tokens={usage['total_tokens']}"
-                    f" latency_s={outcome['latency_s']}"
-                )
+            for reconcile in args.reconcile_modes:
+                for task in args.tasks:
+                    outcome = evaluate_polyglot_python_task(
+                        project_root=project_root,
+                        polyglot_root=polyglot_root,
+                        task=task,
+                        model=model,
+                        debate=mode,
+                        reconcile=reconcile,
+                        timeout=args.timeout,
+                    )
+                    results.append(outcome)
+                    write_payload(output, results=results, partial=True)
+                    usage = outcome["usage"]
+                    print(
+                        "[public-bench]"
+                        f" model={model} debate={mode} reconcile={reconcile} case={task} status={outcome['status']}"
+                        f" calls={usage['llm_calls']} tokens={usage['total_tokens']}"
+                        f" latency_s={outcome['latency_s']}"
+                    )
 
     baseline_results = None
     if args.compare:
@@ -214,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
         for row in comparisons:
             print(
                 "[public-bench] comparison"
-                f" case={row['case']} status={row['before_status']}->{row['after_status']}"
+                f" case={row['case']} reconcile={row.get('reconcile') or '-'} status={row['before_status']}->{row['after_status']}"
                 f" tokens={row['before_total_tokens']}->{row['after_total_tokens']}"
                 f" delta_pct={row['total_token_delta_pct']}"
                 f" calls={row['before_llm_calls']}->{row['after_llm_calls']}"

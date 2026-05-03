@@ -22,11 +22,13 @@ class FakeClient:
         script_verification: bool = False,
         script_assumption_audit: bool = False,
         script_final_rewrite: bool = False,
+        script_reconciliation: bool = False,
     ) -> None:
         self.responses = list(responses)
         self.script_verification = script_verification
         self.script_assumption_audit = script_assumption_audit
         self.script_final_rewrite = script_final_rewrite
+        self.script_reconciliation = script_reconciliation
         self.calls: list[dict[str, object]] = []
         self.interrupt_events: list[object | None] = []
 
@@ -68,6 +70,8 @@ class FakeClient:
                     model=model,
                     raw={},
                 )
+            if system_prompt.startswith("You are an artifact reconciliation critic") and not self.script_reconciliation:
+                return ChatResponse(content='{"verdict":"accept","reason":"","repair_plan":[],"required_tools":[],"forbidden_tools":[]}', model=model, raw={})
         return ChatResponse(content=self.responses.pop(0), model=model, raw={})
 
 
@@ -1380,7 +1384,7 @@ class AgentTests(unittest.TestCase):
             session = root / ".ollama-code" / "sessions" / "saved.json"
             session.parent.mkdir(parents=True)
             original = (
-                '{"model":"saved-model","approval_mode":"read-only","workspace_root":"'
+                '{"model":"saved-model","approval_mode":"read-only","reconcile_mode":"on","workspace_root":"'
                 + root.as_posix()
                 + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"restore me"}],"events":[{"type":"user","content":"restore me"}]}'
             )
@@ -1395,6 +1399,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(loaded, session.resolve())
         self.assertEqual(agent.model, "saved-model")
         self.assertEqual(agent.approval_mode(), "read-only")
+        self.assertEqual(agent.reconcile_mode(), "on")
         self.assertEqual(on_disk, original)
 
     def test_workspace_roots_match_accepts_wsl_alias_for_windows_path(self) -> None:
@@ -1663,6 +1668,154 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("run_test"), 2)
         self.assertTrue(any("no implementation edit succeeded" in message["content"] for message in agent.messages if message["role"] == "user"))
 
+    def test_agent_reconciles_failed_test_artifact_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fail_command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: 0 != 1'); sys.exit(1)"])
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps(
+                        {
+                            "verdict": "retry",
+                            "reason": "The failing test needs implementation repair before final.",
+                            "repair_plan": ["edit implementation", "rerun tests"],
+                            "required_tools": ["write_file"],
+                            "forbidden_tools": [],
+                        }
+                    ),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "Fixed app.py and tests passed."}),
+                ],
+                script_reconciliation=True,
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, reconcile_mode="auto")
+
+            result = agent.handle_user("Fix app.py, run tests, and summarize.")
+
+        self.assertEqual(result.message, "Fixed app.py and tests passed.")
+        reconciliations = [event for event in agent.events if event["type"] == "reconciliation"]
+        self.assertEqual([event["verdict"] for event in reconciliations], ["retry"])
+        self.assertTrue(any("Artifact reconciliation rejected" in message["content"] for message in agent.messages if message["role"] == "user"))
+        self.assertEqual([call["think"] for call in client.calls if str(call["messages"][0]["content"]).startswith("You are an artifact reconciliation critic")], [False])
+
+    def test_agent_reconcile_off_skips_failed_test_artifact_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fail_command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('FAILED'); sys.exit(1)"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "final", "message": "Tests failed with exit code 1."}),
+                ],
+                script_reconciliation=True,
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, reconcile_mode="off")
+
+            result = agent.handle_user("Run tests and summarize the result.")
+
+        self.assertEqual(result.message, "Tests failed with exit code 1.")
+        self.assertFalse(any(event["type"] == "reconciliation" for event in agent.events))
+
+    def test_agent_reconcile_auto_skips_failed_edit_artifact(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", reconcile_mode="auto")
+
+        needs_reconciliation = agent._tool_result_needs_reconciliation(
+            request_text="Fix app.py and run tests.",
+            name="replace_symbol",
+            result={"ok": False, "summary": "Symbol not found: f"},
+            cache_hit=False,
+            session_memory_request=False,
+            mutation_required=True,
+            test_run_required=True,
+        )
+
+        self.assertFalse(needs_reconciliation)
+
+    def test_agent_runs_final_chance_test_after_last_round_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=pass_command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=1)
+
+            result = agent.handle_user("Edit app.py and run tests.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Ran tests after the latest edit: passed.")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        auto_results = [event for event in agent.events if event["type"] == "tool_result" and event["name"] == "run_test"]
+        self.assertTrue(auto_results[0]["auto"])
+
+    def test_agent_requires_edits_to_explicitly_named_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "src/app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "Tests passed."}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "docs/app.md", "content": "Updated docs.\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "Updated src and docs."}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+
+            result = agent.handle_user("Update src/app.py and docs/app.md, then run tests.")
+
+        self.assertEqual(result.message, "Updated src and docs.")
+        self.assertIn("docs/app.md", " ".join(message["content"] for message in agent.messages if message["role"] == "user"))
+        self.assertEqual(tools.execute_counts.get("write_file"), 2)
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+
+    def test_agent_fails_closed_after_reconciliation_retry_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fail_commands = [
+                subprocess.list2cmdline([sys.executable, "-c", f"import sys; print('FAIL {index}'); sys.exit(1)"])
+                for index in range(3)
+            ]
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_commands[0]}}),
+                    json.dumps({"verdict": "retry", "reason": "repair first", "repair_plan": ["edit"], "required_tools": [], "forbidden_tools": []}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_commands[1]}}),
+                    json.dumps({"verdict": "retry", "reason": "still failing", "repair_plan": ["edit again"], "required_tools": [], "forbidden_tools": []}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 2\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_commands[2]}}),
+                    json.dumps({"verdict": "retry", "reason": "still no approved path", "repair_plan": ["stop"], "required_tools": [], "forbidden_tools": []}),
+                ],
+                script_reconciliation=True,
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, reconcile_mode="on", max_tool_rounds=10)
+
+            result = agent.handle_user("Fix app.py, run tests, and keep repairing until tests pass.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("artifact reconciliation could not approve", result.message)
+        reconciliations = [event for event in agent.events if event["type"] == "reconciliation"]
+        self.assertEqual(len(reconciliations), 3)
+
     def test_agent_normalizes_edit_file_alias_with_content(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1683,6 +1836,93 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(normalizations[0]["normalized_name"], "write_file")
+
+    def test_agent_normalizes_snippet_replace_symbol_to_replace_in_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "replace_symbol", "arguments": {"path": "app.py", "symbol": "return left - right", "content": "return left + right"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Fix app.py so add uses addition.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return left + right", final_text)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertIsNone(tools.execute_counts.get("replace_symbol"))
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "replace_in_file")
+
+    def test_agent_does_not_synthesize_read_symbol_final_for_fix_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_symbol", "arguments": {"path": "app.py", "symbol": "add", "include_context": 0}}),
+                    json.dumps({"type": "final", "message": "add returns left - right."}),
+                    json.dumps({"type": "tool", "name": "replace_in_file", "arguments": {"path": "app.py", "old": "left - right", "new": "left + right"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "Fixed app.py and tests passed."}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Issue: app.py add returns the wrong value. Inspect source, fix it, run tests, and summarize.")
+
+        self.assertEqual(result.message, "Fixed app.py and tests passed.")
+        self.assertIn("workspace change", " ".join(message["content"] for message in agent.messages if message["role"] == "user"))
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+
+    def test_agent_normalizes_edit_payload_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs.md").write_text("total total\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "replace_in_file", "arguments": {"path": "docs.md", "old": "total", "new": "cart_total", "all": True}}),
+                    json.dumps({"type": "final", "message": "docs updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Update docs.md replacing total with cart_total.")
+            final_text = (root / "docs.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "docs updated")
+        self.assertEqual(final_text, "cart_total cart_total\n")
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertIn("replace_all", json.dumps(normalizations[0]["normalized_arguments"]))
+
+    def test_agent_normalizes_replace_symbol_text_edit_on_non_code_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs.md").write_text("Use total(prices).\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "replace_symbol", "arguments": {"path": "docs.md", "symbol": "total", "content": "cart_total"}}),
+                    json.dumps({"type": "final", "message": "docs updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Update docs.md replacing total with cart_total.")
+            final_text = (root / "docs.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "docs updated")
+        self.assertEqual(final_text, "Use cart_total(prices).\n")
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
 
     def test_agent_normalizes_edit_file_alias_with_symbol_content(self) -> None:
         root = self._workspace_scratch()
@@ -1841,6 +2081,33 @@ class AgentTests(unittest.TestCase):
         self.assertFalse((root / "sample_test.py").exists())
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
         self.assertTrue(any("Do not edit test files" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_agent_rejects_test_rewrite_that_drops_import_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_app.py").write_text(
+                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom app import f\n",
+                encoding="utf-8",
+            )
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "tests/test_app.py", "content": "from app import f\n"}}),
+                    json.dumps({"type": "tool", "name": "replace_in_file", "arguments": {"path": "tests/test_app.py", "old": "from app import f", "new": "from app import f"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "tests preserved"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Update tests/test_app.py as needed and run tests.")
+
+        self.assertEqual(result.message, "tests preserved")
+        self.assertTrue(any("sys.path bootstrap" in message["content"] for message in agent.messages if message["role"] == "user"))
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
 
     def test_request_requires_mutation_when_only_tests_are_read_only(self) -> None:
         client = FakeClient([])

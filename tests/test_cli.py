@@ -18,6 +18,7 @@ class DummyAgent:
         self.max_agent_depth = 2
         self._approval = "ask"
         self._debate_enabled = True
+        self._reconcile_mode = "auto"
         self._verifier_model: str | None = None
         self._workspace = Path.cwd()
         self.saved_path: Path | None = None
@@ -37,6 +38,9 @@ class DummyAgent:
     def debate_mode(self) -> bool:
         return self._debate_enabled
 
+    def reconcile_mode(self) -> str:
+        return self._reconcile_mode
+
     def configured_test_command(self) -> str | None:
         return self._test_command
 
@@ -54,6 +58,9 @@ class DummyAgent:
 
     def set_debate_enabled(self, enabled: bool) -> None:
         self._debate_enabled = enabled
+
+    def set_reconcile_mode(self, mode: str) -> None:
+        self._reconcile_mode = mode
 
     def reset(self) -> None:
         pass
@@ -131,6 +138,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.max_agent_depth, 2)
         self.assertEqual(agent.approval_mode(), "ask")
         self.assertTrue(agent.debate_mode())
+        self.assertEqual(agent.reconcile_mode(), "auto")
 
     def test_status_renderer_shows_last_three_thinking_lines_and_clears_on_status(self) -> None:
         stream = io.StringIO()
@@ -182,6 +190,7 @@ class CliCommandTests(unittest.TestCase):
             '"model":"gemma4:latest",'
             '"approval":"auto",'
             '"debate":false,'
+            '"reconcile":"on",'
             '"max_tool_rounds":12,'
             '"max_agent_depth":4,'
             '"timeout":45,'
@@ -199,6 +208,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.max_agent_depth, 4)
         self.assertEqual(agent.configured_test_command(), "python -m unittest -v")
         self.assertFalse(agent.debate_mode())
+        self.assertEqual(agent.reconcile_mode(), "on")
 
     def test_approval_command_updates_mode(self) -> None:
         agent = DummyAgent()
@@ -214,6 +224,14 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertFalse(agent.debate_mode())
         self.assertIn("debate set to off", output[0])
+
+    def test_reconcile_command_updates_mode(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/reconcile on", agent, output.append)
+        self.assertTrue(handled)
+        self.assertEqual(agent.reconcile_mode(), "on")
+        self.assertIn("reconcile set to on", output[0])
 
     def test_save_command_uses_custom_path(self) -> None:
         agent = DummyAgent()

@@ -28,6 +28,8 @@ Command = list[str] | str
 FAIL_CLOSED_MESSAGES = {
     "Stopped because grounded final verification could not accept a final answer.",
     "Stopped because assumption audit could not approve a next tool step.",
+    "Stopped because artifact reconciliation could not approve a repair path.",
+    "Stopped after reaching the maximum tool rounds.",
 }
 
 
@@ -762,17 +764,18 @@ def evaluate_case(
     mode: str,
     case: BenchmarkCase,
     timeout: int,
+    reconcile: str = "auto",
 ) -> dict[str, Any]:
     with workspace_temp_dir("ollama-code-bench-", repo_root) as tmp:
         workspace = Path(tmp)
         build_workspace(workspace)
         if case.prepare is not None:
             case.prepare(workspace)
-        session_file = workspace / "scratch" / f"{case.name}-{mode}.json"
+        session_file = workspace / "scratch" / f"{case.name}-{mode}-{reconcile}.json"
         results: list[subprocess.CompletedProcess[str]] = []
         started = time.perf_counter()
         for index, prompt in enumerate(case.turns):
-            extra_args = ["--debate", mode, "--quiet"]
+            extra_args = ["--debate", mode, "--reconcile", reconcile, "--quiet"]
             if mode == "on":
                 extra_args.extend(["--max-tool-rounds", "24"])
             if verifier_model:
@@ -801,6 +804,7 @@ def evaluate_case(
                     "model": model,
                     "verifier_model": verifier_model,
                     "debate": mode,
+                    "reconcile": reconcile,
                     "status": "fail",
                     "acceptable": list(case.acceptable),
                     "latency_s": round(elapsed, 2),
@@ -809,6 +813,8 @@ def evaluate_case(
                     "failed_tools": failed_tools(session),
                     "assumption_audits": event_count(session, "assumption_audit"),
                     "assumption_audit_retries": event_count(session, "assumption_audit", verdict="retry"),
+                    "reconciliations": event_count(session, "reconciliation"),
+                    "reconciliation_retries": event_count(session, "reconciliation", verdict="retry"),
                     "verification_retries": event_count(session, "verification", verdict="retry"),
                     "verification_rewrites": event_count(session, "verification_rewrite"),
                     "changed_files": _changed_files(workspace),
@@ -835,6 +841,9 @@ def evaluate_case(
         status = case.validate(ctx)
         if any(code != 0 for code in ctx.returncodes):
             status = "fail"
+        final_message = final_assistant_message(session)
+        if is_fail_closed_message(final_message):
+            status = "fail_closed"
         outcome = {
             "case": case.name,
             "suite": case.suite,
@@ -842,6 +851,7 @@ def evaluate_case(
             "model": model,
             "verifier_model": verifier_model,
             "debate": mode,
+            "reconcile": reconcile,
             "status": status,
             "acceptable": list(case.acceptable),
             "latency_s": round(elapsed, 2),
@@ -850,12 +860,14 @@ def evaluate_case(
             "failed_tools": failed_tools(session),
             "assumption_audits": event_count(session, "assumption_audit"),
             "assumption_audit_retries": event_count(session, "assumption_audit", verdict="retry"),
+            "reconciliations": event_count(session, "reconciliation"),
+            "reconciliation_retries": event_count(session, "reconciliation", verdict="retry"),
             "verification_retries": event_count(session, "verification", verdict="retry"),
             "verification_rewrites": event_count(session, "verification_rewrite"),
             "changed_files": _changed_files(workspace),
             "tests_run": tests_run(session),
             "validator_output": _validator_output(ctx, status),
-            "final": final_assistant_message(session),
+            "final": final_message,
             "stdout_tail": ctx.stdout[-1200:],
             "stderr_tail": ctx.stderr[-1200:],
         }
@@ -950,13 +962,13 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
     if baseline is None:
         return []
     index = {
-        (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("case")): item
+        (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("case")): item
         for item in baseline
         if isinstance(item, dict)
     }
     rows: list[dict[str, Any]] = []
     for item in current:
-        key = (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("case"))
+        key = (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("case"))
         before = index.get(key)
         if before is None:
             continue
@@ -971,6 +983,7 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
                 "model": item.get("model"),
                 "verifier_model": item.get("verifier_model"),
                 "debate": item.get("debate"),
+                "reconcile": item.get("reconcile"),
                 "case": item.get("case"),
                 "before_status": before.get("status"),
                 "after_status": item.get("status"),
@@ -996,6 +1009,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
             f" model={item.get('model') or '-'}"
             f" verifier={item.get('verifier_model') or '-'}"
             f" debate={item.get('debate') or '-'}"
+            f" reconcile={item.get('reconcile') or '-'}"
             f" case={item['case']}"
             f" status={item['status']}"
             f" calls={usage.get('llm_calls', 0)}"
@@ -1014,6 +1028,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
                 f" model={row['model']}"
                 f" verifier={row['verifier_model'] or '-'}"
                 f" debate={row['debate']}"
+                f" reconcile={row.get('reconcile') or '-'}"
                 f" case={row['case']}"
                 f" status={row['before_status']}->{row['after_status']}"
                 f" total_tokens={row['before_total_tokens']}->{row['after_total_tokens']}"
@@ -1048,6 +1063,7 @@ def external_smoke_results() -> list[dict[str, Any]]:
                 "model": None,
                 "verifier_model": None,
                 "debate": None,
+                "reconcile": None,
                 "status": status,
                 "acceptable": ["pass", "fail_closed"],
                 "latency_s": round(time.perf_counter() - started, 2),
@@ -1056,6 +1072,8 @@ def external_smoke_results() -> list[dict[str, Any]]:
                 "failed_tools": [],
                 "assumption_audits": 0,
                 "assumption_audit_retries": 0,
+                "reconciliations": 0,
+                "reconciliation_retries": 0,
                 "verification_retries": 0,
                 "verification_rewrites": 0,
                 "changed_files": [],
@@ -1105,6 +1123,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b"], help="Primary models for local suites.")
     parser.add_argument("--verifier-pairs", nargs="*", default=[], help="Optional primary=verifier entries, debate-on only.")
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off", "on"])
+    parser.add_argument("--reconcile-modes", nargs="+", choices=["off", "on", "auto"], default=["auto"], help="Artifact reconciliation modes to run.")
     parser.add_argument("--cases", nargs="*", default=None, help="Case names to run.")
     parser.add_argument("--output", default=None, help="Raw JSON output path. Defaults under scratch/coding-benchmark/.")
     parser.add_argument("--compare", default=None, help="Optional prior JSON path for token/accuracy deltas.")
@@ -1158,11 +1177,12 @@ def main(argv: list[str] | None = None) -> int:
             if verifier_model:
                 _LOADED_MODELS.add(verifier_model)
             for mode in modes:
-                for case in cases:
-                    outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout)
-                    results.append(outcome)
-                    print_table([outcome], [])
-                    write_results_payload(output, repo_root=repo_root, suite=args.suite, results=results, partial=True)
+                for reconcile in args.reconcile_modes:
+                    for case in cases:
+                        outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout, reconcile=reconcile)
+                        results.append(outcome)
+                        print_table([outcome], [])
+                        write_results_payload(output, repo_root=repo_root, suite=args.suite, results=results, partial=True)
             unload_model(model)
             _LOADED_MODELS.discard(model)
             if verifier_model:

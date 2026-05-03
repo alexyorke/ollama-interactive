@@ -88,6 +88,7 @@ PRIMARY_CONTEXT_CONTENT_LIMIT = 900
 MAX_VERIFICATION_RETRIES = 2
 MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
+MAX_RECONCILIATION_RETRIES = 2
 AUDIT_LIST_ITEM_LIMIT = 3
 AUDIT_TEXT_ITEM_LIMIT = 140
 CANDIDATE_CLAIM_LIMIT = 5
@@ -117,6 +118,7 @@ SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
+CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
 MODEL_TOOL_RESULT_LIMITS = {
     "list_files": 500,
     "read_file": 1000,
@@ -189,6 +191,22 @@ Rules:
 - Accept read/inspect steps after failed tests; repair needs fresh evidence more than another audit.
 - Retry if redundant, too broad, constraint-violating, mutating before inspection, or not validating the key assumption.
 - Do not rewrite the tool. Tool arrays: known names only or [].
+"""
+
+ARTIFACT_RECONCILER_SYSTEM_PROMPT = """You are an artifact reconciliation critic for a coding CLI controller.
+
+After a failed tool/test/edit artifact, decide if the main model should retry with a compact repair plan. JSON only.
+
+Replies:
+{"verdict":"accept","reason":"","repair_plan":[],"required_tools":[],"forbidden_tools":[]}
+{"verdict":"retry","reason":"brief concrete reason","repair_plan":["inspect failing symbol","edit implementation","rerun tests"],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
+
+Rules:
+- Use only supplied request, recent messages, tool calls, and artifact evidence.
+- Retry if failed tests, syntax errors, or tool errors imply a specific next validation/repair step.
+- Prefer implementation/source repair before repeated tests.
+- Keep repair_plan short. Tool arrays: known names only or [].
+- Do not write code or the final answer.
 """
 
 
@@ -300,6 +318,7 @@ class OllamaCodeAgent:
         max_agent_depth: int = 2,
         debate_enabled: bool = True,
         verifier_model: str | None = None,
+        reconcile_mode: str = "off",
     ) -> None:
         self.client = client
         self.tools = tools
@@ -312,6 +331,7 @@ class OllamaCodeAgent:
         self.agent_depth = agent_depth
         self.max_agent_depth = max_agent_depth
         self.debate_enabled = debate_enabled
+        self.reconcile_mode_setting = self._normalize_reconcile_mode(reconcile_mode)
         self.events: list[dict[str, Any]] = []
         self._pending_llm_call_events: list[dict[str, Any]] = []
         self._interrupt_event: threading.Event | None = None
@@ -412,6 +432,17 @@ class OllamaCodeAgent:
     def set_debate_enabled(self, enabled: bool) -> None:
         self.debate_enabled = bool(enabled)
 
+    def reconcile_mode(self) -> str:
+        return self.reconcile_mode_setting
+
+    def set_reconcile_mode(self, mode: str) -> None:
+        self.reconcile_mode_setting = self._normalize_reconcile_mode(mode)
+
+    @staticmethod
+    def _normalize_reconcile_mode(mode: str | None) -> str:
+        value = str(mode or "off").strip().lower()
+        return value if value in {"off", "on", "auto"} else "off"
+
     def configured_test_command(self) -> str | None:
         return self.tools.default_test_command
 
@@ -474,6 +505,9 @@ class OllamaCodeAgent:
             self.model = saved_model.strip()
         saved_verifier_model = payload.get("verifier_model")
         self.verifier_model = saved_verifier_model.strip() if isinstance(saved_verifier_model, str) and saved_verifier_model.strip() else None
+        saved_reconcile_mode = payload.get("reconcile_mode")
+        if isinstance(saved_reconcile_mode, str):
+            self.reconcile_mode_setting = self._normalize_reconcile_mode(saved_reconcile_mode)
         saved_approval = payload.get("approval_mode")
         if saved_approval in {"ask", "auto", "read-only"}:
             self.tools.set_approval_mode(str(saved_approval))
@@ -509,6 +543,7 @@ class OllamaCodeAgent:
         payload = {
             "model": self.model,
             "verifier_model": self.verifier_model,
+            "reconcile_mode": self.reconcile_mode_setting,
             "workspace_root": self.tools.workspace_root.as_posix(),
             "approval_mode": self.tools.approval_mode,
             "messages": self.messages,
@@ -1212,6 +1247,136 @@ class OllamaCodeAgent:
         )
         return decision
 
+    def _reconciliation_messages(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        return [
+            {"role": "system", "content": ARTIFACT_RECONCILER_SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
+        ]
+
+    def _reconciliation_context_payload(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        tool_name: str,
+        tool_arguments: dict[str, Any],
+        tool_result: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> dict[str, Any]:
+        recent_messages = [
+            {
+                "role": message["role"],
+                "content": self._truncate_text(message["content"], limit=180),
+            }
+            for message in self.messages[-VERIFICATION_HISTORY_LIMIT:]
+            if message.get("role") != "system"
+        ]
+        return {
+            "round": round_number,
+            "model": self.model,
+            "workspace_root": self.tools.workspace_root.as_posix(),
+            "original_user_request": self._truncate_text(request_text, limit=360),
+            "recent_messages": recent_messages,
+            "failed_artifact": {
+                "tool": tool_name,
+                "arguments": self._truncate_json_value(tool_arguments, limit=180),
+                "result": self._compact_tool_result_for_context(tool_name, tool_result, for_verification=True),
+            },
+            "required_tools": sorted(required_tool_names),
+            "forbidden_tools": sorted(forbidden_tool_names),
+            "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls[-4:]],
+            "evidence_table": self._build_verification_evidence_table(successful_tool_results),
+            "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
+        }
+
+    def _normalize_reconciliation_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        decision = payload if isinstance(payload, dict) else {}
+        verdict = str(decision.get("verdict", "")).strip().lower()
+        if verdict not in {"accept", "retry"}:
+            verdict = "retry"
+        reason = str(decision.get("reason", "")).strip()
+        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        return {
+            "verdict": verdict,
+            "reason": reason,
+            "repair_plan": self._normalize_audit_text_items(decision.get("repair_plan")),
+            "required_tools": sorted(set(required_tools)),
+            "forbidden_tools": sorted(set(forbidden_tools)),
+        }
+
+    def _run_reconciliation(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        tool_name: str,
+        tool_arguments: dict[str, Any],
+        tool_result: dict[str, Any],
+        tool_calls: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        accepted_assumption_audits: list[dict[str, Any]],
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> dict[str, Any]:
+        context_payload = self._reconciliation_context_payload(
+            request_text=request_text,
+            round_number=round_number,
+            tool_name=tool_name,
+            tool_arguments=tool_arguments,
+            tool_result=tool_result,
+            tool_calls=tool_calls,
+            successful_tool_results=successful_tool_results,
+            accepted_assumption_audits=accepted_assumption_audits,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        )
+        self.status_printer("reconciling failed artifact")
+        verdict_response = self._chat(
+            purpose="reconciliation",
+            model=self.model,
+            messages=self._reconciliation_messages(context_payload),
+            think=False,
+        )
+        decision = self._normalize_reconciliation_payload(extract_json_response(verdict_response.content))
+        if decision["verdict"] == "retry" and not decision["reason"]:
+            decision["reason"] = "Failed artifact needs a grounded repair step."
+        self._record_event(
+            "reconciliation",
+            round=round_number,
+            tool=tool_name,
+            arguments=self._truncate_json_value(tool_arguments, limit=800),
+            verdict=decision["verdict"],
+            reason=decision["reason"],
+            repair_plan=decision["repair_plan"],
+            required_tools=decision["required_tools"],
+            forbidden_tools=decision["forbidden_tools"],
+            reconciler_model=self.model,
+            reconciler=verdict_response.content,
+        )
+        return decision
+
+    def _reconciliation_retry_message(self, decision: dict[str, Any]) -> str:
+        parts = [
+            "Artifact reconciliation rejected continuing from the failed artifact without repair.",
+            "Reason: " + str(decision.get("reason") or "The failed artifact needs a focused repair step."),
+        ]
+        repair_plan = decision.get("repair_plan") if isinstance(decision.get("repair_plan"), list) else []
+        required_tools = decision.get("required_tools") if isinstance(decision.get("required_tools"), list) else []
+        forbidden_tools = decision.get("forbidden_tools") if isinstance(decision.get("forbidden_tools"), list) else []
+        if repair_plan:
+            parts.append("Repair plan: " + "; ".join(str(item) for item in repair_plan[:3]) + ".")
+        if required_tools:
+            parts.append("Required tools for this turn: " + ", ".join(str(item) for item in required_tools) + ".")
+        if forbidden_tools:
+            parts.append("Forbidden tools for this turn: " + ", ".join(str(item) for item in forbidden_tools) + ".")
+        parts.append("Choose the next JSON object only.")
+        return " ".join(parts)
+
     def _verify_final_candidate(
         self,
         response: ChatResponse,
@@ -1752,6 +1917,107 @@ class OllamaCodeAgent:
             )
         return name, arguments, None
 
+    def _snippet_symbol_argument_looks_like_text(self, value: str) -> bool:
+        snippet = value.strip()
+        if not snippet:
+            return False
+        if "\n" in snippet:
+            return True
+        if re.match(r"^[A-Za-z_][\w.]*\s*(?:\(|$)", snippet):
+            return False
+        return bool(re.search(r"\b(?:return|raise|yield|if|else|for|while|with|try|except)\b|[=+\-*/%<>\[\]{}]", snippet))
+
+    def _path_looks_like_code_file(self, path: str) -> bool:
+        return Path(path.replace("\\", "/")).suffix.lower() in CODE_EDIT_SUFFIXES
+
+    def _decode_accidental_escaped_newlines(self, value: str) -> str:
+        if "\n" in value or "\\n" not in value:
+            return value
+        if not re.search(r"\b(?:def|class|import|from|return|if|for|while|try|except|function|const|let|var)\b", value):
+            return value
+        return value.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+    def _normalize_edit_payload_aliases(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name not in {"write_file", "replace_symbol", "replace_symbols", "replace_in_file"}:
+            return name, arguments, None
+        updated = deepcopy(arguments)
+        changed_reasons: list[str] = []
+        for key in ("content", "new"):
+            value = updated.get(key)
+            if isinstance(value, str):
+                decoded = self._decode_accidental_escaped_newlines(value)
+                if decoded != value:
+                    updated[key] = decoded
+                    changed_reasons.append(f"decoded escaped newlines in {key}")
+        if name == "replace_symbols":
+            replacements = updated.get("replacements")
+            if isinstance(replacements, list):
+                normalized_replacements: list[Any] = []
+                for item in replacements:
+                    if not isinstance(item, dict):
+                        normalized_replacements.append(item)
+                        continue
+                    normalized_item = dict(item)
+                    content = normalized_item.get("content")
+                    if isinstance(content, str):
+                        decoded = self._decode_accidental_escaped_newlines(content)
+                        if decoded != content:
+                            normalized_item["content"] = decoded
+                            changed_reasons.append("decoded escaped newlines in replacement content")
+                    normalized_replacements.append(normalized_item)
+                updated["replacements"] = normalized_replacements
+        if name == "replace_in_file" and "replace_all" not in updated and "all" in updated:
+            updated["replace_all"] = bool(updated.get("all"))
+            changed_reasons.append("normalized all to replace_all")
+        if name == "replace_symbol":
+            path = str(updated.get("path", "")).strip()
+            symbol = updated.get("symbol")
+            content = updated.get("content")
+            replacements = updated.get("replacements")
+            if path and isinstance(replacements, list) and len(replacements) == 1 and isinstance(replacements[0], dict):
+                item = replacements[0]
+                old = item.get("old")
+                new = item.get("new")
+                if isinstance(old, str) and isinstance(new, str):
+                    return (
+                        "replace_in_file",
+                        {"path": path, "old": old, "new": new, "replace_all": bool(item.get("replace_all", item.get("all", False)))},
+                        "Normalized replace_symbol replacement-list payload to replace_in_file.",
+                    )
+            if path and isinstance(symbol, str) and isinstance(content, str) and not self._path_looks_like_code_file(path):
+                return (
+                    "replace_in_file",
+                    {"path": path, "old": symbol, "new": content, "replace_all": False},
+                    "Normalized replace_symbol text edit on a non-code file to replace_in_file.",
+                )
+        if changed_reasons:
+            return name, updated, "Normalized edit payload: " + "; ".join(sorted(set(changed_reasons))) + "."
+        return name, arguments, None
+
+    def _normalize_snippet_symbol_edit_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "replace_symbol":
+            return name, arguments, None
+        path = str(arguments.get("path", "")).strip()
+        symbol = arguments.get("symbol")
+        content = arguments.get("content")
+        if not path or not isinstance(symbol, str) or not isinstance(content, str):
+            return name, arguments, None
+        if not self._snippet_symbol_argument_looks_like_text(symbol):
+            return name, arguments, None
+        return (
+            "replace_in_file",
+            {"path": path, "old": symbol, "new": content, "all": False},
+            "Normalized snippet-style replace_symbol call to replace_in_file.",
+        )
+
     def _request_needs_exact_grounding(self, text: str) -> bool:
         lowered = text.lower()
         patterns = [
@@ -1915,6 +2181,34 @@ class OllamaCodeAgent:
         return (
             f"Do not create unrelated Python file {raw_path}. Existing tests import implementation file(s): {imported_list}. "
             "Edit those files or inspect tests/source, then rerun run_test. Next JSON only."
+        )
+
+    def _test_write_drops_import_bootstrap_feedback(self, arguments: dict[str, Any]) -> str | None:
+        raw_path = str(arguments.get("path", "")).strip()
+        content = arguments.get("content")
+        if not raw_path.replace("\\", "/").endswith(".py") or not self._path_looks_like_test_file(raw_path):
+            return None
+        if not isinstance(content, str):
+            return None
+        try:
+            target = self.tools.resolve_path(raw_path, allow_missing=False)
+        except (OSError, ValueError):
+            return None
+        if not target.is_file():
+            return None
+        try:
+            existing = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        if "sys.path.insert" not in existing and "sys.path.append" not in existing:
+            return None
+        if "sys.path.insert" in content or "sys.path.append" in content:
+            return None
+        if "from " not in content and "import " not in content:
+            return None
+        return (
+            f"Do not rewrite {raw_path} without preserving its existing sys.path bootstrap for local source imports. "
+            "Use replace_in_file for the specific rename or include the same sys.path setup, then rerun run_test. Next JSON only."
         )
 
     def _path_looks_like_test_file(self, path: str) -> bool:
@@ -2085,6 +2379,16 @@ class OllamaCodeAgent:
                 if path:
                     return path
         return None
+
+    def _requested_mutation_paths(self, text: str) -> set[str]:
+        if not self._request_requires_mutation(text):
+            return set()
+        paths: set[str] = set()
+        for raw_path in re.findall(r"\b(?:[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]+\b", text):
+            normalized = raw_path.strip().strip("`'\".,;:").replace("\\", "/").lstrip("./")
+            if normalized:
+                paths.add(normalized)
+        return paths
 
     def _requested_git_tool_path(self, text: str) -> str | None:
         patterns = [
@@ -2339,6 +2643,32 @@ class OllamaCodeAgent:
             return True
         return True
 
+    def _tool_result_needs_reconciliation(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        result: dict[str, Any],
+        cache_hit: bool,
+        session_memory_request: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+    ) -> bool:
+        if self.reconcile_mode_setting == "off" or cache_hit or session_memory_request:
+            return False
+        if self._request_expects_exact_tool_error(request_text):
+            return False
+        failed = result.get("ok") is not True or result.get("syntax_ok") is False
+        if not failed:
+            return False
+        if self.reconcile_mode_setting == "on":
+            return name in MUTATING_TOOL_NAMES or name in {"run_test", "lint_typecheck", "run_function_probe", "run_shell", "run_agent"}
+        if name == "run_test":
+            return mutation_required or test_run_required
+        if name in {"lint_typecheck", "run_function_probe"}:
+            return mutation_required or test_run_required
+        return False
+
     def _synthesize_final_from_tool_result(
         self,
         *,
@@ -2362,6 +2692,8 @@ class OllamaCodeAgent:
             output = str(result.get("output", ""))
             if expected_exact_reply_text is not None and expected_exact_reply_text in output:
                 return expected_exact_reply_text
+            if self._request_requires_mutation(request_text) or self._request_requires_test_run(request_text):
+                return None
             if self._request_asks_token_only(request_text):
                 if self._request_mentions_repeated_read(request_text):
                     if name != "read_file":
@@ -2910,6 +3242,7 @@ class OllamaCodeAgent:
             max_agent_depth=self.max_agent_depth,
             debate_enabled=self.debate_enabled,
             verifier_model=self.verifier_model,
+            reconcile_mode=self.reconcile_mode_setting,
         )
         child.set_interrupt_event(self._interrupt_event)
         result = child.handle_user(prompt)
@@ -2917,6 +3250,7 @@ class OllamaCodeAgent:
             "tool": "run_agent",
             "model": selected_model,
             "verifier_model": self.verifier_model,
+            "reconcile_mode": self.reconcile_mode_setting,
             "approval_mode": approval_mode,
             "rounds": result.rounds,
             "output": result.message,
@@ -2950,6 +3284,7 @@ class OllamaCodeAgent:
         mutation_required = self._request_requires_mutation(text)
         test_run_required = self._request_requires_test_run(text)
         test_mutation_forbidden = self._request_forbids_test_mutation(text)
+        required_mutation_paths = self._requested_mutation_paths(text)
         primary_tool_names = self._primary_tool_names_for_request(
             text,
             requires_tools=requires_tools,
@@ -2979,12 +3314,14 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]] = []
         tool_calls_this_turn: list[dict[str, Any]] = []
         accepted_assumption_audits: list[dict[str, Any]] = []
+        mutated_paths_this_turn: set[str] = set()
         rejected_final_messages: set[str] = set()
         mutation_verified_this_turn = False
         failed_tool_this_turn = False
         assumption_audit_retries = 0
         verification_retries = 0
         verification_rewrite_attempts = 0
+        reconciliation_retries = 0
         mutation_version = 0
         last_failed_run_test_key: tuple[str, str, int] | None = None
         last_successful_run_test_version: int | None = None
@@ -3116,6 +3453,18 @@ class OllamaCodeAgent:
                         {
                             "role": "user",
                             "content": "The user asked for a workspace change. Do not finish until write_file, replace_symbol, replace_symbols, replace_in_file, or git_commit succeeds in this turn. Use the next JSON object only.",
+                        }
+                    )
+                    continue
+                missing_mutation_paths = sorted(required_mutation_paths - mutated_paths_this_turn)
+                if mutation_required and missing_mutation_paths:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The user explicitly named path(s) that still need a successful edit in this turn: "
+                            + ", ".join(missing_mutation_paths)
+                            + ". Edit those path(s), then rerun required validation. Next JSON only.",
                         }
                     )
                     continue
@@ -3321,6 +3670,16 @@ class OllamaCodeAgent:
                         name,
                         arguments,
                     )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_edit_payload_aliases(
+                        name,
+                        arguments,
+                    )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_snippet_symbol_edit_call(
+                        name,
+                        arguments,
+                    )
                 if name == "run_shell" and exact_shell_command and str(arguments.get("command", "")).strip() != exact_shell_command:
                     arguments = dict(arguments)
                     arguments["command"] = exact_shell_command
@@ -3378,6 +3737,11 @@ class OllamaCodeAgent:
                     continue
                 if mutation_required and test_run_required and name == "write_file":
                     feedback = self._unimported_python_write_feedback(text, arguments)
+                    if feedback:
+                        self._append_assistant_payload(payload)
+                        self.messages.append({"role": "user", "content": feedback})
+                        continue
+                    feedback = self._test_write_drops_import_bootstrap_feedback(arguments)
                     if feedback:
                         self._append_assistant_payload(payload)
                         self.messages.append({"role": "user", "content": feedback})
@@ -3529,6 +3893,9 @@ class OllamaCodeAgent:
                     if name in MUTATING_TOOL_NAMES:
                         mutation_verified_this_turn = True
                         mutation_version += 1
+                        result_path = str(result.get("path", "")).strip().replace("\\", "/").lstrip("./")
+                        if result_path:
+                            mutated_paths_this_turn.add(result_path)
                 if self._counts_as_real_tool_use(name, result):
                     successful_tool_results.append(
                         {
@@ -3563,6 +3930,39 @@ class OllamaCodeAgent:
                         "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use),
                     }
                 )
+                if self._tool_result_needs_reconciliation(
+                    request_text=text,
+                    name=name,
+                    result=result,
+                    cache_hit=cache_hit,
+                    session_memory_request=session_memory_request,
+                    mutation_required=mutation_required,
+                    test_run_required=test_run_required,
+                ):
+                    reconciliation_decision = self._run_reconciliation(
+                        request_text=text,
+                        round_number=round_number,
+                        tool_name=name,
+                        tool_arguments=arguments,
+                        tool_result=result,
+                        tool_calls=tool_calls_this_turn,
+                        successful_tool_results=successful_tool_results,
+                        accepted_assumption_audits=accepted_assumption_audits,
+                        required_tool_names=required_tool_names,
+                        forbidden_tool_names=forbidden_tool_names,
+                    )
+                    if reconciliation_decision["verdict"] == "retry":
+                        reconciliation_retries += 1
+                        required_tool_names.update(reconciliation_decision["required_tools"])
+                        forbidden_tool_names.update(reconciliation_decision["forbidden_tools"])
+                        required_tool_names.difference_update(forbidden_tool_names)
+                        if reconciliation_retries > MAX_RECONCILIATION_RETRIES:
+                            failure = "Stopped because artifact reconciliation could not approve a repair path."
+                            self._record_event("assistant", content=failure, rounds=round_number)
+                            self._flush_llm_call_events()
+                            return AgentResult(message=failure, rounds=round_number, completed=False)
+                        self.messages.append({"role": "user", "content": self._reconciliation_retry_message(reconciliation_decision)})
+                        continue
                 synthesized_final = self._synthesize_final_from_tool_result(
                     request_text=text,
                     name=name,
@@ -3594,6 +3994,50 @@ class OllamaCodeAgent:
                         self._record_event("assistant", content=failure_message, rounds=round_number)
                         self._flush_llm_call_events()
                         return AgentResult(message=failure_message, rounds=round_number, completed=True)
+                if (
+                    round_number == self.max_tool_rounds
+                    and test_run_required
+                    and mutation_verified_this_turn
+                    and self.tools.default_test_command
+                    and last_successful_run_test_version != mutation_version
+                    and not unresolved_syntax_diagnostics
+                    and not (required_mutation_paths - mutated_paths_this_turn)
+                ):
+                    auto_arguments: dict[str, Any] = {}
+                    self.status_printer("tool run_test {}")
+                    self._record_event("tool_call", name="run_test", arguments=auto_arguments, rounds=round_number, auto=True)
+                    tool_calls_this_turn.append({"name": "run_test", "arguments": deepcopy(auto_arguments)})
+                    auto_result = self.tools.execute("run_test", auto_arguments)
+                    self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True)
+                    tool_used_this_turn = True
+                    satisfied_tool_names.add("run_test")
+                    raw_output = str(auto_result.get("output") or auto_result.get("summary") or "").strip()
+                    if auto_result.get("ok") is True:
+                        successful_tool_results.append(
+                            {
+                                "name": "run_test",
+                                "arguments": deepcopy(auto_arguments),
+                                "result": deepcopy(auto_result),
+                            }
+                        )
+                        last_successful_run_test_version = mutation_version
+                        latest_run_test_failed = False
+                        latest_run_test_failure_summary = ""
+                        failed_run_test_mutation_version = None
+                        message = "Ran tests after the latest edit: passed."
+                        self._record_event("assistant_synthesized", content=message, tool="run_test", rounds=round_number, auto=True)
+                        self._record_event("assistant", content=message, rounds=round_number)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=message, rounds=round_number, completed=True)
+                    latest_run_test_failed = True
+                    failed_run_test_mutation_version = mutation_version
+                    latest_run_test_failure_summary = self._compact_run_test_output(raw_output, limit=520) if raw_output else ""
+                    message = "Stopped because final-chance run_test failed."
+                    if latest_run_test_failure_summary:
+                        message += " " + self._truncate_text(latest_run_test_failure_summary, limit=360)
+                    self._record_event("assistant", content=message, rounds=round_number)
+                    self._flush_llm_call_events()
+                    return AgentResult(message=message, rounds=round_number, completed=False)
                 continue
             self._append_assistant_payload(payload)
             self.messages.append(

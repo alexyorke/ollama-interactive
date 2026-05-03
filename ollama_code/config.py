@@ -14,11 +14,13 @@ DEFAULT_MAX_TOOL_ROUNDS = 100
 DEFAULT_MAX_AGENT_DEPTH = 2
 DEFAULT_TIMEOUT = 300
 DEFAULT_DEBATE_ENABLED = True
+DEFAULT_RECONCILE_MODE = "auto"
 ENV_OLLAMA_HOST = "OLLAMA_HOST"
 ENV_OLLAMA_CODE_MODEL = "OLLAMA_CODE_MODEL"
 ENV_OLLAMA_CODE_VERIFIER_MODEL = "OLLAMA_CODE_VERIFIER_MODEL"
 ENV_OLLAMA_CODE_TEST_CMD = "OLLAMA_CODE_TEST_CMD"
 ENV_OLLAMA_CODE_DEBATE = "OLLAMA_CODE_DEBATE"
+ENV_OLLAMA_CODE_RECONCILE = "OLLAMA_CODE_RECONCILE"
 ENV_OLLAMA_CODE_NUM_CTX = "OLLAMA_CODE_NUM_CTX"
 
 
@@ -33,6 +35,7 @@ class CliConfig:
     timeout: int | None = None
     test_cmd: str | None = None
     debate: bool | None = None
+    reconcile: str | None = None
     path: Path | None = None
 
 
@@ -82,6 +85,16 @@ def _bool_config_value(payload: dict[str, Any], key: str, path: Path) -> bool | 
     return value
 
 
+def _reconcile_config_value(payload: dict[str, Any], path: Path) -> str | None:
+    value = _config_value(payload, "reconcile", path)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered not in {"off", "on", "auto"}:
+        raise ValueError(f'Config value "reconcile" must be off, on, or auto in {path}')
+    return lowered
+
+
 def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> CliConfig:
     path = resolve_config_path(workspace_root, raw_path)
     explicit_path = raw_path is not None
@@ -114,5 +127,6 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
         timeout=_int_config_value(data, "timeout", path),
         test_cmd=_config_value(data, "test_cmd", path),
         debate=_bool_config_value(data, "debate", path),
+        reconcile=_reconcile_config_value(data, path),
         path=path,
     )

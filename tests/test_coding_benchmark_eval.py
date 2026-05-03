@@ -113,6 +113,9 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(violations, ["llm_calls 2>1", "total_tokens 11>10"])
 
+    def test_max_rounds_stop_counts_as_fail_closed(self) -> None:
+        self.assertTrue(bench.is_fail_closed_message("Stopped after reaching the maximum tool rounds."))
+
     def test_comparison_rows_report_status_and_token_deltas(self) -> None:
         baseline = [
             {
