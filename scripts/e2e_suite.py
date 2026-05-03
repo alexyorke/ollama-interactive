@@ -6,10 +6,14 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable
+
+try:
+    from workspace_temp import workspace_temp_dir
+except ModuleNotFoundError:
+    from scripts.workspace_temp import workspace_temp_dir
 
 
 _LOADED_MODELS: set[str] = set()
@@ -27,12 +31,19 @@ def _cleanup_loaded_models() -> None:
 atexit.register(_cleanup_loaded_models)
 
 
-def init_git_repo(root: Path) -> None:
-    subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
-    subprocess.run(["git", "config", "user.name", "Ollama Code Tests"], cwd=root, capture_output=True, text=True, check=True)
-    subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
-    subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
-    subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+def init_git_repo(root: Path) -> bool:
+    for command in (
+        ["git", "init"],
+        ["git", "config", "user.name", "Ollama Code Tests"],
+        ["git", "config", "user.email", "tests@example.com"],
+        ["git", "add", "."],
+        ["git", "commit", "-m", "initial"],
+    ):
+        result = subprocess.run(command, cwd=root, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            print(f"[e2e] git workspace unavailable; skipping git-only scenario: {' '.join(command)} failed")
+            return False
+    return True
 
 
 def commit_all(root: Path, message: str) -> None:
@@ -70,7 +81,7 @@ def resolve_model(requested: str, available: set[str]) -> str:
     raise SystemExit(f"Requested model {requested!r} is not installed on {ollama_host()}. Available: {sorted(available)}")
 
 
-def build_workspace(root: Path) -> None:
+def build_workspace(root: Path) -> bool:
     (root / "docs").mkdir(parents=True, exist_ok=True)
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "scratch").mkdir(parents=True, exist_ok=True)
@@ -88,7 +99,7 @@ def build_workspace(root: Path) -> None:
         "import unittest\n\n\nclass SampleTests(unittest.TestCase):\n    def test_truth(self) -> None:\n        self.assertEqual(6 * 7, 42)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
         encoding="utf-8",
     )
-    init_git_repo(root)
+    return init_git_repo(root)
 
 
 def run_cli(
@@ -441,12 +452,15 @@ def main(argv: list[str] | None = None) -> int:
         ("scenario_multiturn_repl", scenario_multiturn_repl),
     ]
 
-    with tempfile.TemporaryDirectory(prefix="ollama-code-e2e-", dir=repo_root) as tmp:
+    with workspace_temp_dir("ollama-code-e2e-", repo_root) as tmp:
         workspace = Path(tmp)
-        build_workspace(workspace)
+        git_available = build_workspace(workspace)
         print(f"[e2e] model={model}")
         _LOADED_MODELS.add(model)
         for name, scenario in scenarios:
+            if name == "scenario_git_tools" and not git_available:
+                print(f"[e2e]   {name} (skipped: git workspace unavailable)")
+                continue
             print(f"[e2e]   {name}")
             scenario(repo_root, workspace, model)
     unload_model(model)

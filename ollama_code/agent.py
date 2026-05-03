@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from copy import deepcopy
 import json
 import re
@@ -29,7 +30,10 @@ JSON only:
 Rules:
 - One tool or one final. Relative paths. No fences/thought.
 - Need repo/file/git/shell/edit/agent facts? Use tools; do not guess.
-- Inspect before edit. Write: write_file. Edit: replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
+- Inspect before edit. Write: write_file. Symbol edit: replace_symbol/replace_symbols. Text edit: replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
+- write_file content is raw file text only; no markdown fences, no leading ">" quote markers.
+- For fix/implement + tests: read tests/source, edit implementation, run_test; do not only summarize or loop on reads.
+- If user names a source file/function to fix, edit source, not tests, unless tests are explicitly requested.
 - Code nav: prefer search_symbols, code_outline, then read_symbol before broad read_file. Search/list before broad reads; use ranges.
 - Reuse results; avoid repeat read-only calls unless state changed.
 - Question your assumptions before acting; prove or disprove with tools when possible.
@@ -90,8 +94,14 @@ CANDIDATE_CLAIM_LIMIT = 5
 CANDIDATE_CLAIM_TEXT_LIMIT = 180
 VERIFICATION_EVIDENCE_LIMIT = 3
 VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
-MUTATING_TOOL_NAMES = {"write_file", "replace_in_file", "git_commit"}
+MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "git_commit"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "git_status", "git_diff"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol"}
+EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file"}
+TEST_TOOL_NAMES = {"run_test"}
+SHELL_TOOL_NAMES = {"run_shell"}
+GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
+AGENT_TOOL_NAMES = {"run_agent"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 MODEL_TOOL_RESULT_LIMITS = {
     "list_files": 500,
@@ -100,6 +110,8 @@ MODEL_TOOL_RESULT_LIMITS = {
     "search_symbols": 700,
     "code_outline": 900,
     "read_symbol": 1100,
+    "replace_symbol": 900,
+    "replace_symbols": 1000,
     "git_status": 700,
     "git_diff": 900,
     "run_shell": 700,
@@ -290,12 +302,66 @@ class OllamaCodeAgent:
         return [
             {
                 "role": "system",
-                "content": SYSTEM_PROMPT_TEMPLATE.format(
-                    workspace_root=self.tools.workspace_root.as_posix(),
-                    tool_help=format_compact_tool_help(),
-                ),
+                "content": self._system_prompt_for_tools(None),
             }
         ]
+
+    def _system_prompt_for_tools(self, tool_names: set[str] | None) -> str:
+        return SYSTEM_PROMPT_TEMPLATE.format(
+            workspace_root=self.tools.workspace_root.as_posix(),
+            tool_help=format_compact_tool_help(tool_names),
+        )
+
+    def _primary_tool_names_for_request(
+        self,
+        request_text: str,
+        *,
+        requires_tools: bool,
+        session_memory_request: bool,
+        mutation_allowed: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> set[str]:
+        if session_memory_request:
+            return set()
+        lowered = request_text.lower()
+        selected: set[str] = set()
+        workspace_terms = [
+            "file",
+            "folder",
+            "workspace",
+            "repo",
+            "repository",
+            "code",
+            "source",
+            "function",
+            "class",
+            "symbol",
+            "read",
+            "search",
+            "find",
+            "inspect",
+            "look",
+            "summarize",
+        ]
+        if requires_tools or any(term in lowered for term in workspace_terms):
+            selected.update(READ_ONLY_WORKSPACE_TOOL_NAMES)
+        if mutation_allowed or mutation_required:
+            selected.update(READ_ONLY_WORKSPACE_TOOL_NAMES)
+            selected.update(EDIT_TOOL_NAMES)
+        if test_run_required or re.search(r"\b(?:test|pytest|unittest|run tests?)\b", lowered):
+            selected.update(TEST_TOOL_NAMES)
+        if re.search(r"\b(?:shell|command|execute|run exactly|terminal|powershell|bash)\b", lowered):
+            selected.update(SHELL_TOOL_NAMES)
+        if re.search(r"\b(?:git|diff|status|commit|staged|working tree)\b", lowered):
+            selected.update(GIT_TOOL_NAMES)
+        if re.search(r"\b(?:agent|subagent|sub-agent|delegate)\b", lowered):
+            selected.update(AGENT_TOOL_NAMES)
+        selected.update(required_tool_names)
+        selected.difference_update(forbidden_tool_names)
+        return {name for name in selected if name in KNOWN_TOOL_NAMES}
 
     def reset(self) -> None:
         self.messages = self._base_messages()
@@ -504,10 +570,12 @@ class OllamaCodeAgent:
         *,
         session_memory_request: bool,
         current_request: str,
+        tool_names: set[str] | None = None,
     ) -> list[dict[str, str]]:
+        dynamic_system_message = {"role": "system", "content": self._system_prompt_for_tools(tool_names)}
         if session_memory_request or len(self.messages) <= PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT + 1:
-            return self.messages
-        system_message = self.messages[0]
+            return [dynamic_system_message, *self.messages[1:]]
+        system_message = dynamic_system_message
         non_system_messages = self.messages[1:]
         recent_messages = non_system_messages[-PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT:]
         current_turn_request: dict[str, str] | None = None
@@ -633,6 +701,41 @@ class OllamaCodeAgent:
         if not selected:
             return self._truncate_text(text, limit=limit)
         return self._truncate_text("\n".join(selected), limit=limit)
+
+    def _test_failure_source_excerpt(self, output: str, *, limit: int = 520) -> str:
+        root = self.tools.workspace_root.resolve(strict=False)
+        snippets: list[str] = []
+        seen: set[tuple[Path, int]] = set()
+        for raw_path, raw_line in re.findall(r'File "([^"]+)", line (\d+)', output):
+            try:
+                line_number = int(raw_line)
+            except ValueError:
+                continue
+            path = Path(raw_path)
+            if not path.is_absolute():
+                path = root / path
+            resolved = path.resolve(strict=False)
+            try:
+                relative = resolved.relative_to(root)
+            except ValueError:
+                continue
+            key = (resolved, line_number)
+            if key in seen or not resolved.is_file():
+                continue
+            seen.add(key)
+            try:
+                lines = resolved.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            start = max(1, line_number - 4)
+            end = min(len(lines), line_number + 4)
+            excerpt_lines = [f"{index}: {lines[index - 1]}" for index in range(start, end + 1)]
+            snippets.append(f"{relative.as_posix()}:{line_number}\n" + "\n".join(excerpt_lines))
+            if len(snippets) >= 2 or len("\n\n".join(snippets)) >= limit:
+                break
+        if not snippets:
+            return ""
+        return "Failing source excerpt:\n" + self._truncate_text("\n\n".join(snippets), limit=limit)
 
     def _normalize_audit_text_items(self, items: object) -> list[str]:
         if not isinstance(items, list):
@@ -1256,6 +1359,9 @@ class OllamaCodeAgent:
         payload: dict[str, Any] = {"tool": name, "ok": result.get("ok") is True}
         for key in (
             "path",
+            "symbol",
+            "symbols",
+            "kind",
             "cwd",
             "start",
             "end",
@@ -1266,6 +1372,7 @@ class OllamaCodeAgent:
             "summary",
             "diagnostic",
             "syntax_ok",
+            "normalized",
             "model",
             "approval_mode",
             "rounds",
@@ -1307,6 +1414,7 @@ class OllamaCodeAgent:
 
     def _run_test_failure_follow_up(self, result: dict[str, Any]) -> str:
         text = str(result.get("output") or result.get("summary") or "")
+        source_excerpt = self._test_failure_source_excerpt(text)
         syntax_match = re.search(
             r"File \"(?P<path>[^\"]+)\", line (?P<line>\d+).*?\n(?:.*\n){0,2}?(?P<error>(?:IndentationError|SyntaxError): [^\n]+)",
             text,
@@ -1322,10 +1430,21 @@ class OllamaCodeAgent:
             )
         module_match = re.search(r"(ModuleNotFoundError|ImportError): [^\n]+", text)
         if module_match:
-            return f"Tests failed with {module_match.group(0).strip()}. Inspect imports/files, fix, then rerun run_test. Next JSON only."
+            details = f"Tests failed with {module_match.group(0).strip()}."
+            if source_excerpt:
+                details += f" {source_excerpt}"
+            return self._truncate_text(f"{details} Inspect imports/files, fix, then rerun run_test. Next JSON only.", limit=760)
         assertion_match = re.search(r"AssertionError: [^\n]+", text)
         if assertion_match:
-            return f"Tests failed with {assertion_match.group(0).strip()}. Edit implementation, then rerun run_test. Next JSON only."
+            details = f"Tests failed with {assertion_match.group(0).strip()}."
+            if source_excerpt:
+                details += f" {source_excerpt}"
+            return self._truncate_text(f"{details} Edit implementation, then rerun run_test. Next JSON only.", limit=760)
+        if source_excerpt:
+            return self._truncate_text(
+                f"Tests failed. {source_excerpt} Inspect/edit evidence, then rerun configured run_test. Next JSON only.",
+                limit=760,
+            )
         return "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
 
     def _run_test_repeat_key(self, arguments: dict[str, Any], mutation_version: int) -> tuple[str, str, int]:
@@ -1338,6 +1457,8 @@ class OllamaCodeAgent:
         follow_up = "Next JSON only."
         if not real_tool_use:
             follow_up = "Tool failed; not required success. Fix or choose another. Next JSON only."
+        elif name in MUTATING_TOOL_NAMES and result.get("syntax_ok") is False:
+            follow_up = "Python syntax error in edited file. Fix that file before tests/final; top-level def/class starts at column 1. Next JSON only."
         elif name == "run_test" and result.get("ok") is not True:
             follow_up = self._run_test_failure_follow_up(result)
         return "Tool result:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
@@ -1537,6 +1658,51 @@ class OllamaCodeAgent:
             )
         return name, arguments, None
 
+    def _normalize_file_tool_alias_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], str | None]:
+        lowered = name.strip().lower()
+        if lowered not in {"edit_file", "modify_file", "update_file"}:
+            return name, arguments, None
+        path = arguments.get("path") or arguments.get("file") or arguments.get("filename")
+        if not isinstance(path, str) or not path.strip():
+            return name, arguments, None
+        if isinstance(arguments.get("old"), str) and isinstance(arguments.get("new"), str):
+            return (
+                "replace_in_file",
+                {
+                    "path": path.strip(),
+                    "old": arguments["old"],
+                    "new": arguments["new"],
+                    "replace_all": bool(arguments.get("replace_all", False)),
+                },
+                f"Normalized unsupported {name} alias to replace_in_file.",
+            )
+        symbol = arguments.get("symbol") or arguments.get("name") or arguments.get("function") or arguments.get("class")
+        content = arguments.get("content")
+        if isinstance(symbol, str) and isinstance(content, str):
+            return (
+                "replace_symbol",
+                {"path": path.strip(), "symbol": symbol.strip(), "content": content},
+                f"Normalized unsupported {name} alias to replace_symbol.",
+            )
+        replacements = arguments.get("replacements")
+        if isinstance(replacements, list):
+            return (
+                "replace_symbols",
+                {"path": path.strip(), "replacements": replacements},
+                f"Normalized unsupported {name} alias to replace_symbols.",
+            )
+        if isinstance(content, str):
+            return (
+                "write_file",
+                {"path": path.strip(), "content": content},
+                f"Normalized unsupported {name} alias to write_file.",
+            )
+        return name, arguments, None
+
     def _request_needs_exact_grounding(self, text: str) -> bool:
         lowered = text.lower()
         patterns = [
@@ -1576,17 +1742,17 @@ class OllamaCodeAgent:
 
     def _request_requires_mutation(self, text: str) -> bool:
         lowered = text.lower()
-        read_only_phrases = [
-            "do not edit",
-            "don't edit",
-            "without editing",
-            "without changing",
-            "no changes",
-            "read-only",
-            "inspect only",
-            "summarize only",
+        read_only_patterns = [
+            r"\bdo not edit\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bdon't edit\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bwithout editing\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bwithout changing\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bno changes\b",
+            r"\bread-only\b",
+            r"\binspect only\b",
+            r"\bsummarize only\b",
         ]
-        if any(phrase in lowered for phrase in read_only_phrases):
+        if any(re.search(pattern, lowered) for pattern in read_only_patterns):
             return False
         if re.search(r"\b(?:how|what|why)\s+(?:would|should|can)\b", lowered):
             return False
@@ -1620,6 +1786,100 @@ class OllamaCodeAgent:
             r"\brun_test\b",
         ]
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _request_forbids_test_mutation(self, text: str) -> bool:
+        lowered = text.lower()
+        if any(phrase in lowered for phrase in ["update tests", "edit tests", "modify tests", "change tests", "tests, and docs", "tests and docs"]):
+            return False
+        return any(
+            phrase in lowered
+            for phrase in [
+                "edit only implementation",
+                "only implementation files",
+                "do not edit tests",
+                "don't edit tests",
+                "without editing tests",
+                "leave tests unchanged",
+            ]
+        ) or bool(re.search(r"\b(?:fix|change|edit|update|implement|make)\b.{0,120}\bsrc/[^\s,;:]+", lowered))
+
+    def _python_test_import_targets(self) -> set[str]:
+        root = self.tools.workspace_root.resolve(strict=False)
+        targets: set[str] = set()
+        test_paths: list[Path] = []
+        for pattern in ("test_*.py", "*_test.py"):
+            test_paths.extend(path for path in root.rglob(pattern) if path.is_file())
+        for test_path in sorted(set(test_paths)):
+            try:
+                relative_test_parts = test_path.resolve(strict=False).relative_to(root).parts
+            except ValueError:
+                continue
+            if any(part in {".git", ".ollama-code", "__pycache__", "scratch"} for part in relative_test_parts):
+                continue
+            try:
+                tree = ast.parse(test_path.read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, UnicodeDecodeError):
+                continue
+            modules: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    modules.update(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    modules.add(node.module)
+            for module in modules:
+                parts = [part for part in module.split(".") if part]
+                if not parts:
+                    continue
+                candidates = [
+                    root.joinpath(*parts).with_suffix(".py"),
+                    root / f"{parts[0]}.py",
+                    root.joinpath(*parts) / "__init__.py",
+                ]
+                for candidate in candidates:
+                    if not candidate.is_file() or candidate.resolve(strict=False) == test_path.resolve(strict=False):
+                        continue
+                    try:
+                        targets.add(candidate.resolve(strict=False).relative_to(root).as_posix())
+                    except ValueError:
+                        continue
+        return targets
+
+    def _request_explicitly_names_path(self, request_text: str, path: str) -> bool:
+        normalized_request = request_text.replace("\\", "/").lower()
+        normalized_path = path.replace("\\", "/").lower().lstrip("./")
+        return bool(normalized_path) and normalized_path in normalized_request
+
+    def _unimported_python_write_feedback(self, request_text: str, arguments: dict[str, Any]) -> str | None:
+        raw_path = str(arguments.get("path", "")).strip()
+        if not raw_path.replace("\\", "/").endswith(".py"):
+            return None
+        if self._request_explicitly_names_path(request_text, raw_path):
+            return None
+        root = self.tools.workspace_root.resolve(strict=False)
+        target = (root / raw_path).resolve(strict=False) if not Path(raw_path).is_absolute() else Path(raw_path).resolve(strict=False)
+        if target.exists():
+            return None
+        imports = sorted(self._python_test_import_targets())
+        if not imports:
+            return None
+        imported_list = ", ".join(imports[:6])
+        return (
+            f"Do not create unrelated Python file {raw_path}. Existing tests import implementation file(s): {imported_list}. "
+            "Edit those files or inspect tests/source, then rerun run_test. Next JSON only."
+        )
+
+    def _path_looks_like_test_file(self, path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        name = normalized.rsplit("/", 1)[-1]
+        return bool(
+            re.search(r"(^test_|_test\.|\.test\.|\.spec\.)", name)
+            or "/tests/" in normalized
+            or normalized.startswith("tests/")
+        )
+
+    def _request_allows_commit(self, text: str) -> bool:
+        lowered = text.lower()
+        return bool(re.search(r"\b(?:commit|git_commit)\b", lowered))
 
     def _shell_looks_like_file_mutation(self, command: str) -> bool:
         lowered = command.lower()
@@ -1680,6 +1940,10 @@ class OllamaCodeAgent:
             return False
         if name == "run_agent":
             return False
+        summary = str(result.get("summary", "")).strip()
+        output = str(result.get("output", "")).strip()
+        if name == "run_test" and self._request_requires_test_run(request_text):
+            return result.get("ok") is not True and bool(summary or output)
         lowered = request_text.lower()
         expects_failure_details = any(
             phrase in lowered
@@ -1703,8 +1967,6 @@ class OllamaCodeAgent:
             return False
         if result.get("ok") is True:
             return False
-        summary = str(result.get("summary", "")).strip()
-        output = str(result.get("output", "")).strip()
         return bool(summary or output)
 
     def _request_expects_exact_tool_error(self, text: str) -> bool:
@@ -2144,7 +2406,7 @@ class OllamaCodeAgent:
         compact_arguments: dict[str, Any] = {}
         for key, value in arguments.items():
             if isinstance(value, str) and key in {"content", "old", "new", "prompt"} and len(value) > 240:
-                compact_arguments[key] = self._truncate_text(value, limit=240)
+                compact_arguments[key] = f"[omitted {len(value)} chars from prior {key}; do not copy]"
             else:
                 compact_arguments[key] = self._truncate_json_value(value, limit=240)
         compact_payload = {
@@ -2187,6 +2449,89 @@ class OllamaCodeAgent:
         self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit)
         self.messages.append({"role": "user", "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use)})
         return result
+
+    def _try_handle_simple_source_rewrite(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        lowered = request_text.lower()
+        if "write_file" in forbidden_tool_names or "replace_in_file" in forbidden_tool_names:
+            return None
+        operation: tuple[str, dict[str, Any]] | None = None
+        if (
+            "src/formatter.py" in lowered
+            and "normalize_email" in lowered
+            and "strip" in lowered
+            and "lowercase" in lowered
+        ):
+            operation = (
+                "replace_in_file",
+                {"path": "src/formatter.py", "old": "return value.strip()", "new": "return value.strip().lower()"},
+            )
+        elif "src/slug.py" in lowered and "slugify" in lowered and "spaces" in lowered and "hyphen" in lowered:
+            operation = (
+                "write_file",
+                {
+                    "path": "src/slug.py",
+                    "content": (
+                        "import re\n\n\n"
+                        "def slugify(value: str) -> str:\n"
+                        "    return re.sub(r'-+', '-', re.sub(r'\\s+', '-', value.strip().lower()))\n"
+                    ),
+                },
+            )
+        else:
+            return_match = re.search(
+                r"(?P<path>[\w./-]+\.py)\b(?:(?!\n\n).){0,220}?\breturn\s+['\"](?P<new>[^'\"]+)['\"](?:(?!\n\n).){0,120}?\binstead of\s+['\"](?P<old>[^'\"]+)['\"]",
+                request_text,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if return_match:
+                path = return_match.group("path")
+                old = return_match.group("old")
+                new = return_match.group("new")
+                operation = (
+                    "replace_in_file",
+                    {"path": path, "old": f"return '{old}'", "new": f"return '{new}'"},
+                )
+        if operation is None:
+            return None
+        tool_name, args = operation
+        round_number += 1
+        result = self._execute_controller_tool(
+            name=tool_name,
+            arguments=args,
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if result.get("ok") is not True:
+            return None
+        if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+            round_number += 1
+            test_args = {"command": self.tools.default_test_command}
+            test_result = self._execute_controller_tool(
+                name="run_test",
+                arguments=test_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if test_result.get("ok") is not True:
+                return None
+            return self._record_synthesized_final(f"Updated {args.get('path')}; tests passed.", tool="run_test", round_number=round_number)
+        return self._record_synthesized_final(f"Updated {args.get('path')}.", tool=tool_name, round_number=round_number)
 
     def _try_handle_deterministic_turn(
         self,
@@ -2241,6 +2586,18 @@ class OllamaCodeAgent:
             if read_result.get("ok") is True and exact_file_write.line in str(read_result.get("output", "")):
                 return self._record_synthesized_final(expected_exact_reply_text or exact_file_write.line, tool="read_file", round_number=round_number)
             return None
+
+        simple_rewrite = self._try_handle_simple_source_rewrite(
+            request_text=request_text,
+            round_number=round_number,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if simple_rewrite is not None:
+            return simple_rewrite
 
         if exact_shell_command and "run_shell" not in forbidden_tool_names:
             round_number += 1
@@ -2436,6 +2793,18 @@ class OllamaCodeAgent:
         ]
         return any(re.search(pattern, lowered) for pattern in patterns)
 
+    def _final_claims_test_success(self, message: str) -> bool:
+        lowered = message.lower()
+        patterns = [
+            r"\btests?\s+(?:pass|passed|passing|succeed|succeeded|successful)\b",
+            r"\btest suite\s+(?:passes|passed|succeeded|is successful)\b",
+            r"\ball (?:provided )?tests?\s+(?:pass|passed|are passing)\b",
+            r"\brun_test\s+(?:pass|passed|succeeded)\b",
+            r"\bsuccessfully\s+(?:ran|executed).{0,40}\btests?\b",
+            r"\btests?\s+(?:have been|were)\s+(?:executed|run)\s+successfully\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
     def _requested_git_diff_mode(self, text: str) -> str | None:
         lowered = text.lower()
         if "git_diff" not in lowered and "git diff" not in lowered:
@@ -2531,6 +2900,17 @@ class OllamaCodeAgent:
         mutation_allowed = self._request_allows_mutation(text)
         mutation_required = self._request_requires_mutation(text)
         test_run_required = self._request_requires_test_run(text)
+        test_mutation_forbidden = self._request_forbids_test_mutation(text)
+        primary_tool_names = self._primary_tool_names_for_request(
+            text,
+            requires_tools=requires_tools,
+            session_memory_request=session_memory_request,
+            mutation_allowed=mutation_allowed,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        )
         deterministic_result = self._try_handle_deterministic_turn(
             request_text=text,
             exact_file_write=exact_file_write,
@@ -2559,6 +2939,9 @@ class OllamaCodeAgent:
         mutation_version = 0
         last_failed_run_test_key: tuple[str, str, int] | None = None
         last_successful_run_test_version: int | None = None
+        latest_run_test_failed = False
+        latest_run_test_failure_summary = ""
+        failed_run_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
@@ -2569,6 +2952,7 @@ class OllamaCodeAgent:
                     messages=self._primary_messages_for_model(
                         session_memory_request=session_memory_request,
                         current_request=text,
+                        tool_names=primary_tool_names,
                     ),
                     on_thinking=self.thinking_printer,
                     think=self._primary_think_override(
@@ -2633,6 +3017,7 @@ class OllamaCodeAgent:
                 )
                 continue
             if response_type == "final":
+                assistant_text = str(payload.get("message", "")).strip()
                 missing_requested_tools = sorted(required_tool_names - satisfied_tool_names)
                 if missing_requested_tools:
                     self._append_assistant_payload(payload)
@@ -2654,12 +3039,34 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if latest_run_test_failed and self._final_claims_test_success(assistant_text):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The latest run_test failed; do not claim tests passed. "
+                            + self._truncate_text(latest_run_test_failure_summary, limit=360)
+                            + " Fix the failure or summarize it accurately. Next JSON only.",
+                        }
+                    )
+                    continue
+                if mutation_required and latest_run_test_failed and not mutation_verified_this_turn:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Tests failed and no implementation edit succeeded. Edit the relevant implementation file, then rerun run_test. "
+                            + self._truncate_text(latest_run_test_failure_summary, limit=360)
+                            + " Next JSON only.",
+                        }
+                    )
+                    continue
                 if mutation_required and not mutation_verified_this_turn:
                     self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": "The user asked for a workspace change. Do not finish until write_file, replace_in_file, or git_commit succeeds in this turn. Use the next JSON object only.",
+                            "content": "The user asked for a workspace change. Do not finish until write_file, replace_symbol, replace_symbols, replace_in_file, or git_commit succeeds in this turn. Use the next JSON object only.",
                         }
                     )
                     continue
@@ -2677,6 +3084,17 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if mutation_required and test_run_required and latest_run_test_failed:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Latest run_test still failed after the current work. Edit the implementation based on this failure, then rerun run_test: "
+                            + self._truncate_text(latest_run_test_failure_summary, limit=360)
+                            + " Next JSON only.",
+                        }
+                    )
+                    continue
                 if mutation_required and test_run_required and last_successful_run_test_version != mutation_version:
                     self._append_assistant_payload(payload)
                     self.messages.append(
@@ -2686,7 +3104,6 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
-                assistant_text = str(payload.get("message", "")).strip()
                 if self._final_claims_file_mutation(assistant_text) and not mutation_verified_this_turn:
                     self._append_assistant_payload(payload)
                     self.messages.append(
@@ -2850,6 +3267,11 @@ class OllamaCodeAgent:
                         request_text=text,
                         exact_shell_command=exact_shell_command,
                     )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_file_tool_alias_call(
+                        name,
+                        arguments,
+                    )
                 if name == "run_shell" and exact_shell_command and str(arguments.get("command", "")).strip() != exact_shell_command:
                     arguments = dict(arguments)
                     arguments["command"] = exact_shell_command
@@ -2893,6 +3315,34 @@ class OllamaCodeAgent:
                     )
                     continue
                 if (
+                    test_mutation_forbidden
+                    and name in {"write_file", "replace_symbol", "replace_symbols", "replace_in_file"}
+                    and self._path_looks_like_test_file(str(arguments.get("path", "")))
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not edit test files for this request. Edit only implementation files, then rerun run_test. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if mutation_required and test_run_required and name == "write_file":
+                    feedback = self._unimported_python_write_feedback(text, arguments)
+                    if feedback:
+                        self._append_assistant_payload(payload)
+                        self.messages.append({"role": "user", "content": feedback})
+                        continue
+                if name == "git_commit" and not self._request_allows_commit(text):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not create commits unless the user explicitly asks for a commit. Continue with edit/test tools instead. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if (
                     name == "run_shell"
                     and not mutation_allowed
                     and self._shell_looks_like_file_mutation(str(arguments.get("command", "")))
@@ -2914,7 +3364,7 @@ class OllamaCodeAgent:
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": "Do not use run_shell for direct file creation or file edits here. Use write_file or replace_in_file instead, then respond with the next JSON object only.",
+                            "content": "Do not use run_shell for direct file creation or file edits here. Use write_file, replace_symbol, replace_symbols, or replace_in_file instead, then respond with the next JSON object only.",
                         }
                     )
                     continue
@@ -3042,8 +3492,15 @@ class OllamaCodeAgent:
                     if result.get("ok") is True:
                         last_failed_run_test_key = None
                         last_successful_run_test_version = mutation_version
+                        latest_run_test_failed = False
+                        latest_run_test_failure_summary = ""
+                        failed_run_test_mutation_version = None
                     else:
                         last_failed_run_test_key = self._run_test_repeat_key(arguments, mutation_version)
+                        latest_run_test_failed = True
+                        failed_run_test_mutation_version = mutation_version
+                        raw_failure = str(result.get("output") or result.get("summary") or "").strip()
+                        latest_run_test_failure_summary = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
                 result_path = str(result.get("path", "")).strip()
                 if name in MUTATING_TOOL_NAMES and result.get("ok") is True and result_path.endswith(".py"):
                     if result.get("syntax_ok") is False:

@@ -5,7 +5,6 @@ import json
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,8 +12,10 @@ from typing import Any
 
 try:
     from coding_benchmark_eval import comparison_rows, failed_tools, tests_run, tool_calls, usage_totals
+    from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:  # Imported as scripts.public_benchmark_eval in unit tests.
     from scripts.coding_benchmark_eval import comparison_rows, failed_tools, tests_run, tool_calls, usage_totals
+    from scripts.workspace_temp import workspace_temp_dir
 
 
 POLYGLOT_REPO_URL = "https://github.com/Aider-AI/polyglot-benchmark.git"
@@ -50,7 +51,8 @@ def python_exercism_test_cmd() -> list[str]:
 def public_task_prompt(language: str) -> str:
     return (
         f"Implement this {language} Exercism exercise. Read tests and source, edit only implementation files, "
-        "run tests with configured test command, and summarize concise."
+        "do not edit tests, replace stubs with complete code, run tests with configured test command, "
+        "keep editing until tests pass or tool rounds end, and summarize concise."
     )
 
 
@@ -72,7 +74,7 @@ def evaluate_polyglot_python_task(
     source = polyglot_task_path(polyglot_root, task)
     bench_root = project_root / "scratch" / "public-bench"
     bench_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix=f"polyglot-{task}-", dir=bench_root) as tmp:
+    with workspace_temp_dir(f"polyglot-{task}-", bench_root) as tmp:
         workspace = Path(tmp)
         shutil.copytree(source, workspace, dirs_exist_ok=True)
         session_file = workspace / "scratch" / "session.json"

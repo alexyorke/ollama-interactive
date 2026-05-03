@@ -36,6 +36,33 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertGreaterEqual(len(full), 20)
         self.assertTrue({case.name for case in small}.issubset({case.name for case in full}))
 
+    def test_coding_accuracy_prompts_do_not_leak_synthetic_answers(self) -> None:
+        cases = bench.selected_cases("local-full")
+        violations = {case.name: bench.prompt_integrity_findings(case) for case in cases if bench.prompt_integrity_findings(case)}
+
+        self.assertEqual(violations, {})
+
+    def test_tool_contract_cases_can_use_exact_tool_prompts_without_counting_as_coding_accuracy(self) -> None:
+        cases = {case.name: case for case in bench.selected_cases("local-full")}
+
+        self.assertEqual(cases["exact_literal_write_readback"].benchmark_kind, "tool_contract")
+        self.assertEqual(cases["forbidden_tool_efficiency"].benchmark_kind, "tool_contract")
+        self.assertEqual(cases["large_repo_symbol_nav"].benchmark_kind, "tool_contract")
+
+    def test_prompt_integrity_flags_leaked_answers_for_coding_accuracy_cases(self) -> None:
+        case = bench.BenchmarkCase(
+            name="leaky",
+            suite="local-small",
+            turns=("Use git_status and tell me whether return 99 appears. Reply with TOKEN_42.",),
+            validate=lambda ctx: "pass",
+        )
+
+        findings = bench.prompt_integrity_findings(case)
+
+        self.assertIn("synthetic marker token", findings)
+        self.assertIn("exact git-diff answer", findings)
+        self.assertIn("forced git tool path", findings)
+
     def test_usage_totals_aggregates_prompt_profile(self) -> None:
         session = {
             "events": [
@@ -233,7 +260,10 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             validate=lambda ctx: "pass" if len(ctx.results) == 2 else "fail",
         )
 
-        with patch.object(bench, "run_cli", side_effect=fake_run_cli):
+        def fake_build_workspace(workspace: Path) -> None:
+            workspace.mkdir(parents=True, exist_ok=True)
+
+        with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli", side_effect=fake_run_cli):
             outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "on", case, timeout=30)
 
         self.assertEqual(outcome["status"], "pass")

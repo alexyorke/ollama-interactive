@@ -5,6 +5,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from ollama_code.interrupts import OperationInterrupted
 from ollama_code.ollama_client import OllamaClient, OllamaError
@@ -165,6 +166,57 @@ class OllamaClientTests(unittest.TestCase):
 
         self.assertEqual(response.content, "ok")
         self.assertFalse(payload["think"])
+
+    def test_chat_sets_adaptive_small_num_ctx(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        try:
+            response = client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+            payload = json.loads(_MalformedResponseHandler.last_request_body.decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(response.content, "ok")
+        self.assertEqual(payload["options"]["num_ctx"], 4096)
+
+    def test_chat_omits_adaptive_num_ctx_for_very_large_prompt(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        try:
+            client.chat(model="fake-model", messages=[{"role": "user", "content": "x" * 120000}])
+            payload = json.loads(_MalformedResponseHandler.last_request_body.decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertNotIn("options", payload)
+
+    def test_chat_allows_num_ctx_env_override(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        try:
+            with patch.dict("os.environ", {"OLLAMA_CODE_NUM_CTX": "8192"}):
+                client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+            payload = json.loads(_MalformedResponseHandler.last_request_body.decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(payload["options"]["num_ctx"], 8192)
+
+    def test_chat_can_disable_num_ctx_env_override(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        try:
+            with patch.dict("os.environ", {"OLLAMA_CODE_NUM_CTX": "off"}):
+                client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+            payload = json.loads(_MalformedResponseHandler.last_request_body.decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertNotIn("options", payload)
 
     def test_chat_streams_thinking_updates(self) -> None:
         body = (

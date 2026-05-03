@@ -29,4 +29,11 @@ Thumbs.db
 *.log
 
 scratch/
+verify_scratch/
+ollama-code-bench-*/
+ollama-code-e2e-*/
+ollama-code-live-*/
+ollama-code-token-*/
+ollama-code-verify-*/
+probe-*/
 .ollama-code/

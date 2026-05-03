@@ -3,13 +3,17 @@ from __future__ import annotations
 import argparse
 import atexit
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+try:
+    from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from workspace_temp import workspace_temp_dir
+except ModuleNotFoundError:
+    from scripts.e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from scripts.workspace_temp import workspace_temp_dir
 
 
 _LOADED_MODELS: set[str] = set()
@@ -222,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
         for mode in args.modes:
             verification_enabled = mode == "on"
             for case in cases:
-                with tempfile.TemporaryDirectory(prefix="ollama-code-verify-", dir=repo_root) as tmp:
+                with workspace_temp_dir("ollama-code-verify-", repo_root) as tmp:
                     workspace = Path(tmp)
                     build_workspace(workspace)
                     outcome = evaluate_case(

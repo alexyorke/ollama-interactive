@@ -4,11 +4,11 @@ import argparse
 import atexit
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -17,8 +17,10 @@ from typing import Any, Callable
 
 try:
     from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:  # Imported as scripts.coding_benchmark_eval in unit tests.
     from scripts.e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from scripts.workspace_temp import workspace_temp_dir
 
 
 _LOADED_MODELS: set[str] = set()
@@ -53,12 +55,32 @@ class BenchmarkCase:
     suite: str
     turns: tuple[str, ...]
     validate: Callable[["BenchmarkContext"], str]
+    benchmark_kind: str = "coding_accuracy"
     prepare: Callable[[Path], None] | None = None
     test_cmd: str | None = None
     acceptable: tuple[str, ...] = ("pass",)
     budget_off: BenchmarkBudget = BenchmarkBudget(max_llm_calls=12, max_total_tokens=80_000)
     budget_on: BenchmarkBudget = BenchmarkBudget(max_llm_calls=16, max_total_tokens=120_000)
     timeout: int | None = None
+
+
+def prompt_integrity_findings(case: BenchmarkCase) -> list[str]:
+    if case.benchmark_kind != "coding_accuracy":
+        return []
+    text = "\n".join(case.turns)
+    checks = {
+        "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
+        "exact git-diff answer": r"\breturn\s+(?:22|99)\b",
+        "exact shell command": r"\bexecute exactly\b",
+        "forced read_file path": r"\bUse read_file\b",
+        "forced git tool path": r"\bUse git_(?:status|diff)\b",
+        "forbidden-tool routing clause": r"\bDo not use read_file\b",
+    }
+    findings: list[str] = []
+    for label, pattern in checks.items():
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            findings.append(label)
+    return findings
 
 
 @dataclass(frozen=True)
@@ -531,6 +553,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="large_repo_symbol_nav",
         suite="local-small",
         turns=("Use search_symbols to find calculate_discount in src/large_pricing.py. Then use read_symbol on the exact match. Do not use read_file. Reply with the uppercase BENCH_SYMBOL token from that symbol only.",),
+        benchmark_kind="tool_contract",
         prepare=prepare_large_repo_symbol_nav,
         validate=validate_large_repo_symbol_nav,
         budget_off=ZERO_LLM,
@@ -552,6 +575,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         turns=(
             f"Use run_shell to execute exactly: {TERMINAL_ARTIFACT_COMMAND}. Then tell me what artifact was written.",
         ),
+        benchmark_kind="tool_contract",
         prepare=prepare_terminal_artifact_task,
         validate=validate_terminal_artifact_task,
         budget_off=ZERO_LLM,
@@ -571,6 +595,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="forbidden_tool_efficiency",
         suite="local-small",
         turns=("Use git_status on src/app.py. Then use git_diff on src/app.py for the working tree only; omit cached or set cached to false. Do not use read_file. Reply with src/app.py and whether the diff adds return 99.",),
+        benchmark_kind="tool_contract",
         prepare=prepare_forbidden_tool_efficiency,
         validate=validate_forbidden_tool_efficiency,
         acceptable=("pass", "fail_closed"),
@@ -585,6 +610,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
             "Change session_value in src/session_task.py to return 'SESSION_OK' instead of 'todo'. Then run tests.",
             "Use run_test and reply whether tests pass.",
         ),
+        benchmark_kind="tool_contract",
         prepare=prepare_multi_turn_session_task,
         validate=validate_multi_turn_session_task,
         test_cmd=_python_test_cmd(),
@@ -596,6 +622,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="cross_language_smoke",
         suite="local-full",
         turns=("Use search_symbols and read_symbol on src/math.js, then change double(n) so it returns n * 2 instead of n + n. Do not use read_file.",),
+        benchmark_kind="tool_contract",
         prepare=prepare_cross_language_smoke,
         validate=validate_cross_language_smoke,
         budget_off=SMALL_BUDGET_OFF,
@@ -605,6 +632,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="regression_token_traps",
         suite="local-full",
         turns=("Use search_symbols to locate trap_value in src/trap.py, then use read_symbol once on the exact match. Do not use read_file. Reply with the numeric return value only.",),
+        benchmark_kind="tool_contract",
         prepare=prepare_regression_token_traps,
         validate=validate_regression_token_traps,
         budget_off=ZERO_LLM,
@@ -643,6 +671,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="staged_vs_worktree_diff",
         suite="local-full",
         turns=("Use git_status on src/app.py, then git_diff on src/app.py for working tree only, not cached. Do not use read_file. Tell me whether the working-tree diff adds return 22.",),
+        benchmark_kind="tool_contract",
         prepare=prepare_staged_vs_worktree_diff,
         validate=validate_staged_vs_worktree_diff,
         acceptable=("pass", "fail_closed"),
@@ -653,6 +682,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="large_file_targeted_read",
         suite="local-full",
         turns=("Use read_file on docs/huge.md with the smallest useful line range around line 420, then reply with the exact marker token on that line only.",),
+        benchmark_kind="tool_contract",
         prepare=prepare_large_file_targeted_read,
         validate=validate_large_file_targeted_read,
         budget_off=ZERO_LLM,
@@ -662,6 +692,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="exact_literal_write_readback",
         suite="local-full",
         turns=("Create scratch/bench_exact.txt with exactly the single line BENCH_EXACT followed by a newline. Then use read_file to confirm it and reply with BENCH_EXACT only.",),
+        benchmark_kind="tool_contract",
         validate=validate_exact_literal_write_readback,
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
@@ -670,6 +701,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="path_escape_error",
         suite="local-full",
         turns=("Use read_file on ../outside.txt and tell me the exact tool error.",),
+        benchmark_kind="tool_contract",
         validate=validate_path_escape_error,
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
@@ -678,6 +710,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="shell_failure_exact_command",
         suite="local-full",
         turns=(f"Use run_shell to execute exactly: {SHELL_FAILURE_COMMAND}. Then tell me the exit code and printed word.",),
+        benchmark_kind="tool_contract",
         validate=validate_shell_failure_exact_command,
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
@@ -686,6 +719,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="run_test_summary",
         suite="local-full",
         turns=("Use run_test and tell me whether tests passed and which test module ran.",),
+        benchmark_kind="tool_contract",
         validate=validate_run_test_summary,
         test_cmd=_python_test_cmd(),
         budget_off=ZERO_LLM,
@@ -695,6 +729,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         name="code_outline_summary",
         suite="local-full",
         turns=("Use code_outline on src/app.py and tell me which function is defined there.",),
+        benchmark_kind="tool_contract",
         validate=validate_code_outline_summary,
         budget_off=BenchmarkBudget(max_llm_calls=4, max_total_tokens=30_000),
         budget_on=BenchmarkBudget(max_llm_calls=6, max_total_tokens=45_000),
@@ -728,7 +763,7 @@ def evaluate_case(
     case: BenchmarkCase,
     timeout: int,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="ollama-code-bench-", dir=repo_root) as tmp:
+    with workspace_temp_dir("ollama-code-bench-", repo_root) as tmp:
         workspace = Path(tmp)
         build_workspace(workspace)
         if case.prepare is not None:
@@ -762,6 +797,7 @@ def evaluate_case(
                 return {
                     "case": case.name,
                     "suite": case.suite,
+                    "benchmark_kind": case.benchmark_kind,
                     "model": model,
                     "verifier_model": verifier_model,
                     "debate": mode,
@@ -802,6 +838,7 @@ def evaluate_case(
         outcome = {
             "case": case.name,
             "suite": case.suite,
+            "benchmark_kind": case.benchmark_kind,
             "model": model,
             "verifier_model": verifier_model,
             "debate": mode,
@@ -879,6 +916,14 @@ def budget_violations(outcome: dict[str, Any], case: BenchmarkCase) -> list[str]
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total_tokens = [int(item["usage"]["total_tokens"]) for item in results if isinstance(item.get("usage"), dict)]
+    by_kind: dict[str, dict[str, int]] = {}
+    for item in results:
+        kind = str(item.get("benchmark_kind") or "unknown")
+        bucket = by_kind.setdefault(kind, {"runs": 0, "pass": 0, "fail_closed": 0, "fail": 0})
+        bucket["runs"] += 1
+        status = str(item.get("status"))
+        if status in {"pass", "fail_closed", "fail"}:
+            bucket[status] += 1
     return {
         "runs": len(results),
         "pass": sum(1 for item in results if item.get("status") == "pass"),
@@ -887,6 +932,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_llm_calls": sum(int(item["usage"]["llm_calls"]) for item in results if isinstance(item.get("usage"), dict)),
         "total_tokens": sum(total_tokens),
         "median_total_tokens": median(total_tokens),
+        "by_benchmark_kind": dict(sorted(by_kind.items())),
     }
 
 
@@ -946,6 +992,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
         print(
             "[coding-bench]"
             f" suite={item['suite']}"
+            f" kind={item.get('benchmark_kind') or '-'}"
             f" model={item.get('model') or '-'}"
             f" verifier={item.get('verifier_model') or '-'}"
             f" debate={item.get('debate') or '-'}"
@@ -1081,6 +1128,13 @@ def main(argv: list[str] | None = None) -> int:
         cases = selected_cases(args.suite, requested_cases)
         if not cases:
             raise SystemExit("No benchmark cases selected.")
+        integrity_violations = [
+            {"case": case.name, "findings": prompt_integrity_findings(case)}
+            for case in cases
+            if prompt_integrity_findings(case)
+        ]
+        if integrity_violations:
+            raise SystemExit(f"Coding-accuracy prompt integrity violation(s): {json.dumps(integrity_violations)}")
         cases_by_name = {case.name: case for case in cases}
         available = set(installed_models())
         matrix: list[tuple[str, str | None, list[str]]] = []

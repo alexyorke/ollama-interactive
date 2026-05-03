@@ -4,15 +4,20 @@ import argparse
 import atexit
 import json
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
-from verification_eval import is_fail_closed_message
+try:
+    from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from verification_eval import is_fail_closed_message
+    from workspace_temp import workspace_temp_dir
+except ModuleNotFoundError:
+    from scripts.e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from scripts.verification_eval import is_fail_closed_message
+    from scripts.workspace_temp import workspace_temp_dir
 
 
 _LOADED_MODELS: set[str] = set()
@@ -252,6 +257,7 @@ class EvalCase:
     prepare: Callable[[Path], None] | None = None
     extra_args: tuple[str, ...] = ()
     acceptable: tuple[str, ...] = ("pass",)
+    requires_git: bool = False
 
 
 CASES = [
@@ -266,6 +272,7 @@ CASES = [
         validate=validate_git_diff,
         prepare=prepare_git_diff_case,
         acceptable=("pass", "fail_closed"),
+        requires_git=True,
     ),
     EvalCase(
         name="exact_literal_write_readback",
@@ -299,6 +306,7 @@ CASES = [
         validate=validate_git_diff,
         prepare=prepare_git_diff_case,
         acceptable=("pass", "fail_closed"),
+        requires_git=True,
     ),
     EvalCase(
         name="large_file_targeted_read",
@@ -323,6 +331,7 @@ CASES = [
         validate=validate_git_diff,
         prepare=prepare_git_diff_case,
         acceptable=("pass", "fail_closed"),
+        requires_git=True,
     ),
 ]
 
@@ -335,9 +344,27 @@ def evaluate_case(
     case: EvalCase,
     timeout: int,
 ) -> dict[str, Any]:
-    with tempfile.TemporaryDirectory(prefix="ollama-code-token-", dir=repo_root) as tmp:
+    with workspace_temp_dir("ollama-code-token-", repo_root) as tmp:
         workspace = Path(tmp)
-        build_workspace(workspace)
+        git_available = build_workspace(workspace)
+        if case.requires_git and not git_available:
+            return {
+                "model": model,
+                "verifier_model": verifier_model,
+                "debate": mode,
+                "case": case.name,
+                "status": "skipped",
+                "acceptable": [*case.acceptable, "skipped"],
+                "latency_s": 0.0,
+                "returncode": 0,
+                "usage": usage_totals({}),
+                "tool_calls": [],
+                "assumption_audits": 0,
+                "assumption_retries": 0,
+                "verifier_retries": 0,
+                "stdout_tail": "skipped: git workspace unavailable",
+                "stderr_tail": "",
+            }
         if case.prepare is not None:
             case.prepare(workspace)
         session_file = workspace / "scratch" / f"{case.name}-{mode}.json"
@@ -517,7 +544,8 @@ def main(argv: list[str] | None = None) -> int:
             for case in cases:
                 outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout)
                 results.append(outcome)
-                if args.strict_accuracy and outcome["status"] not in case.acceptable:
+                acceptable_statuses = outcome.get("acceptable", case.acceptable)
+                if args.strict_accuracy and outcome["status"] not in acceptable_statuses:
                     failures.append(outcome)
                 print_table([outcome], [])
         unload_model(model)

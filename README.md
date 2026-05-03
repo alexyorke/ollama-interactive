@@ -75,7 +75,7 @@ Precedence:
 
 - CLI flags override everything else
 - when resuming a saved session, the saved model wins unless `--model` is provided
-- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_VERIFIER_MODEL`, `OLLAMA_CODE_TEST_CMD`, and `OLLAMA_CODE_DEBATE` override the config file for one-off runs
+- `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_VERIFIER_MODEL`, `OLLAMA_CODE_TEST_CMD`, `OLLAMA_CODE_DEBATE`, and `OLLAMA_CODE_NUM_CTX` override the config file for one-off runs
 - otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
 
 ## Run
@@ -140,6 +140,13 @@ export OLLAMA_HOST=http://127.0.0.1:11434
 You can also set the default test command with `OLLAMA_CODE_TEST_CMD`.
 You can disable assumption auditing and grounded verification with `OLLAMA_CODE_DEBATE=off`.
 You can override the verifier/rewrite model with `OLLAMA_CODE_VERIFIER_MODEL`.
+The client sends an adaptive `num_ctx` option for normal compact turns so large-context models do not allocate 40K-131K context for tiny prompts. Set `OLLAMA_CODE_NUM_CTX=off` to use the model default, or set an integer such as `8192` to force a fixed context.
+
+Profile local Ollama speed with raw load/prompt/generation counters:
+
+```bash
+python scripts/ollama_perf_probe.py --models gemma3:4b qwen3:8b granite4.1:8b --output scratch/perf/ollama.json
+```
 
 ## Docker
 
@@ -312,7 +319,7 @@ git push origin v0.1.0
 - Explicit forbidden-tool constraints such as `do not use read_file` are enforced before tool execution.
 - Tool-heavy turns run with thinking disabled by default to cut latency and token use. Simple non-tool turns still use the normal Ollama thinking path.
 - Repeated read-only tool calls in one user turn are cached, and only compact tool-result summaries are fed back into the model. Full raw tool results still stay in the transcript and event log.
-- Code navigation tools (`search_symbols`, `code_outline`, `read_symbol`) let the model inspect relevant functions/classes instead of reading full files. Python uses AST ranges; other common code files use a lightweight definition fallback.
+- Code navigation tools (`search_symbols`, `code_outline`, `read_symbol`) let the model inspect relevant functions/classes instead of reading full files. `replace_symbol` can mechanically replace one function/class/method by symbol range and rejects Python replacements that would break file syntax. Python uses AST ranges; other common code files use a lightweight definition fallback.
 - Token profiling is recorded in `llm_call` events, including prompt chars by role and largest prompt messages, so evals can identify input-token waste.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.

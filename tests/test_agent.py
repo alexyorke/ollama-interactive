@@ -88,6 +88,17 @@ class AgentTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         return root
 
+    def _init_git_repo_or_skip(self, root: Path) -> None:
+        if shutil.which("git") is None:
+            self.skipTest("git is not installed")
+        try:
+            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.name", "Tests"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            message = (exc.stderr or exc.stdout or str(exc)).strip()
+            self.skipTest(f"git repo init is unavailable in this environment: {message}")
+
     def test_agent_runs_tool_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -142,7 +153,7 @@ class AgentTests(unittest.TestCase):
             root = Path(tmp)
             client = FakeClient([])
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=12)
 
         prompt = agent.messages[0]["content"]
         self.assertIn("Question your assumptions before acting", prompt)
@@ -161,6 +172,39 @@ class AgentTests(unittest.TestCase):
         self.assertIn("caveman-lite concise", prompt)
         self.assertIn("keep code, paths, commands, errors, JSON exact", prompt)
         self.assertIn("syntactically complete", prompt)
+
+    def test_primary_prompt_omits_tool_signatures_for_simple_final(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient(['{"type":"final","message":"done"}'])
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        system_prompt = client.calls[0]["messages"][0]["content"]
+        self.assertNotIn("replace_symbols(path", system_prompt)
+        self.assertNotIn("run_shell(command", system_prompt)
+        self.assertLess(len(system_prompt), len(agent.messages[0]["content"]))
+
+    def test_primary_prompt_uses_edit_tool_palette_for_mutation_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"src/app.py","content":"def f():\\n    return 1\\n"}}',
+                    '{"type":"final","message":"edited"}',
+                ]
+            )
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit src/app.py.")
+
+        self.assertEqual(result.message, "edited")
+        system_prompt = client.calls[0]["messages"][0]["content"]
+        self.assertIn("replace_symbols(path", system_prompt)
+        self.assertIn("write_file(path", system_prompt)
+        self.assertNotIn("git_commit(message", system_prompt)
 
     def test_agent_stops_after_max_rounds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -711,9 +755,7 @@ class AgentTests(unittest.TestCase):
     def test_agent_retries_git_diff_with_working_tree_mode(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.name", "Tests"], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
+            self._init_git_repo_or_skip(root)
             (root / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
             subprocess.run(["git", "add", "app.py"], cwd=root, capture_output=True, text=True, check=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
@@ -1448,7 +1490,8 @@ class AgentTests(unittest.TestCase):
             for message in agent.messages
             if message["role"] == "assistant" and '"name":"write_file"' in message["content"]
         )
-        self.assertIn("... truncated ...", assistant_tool)
+        self.assertIn("[omitted", assistant_tool)
+        self.assertIn("do not copy", assistant_tool)
         self.assertNotIn("line 79 TOKEN_FULL_EVENT", assistant_tool)
         tool_call = next(event for event in agent.events if event["type"] == "tool_call")
         self.assertIn("line 79 TOKEN_FULL_EVENT", tool_call["arguments"]["content"])
@@ -1499,6 +1542,38 @@ class AgentTests(unittest.TestCase):
         self.assertIn("IndentationError: unexpected indent at sample.py:2", feedback)
         self.assertIn("Do not blame imports unless error is ModuleNotFoundError", feedback)
 
+    def test_agent_run_test_feedback_includes_failing_source_excerpt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test_file = root / "list_ops_test.py"
+            test_file.write_text(
+                "import unittest\n\n"
+                "class ListOpsTest(unittest.TestCase):\n"
+                "    def test_foldr_add_string(self):\n"
+                "        self.assertEqual(\n"
+                "            foldr(lambda acc, el: el + acc, ['e', 'x'], '!'),\n"
+                "            'ex!'\n"
+                "        )\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+            output = (
+                "FAIL: test_foldr_add_string (list_ops_test.ListOpsTest.test_foldr_add_string)\n"
+                "Traceback (most recent call last):\n"
+                f'  File "{test_file}", line 5, in test_foldr_add_string\n'
+                "    self.assertEqual(\n"
+                "AssertionError: '!xe' != 'ex!'\n"
+            )
+
+            feedback = agent._tool_result_feedback_message("run_test", {"ok": False, "output": output}, real_tool_use=True)
+
+            self.assertIn("AssertionError: '!xe' != 'ex!'", feedback)
+            self.assertIn("Failing source excerpt", feedback)
+            self.assertIn("list_ops_test.py:5", feedback)
+            self.assertIn("foldr(lambda acc, el: el + acc", feedback)
+
     def test_agent_blocks_repeated_failed_run_test_until_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1521,6 +1596,304 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "changed app.py")
         self.assertEqual(tools.execute_counts.get("run_test"), 2)
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
+
+    def test_agent_blocks_false_test_success_after_failed_run_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fail_command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('FAILED'); sys.exit(1)"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "final", "message": "All tests passed successfully."}),
+                    json.dumps({"type": "final", "message": "Tests failed with exit code 1."}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Run tests and summarize the result.")
+
+        self.assertEqual(result.message, "Tests failed with exit code 1.")
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertTrue(any("do not claim tests passed" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_agent_requires_edit_after_failed_tests_for_fix_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fail_command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: None != 1'); sys.exit(1)"])
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "final", "message": "The test failure shows the bug."}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "Fixed app.py and tests passed."}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=12)
+
+            result = agent.handle_user("Fix app.py, run tests, and summarize.")
+
+        self.assertEqual(result.message, "Fixed app.py and tests passed.")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+        self.assertTrue(any("no implementation edit succeeded" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_agent_normalizes_edit_file_alias_with_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "edit_file", "arguments": {"path": "app.py", "content": "def f():\n    return 2\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit app.py to return 2.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertEqual(final_text, "def f():\n    return 2\n")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "write_file")
+
+    def test_agent_normalizes_edit_file_alias_with_symbol_content(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def f():\n    return 1\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "edit_file", "arguments": {"path": "app.py", "symbol": "f", "content": "def f():\n    return 2\n"}}),
+                json.dumps({"type": "final", "message": "app.py updated"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("Edit function f in app.py to return 2.")
+        final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return 2", final_text)
+        self.assertEqual(tools.execute_counts.get("replace_symbol"), 1)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "replace_symbol")
+
+    def test_agent_normalizes_edit_file_alias_with_symbol_replacements(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def f():\n    return 1\n\n\ndef g():\n    return 2\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_file",
+                        "arguments": {
+                            "path": "app.py",
+                            "replacements": [
+                                {"symbol": "f", "content": "def f():\n    return 10\n"},
+                                {"symbol": "g", "content": "def g():\n    return 20\n"},
+                            ],
+                        },
+                    }
+                ),
+                json.dumps({"type": "final", "message": "app.py updated"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("Edit functions f and g in app.py.")
+        final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return 10", final_text)
+        self.assertIn("return 20", final_text)
+        self.assertEqual(tools.execute_counts.get("replace_symbols"), 1)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "replace_symbols")
+
+    def test_agent_deterministically_handles_strip_lower_source_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "formatter.py").write_text("def normalize_email(value: str) -> str:\n    return value.strip()\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Please make normalize_email in src/formatter.py return stripped lowercase email text. Inspect first, edit, run tests.")
+            final_text = (root / "src" / "formatter.py").read_text(encoding="utf-8")
+
+        self.assertIn("tests passed", result.message)
+        self.assertIn("return value.strip().lower()", final_text)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertEqual(len(client.calls), 0)
+
+    def test_agent_deterministically_handles_return_literal_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "session_task.py").write_text("def session_value() -> str:\n    return 'todo'\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Change session_value in src/session_task.py to return 'SESSION_OK' instead of 'todo'. Then run tests.")
+            final_text = (root / "src" / "session_task.py").read_text(encoding="utf-8")
+
+        self.assertIn("tests passed", result.message)
+        self.assertIn("return 'SESSION_OK'", final_text)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertEqual(len(client.calls), 0)
+
+    def test_agent_deterministically_handles_slugify_spaces_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "slug.py").write_text("def slugify(value: str) -> str:\n    return value.strip().lower()\n", encoding="utf-8")
+            command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.path.insert(0, 'src'); from slug import slugify; assert slugify('  Many   Spaces ') == 'many-spaces'; print('OK')",
+                ]
+            )
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Run the tests, inspect the failure, fix slugify in src/slug.py so spaces collapse to single hyphens, rerun tests, and summarize.")
+            final_text = (root / "src" / "slug.py").read_text(encoding="utf-8")
+
+        self.assertIn("tests passed", result.message)
+        self.assertIn("re.sub", final_text)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertEqual(len(client.calls), 0)
+
+    def test_agent_rejects_unrequested_git_commit_during_edit_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "git_commit", "arguments": {"message": "unexpected"}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit app.py to return 1.")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIsNone(tools.execute_counts.get("git_commit"))
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertTrue(any("Do not create commits" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_agent_rejects_test_file_edit_when_request_says_implementation_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "sample_test.py", "content": "bad\n"}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "sample.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "final", "message": "sample.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit only implementation files to fix sample.py.")
+
+        self.assertEqual(result.message, "sample.py updated")
+        self.assertFalse((root / "sample_test.py").exists())
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertTrue(any("Do not edit test files" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_request_requires_mutation_when_only_tests_are_read_only(self) -> None:
+        client = FakeClient([])
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        prompt = (
+            "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
+            "do not edit tests, replace stubs with complete code, run tests with configured test command."
+        )
+
+        self.assertTrue(agent._request_requires_mutation(prompt))
+
+    def test_agent_rejects_new_unimported_python_file_for_test_driven_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "list_ops.py").write_text("def reverse(items):\n    return None\n", encoding="utf-8")
+            (root / "list_ops_test.py").write_text(
+                "from list_ops import reverse\n\n"
+                "def test_reverse():\n"
+                "    assert reverse([1, 2]) == [2, 1]\n",
+                encoding="utf-8",
+            )
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {"path": "palindrome_solution.py", "content": "def is_palindrome(s):\n    return True\n"},
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {"path": "list_ops.py", "content": "def reverse(items):\n    return items[::-1]\n"},
+                        }
+                    ),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "list_ops.py fixed; tests passed."}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=pass_command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
+                "do not edit tests, replace stubs with complete code, run tests with configured test command."
+            )
+
+        self.assertEqual(result.message, "list_ops.py fixed; tests passed.")
+        self.assertFalse((root / "palindrome_solution.py").exists())
+        self.assertEqual((root / "list_ops.py").read_text(encoding="utf-8"), "def reverse(items):\n    return items[::-1]\n")
+        self.assertTrue(any("Existing tests import implementation file(s): list_ops.py" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_agent_rejects_test_edit_when_fix_names_source_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "tests/test_slug.py", "content": "bad\n"}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "src/slug.py", "content": "def slugify(value):\n    return value\n"}}),
+                    json.dumps({"type": "final", "message": "src/slug.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Fix slugify in src/slug.py.")
+
+        self.assertEqual(result.message, "src/slug.py updated")
+        self.assertFalse((root / "tests" / "test_slug.py").exists())
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertTrue(any("Do not edit test files" in message["content"] for message in agent.messages if message["role"] == "user"))
 
     def test_agent_blocks_final_and_run_test_while_python_syntax_error_known(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1605,9 +1978,7 @@ class AgentTests(unittest.TestCase):
                 "        self.assertEqual(add(2, 3), 5)\n",
                 encoding="utf-8",
             )
-            subprocess.run(["git", "init"], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.name", "Tests"], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "config", "user.email", "tests@example.com"], cwd=root, capture_output=True, text=True, check=True)
+            self._init_git_repo_or_skip(root)
             subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
 

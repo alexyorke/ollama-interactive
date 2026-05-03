@@ -15,6 +15,21 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertIn("unittest", command)
         self.assertIn("*_test.py", command)
 
+    def test_public_task_prompt_requires_complete_implementation_loop(self) -> None:
+        prompt = public_bench.public_task_prompt("Python")
+
+        self.assertIn("edit only implementation files", prompt)
+        self.assertIn("do not edit tests", prompt)
+        self.assertIn("keep editing until tests pass", prompt)
+
+    def test_public_task_prompt_is_task_agnostic(self) -> None:
+        prompt = public_bench.public_task_prompt("Python").lower()
+
+        for task_name in public_bench.DEFAULT_POLYGLOT_TASKS:
+            self.assertNotIn(task_name, prompt)
+        for solution_hint in ("foldr", "pig latin", "question", "return 99", "token_"):
+            self.assertNotIn(solution_hint, prompt)
+
     def test_polyglot_task_path_validates_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

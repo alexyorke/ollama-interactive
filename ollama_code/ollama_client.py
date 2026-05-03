@@ -8,7 +8,7 @@ from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from ollama_code.config import DEFAULT_OLLAMA_HOST, ENV_OLLAMA_HOST
+from ollama_code.config import DEFAULT_OLLAMA_HOST, ENV_OLLAMA_CODE_NUM_CTX, ENV_OLLAMA_HOST
 from ollama_code.interrupts import OperationInterrupted
 
 
@@ -86,6 +86,7 @@ class OllamaClient:
         stream: bool,
         think: bool,
     ) -> Request:
+        options = self._chat_options(messages)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -94,11 +95,41 @@ class OllamaClient:
         }
         if response_format is not None:
             payload["format"] = response_format
+        if options:
+            payload["options"] = options
         return Request(
             f"{self.host}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
+
+    def _chat_options(self, messages: list[dict[str, str]]) -> dict[str, int]:
+        num_ctx = self._num_ctx_for_messages(messages)
+        return {"num_ctx": num_ctx} if num_ctx is not None else {}
+
+    def _num_ctx_for_messages(self, messages: list[dict[str, str]]) -> int | None:
+        configured = os.environ.get(ENV_OLLAMA_CODE_NUM_CTX)
+        if configured is not None:
+            stripped = configured.strip().lower()
+            if stripped in {"", "off", "false", "0"}:
+                return None
+            try:
+                parsed = int(stripped)
+            except ValueError:
+                return None
+            return parsed if parsed > 0 else None
+
+        # Avoid huge model-default contexts (40k-131k) for ordinary compact agent turns.
+        # If a prompt is truly large, omit the override and let the model's native context apply.
+        prompt_chars = 0
+        for message in messages:
+            prompt_chars += len(str(message.get("role", ""))) + len(str(message.get("content", ""))) + 12
+        estimated_tokens = max(1, prompt_chars // 3)
+        needed = estimated_tokens + 1024
+        for bucket in (4096, 8192, 16384, 32768):
+            if needed <= bucket:
+                return bucket
+        return None
 
     def _thinking_unsupported(self, body: str) -> bool:
         lowered = body.lower()

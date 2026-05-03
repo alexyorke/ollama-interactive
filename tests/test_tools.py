@@ -39,9 +39,13 @@ class ToolExecutorTests(unittest.TestCase):
     def init_git_repo(self, root: Path) -> None:
         if shutil.which("git") is None:
             self.skipTest("git is not installed")
-        subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True, capture_output=True, text=True)
-        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True, capture_output=True, text=True)
+        try:
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            message = (exc.stderr or exc.stdout or str(exc)).strip()
+            self.skipTest(f"git repo init is unavailable in this environment: {message}")
 
     def test_list_and_read_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -79,6 +83,58 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Python syntax error", result["summary"])
         self.assertIn("bad.py:2", result["diagnostic"])
         self.assertEqual(final_text, "def f():\nreturn 1\n")
+
+    def test_write_file_auto_dedents_globally_indented_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("fixed.py", "    def f():\n        return 1\n")
+            final_text = (root / "fixed.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertNotIn("syntax_ok", result)
+        self.assertIn("Auto-dedented", result["summary"])
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+
+    def test_write_file_strips_markdown_quote_prefixes_for_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("quoted.py", "> def f():\n>     return 1\n")
+            final_text = (root / "quoted.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("quote prefixes", result["summary"])
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+
+    def test_write_file_repairs_common_join_string_typo_when_parseable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("joiner.py", "def f(items):\n    return '.join(items)\n")
+            final_text = (root / "joiner.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("join string typo", result["summary"])
+        self.assertEqual(final_text, 'def f(items):\n    return " ".join(items)\n')
+
+    def test_write_file_rejects_generated_cache_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("__pycache__/sample.pyc", "")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("generated/cache", result["summary"])
+
+    def test_write_file_rejects_omitted_context_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("sample.py", "[omitted 500 chars from prior content; do not copy]")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("omitted-context marker", result["summary"])
 
     def test_replace_in_file_reports_python_syntax_error_without_blocking_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -309,6 +365,129 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Alpha.save", ambiguous["matches"])
         self.assertTrue(precise["ok"])
         self.assertIn("return 'b'", precise["output"])
+
+    def test_replace_symbol_replaces_python_function_without_old_text(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "sample.py"
+        sample.write_text(
+            "def keep():\n"
+            "    return 'keep'\n\n"
+            "def target(value):\n"
+            "    return value + 1\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol("sample.py", "target", "def target(value):\n    return value * 2")
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["symbol"], "target")
+        self.assertIn("return value * 2", final_text)
+        self.assertIn("return 'keep'", final_text)
+
+    def test_replace_symbol_aligns_method_indent(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "sample.py"
+        sample.write_text(
+            "class Service:\n"
+            "    def value(self):\n"
+            "        return 1\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol("sample.py", "Service.value", "def value(self):\n    return 2\n")
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("    def value(self):\n        return 2\n", final_text)
+
+    def test_replace_symbol_rejects_python_syntax_error_without_writing(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "sample.py"
+        original = "def target():\n    return 1\n"
+        sample.write_text(original, encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol("sample.py", "target", "def target(:\n    return 2\n")
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["syntax_ok"])
+        self.assertIn("Refusing replace_symbol", result["summary"])
+        self.assertEqual(final_text, original)
+
+    def test_replace_symbol_reports_ambiguous_names(self) -> None:
+        root = self._workspace_scratch()
+        (root / "models.py").write_text(
+            "class Alpha:\n"
+            "    def save(self):\n"
+            "        return 'a'\n\n"
+            "class Beta:\n"
+            "    def save(self):\n"
+            "        return 'b'\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol("models.py", "save", "def save(self):\n    return 'x'\n")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Ambiguous", result["summary"])
+        self.assertIn("Alpha.save", result["matches"])
+
+    def test_replace_symbols_replaces_multiple_python_functions_atomically(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        original = (
+            "def add(a, b):\n"
+            "    return None\n\n"
+            "def multiply(a, b):\n"
+            "    return None\n"
+        )
+        sample.write_text(original, encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbols(
+            "ops.py",
+            [
+                {"symbol": "add", "content": "def add(a, b):\n    return a + b\n"},
+                {"symbol": "multiply", "content": "def multiply(a, b):\n    return a * b\n"},
+            ],
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 2)
+        self.assertIn("return a + b", final_text)
+        self.assertIn("return a * b", final_text)
+
+    def test_replace_symbols_rejects_python_syntax_error_without_writing(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        original = "def add(a, b):\n    return None\n"
+        sample.write_text(original, encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbols(
+            "ops.py",
+            [{"symbol": "add", "content": "def add(a, b):\nreturn a + b\n"}],
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["syntax_ok"])
+        self.assertEqual(final_text, original)
+
+    def test_replace_symbols_accepts_python_file_with_utf8_bom(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("\ufeffdef add(a, b):\n    return None\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbols(
+            "ops.py",
+            [{"symbol": "add", "content": "def add(a, b):\n    return a + b\n"}],
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(final_text.startswith("\ufeffdef add"))
+        self.assertIn("return a + b", final_text)
 
     def test_execute_ignores_extra_tool_arguments_when_required_args_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

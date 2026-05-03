@@ -6,10 +6,14 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import urllib.request
 from pathlib import Path
 from typing import Callable
+
+try:
+    from workspace_temp import workspace_temp_dir
+except ModuleNotFoundError:
+    from scripts.workspace_temp import workspace_temp_dir
 
 
 _LOADED_MODELS: set[str] = set()
@@ -400,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
         scenario_repl,
     ]
     for model in requested:
-        with tempfile.TemporaryDirectory(prefix="ollama-code-live-", dir=repo_root) as tmp:
+        with workspace_temp_dir("ollama-code-live-", repo_root) as tmp:
             workspace = Path(tmp)
             build_workspace(workspace)
             print(f"[live] model={model}")

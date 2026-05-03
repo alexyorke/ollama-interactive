@@ -10,9 +10,10 @@ import signal
 import shutil
 import subprocess
 import threading
+import textwrap
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ollama_code.interrupts import OperationInterrupted
 
@@ -34,6 +35,7 @@ SKIP_CODE_DIRS = {
     ".venv",
     "venv",
 }
+DENY_MUTATION_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ollama-code"}
 
 
 TOOL_DESCRIPTIONS = [
@@ -66,6 +68,16 @@ TOOL_DESCRIPTIONS = [
         "name": "read_symbol",
         "arguments": {"path": "code file", "symbol": "name or qualified name", "include_context": "lines around symbol, default 2"},
         "description": "Read one code symbol body by AST/definition range.",
+    },
+    {
+        "name": "replace_symbol",
+        "arguments": {"path": "code file", "symbol": "name or qualified name", "content": "replacement symbol source"},
+        "description": "Replace one function/class/method by symbol range. Python replacements must keep the full file syntactically valid.",
+    },
+    {
+        "name": "replace_symbols",
+        "arguments": {"path": "code file", "replacements": "list of {symbol, content} objects"},
+        "description": "Replace multiple functions/classes/methods in one syntactically checked edit.",
     },
     {
         "name": "write_file",
@@ -133,7 +145,7 @@ def format_tool_help() -> str:
     return "\n".join(lines)
 
 
-def format_compact_tool_help() -> str:
+def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
     signatures = {
         "list_files": "list_files(path='.',depth=4,limit=200)",
         "read_file": "read_file(path,start=1,end=200)",
@@ -141,6 +153,8 @@ def format_compact_tool_help() -> str:
         "search_symbols": "search_symbols(query,path='.',limit=50)",
         "code_outline": "code_outline(path,max_symbols=120)",
         "read_symbol": "read_symbol(path,symbol,context=2)",
+        "replace_symbol": "replace_symbol(path,symbol,content)",
+        "replace_symbols": 'replace_symbols(path,replacements=[{"symbol":"f","content":"def f():\\n    return ..."}])',
         "write_file": "write_file(path,content)",
         "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
         "run_shell": "run_shell(command,cwd='.',timeout=30)",
@@ -150,7 +164,8 @@ def format_compact_tool_help() -> str:
         "git_commit": "git_commit(message,add_all=true)",
         "run_agent": "run_agent(prompt,model?,approval?,rounds?)",
     }
-    return "\n".join(signatures[tool["name"]] for tool in TOOL_DESCRIPTIONS)
+    allowed = set(tool_names) if tool_names is not None else None
+    return "\n".join(signatures[tool["name"]] for tool in TOOL_DESCRIPTIONS if allowed is None or tool["name"] in allowed)
 
 
 class ToolExecutor:
@@ -211,6 +226,8 @@ class ToolExecutor:
             "search_symbols": self.search_symbols,
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
+            "replace_symbol": self.replace_symbol,
+            "replace_symbols": self.replace_symbols,
             "write_file": self.write_file,
             "replace_in_file": self.replace_in_file,
             "run_shell": self.run_shell,
@@ -492,7 +509,10 @@ class ToolExecutor:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
         if shutil.which("rg"):
-            command = ["rg", "-n", "--color", "never", "--max-count", str(limit), query, str(base)]
+            command = ["rg", "-n", "--color", "never", "--no-ignore-parent", "--max-count", str(limit)]
+            for directory in sorted(SKIP_CODE_DIRS):
+                command.extend(["--glob", f"!{directory}/**"])
+            command.extend([query, str(base)])
             result = self._run_process(command, cwd=self.workspace_root, timeout=30)
             output = result.stdout.strip() or result.stderr.strip() or "(no matches)"
             if output != "(no matches)":
@@ -565,7 +585,7 @@ class ToolExecutor:
     def _python_symbols(self, target: Path, text: str) -> list[dict[str, Any]]:
         lines = text.splitlines()
         try:
-            tree = ast.parse(text)
+            tree = ast.parse(self._python_parse_text(text))
         except SyntaxError:
             return []
         symbols: list[dict[str, Any]] = []
@@ -706,6 +726,14 @@ class ToolExecutor:
                 output.append("  (no symbols found)")
         return {"ok": True, "tool": "code_outline", "path": self.relative_label(base), "count": count, "output": "\n".join(output) if output else "(no code files found)"}
 
+    def _symbol_matches(self, symbols: list[dict[str, Any]], symbol: str) -> list[dict[str, Any]]:
+        needle = symbol.strip()
+        exact = [item for item in symbols if item["qualname"] == needle or item["name"] == needle]
+        if exact:
+            return exact
+        lowered = needle.lower()
+        return [item for item in symbols if lowered in str(item["qualname"]).lower() or lowered in str(item["name"]).lower()]
+
     def read_symbol(self, path: str, symbol: str, include_context: int = 2) -> dict[str, Any]:
         self._check_interrupted()
         target = self.resolve_path(path, allow_missing=False)
@@ -714,15 +742,7 @@ class ToolExecutor:
         if not self._is_code_file(target):
             return {"ok": False, "tool": "read_symbol", "summary": f"{path} is not a supported code file."}
         symbols, text, _ = self._code_symbols(target)
-        needle = symbol.strip()
-        exact = [
-            item
-            for item in symbols
-            if item["qualname"] == needle or item["name"] == needle
-        ]
-        if not exact:
-            lowered = needle.lower()
-            exact = [item for item in symbols if lowered in str(item["qualname"]).lower() or lowered in str(item["name"]).lower()]
+        exact = self._symbol_matches(symbols, symbol)
         if not exact:
             return {"ok": False, "tool": "read_symbol", "path": self.relative_label(target), "summary": f"Symbol not found: {symbol}"}
         if len(exact) > 1:
@@ -745,6 +765,193 @@ class ToolExecutor:
             "end": end,
             "output": "\n".join(rendered) if rendered else "(empty symbol)",
         }
+
+    def _first_non_empty_indent(self, content: str) -> str:
+        for line in content.splitlines():
+            if line.strip():
+                return line[: len(line) - len(line.lstrip())]
+        return ""
+
+    def _align_symbol_replacement_indent(self, content: str, existing_first_line: str) -> str:
+        target_indent = existing_first_line[: len(existing_first_line) - len(existing_first_line.lstrip())]
+        if not target_indent:
+            return content
+        current_indent = self._first_non_empty_indent(content)
+        if len(current_indent) >= len(target_indent):
+            return content
+        lines = content.splitlines(keepends=True)
+        return "".join(target_indent + line if line.strip() else line for line in lines)
+
+    def replace_symbol(self, path: str, symbol: str, content: str) -> dict[str, Any]:
+        self._check_interrupted()
+        target = self.resolve_path(path, allow_missing=False)
+        relative_path = self.relative_label(target)
+        if target.is_dir():
+            return {"ok": False, "tool": "replace_symbol", "summary": f"{path} is a directory."}
+        if not self._is_code_file(target):
+            return {"ok": False, "tool": "replace_symbol", "summary": f"{path} is not a supported code file."}
+        denied = self._mutation_denied_path(target)
+        if denied:
+            return {"ok": False, "tool": "replace_symbol", "path": relative_path, "summary": denied}
+        if self._contains_omitted_context_marker(content):
+            return {
+                "ok": False,
+                "tool": "replace_symbol",
+                "path": relative_path,
+                "summary": "Refusing to use omitted-context marker as symbol replacement text. Read the file or reconstruct exact text instead.",
+            }
+        symbols, original, _ = self._code_symbols(target)
+        matches = self._symbol_matches(symbols, symbol)
+        if not matches:
+            return {"ok": False, "tool": "replace_symbol", "path": relative_path, "summary": f"Symbol not found: {symbol}"}
+        if len(matches) > 1:
+            rendered = "\n".join(f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}" for item in matches[:20])
+            return {"ok": False, "tool": "replace_symbol", "path": relative_path, "summary": f"Ambiguous symbol: {symbol}", "matches": rendered}
+        found = matches[0]
+        lines = original.splitlines(keepends=True)
+        start = int(found["start"])
+        end = int(found["end"])
+        replacement = self._strip_read_file_line_prefixes(content)
+        normalization = None
+        if target.suffix.lower() == ".py":
+            replacement, normalization = self._normalize_python_write_content(target, replacement)
+            replacement = self._align_symbol_replacement_indent(replacement, lines[start - 1])
+            if original.startswith("\ufeff") and start == 1 and not replacement.startswith("\ufeff"):
+                replacement = "\ufeff" + replacement
+        if replacement and not replacement.endswith(("\n", "\r")):
+            replacement += "\n"
+        updated = "".join(lines[: start - 1]) + replacement + "".join(lines[end:])
+        diagnostic = self._python_syntax_diagnostic(target, updated)
+        if diagnostic is not None:
+            return {
+                "ok": False,
+                "tool": "replace_symbol",
+                "path": relative_path,
+                "symbol": found["qualname"],
+                "start": start,
+                "end": end,
+                "syntax_ok": False,
+                "diagnostic": diagnostic,
+                "summary": f"Refusing replace_symbol because the updated file would be invalid. {diagnostic}",
+            }
+        preview = self._diff_preview(relative_path, original, updated)
+        approved, reason = self._approve_mutation(f"Replace symbol {found['qualname']} in {relative_path}?", preview)
+        if not approved:
+            return {"ok": False, "tool": "replace_symbol", "path": relative_path, "symbol": found["qualname"], "summary": reason}
+        target.write_text(updated, encoding="utf-8")
+        result = {
+            "ok": True,
+            "tool": "replace_symbol",
+            "path": relative_path,
+            "symbol": found["qualname"],
+            "kind": found["kind"],
+            "start": start,
+            "end": end,
+            "syntax_ok": True if target.suffix.lower() == ".py" else None,
+            "summary": f"Replaced {found['kind']} {found['qualname']} in {relative_path}.",
+            "diff": preview,
+        }
+        if result["syntax_ok"] is None:
+            result.pop("syntax_ok")
+        if normalization:
+            result["normalized"] = normalization
+            result["summary"] += f" {normalization}"
+        return result
+
+    def replace_symbols(self, path: str, replacements: list[dict[str, Any]]) -> dict[str, Any]:
+        self._check_interrupted()
+        target = self.resolve_path(path, allow_missing=False)
+        relative_path = self.relative_label(target)
+        if target.is_dir():
+            return {"ok": False, "tool": "replace_symbols", "summary": f"{path} is a directory."}
+        if not self._is_code_file(target):
+            return {"ok": False, "tool": "replace_symbols", "summary": f"{path} is not a supported code file."}
+        denied = self._mutation_denied_path(target)
+        if denied:
+            return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": denied}
+        if not isinstance(replacements, list) or not replacements:
+            return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": "replace_symbols requires a non-empty replacements list."}
+        symbols, original, _ = self._code_symbols(target)
+        lines = original.splitlines(keepends=True)
+        prepared: list[dict[str, Any]] = []
+        seen_ranges: set[tuple[int, int]] = set()
+        normalizations: list[str] = []
+        for index, item in enumerate(replacements, start=1):
+            if not isinstance(item, dict):
+                return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": f'Replacement {index} must be an object shaped {{"symbol":"name","content":"full def/class source"}}.'}
+            symbol = item.get("symbol")
+            content = item.get("content")
+            if not isinstance(symbol, str) or not symbol.strip() or not isinstance(content, str):
+                return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": f'Replacement {index} requires string symbol and content fields, e.g. {{"symbol":"add","content":"def add(a, b):\\n    return a + b"}}.'}
+            if self._contains_omitted_context_marker(content):
+                return {
+                    "ok": False,
+                    "tool": "replace_symbols",
+                    "path": relative_path,
+                    "summary": "Refusing to use omitted-context marker as symbol replacement text. Read the file or reconstruct exact text instead.",
+                }
+            matches = self._symbol_matches(symbols, symbol)
+            if not matches:
+                return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": f"Symbol not found: {symbol}"}
+            if len(matches) > 1:
+                rendered = "\n".join(f"{entry['start']}-{entry['end']} {entry['kind']} {entry['qualname']}" for entry in matches[:20])
+                return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": f"Ambiguous symbol: {symbol}", "matches": rendered}
+            found = matches[0]
+            start = int(found["start"])
+            end = int(found["end"])
+            line_range = (start, end)
+            if line_range in seen_ranges:
+                return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": f"Duplicate replacement for symbol range {start}-{end}."}
+            seen_ranges.add(line_range)
+            replacement = self._strip_read_file_line_prefixes(content)
+            normalization = None
+            if target.suffix.lower() == ".py":
+                replacement, normalization = self._normalize_python_write_content(target, replacement)
+                replacement = self._align_symbol_replacement_indent(replacement, lines[start - 1])
+                if original.startswith("\ufeff") and start == 1 and not replacement.startswith("\ufeff"):
+                    replacement = "\ufeff" + replacement
+            if replacement and not replacement.endswith(("\n", "\r")):
+                replacement += "\n"
+            if normalization:
+                normalizations.append(normalization)
+            prepared.append({"found": found, "start": start, "end": end, "replacement": replacement})
+        updated_lines = list(lines)
+        for item in sorted(prepared, key=lambda entry: int(entry["start"]), reverse=True):
+            updated_lines[int(item["start"]) - 1 : int(item["end"])] = str(item["replacement"]).splitlines(keepends=True)
+        updated = "".join(updated_lines)
+        diagnostic = self._python_syntax_diagnostic(target, updated)
+        if diagnostic is not None:
+            return {
+                "ok": False,
+                "tool": "replace_symbols",
+                "path": relative_path,
+                "count": len(prepared),
+                "syntax_ok": False,
+                "diagnostic": diagnostic,
+                "summary": f"Refusing replace_symbols because the updated file would be invalid. {diagnostic}",
+            }
+        preview = self._diff_preview(relative_path, original, updated)
+        names = [str(item["found"]["qualname"]) for item in prepared]
+        approved, reason = self._approve_mutation(f"Replace {len(prepared)} symbols in {relative_path}?", preview)
+        if not approved:
+            return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": reason}
+        target.write_text(updated, encoding="utf-8")
+        result = {
+            "ok": True,
+            "tool": "replace_symbols",
+            "path": relative_path,
+            "count": len(prepared),
+            "symbols": names,
+            "syntax_ok": True if target.suffix.lower() == ".py" else None,
+            "summary": f"Replaced {len(prepared)} symbol(s) in {relative_path}: {', '.join(names[:8])}.",
+            "diff": preview,
+        }
+        if result["syntax_ok"] is None:
+            result.pop("syntax_ok")
+        if normalizations:
+            result["normalized"] = "; ".join(dict.fromkeys(normalizations))
+            result["summary"] += f" {result['normalized']}"
+        return result
 
     def git_status(self, path: str | None = None) -> dict[str, Any]:
         ok, error = self._ensure_git_repo()
@@ -837,6 +1044,17 @@ class ToolExecutor:
 
     def write_file(self, path: str, content: str) -> dict[str, Any]:
         target = self.resolve_path(path)
+        denied = self._mutation_denied_path(target)
+        if denied:
+            return {"ok": False, "tool": "write_file", "path": self.relative_label(target), "summary": denied}
+        if self._contains_omitted_context_marker(content):
+            return {
+                "ok": False,
+                "tool": "write_file",
+                "path": self.relative_label(target),
+                "summary": "Refusing to write omitted-context marker as file content. Reconstruct complete file content instead.",
+            }
+        content, normalization = self._normalize_python_write_content(target, content)
         existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
         relative_path = self.relative_label(target)
         preview = self._diff_preview(relative_path, existing, content)
@@ -852,6 +1070,9 @@ class ToolExecutor:
             "summary": f"Wrote {relative_path}.",
             "diff": preview,
         }
+        if normalization:
+            result["normalized"] = normalization
+            result["summary"] += f" {normalization}"
         diagnostic = self._python_syntax_diagnostic(target, content)
         if diagnostic is not None:
             result["syntax_ok"] = False
@@ -859,17 +1080,75 @@ class ToolExecutor:
             result["summary"] += f" {diagnostic}"
         return result
 
+    def _mutation_denied_path(self, target: Path) -> str | None:
+        for part in target.relative_to(self.workspace_root).parts:
+            if part in DENY_MUTATION_DIRS:
+                return f"Refusing to mutate generated/cache path: {self.relative_label(target)}."
+        return None
+
+    def _contains_omitted_context_marker(self, content: str) -> bool:
+        return bool(re.search(r"\[omitted \d+ chars from prior [A-Za-z_]+; do not copy\]", content))
+
+    def _normalize_python_write_content(self, target: Path, content: str) -> tuple[str, str | None]:
+        if target.suffix.lower() != ".py":
+            return content, None
+        if self._python_syntax_diagnostic(target, content) is None:
+            return content, None
+        candidates: list[tuple[str, str]] = []
+        fenced_match = re.match(r"^\s*```(?:python|py)?\s*\n(?P<body>.*?)(?:\n)?```\s*$", content, flags=re.DOTALL | re.IGNORECASE)
+        if fenced_match:
+            candidates.append((fenced_match.group("body"), "Stripped markdown code fence from Python file content before write."))
+        quote_stripped = self._strip_markdown_quote_prefixes(content)
+        if quote_stripped != content:
+            candidates.append((quote_stripped, "Stripped markdown quote prefixes from Python file content before write."))
+        if fenced_match:
+            fenced_quote_stripped = self._strip_markdown_quote_prefixes(fenced_match.group("body"))
+            if fenced_quote_stripped != fenced_match.group("body"):
+                candidates.append((fenced_quote_stripped, "Stripped markdown code fence and quote prefixes from Python file content before write."))
+        join_repaired = self._repair_common_python_join_typo(content)
+        if join_repaired != content:
+            candidates.append((join_repaired, "Repaired common Python join string typo before write."))
+        for candidate, reason in list(candidates):
+            if self._python_syntax_diagnostic(target, candidate) is None:
+                return candidate, reason
+        bases = [(content, "Auto-dedented Python file content before write."), *candidates]
+        for candidate, reason in bases:
+            dedented = textwrap.dedent(candidate)
+            if dedented == candidate:
+                continue
+            if self._python_syntax_diagnostic(target, dedented) is None:
+                if reason.startswith("Auto-dedented"):
+                    return dedented, reason
+                return dedented, reason[:-1] + " and auto-dedented it."
+        return content, None
+
+    def _repair_common_python_join_typo(self, content: str) -> str:
+        return re.sub(r"(?m)^(\s*return\s+)['\"]\.join\(", r'\1" ".join(', content)
+
+    def _strip_markdown_quote_prefixes(self, content: str) -> str:
+        lines = content.splitlines(keepends=True)
+        if not lines:
+            return content
+        prefixed = sum(1 for line in lines if re.match(r"^\s*>\s?", line))
+        non_empty = sum(1 for line in lines if line.strip())
+        if non_empty == 0 or prefixed < max(1, non_empty // 2):
+            return content
+        return "".join(re.sub(r"^\s*>\s?", "", line, count=1) for line in lines)
+
     def _python_syntax_diagnostic(self, target: Path, content: str) -> str | None:
         if target.suffix.lower() != ".py":
             return None
         try:
-            ast.parse(content, filename=self.relative_label(target))
+            ast.parse(self._python_parse_text(content), filename=self.relative_label(target))
         except SyntaxError as exc:
             line = exc.lineno if exc.lineno is not None else "?"
             offset = exc.offset if exc.offset is not None else "?"
             near = f" near {exc.text.strip()[:80]!r}" if exc.text and exc.text.strip() else ""
             return f"Python syntax error: {exc.__class__.__name__}: {exc.msg} at {self.relative_label(target)}:{line}:{offset}{near}."
         return None
+
+    def _python_parse_text(self, content: str) -> str:
+        return content[1:] if content.startswith("\ufeff") else content
 
     def _looks_like_word_char(self, value: str) -> bool:
         return value.isalnum() or value == "_"
@@ -943,6 +1222,16 @@ class ToolExecutor:
         match_whole_word: bool = False,
     ) -> dict[str, Any]:
         target = self.resolve_path(path, allow_missing=False)
+        denied = self._mutation_denied_path(target)
+        if denied:
+            return {"ok": False, "tool": "replace_in_file", "path": self.relative_label(target), "summary": denied}
+        if self._contains_omitted_context_marker(old) or self._contains_omitted_context_marker(new):
+            return {
+                "ok": False,
+                "tool": "replace_in_file",
+                "path": self.relative_label(target),
+                "summary": "Refusing to use omitted-context marker as replacement text. Read the file or reconstruct exact text instead.",
+            }
         original = target.read_text(encoding="utf-8", errors="replace")
         stripped_old = self._strip_read_file_line_prefixes(old)
         if stripped_old != old:
