@@ -9,6 +9,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 import threading
 import textwrap
 import time
@@ -70,6 +71,36 @@ TOOL_DESCRIPTIONS = [
         "description": "Read one code symbol body by AST/definition range.",
     },
     {
+        "name": "repo_index_search",
+        "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
+        "description": "Search code with compact ranked snippets instead of whole files.",
+    },
+    {
+        "name": "find_implementation_target",
+        "arguments": {"test_path": "optional test file", "output": "optional failing test output/traceback", "limit": "int, default 12"},
+        "description": "Map tests or tracebacks to likely implementation files and symbols.",
+    },
+    {
+        "name": "diagnose_test_failure",
+        "arguments": {"output": "run_test output", "path": "relative path, default .", "limit": "int, default 12"},
+        "description": "Group failing tests by likely root cause with expected/actual and likely target files.",
+    },
+    {
+        "name": "run_function_probe",
+        "arguments": {"module": "python module", "expressions": "list of Python expressions", "function": "optional function name", "timeout": "seconds, default 30"},
+        "description": "Run small Python expressions against a target module/function and return actual values/errors.",
+    },
+    {
+        "name": "call_graph",
+        "arguments": {"path": "file or directory", "symbol": "optional symbol", "limit": "int, default 40"},
+        "description": "Show static Python callers, callees, imports, and affected tests.",
+    },
+    {
+        "name": "lint_typecheck",
+        "arguments": {"paths": "path or list of paths, default .", "command": "optional lint/type command", "timeout": "seconds, default 120"},
+        "description": "Run deterministic syntax/lint/type checks with exact file lines.",
+    },
+    {
         "name": "replace_symbol",
         "arguments": {"path": "code file", "symbol": "name or qualified name", "content": "replacement symbol source"},
         "description": "Replace one function/class/method by symbol range. Python replacements must keep the full file syntactically valid.",
@@ -94,6 +125,16 @@ TOOL_DESCRIPTIONS = [
             "match_whole_word": "bool, default false",
         },
         "description": "Replace text inside an existing file. Prefer unique snippets; use match_whole_word for standalone words.",
+    },
+    {
+        "name": "apply_structured_edit",
+        "arguments": {"operation": "JSON operation: rename_symbol, replace_symbol, add_import, move_symbol, delete_symbol"},
+        "description": "Apply a mechanical code edit from an intent JSON, then syntax-check and return diff.",
+    },
+    {
+        "name": "generate_tests_from_spec",
+        "arguments": {"target_symbol": "symbol under test", "behavior": "expected behavior", "test_path": "optional output test path", "apply": "bool, default false"},
+        "description": "Generate a compact pytest test patch from a spec; preview by default, apply only when requested.",
     },
     {
         "name": "run_shell",
@@ -153,10 +194,18 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "search_symbols": "search_symbols(query,path='.',limit=50)",
         "code_outline": "code_outline(path,max_symbols=120)",
         "read_symbol": "read_symbol(path,symbol,context=2)",
+        "repo_index_search": "repo_index_search(query,path='.',limit=10)",
+        "find_implementation_target": "find_implementation_target(test_path?,output?,limit=12)",
+        "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
+        "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
+        "call_graph": "call_graph(path,symbol?,limit=40)",
+        "lint_typecheck": "lint_typecheck(paths='.',command?,timeout=120)",
         "replace_symbol": "replace_symbol(path,symbol,content)",
         "replace_symbols": 'replace_symbols(path,replacements=[{"symbol":"f","content":"def f():\\n    return ..."}])',
         "write_file": "write_file(path,content)",
         "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
+        "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol","path":"a.py","old":"x","new":"y"})',
+        "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
         "run_shell": "run_shell(command,cwd='.',timeout=30)",
         "run_test": "run_test(command?,cwd='.',timeout=1200)",
         "git_status": "git_status(path?)",
@@ -226,8 +275,16 @@ class ToolExecutor:
             "search_symbols": self.search_symbols,
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
+            "repo_index_search": self.repo_index_search,
+            "find_implementation_target": self.find_implementation_target,
+            "diagnose_test_failure": self.diagnose_test_failure,
+            "run_function_probe": self.run_function_probe,
+            "call_graph": self.call_graph,
+            "lint_typecheck": self.lint_typecheck,
             "replace_symbol": self.replace_symbol,
             "replace_symbols": self.replace_symbols,
+            "apply_structured_edit": self.apply_structured_edit,
+            "generate_tests_from_spec": self.generate_tests_from_spec,
             "write_file": self.write_file,
             "replace_in_file": self.replace_in_file,
             "run_shell": self.run_shell,
@@ -766,6 +823,400 @@ class ToolExecutor:
             "output": "\n".join(rendered) if rendered else "(empty symbol)",
         }
 
+    def repo_index_search(self, query: str, path: str = ".", limit: int = 10) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        if not terms:
+            return {"ok": False, "tool": "repo_index_search", "summary": "repo_index_search requires a non-empty query."}
+        results: list[dict[str, Any]] = []
+        for file_path in self._iter_code_files(base, limit=500):
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
+            symbols, _, _ = self._code_symbols(file_path)
+            score = 0
+            snippets: list[str] = []
+            rel = self.relative_label(file_path)
+            haystack_path = rel.lower()
+            for term in terms:
+                if term in haystack_path:
+                    score += 4
+            for symbol in symbols:
+                haystack = f"{symbol.get('qualname', '')} {symbol.get('signature', '')}".lower()
+                hits = sum(1 for term in terms if term in haystack)
+                if hits:
+                    score += 20 * hits
+                    start = max(1, int(symbol["start"]) - 1)
+                    end = min(len(lines), int(symbol["start"]) + 1)
+                    snippets.append(f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']}: {symbol['signature']}")
+                    for line_no in range(start, end + 1):
+                        snippets.append(f"{rel}:{line_no}: {lines[line_no - 1].strip()[:160]}")
+            for line_no, line in enumerate(lines, start=1):
+                lowered = line.lower()
+                hits = sum(1 for term in terms if term in lowered)
+                if hits:
+                    score += hits
+                    if len(snippets) < 6:
+                        snippets.append(f"{rel}:{line_no}: {line.strip()[:180]}")
+            if score:
+                results.append({"score": score, "path": rel, "snippets": snippets[:6]})
+        ranked = sorted(results, key=lambda item: (-int(item["score"]), str(item["path"])))[: max(1, int(limit))]
+        output: list[str] = []
+        for item in ranked:
+            output.append(f"{item['path']} score={item['score']}")
+            output.extend(f"  {snippet}" for snippet in item["snippets"])
+        return {
+            "ok": True,
+            "tool": "repo_index_search",
+            "path": self.relative_label(base),
+            "count": len(ranked),
+            "output": "\n".join(output) if output else "(no ranked snippets)",
+        }
+
+    def _resolve_python_module_file(self, module: str) -> Path | None:
+        clean = module.strip(".")
+        if not clean:
+            return None
+        rel = Path(*clean.split("."))
+        candidates = [
+            self.workspace_root / rel.with_suffix(".py"),
+            self.workspace_root / rel / "__init__.py",
+            self.workspace_root / "src" / rel.with_suffix(".py"),
+            self.workspace_root / "src" / rel / "__init__.py",
+        ]
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file() and self.workspace_root in candidate.resolve().parents:
+                return candidate.resolve()
+        return None
+
+    def _python_import_targets(self, target: Path) -> list[dict[str, Any]]:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(text), filename=self.relative_label(target))
+        except SyntaxError:
+            return []
+        targets: list[dict[str, Any]] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                module_file = self._resolve_python_module_file(node.module)
+                for alias in node.names:
+                    if module_file is not None:
+                        targets.append(
+                            {
+                                "path": self.relative_label(module_file),
+                                "symbol": alias.name,
+                                "reason": f"{self.relative_label(target)} imports {alias.name} from {node.module}",
+                            }
+                        )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    module_file = self._resolve_python_module_file(alias.name)
+                    if module_file is not None:
+                        targets.append(
+                            {
+                                "path": self.relative_label(module_file),
+                                "symbol": alias.asname or alias.name.split(".")[-1],
+                                "reason": f"{self.relative_label(target)} imports {alias.name}",
+                            }
+                        )
+        return targets
+
+    def _traceback_targets(self, output: str) -> list[dict[str, Any]]:
+        targets: list[dict[str, Any]] = []
+        for match in re.finditer(r'File "([^"]+)", line (\d+), in ([A-Za-z_<>][\w<>]*)', output):
+            raw_path, line, symbol = match.groups()
+            try:
+                path = self.resolve_path(raw_path, allow_missing=False)
+            except Exception:
+                continue
+            rel = self.relative_label(path)
+            if any(part in {"tests", "test"} or part.startswith("test_") for part in Path(rel).parts):
+                continue
+            targets.append({"path": rel, "symbol": symbol, "line": int(line), "reason": "implementation frame in traceback"})
+        return targets
+
+    def find_implementation_target(
+        self,
+        test_path: str | None = None,
+        output: str | None = None,
+        traceback: str | None = None,
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        targets: list[dict[str, Any]] = []
+        raw_output = "\n".join(part for part in [output, traceback] if isinstance(part, str) and part.strip())
+        if raw_output:
+            targets.extend(self._traceback_targets(raw_output))
+            for failed in re.findall(r"(?m)^FAILED\s+([^:\s]+)(?:::[^\s]+)?", raw_output):
+                try:
+                    test_file = self.resolve_path(failed, allow_missing=False)
+                except Exception:
+                    continue
+                if test_file.suffix.lower() == ".py":
+                    targets.extend(self._python_import_targets(test_file))
+        if test_path:
+            target = self.resolve_path(test_path, allow_missing=False)
+            if target.suffix.lower() == ".py":
+                targets.extend(self._python_import_targets(target))
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for item in targets:
+            key = (str(item.get("path", "")), str(item.get("symbol", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+            if len(deduped) >= max(1, int(limit)):
+                break
+        lines = []
+        for item in deduped:
+            suffix = f":{item['line']}" if "line" in item else ""
+            symbol = f" symbol={item['symbol']}" if item.get("symbol") else ""
+            lines.append(f"{item['path']}{suffix}{symbol} reason={item.get('reason', '')}")
+        return {
+            "ok": True,
+            "tool": "find_implementation_target",
+            "count": len(deduped),
+            "targets": deduped,
+            "output": "\n".join(lines) if lines else "(no likely implementation targets found)",
+        }
+
+    def diagnose_test_failure(
+        self,
+        output: str = "",
+        run_test_output: str | None = None,
+        path: str = ".",
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        text = run_test_output if isinstance(run_test_output, str) and run_test_output.strip() else output
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "tool": "diagnose_test_failure", "summary": "diagnose_test_failure requires run_test output."}
+        failures: list[dict[str, Any]] = []
+        for match in re.finditer(r"(?m)^FAILED\s+([^\s]+?)(?:::([^\s]+))?\s*(?:-\s*(.*))?$", text):
+            failures.append({"test": match.group(1), "case": match.group(2) or "", "message": (match.group(3) or "").strip()})
+        assertions = re.findall(r"(?m)^\s*E\s+assert\s+(.+)$", text)
+        exceptions = re.findall(r"(?m)^(?:E\s+)?([A-Za-z_][\w.]+(?:Error|Exception)):\s*(.+)$", text)
+        expected_actual: list[str] = []
+        for assertion in assertions:
+            if "==" in assertion:
+                left, right = assertion.split("==", 1)
+                expected_actual.append(f"actual={left.strip()[:120]} expected={right.strip()[:120]}")
+            else:
+                expected_actual.append(assertion.strip()[:180])
+        root_causes: list[str] = []
+        if exceptions:
+            for exc, message in exceptions[: max(1, int(limit))]:
+                root_causes.append(f"{exc}: {message.strip()[:180]}")
+        if expected_actual:
+            root_causes.extend(f"assertion mismatch: {item}" for item in expected_actual[: max(1, int(limit))])
+        if not root_causes and "ModuleNotFoundError" in text:
+            root_causes.append("import/module discovery failure")
+        targets = self.find_implementation_target(output=text, limit=limit)
+        lines: list[str] = []
+        for failure in failures[: max(1, int(limit))]:
+            test_id = failure["test"] + (f"::{failure['case']}" if failure["case"] else "")
+            lines.append(f"fail {test_id}: {failure['message'] or '(see traceback)'}")
+        for cause in root_causes[: max(1, int(limit))]:
+            lines.append(f"cause {cause}")
+        if targets.get("targets"):
+            lines.append("likely targets:")
+            lines.extend(f"  {line}" for line in str(targets.get("output", "")).splitlines()[: max(1, int(limit))])
+        return {
+            "ok": True,
+            "tool": "diagnose_test_failure",
+            "path": self.relative_label(self.resolve_path(path, allow_missing=False)),
+            "failures": failures[: max(1, int(limit))],
+            "root_causes": root_causes[: max(1, int(limit))],
+            "targets": targets.get("targets", []),
+            "output": "\n".join(lines) if lines else "(no structured failures found; inspect raw output)",
+        }
+
+    def run_function_probe(
+        self,
+        module: str,
+        expressions: list[str] | str,
+        function: str | None = None,
+        timeout: int = 30,
+    ) -> dict[str, Any]:
+        if isinstance(expressions, str):
+            probe_expressions = [expressions]
+        elif isinstance(expressions, list):
+            probe_expressions = [str(item) for item in expressions]
+        else:
+            return {"ok": False, "tool": "run_function_probe", "summary": "expressions must be a string or list of strings."}
+        if not module.strip() or not probe_expressions:
+            return {"ok": False, "tool": "run_function_probe", "summary": "module and expressions are required."}
+        approved, reason = self._approve_shell(f"python function probe for {module}", ".")
+        if not approved:
+            return {"ok": False, "tool": "run_function_probe", "summary": reason}
+        script = (
+            "import importlib,json,os,sys,traceback\n"
+            "workspace=os.getcwd(); sys.path.insert(0, workspace); sys.path.insert(0, os.path.join(workspace, 'src'))\n"
+            f"module_name={json.dumps(module)}\n"
+            f"function_name={json.dumps(function or '')}\n"
+            f"expressions={json.dumps(probe_expressions)}\n"
+            "rows=[]\n"
+            "try:\n"
+            "    mod=importlib.import_module(module_name)\n"
+            "    ns={'module': mod}\n"
+            "    if function_name:\n"
+            "        ns['fn']=getattr(mod, function_name)\n"
+            "    for expr in expressions:\n"
+            "        try:\n"
+            "            value=eval(expr, ns)\n"
+            "            rows.append({'expression': expr, 'ok': True, 'repr': repr(value), 'type': type(value).__name__})\n"
+            "        except Exception as exc:\n"
+            "            rows.append({'expression': expr, 'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)})\n"
+            "except Exception as exc:\n"
+            "    rows.append({'expression': '<import>', 'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)})\n"
+            "print(json.dumps(rows, ensure_ascii=False))\n"
+        )
+        completed = self._run_process([sys.executable, "-c", script], cwd=self.workspace_root, timeout=max(1, int(timeout)))
+        raw_output = self._collect_process_output(completed)
+        rows: list[Any]
+        try:
+            rows = json.loads(completed.stdout.strip())
+        except json.JSONDecodeError:
+            rows = []
+        rendered = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("ok"):
+                rendered.append(f"{row.get('expression')}: {row.get('repr')} ({row.get('type')})")
+            else:
+                rendered.append(f"{row.get('expression')}: ERROR {row.get('error')}")
+        return {
+            "ok": completed.returncode == 0 and all(isinstance(row, dict) and row.get("ok") for row in rows),
+            "tool": "run_function_probe",
+            "module": module,
+            "function": function or "",
+            "exit_code": completed.returncode,
+            "results": rows,
+            "output": "\n".join(rendered) if rendered else raw_output,
+        }
+
+    def call_graph(self, path: str = ".", symbol: str | None = None, limit: int = 40) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        definitions: dict[str, dict[str, Any]] = {}
+        calls_by_def: dict[str, set[str]] = {}
+        imports_by_file: dict[str, list[str]] = {}
+        for file_path in self._iter_code_files(base, limit=500):
+            if file_path.suffix.lower() != ".py":
+                continue
+            rel = self.relative_label(file_path)
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                tree = ast.parse(self._python_parse_text(text), filename=rel)
+            except SyntaxError:
+                continue
+            imports_by_file[rel] = []
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    imports_by_file[rel].extend(alias.name for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    imports_by_file[rel].extend(f"{node.module}.{alias.name}" for alias in node.names)
+
+            class Visitor(ast.NodeVisitor):
+                def __init__(self) -> None:
+                    self.stack: list[str] = []
+
+                def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+                    self._visit_def(node, "function")
+
+                def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+                    self._visit_def(node, "function")
+
+                def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+                    self._visit_def(node, "class")
+
+                def _visit_def(self, node: ast.AST, kind: str) -> None:
+                    name = str(getattr(node, "name", ""))
+                    qualname = ".".join([*self.stack, name])
+                    key = f"{rel}:{qualname}"
+                    definitions[key] = {"path": rel, "symbol": qualname, "kind": kind, "line": int(getattr(node, "lineno", 1))}
+                    previous = list(self.stack)
+                    self.stack.append(name)
+                    calls: set[str] = set()
+                    for child in ast.walk(node):
+                        if isinstance(child, ast.Call):
+                            func = child.func
+                            if isinstance(func, ast.Name):
+                                calls.add(func.id)
+                            elif isinstance(func, ast.Attribute):
+                                calls.add(func.attr)
+                    calls_by_def[key] = calls
+                    self.generic_visit(node)
+                    self.stack = previous
+
+            Visitor().visit(tree)
+        target_name = (symbol or "").strip()
+        if target_name:
+            matched_keys = [key for key, item in definitions.items() if item["symbol"] == target_name or item["symbol"].endswith(f".{target_name}") or key.endswith(f":{target_name}")]
+        else:
+            matched_keys = list(definitions)[: max(1, int(limit))]
+        lines: list[str] = []
+        for key in matched_keys[: max(1, int(limit))]:
+            item = definitions[key]
+            callees = sorted(calls_by_def.get(key, set()))[:12]
+            target_leaf = str(item["symbol"]).split(".")[-1]
+            callers = [
+                definitions[other]
+                for other, calls in calls_by_def.items()
+                if other != key and target_leaf in calls
+            ][:12]
+            affected_tests: list[str] = []
+            for file_path in imports_by_file:
+                if "test" not in Path(file_path).name.lower() and "tests" not in Path(file_path).parts:
+                    continue
+                full_path = self.workspace_root / file_path
+                if full_path.exists() and target_leaf in full_path.read_text(encoding="utf-8", errors="replace"):
+                    affected_tests.append(file_path)
+                    if len(affected_tests) >= 8:
+                        break
+            lines.append(f"{item['path']}:{item['line']} {item['kind']} {item['symbol']}")
+            lines.append(f"  callees: {', '.join(callees) if callees else '(none)'}")
+            lines.append("  callers: " + (", ".join(f"{caller['path']}:{caller['line']} {caller['symbol']}" for caller in callers) if callers else "(none)"))
+            lines.append(f"  affected_tests: {', '.join(affected_tests) if affected_tests else '(none)'}")
+        return {
+            "ok": True,
+            "tool": "call_graph",
+            "path": self.relative_label(base),
+            "symbol": target_name,
+            "count": len(matched_keys),
+            "output": "\n".join(lines) if lines else "(no call graph entries found)",
+        }
+
+    def lint_typecheck(self, paths: str | list[str] = ".", command: str | None = None, timeout: int = 120) -> dict[str, Any]:
+        if isinstance(command, str) and command.strip():
+            result = self.run_shell(command.strip(), timeout=timeout)
+            result["tool"] = "lint_typecheck"
+            return result
+        raw_paths = paths if isinstance(paths, list) else [paths]
+        checked: list[str] = []
+        diagnostics: list[str] = []
+        for raw_path in raw_paths:
+            base = self.resolve_path(str(raw_path), allow_missing=False)
+            files = [base] if base.is_file() else list(base.rglob("*.py"))
+            for file_path in files:
+                if not file_path.is_file() or any(part in SKIP_CODE_DIRS for part in file_path.parts):
+                    continue
+                rel = self.relative_label(file_path)
+                checked.append(rel)
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                diagnostic = self._python_syntax_diagnostic(file_path, text)
+                if diagnostic:
+                    diagnostics.append(diagnostic)
+        return {
+            "ok": not diagnostics,
+            "tool": "lint_typecheck",
+            "checked": checked,
+            "diagnostics": diagnostics,
+            "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} Python file(s)",
+        }
+
     def _first_non_empty_indent(self, content: str) -> str:
         for line in content.splitlines():
             if line.strip():
@@ -952,6 +1403,211 @@ class ToolExecutor:
             result["normalized"] = "; ".join(dict.fromkeys(normalizations))
             result["summary"] += f" {result['normalized']}"
         return result
+
+    def _operation_payload(self, operation: dict[str, Any] | str) -> dict[str, Any] | None:
+        if isinstance(operation, dict):
+            return operation
+        if isinstance(operation, str):
+            try:
+                parsed = json.loads(operation)
+            except json.JSONDecodeError:
+                return None
+            return parsed if isinstance(parsed, dict) else None
+        return None
+
+    def _insert_import_statement(self, original: str, statement: str) -> str:
+        lines = original.splitlines(keepends=True)
+        insert_at = 0
+        if lines and lines[0].startswith("#!"):
+            insert_at = 1
+        try:
+            tree = ast.parse(self._python_parse_text(original))
+            if (
+                tree.body
+                and isinstance(tree.body[0], ast.Expr)
+                and isinstance(getattr(tree.body[0], "value", None), ast.Constant)
+                and isinstance(tree.body[0].value.value, str)
+            ):
+                insert_at = max(insert_at, int(getattr(tree.body[0], "end_lineno", 1)))
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                    insert_at = max(insert_at, int(getattr(node, "end_lineno", getattr(node, "lineno", 1))))
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    insert_at = max(insert_at, int(getattr(node, "end_lineno", getattr(node, "lineno", 1))))
+                elif int(getattr(node, "lineno", 1)) > insert_at + 1:
+                    break
+        except SyntaxError:
+            pass
+        if statement.strip() in {line.strip() for line in lines}:
+            return original
+        if not statement.endswith("\n"):
+            statement += "\n"
+        return "".join(lines[:insert_at]) + statement + "".join(lines[insert_at:])
+
+    def _delete_symbol_text(self, target: Path, symbol: str) -> tuple[str, str, dict[str, Any] | None]:
+        symbols, original, _ = self._code_symbols(target)
+        matches = self._symbol_matches(symbols, symbol)
+        if not matches:
+            return original, f"Symbol not found: {symbol}", None
+        if len(matches) > 1:
+            rendered = "\n".join(f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}" for item in matches[:20])
+            return original, f"Ambiguous symbol: {symbol}\n{rendered}", None
+        found = matches[0]
+        lines = original.splitlines(keepends=True)
+        start = int(found["start"])
+        end = int(found["end"])
+        while end < len(lines) and not lines[end].strip():
+            end += 1
+        updated = "".join(lines[: start - 1]) + "".join(lines[end:])
+        return updated, "", found
+
+    def apply_structured_edit(self, operation: dict[str, Any] | str) -> dict[str, Any]:
+        payload = self._operation_payload(operation)
+        if payload is None:
+            return {"ok": False, "tool": "apply_structured_edit", "summary": "operation must be a JSON object."}
+        op = str(payload.get("op") or payload.get("operation") or "").strip().lower()
+        if op in {"replace_function", "replace_method", "replace_class", "replace_symbol"}:
+            return self.replace_symbol(str(payload.get("path") or ""), str(payload.get("symbol") or payload.get("name") or ""), str(payload.get("content") or ""))
+        if op == "rename_symbol":
+            target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
+            relative_path = self.relative_label(target)
+            old = str(payload.get("old") or payload.get("symbol") or "")
+            new = str(payload.get("new") or payload.get("new_name") or "")
+            if not old or not new or not re.match(r"^[A-Za-z_]\w*$", old) or not re.match(r"^[A-Za-z_]\w*$", new):
+                return {"ok": False, "tool": "apply_structured_edit", "summary": "rename_symbol requires valid old/new identifiers."}
+            denied = self._mutation_denied_path(target)
+            if denied:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": denied}
+            original = target.read_text(encoding="utf-8", errors="replace")
+            updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
+            if count == 0:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": f"Identifier not found: {old}"}
+            diagnostic = self._python_syntax_diagnostic(target, updated)
+            if diagnostic:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
+            preview = self._diff_preview(relative_path, original, updated)
+            approved, reason = self._approve_mutation(f"Rename {old} to {new} in {relative_path}?", preview)
+            if not approved:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
+            target.write_text(updated, encoding="utf-8")
+            return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "count": count, "summary": f"Renamed {count} occurrence(s) of {old} to {new}.", "diff": preview}
+        if op == "add_import":
+            target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
+            relative_path = self.relative_label(target)
+            statement = str(payload.get("statement") or payload.get("import") or "").strip()
+            if not statement:
+                module = str(payload.get("module") or "").strip()
+                name = str(payload.get("name") or "").strip()
+                statement = f"from {module} import {name}" if module and name else ""
+            if not statement.startswith(("import ", "from ")):
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": "add_import requires an import/from statement."}
+            original = target.read_text(encoding="utf-8", errors="replace")
+            updated = self._insert_import_statement(original, statement)
+            diagnostic = self._python_syntax_diagnostic(target, updated)
+            if diagnostic:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
+            preview = self._diff_preview(relative_path, original, updated)
+            approved, reason = self._approve_mutation(f"Add import to {relative_path}?", preview)
+            if not approved:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
+            target.write_text(updated, encoding="utf-8")
+            return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": f"Added import to {relative_path}.", "diff": preview}
+        if op == "delete_symbol":
+            target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
+            relative_path = self.relative_label(target)
+            symbol = str(payload.get("symbol") or payload.get("name") or "")
+            denied = self._mutation_denied_path(target)
+            if denied:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": denied}
+            original = target.read_text(encoding="utf-8", errors="replace")
+            updated, error, found = self._delete_symbol_text(target, symbol)
+            if found is None:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": error}
+            diagnostic = self._python_syntax_diagnostic(target, updated)
+            if diagnostic:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
+            preview = self._diff_preview(relative_path, original, updated)
+            approved, reason = self._approve_mutation(f"Delete {symbol} from {relative_path}?", preview)
+            if not approved:
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
+            target.write_text(updated, encoding="utf-8")
+            return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": f"Deleted {symbol} from {relative_path}.", "diff": preview}
+        if op == "move_symbol":
+            source = self.resolve_path(str(payload.get("from_path") or payload.get("path") or ""), allow_missing=False)
+            destination = self.resolve_path(str(payload.get("to_path") or ""), allow_missing=True)
+            source_rel = self.relative_label(source)
+            dest_rel = self.relative_label(destination)
+            symbol = str(payload.get("symbol") or payload.get("name") or "")
+            source_original = source.read_text(encoding="utf-8", errors="replace")
+            symbols, _, _ = self._code_symbols(source)
+            matches = self._symbol_matches(symbols, symbol)
+            if len(matches) != 1:
+                return {"ok": False, "tool": "apply_structured_edit", "path": source_rel, "summary": f"move_symbol requires one exact symbol match for {symbol}."}
+            found = matches[0]
+            lines = source_original.splitlines(keepends=True)
+            moved_text = "".join(lines[int(found["start"]) - 1 : int(found["end"])])
+            source_updated, error, _ = self._delete_symbol_text(source, symbol)
+            if error:
+                return {"ok": False, "tool": "apply_structured_edit", "path": source_rel, "summary": error}
+            dest_original = destination.read_text(encoding="utf-8", errors="replace") if destination.exists() else ""
+            dest_updated = dest_original.rstrip() + "\n\n" + moved_text.lstrip()
+            source_diag = self._python_syntax_diagnostic(source, source_updated)
+            dest_diag = self._python_syntax_diagnostic(destination, dest_updated)
+            if source_diag or dest_diag:
+                return {"ok": False, "tool": "apply_structured_edit", "syntax_ok": False, "summary": source_diag or dest_diag}
+            preview = self._diff_preview(source_rel, source_original, source_updated) + "\n" + self._diff_preview(dest_rel, dest_original, dest_updated)
+            approved, reason = self._approve_mutation(f"Move {symbol} from {source_rel} to {dest_rel}?", preview)
+            if not approved:
+                return {"ok": False, "tool": "apply_structured_edit", "summary": reason}
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(source_updated, encoding="utf-8")
+            destination.write_text(dest_updated, encoding="utf-8")
+            return {"ok": True, "tool": "apply_structured_edit", "op": op, "path": source_rel, "to_path": dest_rel, "summary": f"Moved {symbol} to {dest_rel}.", "diff": preview}
+        return {"ok": False, "tool": "apply_structured_edit", "summary": f"Unsupported structured edit op: {op or '(missing)'}"}
+
+    def generate_tests_from_spec(
+        self,
+        target_symbol: str,
+        behavior: str,
+        test_path: str | None = None,
+        apply: bool = False,
+    ) -> dict[str, Any]:
+        symbol = target_symbol.strip()
+        spec = behavior.strip()
+        if not symbol or not spec:
+            return {"ok": False, "tool": "generate_tests_from_spec", "summary": "target_symbol and behavior are required."}
+        leaf = re.sub(r"\W+", "_", symbol.split(".")[-1]).strip("_").lower() or "target"
+        rel_test_path = test_path or f"tests/test_{leaf}_spec.py"
+        target = self.resolve_path(rel_test_path)
+        test_name = f"test_{leaf}_matches_spec"
+        module = ".".join(symbol.split(".")[:-1])
+        imported = symbol.split(".")[-1]
+        import_line = f"from {module} import {imported}\n\n" if module else ""
+        content = (
+            import_line
+            + f"def {test_name}():\n"
+            + f"    \"\"\"Spec: {spec[:180].replace(chr(10), ' ')}\"\"\"\n"
+            + "    # Fill in concrete arrange/act/assert values from the spec before relying on this test.\n"
+            + f"    raise AssertionError({json.dumps('TODO encode spec for ' + symbol + ': ' + spec[:220])})\n"
+        )
+        existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
+        updated = existing.rstrip() + ("\n\n" if existing.strip() else "") + content
+        preview = self._diff_preview(self.relative_label(target), existing, updated)
+        if not apply:
+            return {
+                "ok": True,
+                "tool": "generate_tests_from_spec",
+                "path": self.relative_label(target),
+                "applied": False,
+                "summary": "Generated test patch preview only. Review and apply explicitly before using it as a gate.",
+                "diff": preview,
+            }
+        approved, reason = self._approve_mutation(f"Apply generated tests to {self.relative_label(target)}?", preview)
+        if not approved:
+            return {"ok": False, "tool": "generate_tests_from_spec", "path": self.relative_label(target), "summary": reason}
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(updated, encoding="utf-8")
+        return {"ok": True, "tool": "generate_tests_from_spec", "path": self.relative_label(target), "applied": True, "summary": f"Wrote generated test scaffold to {self.relative_label(target)}.", "diff": preview}
 
     def git_status(self, path: str | None = None) -> dict[str, Any]:
         ok, error = self._ensure_git_repo()

@@ -528,6 +528,126 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(symbol["ok"])
         self.assertIn("new Widget", symbol["output"])
 
+    def test_repo_index_search_returns_ranked_compact_snippets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pricing.py").write_text(
+                "def calculate_discount(cart):\n"
+                "    return sum(cart) * 0.9\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.repo_index_search("discount calculation")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("pricing.py", result["output"])
+        self.assertIn("calculate_discount", result["output"])
+        self.assertNotIn("   1 |", result["output"])
+
+    def test_find_implementation_target_maps_test_imports_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            (root / "tests" / "test_ops.py").write_text("from ops import add\n\ndef test_add():\n    assert add(1, 2) == 3\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.find_implementation_target(test_path="tests/test_ops.py")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("ops.py", result["output"])
+        self.assertIn("symbol=add", result["output"])
+
+    def test_diagnose_test_failure_groups_assertions_and_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "ops.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+            (root / "tests" / "test_ops.py").write_text("from ops import add\n", encoding="utf-8")
+            output = (
+                "FAILED tests/test_ops.py::test_add - AssertionError\n"
+                "E       assert 1 == 3\n"
+                '  File "ops.py", line 2, in add\n'
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.diagnose_test_failure(output)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("assertion mismatch", result["output"])
+        self.assertIn("ops.py", result["output"])
+
+    def test_run_function_probe_reports_actual_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_function_probe("ops", ["fn(2, 5)"], function="add")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("fn(2, 5): 7", result["output"])
+
+    def test_call_graph_finds_callers_and_callees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def helper(value):\n"
+                "    return value + 1\n\n"
+                "def target(value):\n"
+                "    return helper(value)\n\n"
+                "def caller():\n"
+                "    return target(1)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.call_graph("app.py", "target")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("callees: helper", result["output"])
+        self.assertIn("caller", result["output"])
+
+    def test_lint_typecheck_reports_python_syntax_lines(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bad.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.lint_typecheck("bad.py")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("bad.py:1", result["output"])
+
+    def test_apply_structured_edit_renames_symbol_mechanically(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def old_name(value):\n    return value\n\nRESULT = old_name(1)\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "rename_symbol", "path": "ops.py", "old": "old_name", "new": "new_name"})
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("def new_name", final_text)
+        self.assertIn("RESULT = new_name(1)", final_text)
+
+    def test_apply_structured_edit_adds_import(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "app.py"
+        sample.write_text("def area(radius):\n    return math.pi * radius\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "add_import", "path": "app.py", "statement": "import math"})
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(final_text.startswith("import math\n"))
+
+    def test_generate_tests_from_spec_previews_patch_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.generate_tests_from_spec("ops.add", "adds two positive integers")
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["applied"])
+        self.assertIn("tests/test_add_spec.py", result["path"])
+        self.assertFalse((root / "tests" / "test_add_spec.py").exists())
+
     def test_run_shell_returns_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")

@@ -1870,10 +1870,10 @@ class AgentTests(unittest.TestCase):
                 "do not edit tests, replace stubs with complete code, run tests with configured test command."
             )
 
-        self.assertEqual(result.message, "list_ops.py fixed; tests passed.")
-        self.assertFalse((root / "palindrome_solution.py").exists())
-        self.assertEqual((root / "list_ops.py").read_text(encoding="utf-8"), "def reverse(items):\n    return items[::-1]\n")
-        self.assertTrue(any("Existing tests import implementation file(s): list_ops.py" in message["content"] for message in agent.messages if message["role"] == "user"))
+            self.assertEqual(result.message, "list_ops.py fixed; tests passed.")
+            self.assertFalse((root / "palindrome_solution.py").exists())
+            self.assertEqual((root / "list_ops.py").read_text(encoding="utf-8"), "def reverse(items):\n    return items[::-1]\n")
+            self.assertTrue(any("Existing tests import implementation file(s): list_ops.py" in message["content"] for message in agent.messages if message["role"] == "user"))
 
     def test_agent_rejects_test_edit_when_fix_names_source_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

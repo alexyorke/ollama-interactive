@@ -94,12 +94,26 @@ CANDIDATE_CLAIM_LIMIT = 5
 CANDIDATE_CLAIM_TEXT_LIMIT = 180
 VERIFICATION_EVIDENCE_LIMIT = 3
 VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
-MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "git_commit"}
-READ_ONLY_CACHEABLE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "git_status", "git_diff"}
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol"}
-EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file"}
-TEST_TOOL_NAMES = {"run_test"}
-SHELL_TOOL_NAMES = {"run_shell"}
+MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "git_commit"}
+READ_ONLY_CACHEABLE_TOOL_NAMES = {
+    "list_files",
+    "read_file",
+    "search",
+    "search_symbols",
+    "code_outline",
+    "read_symbol",
+    "repo_index_search",
+    "find_implementation_target",
+    "diagnose_test_failure",
+    "call_graph",
+    "lint_typecheck",
+    "git_status",
+    "git_diff",
+}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "find_implementation_target", "call_graph"}
+EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
+TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "find_implementation_target", "run_function_probe", "lint_typecheck", "generate_tests_from_spec"}
+SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
@@ -110,8 +124,16 @@ MODEL_TOOL_RESULT_LIMITS = {
     "search_symbols": 700,
     "code_outline": 900,
     "read_symbol": 1100,
+    "repo_index_search": 900,
+    "find_implementation_target": 800,
+    "diagnose_test_failure": 900,
+    "run_function_probe": 700,
+    "call_graph": 900,
+    "lint_typecheck": 800,
     "replace_symbol": 900,
     "replace_symbols": 1000,
+    "apply_structured_edit": 1000,
+    "generate_tests_from_spec": 1000,
     "git_status": 700,
     "git_diff": 900,
     "run_shell": 700,
