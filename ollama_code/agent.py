@@ -1437,6 +1437,7 @@ class OllamaCodeAgent:
     def _run_test_failure_follow_up(self, result: dict[str, Any]) -> str:
         text = str(result.get("output") or result.get("summary") or "")
         source_excerpt = self._test_failure_source_excerpt(text)
+        diagnosis = self._run_test_failure_diagnosis(text)
         syntax_match = re.search(
             r"File \"(?P<path>[^\"]+)\", line (?P<line>\d+).*?\n(?:.*\n){0,2}?(?P<error>(?:IndentationError|SyntaxError): [^\n]+)",
             text,
@@ -1453,21 +1454,44 @@ class OllamaCodeAgent:
         module_match = re.search(r"(ModuleNotFoundError|ImportError): [^\n]+", text)
         if module_match:
             details = f"Tests failed with {module_match.group(0).strip()}."
+            if diagnosis:
+                details += f" {diagnosis}"
             if source_excerpt:
                 details += f" {source_excerpt}"
             return self._truncate_text(f"{details} Inspect imports/files, fix, then rerun run_test. Next JSON only.", limit=760)
         assertion_match = re.search(r"AssertionError: [^\n]+", text)
         if assertion_match:
             details = f"Tests failed with {assertion_match.group(0).strip()}."
+            if diagnosis:
+                details += f" {diagnosis}"
             if source_excerpt:
                 details += f" {source_excerpt}"
             return self._truncate_text(f"{details} Edit implementation, then rerun run_test. Next JSON only.", limit=760)
+        if diagnosis:
+            return self._truncate_text(
+                f"Tests failed. {diagnosis} Edit likely implementation targets, then rerun configured run_test. Next JSON only.",
+                limit=760,
+            )
         if source_excerpt:
             return self._truncate_text(
                 f"Tests failed. {source_excerpt} Inspect/edit evidence, then rerun configured run_test. Next JSON only.",
                 limit=760,
             )
         return "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
+
+    def _run_test_failure_diagnosis(self, output: str) -> str:
+        if not output.strip():
+            return ""
+        try:
+            result = self.tools.diagnose_test_failure(output=output, limit=4)
+        except Exception:
+            return ""
+        if result.get("ok") is not True:
+            return ""
+        text = str(result.get("output") or "").strip()
+        if not text or text.startswith("(no structured failures"):
+            return ""
+        return "Diagnosis: " + self._truncate_text(text.replace("\n", " | "), limit=420)
 
     def _run_test_repeat_key(self, arguments: dict[str, Any], mutation_version: int) -> tuple[str, str, int]:
         command = str(arguments.get("command") or self.tools.default_test_command or "").strip()
@@ -1479,6 +1503,9 @@ class OllamaCodeAgent:
         follow_up = "Next JSON only."
         if not real_tool_use:
             follow_up = "Tool failed; not required success. Fix or choose another. Next JSON only."
+            summary = str(result.get("summary") or "")
+            if "omitted-context marker" in summary:
+                follow_up = "Tool failed because content was abbreviated. Use replace_symbol/replace_in_file for partial edits, or read and provide complete file content. Next JSON only."
         elif name in MUTATING_TOOL_NAMES and result.get("syntax_ok") is False:
             follow_up = "Python syntax error in edited file. Fix that file before tests/final; top-level def/class starts at column 1. Next JSON only."
         elif name == "run_test" and result.get("ok") is not True:

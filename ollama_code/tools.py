@@ -784,12 +784,19 @@ class ToolExecutor:
         return {"ok": True, "tool": "code_outline", "path": self.relative_label(base), "count": count, "output": "\n".join(output) if output else "(no code files found)"}
 
     def _symbol_matches(self, symbols: list[dict[str, Any]], symbol: str) -> list[dict[str, Any]]:
-        needle = symbol.strip()
+        needle = self._normalize_symbol_query(symbol)
         exact = [item for item in symbols if item["qualname"] == needle or item["name"] == needle]
         if exact:
             return exact
         lowered = needle.lower()
         return [item for item in symbols if lowered in str(item["qualname"]).lower() or lowered in str(item["name"]).lower()]
+
+    def _normalize_symbol_query(self, symbol: str) -> str:
+        needle = symbol.strip()
+        needle = re.sub(r"^(?:async\s+def|def|class)\s+", "", needle)
+        needle = needle.split(":", 1)[0].strip()
+        match = re.match(r"(?P<name>[A-Za-z_][\w.]*)(?:\s*\(|$)", needle)
+        return match.group("name") if match else needle
 
     def read_symbol(self, path: str, symbol: str, include_context: int = 2) -> dict[str, Any]:
         self._check_interrupted()
@@ -935,6 +942,24 @@ class ToolExecutor:
             targets.append({"path": rel, "symbol": symbol, "line": int(line), "reason": "implementation frame in traceback"})
         return targets
 
+    def _test_import_targets_from_output(self, output: str) -> list[dict[str, Any]]:
+        targets: list[dict[str, Any]] = []
+        seen_files: set[Path] = set()
+        for raw_path in re.findall(r'File "([^"]+?\.py)"', output):
+            try:
+                path = self.resolve_path(raw_path, allow_missing=False)
+            except Exception:
+                continue
+            rel = self.relative_label(path)
+            name = path.name.lower()
+            if not (name.startswith("test_") or name.endswith("_test.py") or "/tests/" in rel.replace("\\", "/").lower()):
+                continue
+            if path in seen_files:
+                continue
+            seen_files.add(path)
+            targets.extend(self._python_import_targets(path))
+        return targets
+
     def find_implementation_target(
         self,
         test_path: str | None = None,
@@ -947,6 +972,7 @@ class ToolExecutor:
         raw_output = "\n".join(part for part in [output, traceback] if isinstance(part, str) and part.strip())
         if raw_output:
             targets.extend(self._traceback_targets(raw_output))
+            targets.extend(self._test_import_targets_from_output(raw_output))
             for failed in re.findall(r"(?m)^FAILED\s+([^:\s]+)(?:::[^\s]+)?", raw_output):
                 try:
                     test_file = self.resolve_path(failed, allow_missing=False)
@@ -995,12 +1021,21 @@ class ToolExecutor:
         failures: list[dict[str, Any]] = []
         for match in re.finditer(r"(?m)^FAILED\s+([^\s]+?)(?:::([^\s]+))?\s*(?:-\s*(.*))?$", text):
             failures.append({"test": match.group(1), "case": match.group(2) or "", "message": (match.group(3) or "").strip()})
+        for match in re.finditer(r"(?m)^(?:FAIL|ERROR):\s+([^\s]+)\s+\(([^)]+)\)", text):
+            failures.append({"test": match.group(2), "case": match.group(1), "message": ""})
         assertions = re.findall(r"(?m)^\s*E\s+assert\s+(.+)$", text)
+        unittest_assertions = re.findall(r"AssertionError:\s+([^\n]+)", text)
         exceptions = re.findall(r"(?m)^(?:E\s+)?([A-Za-z_][\w.]+(?:Error|Exception)):\s*(.+)$", text)
         expected_actual: list[str] = []
         for assertion in assertions:
             if "==" in assertion:
                 left, right = assertion.split("==", 1)
+                expected_actual.append(f"actual={left.strip()[:120]} expected={right.strip()[:120]}")
+            else:
+                expected_actual.append(assertion.strip()[:180])
+        for assertion in unittest_assertions:
+            if "!=" in assertion:
+                left, right = assertion.split("!=", 1)
                 expected_actual.append(f"actual={left.strip()[:120]} expected={right.strip()[:120]}")
             else:
                 expected_actual.append(assertion.strip()[:180])
@@ -1787,7 +1822,8 @@ class ToolExecutor:
             return content
         prefixed = sum(1 for line in lines if re.match(r"^\s*>\s?", line))
         non_empty = sum(1 for line in lines if line.strip())
-        if non_empty == 0 or prefixed < max(1, non_empty // 2):
+        first_non_empty = next((line for line in lines if line.strip()), "")
+        if non_empty == 0 or (prefixed < max(1, non_empty // 2) and not re.match(r"^\s*>\s?", first_non_empty)):
             return content
         return "".join(re.sub(r"^\s*>\s?", "", line, count=1) for line in lines)
 
@@ -1869,6 +1905,16 @@ class ToolExecutor:
                 parts.append(re.escape(line))
         return re.compile("\n".join(parts))
 
+    def _identifier_call_rename_pattern(self, old: str, new: str) -> re.Pattern[str] | None:
+        old_match = re.fullmatch(r"\s*(?P<old>[A-Za-z_]\w*)\s*\(\s*", old)
+        new_match = re.fullmatch(r"\s*(?P<new>[A-Za-z_]\w*)\s*\(\s*", new)
+        if not old_match or not new_match:
+            return None
+        old_name = old_match.group("old")
+        if old_name == new_match.group("new"):
+            return None
+        return re.compile(rf"(?<![A-Za-z0-9_]){re.escape(old_name)}\s*\(")
+
     def replace_in_file(
         self,
         path: str,
@@ -1893,7 +1939,11 @@ class ToolExecutor:
         if stripped_old != old:
             old = stripped_old
             new = self._strip_read_file_line_prefixes(new)
-        if match_whole_word:
+        identifier_call_pattern = None if match_whole_word else self._identifier_call_rename_pattern(old, new)
+        if identifier_call_pattern is not None:
+            pattern = identifier_call_pattern
+            count = len(pattern.findall(original))
+        elif match_whole_word:
             pattern = re.compile(rf"\b{re.escape(old)}\b")
             count = len(pattern.findall(original))
         else:

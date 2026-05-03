@@ -1545,8 +1545,10 @@ class AgentTests(unittest.TestCase):
     def test_agent_run_test_feedback_includes_failing_source_excerpt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            (root / "list_ops.py").write_text("def foldr(function, items, initial):\n    return initial\n", encoding="utf-8")
             test_file = root / "list_ops_test.py"
             test_file.write_text(
+                "from list_ops import foldr\n\n"
                 "import unittest\n\n"
                 "class ListOpsTest(unittest.TestCase):\n"
                 "    def test_foldr_add_string(self):\n"
@@ -1562,7 +1564,7 @@ class AgentTests(unittest.TestCase):
             output = (
                 "FAIL: test_foldr_add_string (list_ops_test.ListOpsTest.test_foldr_add_string)\n"
                 "Traceback (most recent call last):\n"
-                f'  File "{test_file}", line 5, in test_foldr_add_string\n'
+                f'  File "{test_file}", line 7, in test_foldr_add_string\n'
                 "    self.assertEqual(\n"
                 "AssertionError: '!xe' != 'ex!'\n"
             )
@@ -1570,9 +1572,29 @@ class AgentTests(unittest.TestCase):
             feedback = agent._tool_result_feedback_message("run_test", {"ok": False, "output": output}, real_tool_use=True)
 
             self.assertIn("AssertionError: '!xe' != 'ex!'", feedback)
+            self.assertIn("Diagnosis:", feedback)
+            self.assertIn("actual='!xe' expected='ex!'", feedback)
+            self.assertIn("list_ops.py", feedback)
             self.assertIn("Failing source excerpt", feedback)
-            self.assertIn("list_ops_test.py:5", feedback)
+            self.assertIn("list_ops_test.py:7", feedback)
             self.assertIn("foldr(lambda acc, el: el + acc", feedback)
+
+    def test_agent_failed_omitted_context_write_points_to_partial_edit_tools(self) -> None:
+        client = FakeClient([])
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        feedback = agent._tool_result_feedback_message(
+            "write_file",
+            {
+                "ok": False,
+                "summary": "Refusing to write omitted-context marker as file content. Reconstruct complete file content instead.",
+            },
+            real_tool_use=False,
+        )
+
+        self.assertIn("Use replace_symbol/replace_in_file", feedback)
+        self.assertIn("content was abbreviated", feedback)
 
     def test_agent_blocks_repeated_failed_run_test_until_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

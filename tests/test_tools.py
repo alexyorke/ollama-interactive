@@ -107,6 +107,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("quote prefixes", result["summary"])
         self.assertEqual(final_text, "def f():\n    return 1\n")
 
+    def test_write_file_strips_single_leading_markdown_quote_for_python(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("quoted.py", "> import re\n\ndef f():\n    return re.escape('x')\n")
+            final_text = (root / "quoted.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("quote prefixes", result["summary"])
+        self.assertEqual(final_text, "import re\n\ndef f():\n    return re.escape('x')\n")
+
     def test_write_file_repairs_common_join_string_typo_when_parseable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -177,6 +188,26 @@ class ToolExecutorTests(unittest.TestCase):
             final_text = sample.read_text(encoding="utf-8")
         self.assertTrue(result["ok"])
         self.assertEqual(final_text, "def f():\n    return 'new'\n")
+
+    def test_replace_in_file_identifier_call_rename_ignores_embedded_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "test_pricing.py"
+            sample.write_text(
+                "def test_cart_total():\n"
+                "    assert cart_total([1]) == 1\n"
+                "    assert total([2]) == 2\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_in_file("test_pricing.py", "total(", "cart_total(")
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("def test_cart_total():", final_text)
+        self.assertIn("assert cart_total([1]) == 1", final_text)
+        self.assertIn("assert cart_total([2]) == 2", final_text)
+        self.assertNotIn("cart_cart_total", final_text)
 
     def test_replace_strips_read_file_line_number_prefixes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -385,6 +416,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return value * 2", final_text)
         self.assertIn("return 'keep'", final_text)
 
+    def test_replace_symbol_accepts_signature_as_symbol_query(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def map(f, items):\n    return []\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol("ops.py", "map(f, items):", "def map(f, items):\n    return [f(item) for item in items]\n")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("return [f(item) for item in items]", sample.read_text(encoding="utf-8"))
+
     def test_replace_symbol_aligns_method_indent(self) -> None:
         root = self._workspace_scratch()
         sample = root / "sample.py"
@@ -574,6 +615,31 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("assertion mismatch", result["output"])
         self.assertIn("ops.py", result["output"])
+
+    def test_diagnose_test_failure_maps_unittest_traceback_imports_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            test_file = root / "list_ops_test.py"
+            (root / "list_ops.py").write_text("def foldr(function, items, initial):\n    return initial\n", encoding="utf-8")
+            test_file.write_text(
+                "from list_ops import foldr\n\n"
+                "def test_foldr():\n"
+                "    assert foldr(lambda acc, el: el + acc, ['e'], '!') == 'e!'\n",
+                encoding="utf-8",
+            )
+            output = (
+                "FAIL: test_foldr (list_ops_test.ListOpsTest.test_foldr)\n"
+                "Traceback (most recent call last):\n"
+                f'  File "{test_file}", line 4, in test_foldr\n'
+                "AssertionError: '!e' != 'e!'\n"
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.diagnose_test_failure(output)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("actual='!e' expected='e!'", result["output"])
+        self.assertIn("list_ops.py", result["output"])
+        self.assertIn("symbol=foldr", result["output"])
 
     def test_run_function_probe_reports_actual_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
