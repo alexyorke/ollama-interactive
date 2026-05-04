@@ -21,6 +21,7 @@ except ModuleNotFoundError:
 
 
 _LOADED_MODELS: set[str] = set()
+FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "all")
 
 
 def unload_model(model: str) -> None:
@@ -343,6 +344,7 @@ def evaluate_case(
     mode: str,
     case: EvalCase,
     timeout: int,
+    feature_profile: str = "baseline",
 ) -> dict[str, Any]:
     with workspace_temp_dir("ollama-code-token-", repo_root) as tmp:
         workspace = Path(tmp)
@@ -352,6 +354,7 @@ def evaluate_case(
                 "model": model,
                 "verifier_model": verifier_model,
                 "debate": mode,
+                "feature_profile": feature_profile,
                 "case": case.name,
                 "status": "skipped",
                 "acceptable": [*case.acceptable, "skipped"],
@@ -380,6 +383,7 @@ def evaluate_case(
             session_file=session_file,
             timeout=timeout,
             extra_args=extra_args,
+            extra_env={"OLLAMA_CODE_FEATURE_PROFILE": feature_profile},
         )
         elapsed = time.perf_counter() - started
         session = load_session(session_file)
@@ -392,6 +396,7 @@ def evaluate_case(
             "model": model,
             "verifier_model": verifier_model,
             "debate": mode,
+            "feature_profile": feature_profile,
             "status": status,
             "acceptable": list(case.acceptable),
             "latency_s": round(elapsed, 2),
@@ -436,12 +441,12 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
     if baseline is None:
         return []
     index = {
-        (item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("case")): item
+        (item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("feature_profile", "baseline"), item.get("case")): item
         for item in baseline
     }
     rows: list[dict[str, Any]] = []
     for item in current:
-        key = (item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("case"))
+        key = (item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("feature_profile", "baseline"), item.get("case"))
         before = index.get(key)
         if before is None:
             continue
@@ -454,6 +459,7 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
                 "verifier_model": item.get("verifier_model"),
                 "debate": item.get("debate"),
                 "case": item.get("case"),
+                "feature_profile": item.get("feature_profile", "baseline"),
                 "before_status": before.get("status"),
                 "after_status": item.get("status"),
                 "before_prompt_tokens": before_prompt,
@@ -476,6 +482,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
             f" model={item['model']}"
             f" verifier={item['verifier_model'] or '-'}"
             f" debate={item['debate']}"
+            f" profile={item.get('feature_profile', 'baseline')}"
             f" case={item['case']}"
             f" status={item['status']}"
             f" calls={usage['llm_calls']}"
@@ -492,6 +499,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
                 f" model={row['model']}"
                 f" verifier={row['verifier_model'] or '-'}"
                 f" debate={row['debate']}"
+                f" profile={row.get('feature_profile', 'baseline')}"
                 f" case={row['case']}"
                 f" status={row['before_status']}->{row['after_status']}"
                 f" prompt={row['before_prompt_tokens']}->{row['after_prompt_tokens']}"
@@ -508,6 +516,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases", nargs="*", default=[case.name for case in CASES], help="Scenario names to run.")
     parser.add_argument("--output", required=True, help="Raw JSON output path.")
     parser.add_argument("--compare", default=None, help="Optional baseline JSON path.")
+    parser.add_argument("--feature-profiles", nargs="+", choices=FEATURE_PROFILES, default=["baseline"], help="A/B controller feature profiles.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-case timeout in seconds.")
     parser.add_argument("--strict-accuracy", action="store_true", help="Exit non-zero for unacceptable statuses.")
     args = parser.parse_args(argv)
@@ -541,13 +550,14 @@ def main(argv: list[str] | None = None) -> int:
         if verifier_model:
             _LOADED_MODELS.add(verifier_model)
         for mode in modes:
-            for case in cases:
-                outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout)
-                results.append(outcome)
-                acceptable_statuses = outcome.get("acceptable", case.acceptable)
-                if args.strict_accuracy and outcome["status"] not in acceptable_statuses:
-                    failures.append(outcome)
-                print_table([outcome], [])
+            for feature_profile in args.feature_profiles:
+                for case in cases:
+                    outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout, feature_profile=feature_profile)
+                    results.append(outcome)
+                    acceptable_statuses = outcome.get("acceptable", case.acceptable)
+                    if args.strict_accuracy and outcome["status"] not in acceptable_statuses:
+                        failures.append(outcome)
+                    print_table([outcome], [])
         unload_model(model)
         _LOADED_MODELS.discard(model)
         if verifier_model:

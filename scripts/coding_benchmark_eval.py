@@ -25,6 +25,7 @@ except ModuleNotFoundError:  # Imported as scripts.coding_benchmark_eval in unit
 
 _LOADED_MODELS: set[str] = set()
 Command = list[str] | str
+FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "all")
 FAIL_CLOSED_MESSAGES = {
     "Stopped because grounded final verification could not accept a final answer.",
     "Stopped because assumption audit could not approve a next tool step.",
@@ -765,6 +766,7 @@ def evaluate_case(
     case: BenchmarkCase,
     timeout: int,
     reconcile: str = "auto",
+    feature_profile: str = "baseline",
 ) -> dict[str, Any]:
     with workspace_temp_dir("ollama-code-bench-", repo_root) as tmp:
         workspace = Path(tmp)
@@ -793,6 +795,7 @@ def evaluate_case(
                     session_file=session_file,
                     timeout=case.timeout or timeout,
                     extra_args=extra_args,
+                    extra_env={"OLLAMA_CODE_FEATURE_PROFILE": feature_profile},
                 )
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.perf_counter() - started
@@ -805,6 +808,7 @@ def evaluate_case(
                     "verifier_model": verifier_model,
                     "debate": mode,
                     "reconcile": reconcile,
+                    "feature_profile": feature_profile,
                     "status": "fail",
                     "acceptable": list(case.acceptable),
                     "latency_s": round(elapsed, 2),
@@ -852,6 +856,7 @@ def evaluate_case(
             "verifier_model": verifier_model,
             "debate": mode,
             "reconcile": reconcile,
+            "feature_profile": feature_profile,
             "status": status,
             "acceptable": list(case.acceptable),
             "latency_s": round(elapsed, 2),
@@ -962,13 +967,13 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
     if baseline is None:
         return []
     index = {
-        (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("case")): item
+        (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("feature_profile", "baseline"), item.get("case")): item
         for item in baseline
         if isinstance(item, dict)
     }
     rows: list[dict[str, Any]] = []
     for item in current:
-        key = (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("case"))
+        key = (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("feature_profile", "baseline"), item.get("case"))
         before = index.get(key)
         if before is None:
             continue
@@ -984,6 +989,7 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
                 "verifier_model": item.get("verifier_model"),
                 "debate": item.get("debate"),
                 "reconcile": item.get("reconcile"),
+                "feature_profile": item.get("feature_profile", "baseline"),
                 "case": item.get("case"),
                 "before_status": before.get("status"),
                 "after_status": item.get("status"),
@@ -1010,6 +1016,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
             f" verifier={item.get('verifier_model') or '-'}"
             f" debate={item.get('debate') or '-'}"
             f" reconcile={item.get('reconcile') or '-'}"
+            f" profile={item.get('feature_profile', 'baseline')}"
             f" case={item['case']}"
             f" status={item['status']}"
             f" calls={usage.get('llm_calls', 0)}"
@@ -1029,6 +1036,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
                 f" verifier={row['verifier_model'] or '-'}"
                 f" debate={row['debate']}"
                 f" reconcile={row.get('reconcile') or '-'}"
+                f" profile={row.get('feature_profile', 'baseline')}"
                 f" case={row['case']}"
                 f" status={row['before_status']}->{row['after_status']}"
                 f" total_tokens={row['before_total_tokens']}->{row['after_total_tokens']}"
@@ -1064,6 +1072,7 @@ def external_smoke_results() -> list[dict[str, Any]]:
                 "verifier_model": None,
                 "debate": None,
                 "reconcile": None,
+                "feature_profile": None,
                 "status": status,
                 "acceptable": ["pass", "fail_closed"],
                 "latency_s": round(time.perf_counter() - started, 2),
@@ -1127,6 +1136,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cases", nargs="*", default=None, help="Case names to run.")
     parser.add_argument("--output", default=None, help="Raw JSON output path. Defaults under scratch/coding-benchmark/.")
     parser.add_argument("--compare", default=None, help="Optional prior JSON path for token/accuracy deltas.")
+    parser.add_argument("--feature-profiles", nargs="+", choices=FEATURE_PROFILES, default=["baseline"], help="A/B controller feature profiles.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-turn timeout in seconds.")
     parser.add_argument("--strict-accuracy", action="store_true", help="Fail if any run status is not acceptable.")
     parser.add_argument("--strict-budget", action="store_true", help="Fail if a local case exceeds its token or LLM-call budget.")
@@ -1178,11 +1188,21 @@ def main(argv: list[str] | None = None) -> int:
                 _LOADED_MODELS.add(verifier_model)
             for mode in modes:
                 for reconcile in args.reconcile_modes:
-                    for case in cases:
-                        outcome = evaluate_case(repo_root, model, verifier_model, mode, case, args.timeout, reconcile=reconcile)
-                        results.append(outcome)
-                        print_table([outcome], [])
-                        write_results_payload(output, repo_root=repo_root, suite=args.suite, results=results, partial=True)
+                    for feature_profile in args.feature_profiles:
+                        for case in cases:
+                            outcome = evaluate_case(
+                                repo_root,
+                                model,
+                                verifier_model,
+                                mode,
+                                case,
+                                args.timeout,
+                                reconcile=reconcile,
+                                feature_profile=feature_profile,
+                            )
+                            results.append(outcome)
+                            print_table([outcome], [])
+                            write_results_payload(output, repo_root=repo_root, suite=args.suite, results=results, partial=True)
             unload_model(model)
             _LOADED_MODELS.discard(model)
             if verifier_model:

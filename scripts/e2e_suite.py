@@ -113,6 +113,7 @@ def run_cli(
     session_file: Path | None = None,
     stdin_text: str | None = None,
     extra_args: list[str] | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -134,6 +135,9 @@ def run_cli(
     if session_file is not None:
         command.extend(["--session-file", str(session_file)])
     command.append(prompt)
+    env = os.environ.copy()
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run(
         command,
         cwd=repo_root,
@@ -141,7 +145,7 @@ def run_cli(
         text=True,
         input=stdin_text,
         timeout=timeout,
-        env=os.environ.copy(),
+        env=env,
         check=False,
     )
 

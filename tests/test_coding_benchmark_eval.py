@@ -42,6 +42,13 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(violations, {})
 
+    def test_runtime_source_does_not_special_case_public_smoke_tasks(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        runtime_text = "\n".join(path.read_text(encoding="utf-8") for path in (repo_root / "ollama_code").glob("*.py"))
+
+        for forbidden in ("list-ops", "pig-latin", "wordy"):
+            self.assertNotIn(forbidden, runtime_text)
+
     def test_tool_contract_cases_can_use_exact_tool_prompts_without_counting_as_coding_accuracy(self) -> None:
         cases = {case.name: case for case in bench.selected_cases("local-full")}
 
@@ -150,6 +157,36 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(rows[0]["before_llm_calls"], 4)
         self.assertEqual(rows[0]["after_llm_calls"], 3)
 
+    def test_comparison_rows_separate_feature_profiles(self) -> None:
+        baseline = [
+            {
+                "suite": "local-small",
+                "model": "gemma3:4b",
+                "verifier_model": None,
+                "debate": "off",
+                "reconcile": "auto",
+                "feature_profile": "baseline",
+                "case": "issue",
+                "status": "pass",
+                "usage": {"total_tokens": 100, "llm_calls": 4},
+            }
+        ]
+        current = [
+            {
+                "suite": "local-small",
+                "model": "gemma3:4b",
+                "verifier_model": None,
+                "debate": "off",
+                "reconcile": "auto",
+                "feature_profile": "all",
+                "case": "issue",
+                "status": "pass",
+                "usage": {"total_tokens": 70, "llm_calls": 3},
+            }
+        ]
+
+        self.assertEqual(bench.comparison_rows(current, baseline), [])
+
     def test_issue_validator_passes_hidden_solution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -230,10 +267,11 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             *,
             session_file: Path | None = None,
             extra_args: list[str] | None = None,
+            extra_env: dict[str, str] | None = None,
             **_: object,
         ) -> subprocess.CompletedProcess[str]:
             self.assertIsNotNone(session_file)
-            calls.append({"prompt": prompt, "extra_args": list(extra_args or [])})
+            calls.append({"prompt": prompt, "extra_args": list(extra_args or []), "extra_env": dict(extra_env or {})})
             session_file = Path(session_file or workspace / "scratch" / "session.json")
             session_file.parent.mkdir(parents=True, exist_ok=True)
             session_file.write_text(
@@ -267,10 +305,12 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             workspace.mkdir(parents=True, exist_ok=True)
 
         with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli", side_effect=fake_run_cli):
-            outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "on", case, timeout=30)
+            outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "on", case, timeout=30, feature_profile="all")
 
         self.assertEqual(outcome["status"], "pass")
+        self.assertEqual(outcome["feature_profile"], "all")
         self.assertEqual(outcome["usage"]["llm_calls"], 1)
+        self.assertEqual(calls[0]["extra_env"], {"OLLAMA_CODE_FEATURE_PROFILE": "all"})
         self.assertNotIn("--resume", calls[0]["extra_args"])
         self.assertIn("--resume", calls[1]["extra_args"])
 

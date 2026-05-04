@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 import threading
 
+from ollama_code.features import feature_enabled, options_for_purpose, response_format_for_purpose
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
 from ollama_code.sessions import (
     SessionSummary,
@@ -104,6 +105,7 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "code_outline",
     "read_symbol",
     "repo_index_search",
+    "context_pack",
     "find_implementation_target",
     "diagnose_test_failure",
     "call_graph",
@@ -111,7 +113,7 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "git_status",
     "git_diff",
 }
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "find_implementation_target", "call_graph"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "context_pack", "find_implementation_target", "call_graph"}
 EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
 TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "find_implementation_target", "run_function_probe", "lint_typecheck", "generate_tests_from_spec"}
 SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
@@ -127,6 +129,7 @@ MODEL_TOOL_RESULT_LIMITS = {
     "code_outline": 900,
     "read_symbol": 1100,
     "repo_index_search": 900,
+    "context_pack": 900,
     "find_implementation_target": 800,
     "diagnose_test_failure": 900,
     "run_function_probe": 700,
@@ -337,6 +340,7 @@ class OllamaCodeAgent:
         self._interrupt_event: threading.Event | None = None
         self._turn_tool_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._turn_cache_epoch = 0
+        self._turn_evidence_counter = 0
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
@@ -402,6 +406,14 @@ class OllamaCodeAgent:
         if re.search(r"\b(?:agent|subagent|sub-agent|delegate)\b", lowered):
             selected.update(AGENT_TOOL_NAMES)
         selected.update(required_tool_names)
+        if "context_pack" not in required_tool_names:
+            selected.discard("context_pack")
+            if feature_enabled("context-pack") and (
+                mutation_required
+                or test_run_required
+                or self._request_is_broad_or_ambiguous(request_text)
+            ):
+                selected.add("context_pack")
         selected.difference_update(forbidden_tool_names)
         return {name for name in selected if name in KNOWN_TOOL_NAMES}
 
@@ -576,13 +588,20 @@ class OllamaCodeAgent:
         response_format: str | dict[str, Any] | None = "json",
         on_thinking: Callable[[str], None] | None = None,
         think: bool | None = None,
+        options: dict[str, Any] | None = None,
+        primary_can_emit_large_payload: bool = False,
     ) -> ChatResponse:
+        effective_response_format = response_format_for_purpose(purpose, response_format)
+        effective_options = options_for_purpose(purpose, primary_can_emit_large_payload=primary_can_emit_large_payload)
+        if options:
+            effective_options.update(options)
         response = self.client.chat(
             model=model,
             messages=messages,
-            response_format=response_format,
+            response_format=effective_response_format,
             on_thinking=on_thinking,
             think=think,
+            options=effective_options or None,
         )
         prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
         prompt_chars_by_role: dict[str, int] = {}
@@ -611,6 +630,8 @@ class OllamaCodeAgent:
             "response_chars": len(response.content),
             "thinking_chars": len(response.thinking),
             "think": think,
+            "response_format": "schema" if isinstance(effective_response_format, dict) else effective_response_format,
+            "options": effective_options,
             **response.usage.as_event_payload(),
         }
         self._pending_llm_call_events.append(payload)
@@ -855,7 +876,7 @@ class OllamaCodeAgent:
             arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
             result = item.get("result") if isinstance(item.get("result"), dict) else {}
             row: dict[str, Any] = {
-                "id": f"E{index}",
+                "id": str(item.get("evidence_id") or f"E{index}"),
                 "tool": name,
                 "arguments": self._truncate_json_value(arguments, limit=180),
                 "observation": self._evidence_observation_for_result(name, result),
@@ -1498,6 +1519,7 @@ class OllamaCodeAgent:
     def _reset_turn_cache(self) -> None:
         self._turn_tool_cache = {}
         self._turn_cache_epoch = 0
+        self._turn_evidence_counter = 0
 
     def _tool_cache_key(self, name: str, arguments: dict[str, Any]) -> tuple[str, str, int] | None:
         if name not in READ_ONLY_CACHEABLE_TOOL_NAMES:
@@ -1663,7 +1685,28 @@ class OllamaCodeAgent:
         cwd = str(arguments.get("cwd") or ".").strip()
         return (command, cwd, mutation_version)
 
-    def _tool_result_feedback_message(self, name: str, result: dict[str, Any], *, real_tool_use: bool) -> str:
+    def _next_evidence_id(self) -> str:
+        self._turn_evidence_counter += 1
+        return f"E{self._turn_evidence_counter}"
+
+    def _evidence_handle_summary(self, evidence_id: str, name: str, result: dict[str, Any]) -> str:
+        status = "ok" if result.get("ok") is True else "fail"
+        parts = [f"{evidence_id} {name} {status}"]
+        for key in ("path", "symbol", "exit_code", "diagnostic", "summary"):
+            value = result.get(key)
+            if value not in (None, ""):
+                parts.append(f"{key}={self._truncate_text(str(value).replace(chr(10), ' | '), limit=180)}")
+        output = result.get("output")
+        if isinstance(output, str) and output.strip():
+            limit = 420 if name == "run_test" else 260
+            compact = self._compact_run_test_output(output, limit=limit) if name == "run_test" else self._truncate_text(output.strip(), limit=limit)
+            parts.append("obs=" + compact.replace("\n", " | "))
+        diff = result.get("diff")
+        if isinstance(diff, str) and diff.strip() and "obs=" not in " ".join(parts):
+            parts.append("diff=" + self._truncate_text(diff.strip().replace("\n", " | "), limit=260))
+        return self._truncate_text(" ".join(parts), limit=760)
+
+    def _tool_result_feedback_message(self, name: str, result: dict[str, Any], *, real_tool_use: bool, evidence_id: str | None = None) -> str:
         payload = self._compact_tool_result_for_context(name, result, for_verification=False)
         follow_up = "Next JSON only."
         if not real_tool_use:
@@ -1675,6 +1718,8 @@ class OllamaCodeAgent:
             follow_up = "Python syntax error in edited file. Fix that file before tests/final; top-level def/class starts at column 1. Next JSON only."
         elif name == "run_test" and result.get("ok") is not True:
             follow_up = self._run_test_failure_follow_up(result)
+        if feature_enabled("evidence-handles") and evidence_id:
+            return "Evidence:\n" + self._evidence_handle_summary(evidence_id, name, result) + "\n" + follow_up
         return "Tool result:\n" + json.dumps(payload, ensure_ascii=True, separators=(",", ":")) + "\n" + follow_up
 
     def _final_requires_verification(
@@ -2606,7 +2651,7 @@ class OllamaCodeAgent:
         ):
             return False
         if failed_tool_this_turn:
-            if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol"}:
+            if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol", "context_pack"}:
                 return False
             if name == "run_test":
                 return True
@@ -2631,7 +2676,7 @@ class OllamaCodeAgent:
             if name == "run_test" and re.search(r"\b(?:run|rerun|execute)\b[^.?!\n]{0,80}\b(?:test|tests|pytest|unittest)\b", request_text, flags=re.IGNORECASE):
                 return False
             return True
-        if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol"}:
+        if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol", "context_pack"}:
             if self._request_explicitly_requests_tool(request_text, name):
                 return False
             if forbidden_tool_names:
@@ -2822,13 +2867,14 @@ class OllamaCodeAgent:
         if not cache_hit:
             self._store_cached_tool_result(name, arguments, result)
         self._invalidate_turn_cache_if_needed(name, result)
+        evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
         real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(request_text, name, result)
         if real_tool_use:
             satisfied_tool_names.add(name)
         if self._counts_as_real_tool_use(name, result):
-            successful_tool_results.append({"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result)})
-        self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit)
-        self.messages.append({"role": "user", "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use)})
+            successful_tool_results.append({"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result), "evidence_id": evidence_id})
+        self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, evidence_id=evidence_id)
+        self.messages.append({"role": "user", "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use, evidence_id=evidence_id)})
         return result
 
     def _try_handle_simple_source_rewrite(
@@ -3196,6 +3242,26 @@ class OllamaCodeAgent:
             return "staged"
         return None
 
+    def _should_preload_context_pack(
+        self,
+        *,
+        request_text: str,
+        session_memory_request: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> bool:
+        if not feature_enabled("context-pack") or session_memory_request or "context_pack" in forbidden_tool_names:
+            return False
+        if required_tool_names and "context_pack" not in required_tool_names:
+            return False
+        if self._request_expects_exact_tool_error(request_text):
+            return False
+        if "context_pack" in required_tool_names:
+            return True
+        return mutation_required or test_run_required or self._request_is_broad_or_ambiguous(request_text)
+
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -3329,6 +3395,24 @@ class OllamaCodeAgent:
         latest_run_test_failure_summary = ""
         failed_run_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
+        if self._should_preload_context_pack(
+            request_text=text,
+            session_memory_request=session_memory_request,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        ):
+            context_result = self._execute_controller_tool(
+                name="context_pack",
+                arguments={"request": text, "path": ".", "limit": 8},
+                request_text=text,
+                round_number=0,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            tool_used_this_turn = tool_used_this_turn or self._counts_as_real_tool_use("context_pack", context_result)
         for round_number in range(1, self.max_tool_rounds + 1):
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
@@ -3346,6 +3430,7 @@ class OllamaCodeAgent:
                         round_number=round_number,
                         tool_used_this_turn=tool_used_this_turn,
                     ),
+                    primary_can_emit_large_payload=mutation_allowed or mutation_required,
                 )
             except OllamaError:
                 raise
@@ -3884,6 +3969,7 @@ class OllamaCodeAgent:
                 if not cache_hit:
                     self._store_cached_tool_result(name, arguments, result)
                 self._invalidate_turn_cache_if_needed(name, result)
+                evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
@@ -3902,6 +3988,7 @@ class OllamaCodeAgent:
                             "name": name,
                             "arguments": deepcopy(arguments),
                             "result": deepcopy(result),
+                            "evidence_id": evidence_id,
                         }
                     )
                 if name == "run_test":
@@ -3923,11 +4010,11 @@ class OllamaCodeAgent:
                         unresolved_syntax_diagnostics[result_path] = str(result.get("diagnostic") or result.get("summary") or "").strip()
                     else:
                         unresolved_syntax_diagnostics.pop(result_path, None)
-                self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit)
+                self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, evidence_id=evidence_id)
                 self.messages.append(
                     {
                         "role": "user",
-                        "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use),
+                        "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use, evidence_id=evidence_id),
                     }
                 )
                 if self._tool_result_needs_reconciliation(
@@ -4008,7 +4095,8 @@ class OllamaCodeAgent:
                     self._record_event("tool_call", name="run_test", arguments=auto_arguments, rounds=round_number, auto=True)
                     tool_calls_this_turn.append({"name": "run_test", "arguments": deepcopy(auto_arguments)})
                     auto_result = self.tools.execute("run_test", auto_arguments)
-                    self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True)
+                    evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
+                    self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True, evidence_id=evidence_id)
                     tool_used_this_turn = True
                     satisfied_tool_names.add("run_test")
                     raw_output = str(auto_result.get("output") or auto_result.get("summary") or "").strip()
@@ -4018,6 +4106,7 @@ class OllamaCodeAgent:
                                 "name": "run_test",
                                 "arguments": deepcopy(auto_arguments),
                                 "result": deepcopy(auto_result),
+                                "evidence_id": evidence_id,
                             }
                         )
                         last_successful_run_test_version = mutation_version

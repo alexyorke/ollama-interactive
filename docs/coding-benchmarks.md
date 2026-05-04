@@ -31,6 +31,7 @@ Each result records:
 - latency, tool-call sequence, failed tools, changed files, tests run
 - assumption-audit count/retries, verifier retries/rewrites
 - prompt profile: chars by role and largest prompt messages
+- feature profile: `baseline`, `schema`, `context-pack`, `evidence-handles`, `num-predict-caps`, `structured-edits`, or `all`
 
 ## Commands
 
@@ -38,6 +39,12 @@ Run the frequent local suite:
 
 ```bash
 python scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b qwen3:8b granite4.1:8b --modes off on --strict-accuracy --strict-budget
+```
+
+Run A/B feature profiles without changing prompts:
+
+```bash
+python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline all --compare scratch/coding-benchmark/baseline.json --strict-accuracy --strict-budget
 ```
 
 Run the fuller local suite for deeper regression checks:
@@ -71,3 +78,10 @@ python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --tas
 ```
 
 Raw JSON stays ignored under `scratch/`. Track only concise summaries when results are worth preserving.
+
+## Anti-Cheat Rules
+
+- `coding_accuracy` prompts must not include synthetic marker tokens, exact answer literals, forced tool clauses, or public task-specific answers.
+- Runtime code under `ollama_code/` must not special-case public smoke task names such as `list-ops`, `pig-latin`, or `wordy`.
+- Synthetic exact-answer cases stay marked as `tool_contract`, not coding accuracy.
+- Public benchmark results are local smoke only unless official harness/settings are used.

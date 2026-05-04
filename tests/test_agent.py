@@ -7,9 +7,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from uuid import uuid4
 
 from ollama_code.agent import OllamaCodeAgent, _workspace_roots_match
+from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
 from ollama_code.ollama_client import ChatResponse, TokenUsage
 from ollama_code.tools import ToolExecutor
 
@@ -43,6 +45,7 @@ class FakeClient:
         response_format: str = "json",
         on_thinking: object | None = None,
         think: bool | None = None,
+        options: dict[str, object] | None = None,
     ) -> ChatResponse:
         system_prompt = messages[0]["content"] if messages else ""
         self.calls.append(
@@ -52,6 +55,7 @@ class FakeClient:
                 "response_format": response_format,
                 "on_thinking": on_thinking,
                 "think": think,
+                "options": options,
             }
         )
         if isinstance(system_prompt, str):
@@ -151,6 +155,37 @@ class AgentTests(unittest.TestCase):
         self.assertGreater(llm_calls[0]["message_count"], 0)
         self.assertIn("system", llm_calls[0]["prompt_chars_by_role"])
         self.assertGreater(llm_calls[0]["top_prompt_messages"][0]["chars"], 0)
+
+    def test_agent_uses_schema_and_num_predict_feature_profile(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"final","message":"ok"}'])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "schema,num-predict-caps"}):
+            result = agent.handle_user("say ok")
+
+        self.assertEqual(result.message, "ok")
+        call = client.calls[0]
+        self.assertIsInstance(call["response_format"], dict)
+        self.assertEqual(call["options"], {"num_predict": 256})
+
+    def test_agent_context_pack_profile_preloads_context(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "calc.py").write_text("def sum_values(a, b):\n    return a - b\n", encoding="utf-8")
+        client = FakeClient(['{"type":"final","message":"inspected"}'])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=4, debate_enabled=False)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack,evidence-handles"}):
+            agent.handle_user("Use context_pack to inspect relevant context for src/calc.py and summarize only.")
+
+        calls = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(calls[0], "context_pack")
+        tool_messages = [message["content"] for message in agent.messages if message["role"] == "user" and str(message["content"]).startswith("Evidence:")]
+        self.assertTrue(tool_messages)
+        self.assertIn("context_pack", tool_messages[0])
 
     def test_system_prompt_requires_assumption_checking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

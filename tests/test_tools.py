@@ -585,6 +585,37 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("calculate_discount", result["output"])
         self.assertNotIn("   1 |", result["output"])
 
+    def test_context_pack_returns_ranked_evidence_and_writes_index_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "pricing.py").write_text("def calculate_discount(cart):\n    return sum(cart)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text("from src.pricing import calculate_discount\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.context_pack("fix discount calculation")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool"], "context_pack")
+        self.assertIn("suggested_next_tool", result["output"])
+        self.assertIn("pricing.py", result["output"])
+        self.assertIn("test_pricing.py", result["output"])
+
+    def test_repo_index_search_invalidates_changed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "ops.py"
+            target.write_text("def first_name():\n    return 'old'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            first = tools.repo_index_search("first_name")
+            target.write_text("def second_name():\n    return 'new'\n", encoding="utf-8")
+            second = tools.repo_index_search("second_name")
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertIn("first_name", first["output"])
+        self.assertIn("second_name", second["output"])
+
     def test_find_implementation_target_maps_test_imports_to_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -702,6 +733,41 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertTrue(final_text.startswith("import math\n"))
+
+    def test_apply_structured_edit_replaces_function_body(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "replace_function_body", "path": "ops.py", "symbol": "add", "body": "return a + b"})
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("return a + b", final_text)
+        self.assertNotIn("return a - b", final_text)
+
+    def test_apply_structured_edit_changes_signature(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def fetch_user(user_id):\n    return user_id\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "change_signature", "path": "ops.py", "symbol": "fetch_user", "signature": "def fetch_user(user_id, include_orders=False):"})
+
+        self.assertTrue(result["ok"])
+        self.assertIn("def fetch_user(user_id, include_orders=False):", sample.read_text(encoding="utf-8"))
+
+    def test_apply_structured_edit_renames_symbol_project(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "pricing.py").write_text("def total(items):\n    return sum(items)\n", encoding="utf-8")
+        (root / "tests" / "test_pricing.py").write_text("from src.pricing import total\n\nassert total([1]) == 1\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "rename_symbol_project", "path": ".", "old": "total", "new": "cart_total"})
+
+        self.assertTrue(result["ok"])
+        self.assertIn("def cart_total", (root / "src" / "pricing.py").read_text(encoding="utf-8"))
+        self.assertIn("cart_total", (root / "tests" / "test_pricing.py").read_text(encoding="utf-8"))
 
     def test_generate_tests_from_spec_previews_patch_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -85,8 +85,11 @@ class OllamaClient:
         response_format: str | dict[str, Any] | None,
         stream: bool,
         think: bool,
+        options: dict[str, Any] | None = None,
     ) -> Request:
-        options = self._chat_options(messages)
+        request_options = self._chat_options(messages)
+        if options:
+            request_options.update(options)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -95,15 +98,15 @@ class OllamaClient:
         }
         if response_format is not None:
             payload["format"] = response_format
-        if options:
-            payload["options"] = options
+        if request_options:
+            payload["options"] = request_options
         return Request(
             f"{self.host}/api/chat",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
 
-    def _chat_options(self, messages: list[dict[str, str]]) -> dict[str, int]:
+    def _chat_options(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         num_ctx = self._num_ctx_for_messages(messages)
         return {"num_ctx": num_ctx} if num_ctx is not None else {}
 
@@ -169,6 +172,7 @@ class OllamaClient:
         response_format: str | dict[str, Any] | None = "json",
         on_thinking: Callable[[str], None] | None = None,
         think: bool | None = None,
+        options: dict[str, Any] | None = None,
     ) -> ChatResponse:
         def perform_request(*, think_enabled: bool) -> dict[str, Any]:
             request = self._build_chat_request(
@@ -177,6 +181,7 @@ class OllamaClient:
                 response_format=response_format,
                 stream=on_thinking is not None,
                 think=think_enabled,
+                options=options,
             )
             if on_thinking is None:
                 return self._request_json(request)

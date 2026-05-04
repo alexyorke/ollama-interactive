@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import hashlib
 import inspect
 import json
 import os
@@ -33,6 +34,7 @@ SKIP_CODE_DIRS = {
     "node_modules",
     "dist",
     "build",
+    ".ollama-code",
     ".venv",
     "venv",
 }
@@ -74,6 +76,11 @@ TOOL_DESCRIPTIONS = [
         "name": "repo_index_search",
         "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
         "description": "Search code with compact ranked snippets instead of whole files.",
+    },
+    {
+        "name": "context_pack",
+        "arguments": {"request": "user request or task text", "path": "relative path, default .", "limit": "int, default 8"},
+        "description": "Build compact ranked evidence from repo index, tests, imports, symbols, and git state.",
     },
     {
         "name": "find_implementation_target",
@@ -195,6 +202,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "code_outline": "code_outline(path,max_symbols=120)",
         "read_symbol": "read_symbol(path,symbol,context=2)",
         "repo_index_search": "repo_index_search(query,path='.',limit=10)",
+        "context_pack": "context_pack(request,path='.',limit=8)",
         "find_implementation_target": "find_implementation_target(test_path?,output?,limit=12)",
         "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
         "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
@@ -204,7 +212,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "replace_symbols": 'replace_symbols(path,replacements=[{"symbol":"f","content":"def f():\\n    return ..."}])',
         "write_file": "write_file(path,content)",
         "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
-        "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol","path":"a.py","old":"x","new":"y"})',
+        "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol|replace_function_body|change_signature|...","path":"a.py"})',
         "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
         "run_shell": "run_shell(command,cwd='.',timeout=30)",
         "run_test": "run_test(command?,cwd='.',timeout=1200)",
@@ -244,6 +252,11 @@ class ToolExecutor:
     def set_test_command(self, command: str | None) -> None:
         self.default_test_command = command.strip() if isinstance(command, str) and command.strip() else None
 
+    def _truncate_text(self, text: str, *, limit: int) -> str:
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 18)] + "... truncated ..."
+
     def _call_tool_handler(self, handler: Callable[..., dict[str, Any]], arguments: dict[str, Any]) -> dict[str, Any]:
         signature = inspect.signature(handler)
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
@@ -276,6 +289,7 @@ class ToolExecutor:
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
             "repo_index_search": self.repo_index_search,
+            "context_pack": self.context_pack,
             "find_implementation_target": self.find_implementation_target,
             "diagnose_test_failure": self.diagnose_test_failure,
             "run_function_probe": self.run_function_probe,
@@ -830,29 +844,141 @@ class ToolExecutor:
             "output": "\n".join(rendered) if rendered else "(empty symbol)",
         }
 
+    def _repo_index_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "repo_index.json"
+
+    def _extract_index_terms(self, text: str, *, limit: int = 900) -> list[str]:
+        terms = sorted(set(term.lower() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}|[0-9]+", text)))
+        return terms[:limit]
+
+    def _python_imports_for_index(self, target: Path, text: str) -> list[str]:
+        if target.suffix.lower() != ".py":
+            return []
+        try:
+            tree = ast.parse(self._python_parse_text(text), filename=self.relative_label(target))
+        except SyntaxError:
+            return []
+        imports: list[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.extend(f"{node.module}.{alias.name}" for alias in node.names)
+        return sorted(set(imports))[:120]
+
+    def _code_index_record(self, file_path: Path) -> dict[str, Any]:
+        stat = file_path.stat()
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        symbols, _, _ = self._code_symbols(file_path)
+        return {
+            "path": self.relative_label(file_path),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "size": int(stat.st_size),
+            "sha1": hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest(),
+            "symbols": symbols[:300],
+            "imports": self._python_imports_for_index(file_path, text),
+            "terms": self._extract_index_terms(text),
+        }
+
+    def _load_repo_index(self) -> dict[str, Any]:
+        cache_path = self._repo_index_cache_path()
+        if not cache_path.exists():
+            return {"version": 1, "files": {}}
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "files": {}}
+        if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("files"), dict):
+            return {"version": 1, "files": {}}
+        return payload
+
+    def _write_repo_index(self, payload: dict[str, Any]) -> None:
+        cache_path = self._repo_index_cache_path()
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            return
+
+    def _indexed_code_records(self, base: Path, *, limit: int = 1000) -> list[dict[str, Any]]:
+        payload = self._load_repo_index()
+        files_payload = payload.setdefault("files", {})
+        assert isinstance(files_payload, dict)
+        changed = False
+        seen: set[str] = set()
+        records: list[dict[str, Any]] = []
+        for file_path in self._iter_code_files(base, limit=limit):
+            self._check_interrupted()
+            rel = self.relative_label(file_path)
+            seen.add(rel)
+            stat = file_path.stat()
+            cached = files_payload.get(rel)
+            if not (
+                isinstance(cached, dict)
+                and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+                and cached.get("size") == int(stat.st_size)
+            ):
+                cached = self._code_index_record(file_path)
+                files_payload[rel] = cached
+                changed = True
+            records.append(cached)
+        for rel in list(files_payload):
+            path = self.workspace_root / rel
+            if rel not in seen and (base == self.workspace_root or path == base or base in path.parents):
+                files_payload.pop(rel, None)
+                changed = True
+        if changed:
+            self._write_repo_index(payload)
+        return records
+
+    def _repo_index_score(self, record: dict[str, Any], terms: list[str]) -> tuple[int, list[str]]:
+        score = 0
+        rel = str(record.get("path", ""))
+        path_text = rel.lower()
+        record_terms = set(str(term).lower() for term in record.get("terms", []) if isinstance(term, str))
+        imports = " ".join(str(item).lower() for item in record.get("imports", []) if isinstance(item, str))
+        matched_symbols: list[str] = []
+        for term in terms:
+            if term in path_text:
+                score += 8
+            if term in record_terms:
+                score += 2
+            if term in imports:
+                score += 3
+        for symbol in record.get("symbols", []):
+            if not isinstance(symbol, dict):
+                continue
+            haystack = f"{symbol.get('qualname', '')} {symbol.get('signature', '')} {symbol.get('doc', '')}".lower()
+            hits = sum(1 for term in terms if term in haystack)
+            if hits:
+                score += 25 * hits
+                matched_symbols.append(str(symbol.get("qualname", "")))
+        return score, matched_symbols[:8]
+
     def repo_index_search(self, query: str, path: str = ".", limit: int = 10) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
         terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
         if not terms:
             return {"ok": False, "tool": "repo_index_search", "summary": "repo_index_search requires a non-empty query."}
-        results: list[dict[str, Any]] = []
-        for file_path in self._iter_code_files(base, limit=500):
+        scored: list[dict[str, Any]] = []
+        for record in self._indexed_code_records(base, limit=1000):
+            score, matched_symbols = self._repo_index_score(record, terms)
+            if score:
+                scored.append({"score": score, "path": record.get("path"), "symbols": matched_symbols})
+        ranked_records = sorted(scored, key=lambda item: (-int(item["score"]), str(item["path"])))[: max(1, int(limit))]
+        output: list[str] = []
+        for item in ranked_records:
+            rel = str(item["path"])
+            file_path = self.workspace_root / rel
             text = file_path.read_text(encoding="utf-8", errors="replace")
             lines = text.splitlines()
             symbols, _, _ = self._code_symbols(file_path)
-            score = 0
             snippets: list[str] = []
-            rel = self.relative_label(file_path)
-            haystack_path = rel.lower()
-            for term in terms:
-                if term in haystack_path:
-                    score += 4
+            matched_symbol_names = set(item.get("symbols", []))
             for symbol in symbols:
                 haystack = f"{symbol.get('qualname', '')} {symbol.get('signature', '')}".lower()
-                hits = sum(1 for term in terms if term in haystack)
-                if hits:
-                    score += 20 * hits
+                if symbol.get("qualname") in matched_symbol_names or any(term in haystack for term in terms):
                     start = max(1, int(symbol["start"]) - 1)
                     end = min(len(lines), int(symbol["start"]) + 1)
                     snippets.append(f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']}: {symbol['signature']}")
@@ -862,22 +988,60 @@ class ToolExecutor:
                 lowered = line.lower()
                 hits = sum(1 for term in terms if term in lowered)
                 if hits:
-                    score += hits
                     if len(snippets) < 6:
                         snippets.append(f"{rel}:{line_no}: {line.strip()[:180]}")
-            if score:
-                results.append({"score": score, "path": rel, "snippets": snippets[:6]})
-        ranked = sorted(results, key=lambda item: (-int(item["score"]), str(item["path"])))[: max(1, int(limit))]
-        output: list[str] = []
-        for item in ranked:
             output.append(f"{item['path']} score={item['score']}")
-            output.extend(f"  {snippet}" for snippet in item["snippets"])
+            output.extend(f"  {snippet}" for snippet in snippets[:6])
         return {
             "ok": True,
             "tool": "repo_index_search",
             "path": self.relative_label(base),
-            "count": len(ranked),
+            "count": len(ranked_records),
             "output": "\n".join(output) if output else "(no ranked snippets)",
+        }
+
+    def context_pack(self, request: str, path: str = ".", limit: int = 8) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        query = request.strip()
+        if not query:
+            return {"ok": False, "tool": "context_pack", "summary": "context_pack requires a non-empty request."}
+        ranked = self.repo_index_search(query, path=self.relative_label(base), limit=limit)
+        test_files = [
+            self.relative_label(file_path)
+            for file_path in self._iter_code_files(base, limit=500)
+            if file_path.suffix.lower() == ".py" and ("test" in file_path.name.lower() or "tests" in file_path.parts)
+        ][: max(1, int(limit))]
+        git_summary = ""
+        if (self.workspace_root / ".git").exists():
+            status = self.git_status()
+            if status.get("ok"):
+                git_summary = self._truncate_text(str(status.get("output", "")).replace("\n", " | "), limit=220)
+        suggested = "repo_index_search"
+        ranked_output = str(ranked.get("output", ""))
+        if re.search(r"\b(?:test|tests|pytest|unittest|failing|failure)\b", query, flags=re.IGNORECASE):
+            suggested = "run_test"
+        elif re.search(r"\b(?:fix|implement|refactor|change|edit|update)\b", query, flags=re.IGNORECASE):
+            suggested = "read_symbol" if re.search(r"\b(?:function|method|class|symbol)\b", ranked_output) else "read_file"
+        lines = [
+            "context_pack:",
+            f"request_terms={', '.join(self._extract_index_terms(query, limit=12))}",
+            f"suggested_next_tool={suggested}",
+        ]
+        if test_files:
+            lines.append("test_files=" + ", ".join(test_files))
+        if git_summary:
+            lines.append("git=" + git_summary)
+        lines.append("ranked_evidence:")
+        lines.append(self._truncate_text(ranked_output, limit=1300))
+        return {
+            "ok": True,
+            "tool": "context_pack",
+            "path": self.relative_label(base),
+            "count": ranked.get("count", 0),
+            "suggested_next_tool": suggested,
+            "test_files": test_files,
+            "output": "\n".join(lines),
         }
 
     def _resolve_python_module_file(self, module: str) -> Path | None:
@@ -1496,11 +1660,142 @@ class ToolExecutor:
         updated = "".join(lines[: start - 1]) + "".join(lines[end:])
         return updated, "", found
 
+    def _matched_symbol(self, target: Path, symbol: str) -> tuple[dict[str, Any] | None, str]:
+        symbols, _, _ = self._code_symbols(target)
+        matches = self._symbol_matches(symbols, symbol)
+        if not matches:
+            return None, f"Symbol not found: {symbol}"
+        if len(matches) > 1:
+            rendered = "\n".join(f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}" for item in matches[:20])
+            return None, f"Ambiguous symbol: {symbol}\n{rendered}"
+        return matches[0], ""
+
+    def _python_function_node(self, target: Path, symbol: str) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+        text = target.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(text))
+        except SyntaxError:
+            return None
+        wanted = symbol.split(".")[-1]
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == wanted:
+                return node
+        return None
+
+    def _apply_file_update(self, target: Path, original: str, updated: str, prompt: str, *, op: str) -> dict[str, Any]:
+        relative_path = self.relative_label(target)
+        denied = self._mutation_denied_path(target)
+        if denied:
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": denied}
+        diagnostic = self._python_syntax_diagnostic(target, updated)
+        if diagnostic:
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "op": op, "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
+        preview = self._diff_preview(relative_path, original, updated)
+        approved, reason = self._approve_mutation(prompt, preview)
+        if not approved:
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": reason}
+        target.write_text(updated, encoding="utf-8")
+        return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "syntax_ok": True if target.suffix.lower() == ".py" else None, "summary": f"Applied {op} to {relative_path}.", "diff": preview}
+
+    def _replace_python_function_body(self, target: Path, symbol: str, body: str) -> dict[str, Any]:
+        relative_path = self.relative_label(target)
+        if target.suffix.lower() != ".py":
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": "replace_function_body supports Python files only."}
+        node = self._python_function_node(target, symbol)
+        if node is None or not node.body:
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": f"Function not found: {symbol}"}
+        original = target.read_text(encoding="utf-8", errors="replace")
+        lines = original.splitlines(keepends=True)
+        first_body = node.body[0]
+        last_body = node.body[-1]
+        start = int(getattr(first_body, "lineno", getattr(node, "lineno", 1)))
+        end = int(getattr(last_body, "end_lineno", getattr(last_body, "lineno", start)))
+        header_indent = lines[int(getattr(node, "lineno", 1)) - 1][: len(lines[int(getattr(node, "lineno", 1)) - 1]) - len(lines[int(getattr(node, "lineno", 1)) - 1].lstrip())]
+        body_indent = header_indent + "    "
+        normalized = textwrap.dedent(body).strip("\n")
+        replacement_lines = ["pass"] if not normalized.strip() else normalized.splitlines()
+        replacement = "".join(body_indent + line.rstrip() + "\n" if line.strip() else "\n" for line in replacement_lines)
+        updated = "".join(lines[: start - 1]) + replacement + "".join(lines[end:])
+        return self._apply_file_update(target, original, updated, f"Replace body of {symbol} in {relative_path}?", op="replace_function_body")
+
+    def _change_python_signature(self, target: Path, symbol: str, signature: str) -> dict[str, Any]:
+        relative_path = self.relative_label(target)
+        if target.suffix.lower() != ".py":
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": "change_signature supports Python files only."}
+        found, error = self._matched_symbol(target, symbol)
+        if found is None:
+            return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": error}
+        original = target.read_text(encoding="utf-8", errors="replace")
+        lines = original.splitlines(keepends=True)
+        start = int(found["start"])
+        current = lines[start - 1]
+        indent = current[: len(current) - len(current.lstrip())]
+        clean = signature.strip()
+        if not clean.startswith(("def ", "async def ")):
+            name = str(found.get("name") or symbol.split(".")[-1])
+            clean = f"def {name}{clean if clean.startswith('(') else '(' + clean + ')'}:"
+        if not clean.endswith("\n"):
+            clean += "\n"
+        lines[start - 1] = indent + clean.lstrip()
+        updated = "".join(lines)
+        return self._apply_file_update(target, original, updated, f"Change signature of {symbol} in {relative_path}?", op="change_signature")
+
+    def _rename_symbol_project(self, base: Path, old: str, new: str) -> dict[str, Any]:
+        if not old or not new or not re.match(r"^[A-Za-z_]\w*$", old) or not re.match(r"^[A-Za-z_]\w*$", new):
+            return {"ok": False, "tool": "apply_structured_edit", "summary": "rename_symbol_project requires valid old/new identifiers."}
+        updates: list[tuple[Path, str, str]] = []
+        for file_path in self._iter_code_files(base, limit=1000):
+            original = file_path.read_text(encoding="utf-8", errors="replace")
+            updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
+            if count:
+                diagnostic = self._python_syntax_diagnostic(file_path, updated)
+                if diagnostic:
+                    return {"ok": False, "tool": "apply_structured_edit", "path": self.relative_label(file_path), "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
+                updates.append((file_path, original, updated))
+        if not updates:
+            return {"ok": False, "tool": "apply_structured_edit", "summary": f"Identifier not found: {old}"}
+        preview = "\n".join(self._diff_preview(self.relative_label(path), original, updated) for path, original, updated in updates[:12])
+        approved, reason = self._approve_mutation(f"Rename {old} to {new} in {len(updates)} file(s)?", preview)
+        if not approved:
+            return {"ok": False, "tool": "apply_structured_edit", "summary": reason}
+        for path, _, updated in updates:
+            path.write_text(updated, encoding="utf-8")
+        return {
+            "ok": True,
+            "tool": "apply_structured_edit",
+            "path": self.relative_label(base),
+            "op": "rename_symbol_project",
+            "count": len(updates),
+            "summary": f"Renamed {old} to {new} in {len(updates)} file(s).",
+            "diff": preview,
+        }
+
     def apply_structured_edit(self, operation: dict[str, Any] | str) -> dict[str, Any]:
         payload = self._operation_payload(operation)
         if payload is None:
             return {"ok": False, "tool": "apply_structured_edit", "summary": "operation must be a JSON object."}
         op = str(payload.get("op") or payload.get("operation") or "").strip().lower()
+        if op == "replace_function_body":
+            return self._replace_python_function_body(
+                self.resolve_path(str(payload.get("path") or ""), allow_missing=False),
+                str(payload.get("symbol") or payload.get("name") or ""),
+                str(payload.get("body") or payload.get("content") or ""),
+            )
+        if op == "change_signature":
+            return self._change_python_signature(
+                self.resolve_path(str(payload.get("path") or ""), allow_missing=False),
+                str(payload.get("symbol") or payload.get("name") or ""),
+                str(payload.get("signature") or payload.get("new_signature") or ""),
+            )
+        if op in {"rename_symbol_project", "update_callers"}:
+            return self._rename_symbol_project(
+                self.resolve_path(str(payload.get("path") or "."), allow_missing=False),
+                str(payload.get("old") or payload.get("symbol") or payload.get("from") or ""),
+                str(payload.get("new") or payload.get("new_name") or payload.get("to") or ""),
+            )
+        if op == "add_import_if_missing":
+            payload = {**payload, "op": "add_import"}
+            op = "add_import"
         if op in {"replace_function", "replace_method", "replace_class", "replace_symbol"}:
             return self.replace_symbol(str(payload.get("path") or ""), str(payload.get("symbol") or payload.get("name") or ""), str(payload.get("content") or ""))
         if op == "rename_symbol":

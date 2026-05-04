@@ -188,9 +188,38 @@ After the fix, the same symbol-summary task passes on all tested models and deba
 - Compressed system/tool/verifier/auditor prompts and tool-result feedback.
 - Switched debate-on audit gating to skip explicit low-risk reads and symbol tools while still auditing shell, tests, git, subagents, mutations, failures, and ambiguous turns.
 
+## Accuracy-Gated Feature Profiles
+
+Next optimization pass is feature-gated through `OLLAMA_CODE_FEATURE_PROFILE` and benchmark `--feature-profiles`, so token cuts can be A/B tested without changing benchmark prompts:
+
+- `schema`: use Ollama JSON Schema response formats for primary, verifier, auditor, reconciler, and rewriter calls.
+- `num-predict-caps`: cap internal output tokens by purpose and set deterministic internal calls to `temperature=0`.
+- `context-pack`: preload a compact repo evidence bundle for broad/edit/test requests before first model turn.
+- `evidence-handles`: keep full tool results in event logs but feed compact `E#` evidence handles back to the model.
+- `structured-edits`: benchmark label for syntax-preserving edit-intent paths in `apply_structured_edit`.
+- `all`: enable every gated feature.
+
+Default remains `baseline`. A profile is only safe to enable by default after zero pass-to-fail regressions and lower median total tokens on common passing cases.
+
+Generic additions behind these profiles:
+
+- Persistent ignored repo index under `.ollama-code/index/` with paths, mtimes, sizes, hashes, symbols, imports, and term vectors.
+- `context_pack(request,path='.',limit=8)` ranks compact snippets, likely tests, git state, and a suggested next tool.
+- `apply_structured_edit` now supports `replace_function_body`, `change_signature`, `add_import_if_missing`, `rename_symbol_project`/`update_callers`, plus existing rename/delete/move/replace ops.
+- Anti-cheat tests scan runtime source for public Aider smoke task names and keep synthetic literals out of coding-accuracy prompts.
+
+Local feature-profile smoke on `gemma3:4b`, debate off, same `issue_fix_hidden_tests` prompt:
+
+| Profile | Status | LLM calls | Prompt tokens | Output tokens | Total tokens | Latency |
+|---|---|---:|---:|---:|---:|---:|
+| `baseline` | fail_closed | 12 | 15,720 | 413 | 16,133 | 105.13s |
+| `all` | pass | 7 | 9,010 | 227 | 9,237 | 44.65s |
+
+This saved `6,896` total tokens (`-42.7%`) and improved the case from `fail_closed` to `pass`. The raw run is ignored under `scratch/coding-benchmark/feature-profile-local-smoke.json`.
+
 ## Validation
 
-- `python -m unittest discover -v`: 185 passed, 3 skipped.
+- `python -m unittest discover -v`: 259 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
 - Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
 - Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.
