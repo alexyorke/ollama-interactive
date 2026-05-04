@@ -55,11 +55,11 @@ def _chat(host: str, model: str, prompt: str, *, options: dict[str, int] | None)
 
 
 def _stop_model(model: str) -> None:
-    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, check=False)
+    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
 
 def _ollama_ps() -> str:
-    result = subprocess.run(["ollama", "ps"], capture_output=True, text=True, check=False)
+    result = subprocess.run(["ollama", "ps"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
     return (result.stdout or result.stderr or "").strip()
 
 

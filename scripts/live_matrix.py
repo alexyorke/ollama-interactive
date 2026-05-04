@@ -20,7 +20,7 @@ _LOADED_MODELS: set[str] = set()
 
 
 def unload_model(model: str) -> None:
-    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, check=False)
+    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
 
 def _cleanup_loaded_models() -> None:
