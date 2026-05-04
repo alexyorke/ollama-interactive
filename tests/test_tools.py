@@ -817,6 +817,37 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("returns shape dict", result["output"])
         self.assertIn("may return None", result["output"])
 
+    def test_contract_check_flags_caller_return_shape_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def y() -> dict[str, int]:\n"
+                "    return {'value': 1}\n\n"
+                "def z() -> int:\n"
+                "    return y()[0]\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"], changed_symbols=["y"])
+
+        self.assertFalse(result["ok"])
+        self.assertIn("expects y return as sequence", result["output"])
+
+    def test_contract_check_allows_matching_caller_return_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def y() -> dict[str, int]:\n"
+                "    return {'value': 1}\n\n"
+                "def z() -> int:\n"
+                "    return y()['value']\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"], changed_symbols=["y"])
+
+        self.assertTrue(result["ok"], result["output"])
+
     def test_lint_typecheck_reports_python_syntax_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

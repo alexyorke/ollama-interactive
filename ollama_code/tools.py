@@ -1428,6 +1428,7 @@ class ToolExecutor:
                         "symbol": caller["symbol"],
                         "args": call.get("args", 0),
                         "keywords": call.get("keywords", []),
+                        "return_expectations": call.get("return_expectations", []),
                     }
                 )
 
@@ -1488,7 +1489,84 @@ class ToolExecutor:
                         "line": int(getattr(child, "lineno", 1)),
                     }
                 )
+        for expectation in self._call_return_expectations(node):
+            for call in calls:
+                if call["name"] == expectation["name"] and call["line"] == expectation["call_line"]:
+                    call.setdefault("return_expectations", []).append(
+                        {"shape": expectation["shape"], "line": expectation["line"], "source": expectation["source"]}
+                    )
         return calls
+
+    def _call_return_expectations(self, node: ast.AST) -> list[dict[str, Any]]:
+        expectations: list[dict[str, Any]] = []
+        variable_sources: dict[str, list[dict[str, Any]]] = {}
+
+        def call_source(value: ast.AST) -> dict[str, Any] | None:
+            if isinstance(value, ast.Call):
+                name = self._call_name(value.func)
+                if name:
+                    return {"name": name, "call_line": int(getattr(value, "lineno", 1))}
+            if isinstance(value, ast.Name):
+                sources = variable_sources.get(value.id)
+                if sources:
+                    return sources[-1]
+            return None
+
+        def add_expectation(value: ast.AST, shape: str, line: int, source: str) -> None:
+            found = call_source(value)
+            if found:
+                expectations.append({**found, "shape": shape, "line": line, "source": source})
+
+        class ExpectationVisitor(ast.NodeVisitor):
+            def visit_Assign(self, assign: ast.Assign) -> Any:
+                found = call_source(assign.value)
+                if found:
+                    for target in assign.targets:
+                        if isinstance(target, ast.Name):
+                            variable_sources.setdefault(target.id, []).append(found)
+                self.generic_visit(assign)
+
+            def visit_AnnAssign(self, assign: ast.AnnAssign) -> Any:
+                if assign.value is not None:
+                    found = call_source(assign.value)
+                    if found and isinstance(assign.target, ast.Name):
+                        variable_sources.setdefault(assign.target.id, []).append(found)
+                self.generic_visit(assign)
+
+            def visit_For(self, loop: ast.For) -> Any:
+                add_expectation(loop.iter, "iterable", int(getattr(loop, "lineno", 1)), "for")
+                self.generic_visit(loop)
+
+            def visit_ListComp(self, comp: ast.ListComp) -> Any:
+                for generator in comp.generators:
+                    add_expectation(generator.iter, "iterable", int(getattr(generator, "lineno", 1)), "comprehension")
+                self.generic_visit(comp)
+
+            def visit_Subscript(self, subscript: ast.Subscript) -> Any:
+                shape = "indexable"
+                target_slice = subscript.slice
+                if isinstance(target_slice, ast.Constant):
+                    if isinstance(target_slice.value, str):
+                        shape = "dict"
+                    elif isinstance(target_slice.value, int):
+                        shape = "sequence"
+                add_expectation(subscript.value, shape, int(getattr(subscript, "lineno", 1)), "subscript")
+                self.generic_visit(subscript)
+
+            def visit_Call(self, call: ast.Call) -> Any:
+                if isinstance(call.func, ast.Attribute):
+                    attr = call.func.attr
+                    if attr in {"items", "keys", "values", "get"}:
+                        add_expectation(call.func.value, "dict", int(getattr(call, "lineno", 1)), f".{attr}()")
+                    elif attr in {"append", "extend", "insert"}:
+                        add_expectation(call.func.value, "list", int(getattr(call, "lineno", 1)), f".{attr}()")
+                elif isinstance(call.func, ast.Name) and call.args:
+                    if call.func.id in {"sum", "list", "tuple", "set", "sorted", "any", "all", "max", "min"}:
+                        add_expectation(call.args[0], "iterable", int(getattr(call, "lineno", 1)), call.func.id)
+                self.generic_visit(call)
+
+        ExpectationVisitor().visit(node)
+        return expectations
 
     def _return_shape_hints(self, node: ast.FunctionDef | ast.AsyncFunctionDef, args: list[dict[str, Any]] | None = None) -> set[str]:
         shapes: set[str] = set()
@@ -1625,6 +1703,29 @@ class ToolExecutor:
             return not any(shape in container_shapes or shape.startswith("tuple") for shape in shapes)
         return True
 
+    def _caller_return_expectation_compatible(self, expectation: str, annotation: str, shapes: list[str]) -> bool:
+        annotation_shape = self._annotation_expected_shape(annotation)
+        concrete_shapes = {shape for shape in shapes if not shape.startswith(("name:", "call:")) and shape not in {"binop", "unaryop", "boolop", "compare"}}
+        if expectation == "dict":
+            if annotation_shape:
+                return annotation_shape == "dict"
+            return "dict" in concrete_shapes or not concrete_shapes
+        if expectation in {"sequence", "list"}:
+            if annotation_shape:
+                return annotation_shape in {"list", "tuple"}
+            return bool({"list"} & concrete_shapes or any(shape.startswith("tuple") for shape in concrete_shapes) or not concrete_shapes)
+        if expectation == "iterable":
+            if annotation_shape:
+                return annotation_shape in {"list", "tuple", "set", "dict"}
+            scalar_shapes = {"int", "float", "bool", "none", "implicit_none"}
+            return not bool(concrete_shapes & scalar_shapes)
+        if expectation == "indexable":
+            if annotation_shape:
+                return annotation_shape in {"list", "tuple", "dict"}
+            scalar_shapes = {"int", "float", "bool", "none", "implicit_none"}
+            return not bool(concrete_shapes & scalar_shapes)
+        return True
+
     def contract_check(
         self,
         changed_files: list[str] | str,
@@ -1674,6 +1775,15 @@ class ToolExecutor:
                         f"{caller['path']}:{caller['line']} {caller['symbol']} calls {item['name']} with {arg_count} positional args; expected {min_args}"
                         + (f"-{max_args}" if isinstance(max_args, int) and max_args != min_args else "")
                     )
+                for expectation in caller.get("return_expectations", []) or []:
+                    if not isinstance(expectation, dict):
+                        continue
+                    expected_shape = str(expectation.get("shape") or "")
+                    if expected_shape and not self._caller_return_expectation_compatible(expected_shape, returns, shapes):
+                        diagnostics.append(
+                            f"{caller['path']}:{expectation.get('line', caller['line'])} {caller['symbol']} expects {item['name']} return as {expected_shape}; "
+                            f"contract is -> {returns} shape {','.join(shapes)}"
+                        )
         output = "\n".join(diagnostics[: max(1, int(limit))]) if diagnostics else f"contract ok: {len(checked)} Python function(s)"
         return {
             "ok": not diagnostics,
