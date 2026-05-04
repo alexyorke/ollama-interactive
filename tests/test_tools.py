@@ -848,6 +848,39 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result["output"])
 
+    def test_contract_check_flags_builtin_method_receiver_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def names(items: list[str]) -> list[str]:\n"
+                "    return list(items.items())\n\n"
+                "def update(payload: dict[str, int]) -> None:\n"
+                "    payload.append(1)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"])
+
+        self.assertFalse(result["ok"])
+        self.assertIn("calls .items() on list; expected dict receiver", result["output"])
+        self.assertIn("calls .append() on dict; expected list receiver", result["output"])
+
+    def test_contract_check_allows_matching_builtin_method_receivers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def names(items: dict[str, int], labels: list[str]) -> list[str]:\n"
+                "    labels.append('x')\n"
+                "    return list(items.keys())\n\n"
+                "def normalize(value: str) -> str:\n"
+                "    return value.strip().lower()\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"])
+
+        self.assertTrue(result["ok"], result["output"])
+
     def test_lint_typecheck_reports_python_syntax_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

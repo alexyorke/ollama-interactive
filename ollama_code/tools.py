@@ -1399,6 +1399,7 @@ class ToolExecutor:
                         "purity": purity,
                         "is_async": is_async,
                         "has_yield": any(isinstance(child, (ast.Yield, ast.YieldFrom)) for child in ast.walk(node)),
+                        "node": node,
                     }
                     calls_by_def[key] = self.outer._calls_in_node(node)
                     previous = list(self.stack)
@@ -1695,11 +1696,13 @@ class ToolExecutor:
         if not expected:
             return True
         if expected == "tuple":
-            return any(shape.startswith("tuple") for shape in shapes)
+            return any(shape.startswith("tuple") or shape == "call:tuple" for shape in shapes)
         if expected in {"list", "dict", "set"}:
-            return expected in shapes
+            return expected in shapes or f"call:{expected}" in shapes
         if expected in {"int", "str", "float", "bool"}:
             container_shapes = {"list", "dict", "set"}
+            if f"call:{expected}" in shapes:
+                return True
             return not any(shape in container_shapes or shape.startswith("tuple") for shape in shapes)
         return True
 
@@ -1725,6 +1728,123 @@ class ToolExecutor:
             scalar_shapes = {"int", "float", "bool", "none", "implicit_none"}
             return not bool(concrete_shapes & scalar_shapes)
         return True
+
+    def _value_shape_hint(self, value: ast.AST, local_shapes: dict[str, str]) -> str | None:
+        if isinstance(value, ast.Name):
+            return local_shapes.get(value.id)
+        if isinstance(value, ast.List):
+            return "list"
+        if isinstance(value, ast.Dict):
+            return "dict"
+        if isinstance(value, ast.Set):
+            return "set"
+        if isinstance(value, ast.Tuple):
+            return "tuple"
+        if isinstance(value, ast.Constant):
+            if isinstance(value.value, bool):
+                return "bool"
+            if isinstance(value.value, int):
+                return "int"
+            if isinstance(value.value, float):
+                return "float"
+            if isinstance(value.value, str):
+                return "str"
+            if value.value is None:
+                return "none"
+        if isinstance(value, ast.Call):
+            name = self._call_name(value.func)
+            if name in {"list", "dict", "set", "tuple", "str", "int", "float", "bool"}:
+                return name
+        return None
+
+    def _library_method_receiver_contracts(self) -> dict[str, set[str]]:
+        return {
+            "append": {"list"},
+            "extend": {"list"},
+            "insert": {"list"},
+            "sort": {"list"},
+            "reverse": {"list"},
+            "items": {"dict"},
+            "keys": {"dict"},
+            "values": {"dict"},
+            "get": {"dict"},
+            "setdefault": {"dict"},
+            "add": {"set"},
+            "discard": {"set"},
+            "union": {"set"},
+            "intersection": {"set"},
+            "difference": {"set"},
+            "lower": {"str"},
+            "upper": {"str"},
+            "strip": {"str"},
+            "split": {"str"},
+            "join": {"str"},
+            "startswith": {"str"},
+            "endswith": {"str"},
+            "format": {"str"},
+            "encode": {"str"},
+            "bit_length": {"int"},
+            "to_bytes": {"int"},
+            "is_integer": {"float"},
+        }
+
+    def _library_method_contract_diagnostics(self, item: dict[str, Any], node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
+        local_shapes: dict[str, str] = {}
+        for arg in item.get("args", []):
+            if not isinstance(arg, dict):
+                continue
+            name = str(arg.get("name", "")).lstrip("*")
+            shape = self._annotation_expected_shape(str(arg.get("annotation", "")))
+            if name and shape:
+                local_shapes[name] = shape
+        diagnostics: list[str] = []
+        method_contracts = self._library_method_receiver_contracts()
+
+        class MethodVisitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> Any:
+                if nested is not node:
+                    return None
+                self.generic_visit(nested)
+                return None
+
+            def visit_AsyncFunctionDef(self, nested: ast.AsyncFunctionDef) -> Any:
+                if nested is not node:
+                    return None
+                self.generic_visit(nested)
+                return None
+
+            def visit_Assign(self, assign: ast.Assign) -> Any:
+                shape = self_outer._value_shape_hint(assign.value, local_shapes)
+                if shape:
+                    for target in assign.targets:
+                        if isinstance(target, ast.Name):
+                            local_shapes[target.id] = shape
+                self.generic_visit(assign)
+
+            def visit_AnnAssign(self, assign: ast.AnnAssign) -> Any:
+                shape = self_outer._annotation_expected_shape(self_outer._annotation_text(assign.annotation))
+                if not shape and assign.value is not None:
+                    shape = self_outer._value_shape_hint(assign.value, local_shapes)
+                if shape and isinstance(assign.target, ast.Name):
+                    local_shapes[assign.target.id] = shape
+                self.generic_visit(assign)
+
+            def visit_Call(self, call: ast.Call) -> Any:
+                if isinstance(call.func, ast.Attribute):
+                    method = call.func.attr
+                    expected = method_contracts.get(method)
+                    receiver_shape = self_outer._value_shape_hint(call.func.value, local_shapes)
+                    if expected and receiver_shape and receiver_shape not in expected:
+                        expected_text = "/".join(sorted(expected))
+                        diagnostics.append(
+                            f"{item['path']}:{int(getattr(call, 'lineno', item['line']))} {item['symbol']} calls .{method}() "
+                            f"on {receiver_shape}; expected {expected_text} receiver"
+                        )
+                self.generic_visit(call)
+
+        self_outer = self
+        MethodVisitor().visit(node)
+        return diagnostics
 
     def contract_check(
         self,
@@ -1765,6 +1885,9 @@ class ToolExecutor:
                 diagnostics.append(f"{item['path']}:{item['line']} {item['symbol']} annotated -> {returns} but returns shape {','.join(shapes)}")
             if item.get("is_async") and item.get("has_yield"):
                 diagnostics.append(f"{item['path']}:{item['line']} {item['symbol']} is async and yields; verify async generator contract")
+            node = item.get("node")
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                diagnostics.extend(self._library_method_contract_diagnostics(item, node))
             arity = item.get("arity", {})
             min_args = int(arity.get("min", 0))
             max_args = arity.get("max")
