@@ -31,7 +31,7 @@ Each result records:
 - latency, tool-call sequence, failed tools, changed files, tests run
 - assumption-audit count/retries, verifier retries/rewrites
 - prompt profile: chars by role and largest prompt messages
-- feature profile: `baseline`, `schema`, `context-pack`, `evidence-handles`, `num-predict-caps`, `structured-edits`, or `all`
+- feature profile: `baseline`, `schema`, `context-pack`, `evidence-handles`, `num-predict-caps`, `structured-edits`, `trajectory-guards`, `contract-guards`, or `all`
 
 ## Commands
 
@@ -44,7 +44,7 @@ python scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b q
 Run A/B feature profiles without changing prompts:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline all --compare scratch/coding-benchmark/baseline.json --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline trajectory-guards contract-guards all --compare scratch/coding-benchmark/baseline.json --strict-accuracy --strict-budget
 ```
 
 Run the fuller local suite for deeper regression checks:

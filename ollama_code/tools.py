@@ -103,9 +103,24 @@ TOOL_DESCRIPTIONS = [
         "description": "Show static Python callers, callees, imports, and affected tests.",
     },
     {
+        "name": "contract_graph",
+        "arguments": {"path": "file or directory, default .", "symbol": "optional symbol", "limit": "int, default 40"},
+        "description": "Show compact function contracts, callers/callees, return-shape, and purity hints.",
+    },
+    {
         "name": "lint_typecheck",
         "arguments": {"paths": "path or list of paths, default .", "command": "optional lint/type command", "timeout": "seconds, default 120"},
         "description": "Run deterministic syntax/lint/type checks with exact file lines.",
+    },
+    {
+        "name": "contract_check",
+        "arguments": {"changed_files": "list of changed source files", "changed_symbols": "optional list of symbols", "limit": "int, default 80"},
+        "description": "Check changed Python functions for arity, return-shape, async/yield, and annotation contract issues.",
+    },
+    {
+        "name": "select_tests",
+        "arguments": {"changed_files": "list of changed source files", "changed_symbols": "optional list of symbols", "limit": "int, default 8"},
+        "description": "Select focused test commands for changed files using imports, names, and symbols.",
     },
     {
         "name": "replace_symbol",
@@ -207,7 +222,10 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
         "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
         "call_graph": "call_graph(path,symbol?,limit=40)",
+        "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
         "lint_typecheck": "lint_typecheck(paths='.',command?,timeout=120)",
+        "contract_check": "contract_check(changed_files,changed_symbols?,limit=80)",
+        "select_tests": "select_tests(changed_files,changed_symbols?,limit=8)",
         "replace_symbol": "replace_symbol(path,symbol,content)",
         "replace_symbols": 'replace_symbols(path,replacements=[{"symbol":"f","content":"def f():\\n    return ..."}])',
         "write_file": "write_file(path,content)",
@@ -294,7 +312,10 @@ class ToolExecutor:
             "diagnose_test_failure": self.diagnose_test_failure,
             "run_function_probe": self.run_function_probe,
             "call_graph": self.call_graph,
+            "contract_graph": self.contract_graph,
             "lint_typecheck": self.lint_typecheck,
+            "contract_check": self.contract_check,
+            "select_tests": self.select_tests,
             "replace_symbol": self.replace_symbol,
             "replace_symbols": self.replace_symbols,
             "apply_structured_edit": self.apply_structured_edit,
@@ -585,6 +606,10 @@ class ToolExecutor:
                 command.extend(["--glob", f"!{directory}/**"])
             command.extend([query, str(base)])
             result = self._run_process(command, cwd=self.workspace_root, timeout=30)
+            if result.returncode not in {0, 1} and "regex parse error" in (result.stderr or ""):
+                literal_command = list(command)
+                literal_command.insert(1, "-F")
+                result = self._run_process(literal_command, cwd=self.workspace_root, timeout=30)
             output = result.stdout.strip() or result.stderr.strip() or "(no matches)"
             if output != "(no matches)":
                 output = "\n".join(output.splitlines()[: max(1, limit)])
@@ -1296,6 +1321,369 @@ class ToolExecutor:
             "output": "\n".join(rendered) if rendered else raw_output,
         }
 
+    def _annotation_text(self, node: ast.AST | None) -> str:
+        if node is None:
+            return "Any"
+        try:
+            return ast.unparse(node)[:120]
+        except Exception:
+            return "Any"
+
+    def _python_function_contracts(self, base: Path, limit: int = 500) -> dict[str, Any]:
+        definitions: dict[str, dict[str, Any]] = {}
+        calls_by_def: dict[str, list[dict[str, Any]]] = {}
+        imports_by_file: dict[str, list[str]] = {}
+        tests_by_symbol: dict[str, list[str]] = {}
+        module_aliases_by_file: dict[str, dict[str, str]] = {}
+
+        for file_path in self._iter_code_files(base, limit=limit):
+            if file_path.suffix.lower() != ".py":
+                continue
+            rel = self.relative_label(file_path)
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                tree = ast.parse(self._python_parse_text(text), filename=rel)
+            except SyntaxError:
+                continue
+            imports: list[str] = []
+            aliases: dict[str, str] = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.append(alias.name)
+                        aliases[alias.asname or alias.name.split(".")[0]] = alias.name
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    for alias in node.names:
+                        imports.append(f"{node.module}.{alias.name}")
+                        aliases[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+            imports_by_file[rel] = sorted(set(imports))[:120]
+            module_aliases_by_file[rel] = aliases
+
+            class Visitor(ast.NodeVisitor):
+                def __init__(self, outer: ToolExecutor) -> None:
+                    self.outer = outer
+                    self.stack: list[str] = []
+
+                def visit_FunctionDef(self, node: ast.FunctionDef) -> Any:
+                    self._visit_function(node, "function", is_async=False)
+
+                def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> Any:
+                    self._visit_function(node, "function", is_async=True)
+
+                def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+                    previous = list(self.stack)
+                    self.stack.append(node.name)
+                    self.generic_visit(node)
+                    self.stack = previous
+
+                def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef, kind: str, *, is_async: bool) -> None:
+                    qualname = ".".join([*self.stack, node.name])
+                    if self.stack and self.stack[-1][:1].isupper():
+                        kind = "method"
+                    key = f"{rel}:{qualname}"
+                    args = self.outer._contract_args(node.args)
+                    returns = self.outer._annotation_text(node.returns)
+                    return_shapes = self.outer._return_shape_hints(node, args)
+                    purity = self.outer._purity_hint(node, imports_by_file.get(rel, []))
+                    definitions[key] = {
+                        "path": rel,
+                        "symbol": qualname,
+                        "name": node.name,
+                        "kind": kind,
+                        "line": int(getattr(node, "lineno", 1)),
+                        "end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1))),
+                        "args": args,
+                        "arity": self.outer._callable_arity(node.args),
+                        "returns": returns,
+                        "return_shapes": sorted(return_shapes),
+                        "purity": purity,
+                        "is_async": is_async,
+                        "has_yield": any(isinstance(child, (ast.Yield, ast.YieldFrom)) for child in ast.walk(node)),
+                    }
+                    calls_by_def[key] = self.outer._calls_in_node(node)
+                    previous = list(self.stack)
+                    self.stack.append(node.name)
+                    self.generic_visit(node)
+                    self.stack = previous
+
+            Visitor(self).visit(tree)
+
+            if self._path_looks_like_test(file_path):
+                text_lower = text.lower()
+                for key, item in definitions.items():
+                    leaf = str(item.get("name", "")).lower()
+                    if leaf and re.search(rf"\b{re.escape(leaf)}\b", text_lower):
+                        tests_by_symbol.setdefault(str(item.get("name")), []).append(rel)
+
+        callers_by_leaf: dict[str, list[dict[str, Any]]] = {}
+        for caller_key, calls in calls_by_def.items():
+            caller = definitions.get(caller_key)
+            if not caller:
+                continue
+            for call in calls:
+                callers_by_leaf.setdefault(str(call.get("name")), []).append(
+                    {
+                        "path": caller["path"],
+                        "line": call.get("line", caller["line"]),
+                        "symbol": caller["symbol"],
+                        "args": call.get("args", 0),
+                        "keywords": call.get("keywords", []),
+                    }
+                )
+
+        return {
+            "definitions": definitions,
+            "calls_by_def": calls_by_def,
+            "imports_by_file": imports_by_file,
+            "aliases_by_file": module_aliases_by_file,
+            "callers_by_leaf": callers_by_leaf,
+            "tests_by_symbol": tests_by_symbol,
+        }
+
+    def _contract_args(self, args: ast.arguments) -> list[dict[str, Any]]:
+        defaults_start = len(args.args) - len(args.defaults)
+        rows: list[dict[str, Any]] = []
+        all_positional = [*args.posonlyargs, *args.args]
+        for index, arg in enumerate(all_positional):
+            has_default = index >= defaults_start if arg in args.args else False
+            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": not has_default})
+        if args.vararg:
+            rows.append({"name": "*" + args.vararg.arg, "annotation": self._annotation_text(args.vararg.annotation), "required": False})
+        for index, arg in enumerate(args.kwonlyargs):
+            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": args.kw_defaults[index] is None})
+        if args.kwarg:
+            rows.append({"name": "**" + args.kwarg.arg, "annotation": self._annotation_text(args.kwarg.annotation), "required": False})
+        return rows
+
+    def _callable_arity(self, args: ast.arguments) -> dict[str, Any]:
+        positional = [*args.posonlyargs, *args.args]
+        required_positional = len(positional) - len(args.defaults)
+        required_kwonly = sum(1 for default in args.kw_defaults if default is None)
+        return {
+            "min": required_positional + required_kwonly,
+            "max": None if args.vararg else len(positional),
+            "has_vararg": args.vararg is not None,
+            "has_kwarg": args.kwarg is not None,
+        }
+
+    def _call_name(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Name):
+            return node.id
+        if isinstance(node, ast.Attribute):
+            return node.attr
+        return ""
+
+    def _calls_in_node(self, node: ast.AST) -> list[dict[str, Any]]:
+        calls: list[dict[str, Any]] = []
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                name = self._call_name(child.func)
+                if not name:
+                    continue
+                calls.append(
+                    {
+                        "name": name,
+                        "args": len(child.args),
+                        "keywords": [kw.arg for kw in child.keywords if kw.arg],
+                        "line": int(getattr(child, "lineno", 1)),
+                    }
+                )
+        return calls
+
+    def _return_shape_hints(self, node: ast.FunctionDef | ast.AsyncFunctionDef, args: list[dict[str, Any]] | None = None) -> set[str]:
+        shapes: set[str] = set()
+        arg_shapes: dict[str, str] = {}
+        for arg in args or []:
+            name = str(arg.get("name", "")).lstrip("*")
+            shape = self._annotation_expected_shape(str(arg.get("annotation", "")))
+            if name and shape:
+                arg_shapes[name] = shape
+        has_return = False
+        for child in ast.walk(node):
+            if isinstance(child, ast.Return):
+                has_return = True
+                value = child.value
+                if value is None or isinstance(value, ast.Constant) and value.value is None:
+                    shapes.add("none")
+                elif isinstance(value, ast.Tuple):
+                    shapes.add(f"tuple[{len(value.elts)}]")
+                elif isinstance(value, ast.List):
+                    shapes.add("list")
+                elif isinstance(value, ast.Dict):
+                    shapes.add("dict")
+                elif isinstance(value, ast.Set):
+                    shapes.add("set")
+                elif isinstance(value, ast.Constant):
+                    shapes.add(type(value.value).__name__)
+                elif isinstance(value, ast.Call):
+                    shapes.add(f"call:{self._call_name(value.func) or 'unknown'}")
+                elif isinstance(value, ast.Name):
+                    shapes.add(arg_shapes.get(value.id, f"name:{value.id}"))
+                else:
+                    shapes.add(type(value).__name__.lower())
+        if not has_return:
+            shapes.add("implicit_none")
+        return shapes
+
+    def _purity_hint(self, node: ast.FunctionDef | ast.AsyncFunctionDef, imports: list[str]) -> str:
+        impure_imports = {"os", "subprocess", "requests", "httpx", "socket", "pathlib", "shutil"}
+        mutating_methods = {"append", "extend", "insert", "remove", "pop", "clear", "update", "setdefault", "write", "writelines", "unlink", "mkdir", "rmdir", "rename", "replace"}
+        for imported in imports:
+            if imported.split(".")[0] in impure_imports:
+                return "impure_hint"
+        for child in ast.walk(node):
+            if isinstance(child, (ast.Global, ast.Nonlocal, ast.Delete, ast.AugAssign)):
+                return "impure_hint"
+            if isinstance(child, ast.Assign) and any(isinstance(target, (ast.Attribute, ast.Subscript)) for target in child.targets):
+                return "impure_hint"
+            if isinstance(child, ast.Call):
+                name = self._call_name(child.func)
+                if name in mutating_methods or name in {"open", "print", "input"}:
+                    return "impure_hint"
+        return "pure_hint"
+
+    def _contract_signature(self, item: dict[str, Any]) -> str:
+        args = []
+        for arg in item.get("args", []):
+            if not isinstance(arg, dict):
+                continue
+            text = str(arg.get("name", ""))
+            annotation = str(arg.get("annotation", "Any"))
+            if annotation and annotation != "Any":
+                text += f": {annotation}"
+            if not arg.get("required", True):
+                text += "=?"
+            args.append(text)
+        returns = str(item.get("returns") or "Any")
+        return f"{item.get('symbol')}({', '.join(args)})->{returns}"
+
+    def contract_graph(self, path: str = ".", symbol: str | None = None, limit: int = 40) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        contracts = self._python_function_contracts(base)
+        definitions = contracts["definitions"]
+        target = (symbol or "").strip()
+        if target:
+            rows = [
+                item for item in definitions.values()
+                if item["symbol"] == target or str(item["symbol"]).endswith(f".{target}") or item["name"] == target
+            ]
+        else:
+            rows = list(definitions.values())
+        if not rows and base.suffix.lower() != ".py":
+            fallback = self.call_graph(path=path, symbol=symbol, limit=limit)
+            fallback["tool"] = "contract_graph"
+            return fallback
+        output: list[str] = []
+        for item in rows[: max(1, int(limit))]:
+            leaf = str(item["name"])
+            key = f"{item['path']}:{item['symbol']}"
+            callees = sorted({str(call.get("name")) for call in contracts["calls_by_def"].get(key, []) if call.get("name")})[:10]
+            callers = contracts["callers_by_leaf"].get(leaf, [])[:8]
+            tests = contracts["tests_by_symbol"].get(leaf, [])[:6]
+            shapes = ",".join(item.get("return_shapes", [])) or "unknown"
+            output.append(f"{item['path']}:{item['line']} {self._contract_signature(item)} shape={shapes} purity={item['purity']}")
+            output.append(f"  callees: {', '.join(callees) if callees else '(none)'}")
+            output.append("  callers: " + (", ".join(f"{caller['path']}:{caller['line']} {caller['symbol']}({caller['args']})" for caller in callers) if callers else "(none)"))
+            output.append(f"  affected_tests: {', '.join(tests) if tests else '(none)'}")
+        return {
+            "ok": True,
+            "tool": "contract_graph",
+            "path": self.relative_label(base),
+            "symbol": target,
+            "count": len(rows),
+            "output": "\n".join(output) if output else "(no Python contracts found)",
+        }
+
+    def _annotation_allows_none(self, annotation: str) -> bool:
+        lowered = annotation.replace(" ", "").lower()
+        return lowered in {"any", "none"} or "optional[" in lowered or "|none" in lowered or "none|" in lowered
+
+    def _annotation_expected_shape(self, annotation: str) -> str | None:
+        lowered = annotation.replace("typing.", "").lower()
+        if lowered.startswith(("list", "sequence", "iterable")):
+            return "list"
+        if lowered.startswith("dict"):
+            return "dict"
+        if lowered.startswith("set"):
+            return "set"
+        if lowered.startswith("tuple"):
+            return "tuple"
+        if lowered in {"int", "str", "float", "bool"}:
+            return lowered
+        return None
+
+    def _return_shape_compatible(self, expected: str, shapes: list[str]) -> bool:
+        if not expected:
+            return True
+        if expected == "tuple":
+            return any(shape.startswith("tuple") for shape in shapes)
+        if expected in {"list", "dict", "set"}:
+            return expected in shapes
+        if expected in {"int", "str", "float", "bool"}:
+            container_shapes = {"list", "dict", "set"}
+            return not any(shape in container_shapes or shape.startswith("tuple") for shape in shapes)
+        return True
+
+    def contract_check(
+        self,
+        changed_files: list[str] | str,
+        changed_symbols: list[str] | str | None = None,
+        limit: int = 80,
+    ) -> dict[str, Any]:
+        raw_files = [changed_files] if isinstance(changed_files, str) else list(changed_files or [])
+        raw_symbols = [changed_symbols] if isinstance(changed_symbols, str) else list(changed_symbols or [])
+        selected_symbols = {str(symbol).split(".")[-1] for symbol in raw_symbols if str(symbol).strip()}
+        python_files: list[Path] = []
+        for raw_path in raw_files:
+            try:
+                path = self.resolve_path(str(raw_path), allow_missing=False)
+            except Exception:
+                continue
+            if path.is_file() and path.suffix.lower() == ".py":
+                python_files.append(path)
+        if not python_files:
+            return {"ok": True, "tool": "contract_check", "checked": [], "diagnostics": [], "output": "no changed Python source files"}
+        contracts = self._python_function_contracts(self.workspace_root)
+        definitions = contracts["definitions"]
+        diagnostics: list[str] = []
+        checked: list[str] = []
+        changed_rels = {self.relative_label(path) for path in python_files}
+        for key, item in definitions.items():
+            if item["path"] not in changed_rels:
+                continue
+            if selected_symbols and item["name"] not in selected_symbols and item["symbol"] not in selected_symbols:
+                continue
+            checked.append(f"{item['path']}:{item['line']} {item['symbol']}")
+            returns = str(item.get("returns") or "Any")
+            shapes = list(item.get("return_shapes", []))
+            if not self._annotation_allows_none(returns) and any(shape in {"none", "implicit_none"} for shape in shapes):
+                diagnostics.append(f"{item['path']}:{item['line']} {item['symbol']} annotated -> {returns} but may return None")
+            expected_shape = self._annotation_expected_shape(returns)
+            if expected_shape and not self._return_shape_compatible(expected_shape, shapes):
+                diagnostics.append(f"{item['path']}:{item['line']} {item['symbol']} annotated -> {returns} but returns shape {','.join(shapes)}")
+            if item.get("is_async") and item.get("has_yield"):
+                diagnostics.append(f"{item['path']}:{item['line']} {item['symbol']} is async and yields; verify async generator contract")
+            arity = item.get("arity", {})
+            min_args = int(arity.get("min", 0))
+            max_args = arity.get("max")
+            for caller in contracts["callers_by_leaf"].get(str(item["name"]), [])[: max(1, int(limit))]:
+                arg_count = int(caller.get("args", 0))
+                if arg_count < min_args or (isinstance(max_args, int) and arg_count > max_args):
+                    diagnostics.append(
+                        f"{caller['path']}:{caller['line']} {caller['symbol']} calls {item['name']} with {arg_count} positional args; expected {min_args}"
+                        + (f"-{max_args}" if isinstance(max_args, int) and max_args != min_args else "")
+                    )
+        output = "\n".join(diagnostics[: max(1, int(limit))]) if diagnostics else f"contract ok: {len(checked)} Python function(s)"
+        return {
+            "ok": not diagnostics,
+            "tool": "contract_check",
+            "checked": checked,
+            "diagnostics": diagnostics[: max(1, int(limit))],
+            "output": output,
+            "summary": output,
+        }
+
     def call_graph(self, path: str = ".", symbol: str | None = None, limit: int = 40) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
@@ -1416,6 +1804,132 @@ class ToolExecutor:
             "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} Python file(s)",
         }
 
+    def _test_module_for_path(self, test_path: Path) -> str:
+        rel = self.relative_label(test_path)
+        if rel.endswith(".py"):
+            rel = rel[:-3]
+        return rel.replace("/", ".").replace("\\", ".")
+
+    def _source_modules_for_path(self, source_path: Path) -> set[str]:
+        rel = self.relative_label(source_path)
+        without_suffix = rel[:-3] if rel.endswith(".py") else rel
+        modules = {without_suffix.replace("/", ".").replace("\\", ".")}
+        if without_suffix.startswith("src/"):
+            modules.add(without_suffix[4:].replace("/", ".").replace("\\", "."))
+        return modules
+
+    def _iter_python_test_files(self) -> list[Path]:
+        candidates: list[Path] = []
+        for file_path in sorted(self.workspace_root.rglob("*.py")):
+            if not file_path.is_file() or any(part in SKIP_CODE_DIRS for part in file_path.parts):
+                continue
+            rel = self.relative_label(file_path).replace("\\", "/")
+            name = file_path.name.lower()
+            if name.startswith("test_") or name.endswith("_test.py") or "/tests/" in rel:
+                candidates.append(file_path)
+        return candidates
+
+    def _path_looks_like_test(self, path: Path) -> bool:
+        rel = self.relative_label(path).replace("\\", "/").lower()
+        name = path.name.lower()
+        return name.startswith("test_") or name.endswith("_test.py") or "/tests/" in rel
+
+    def _test_matches_source(self, test_path: Path, source_path: Path, symbols: set[str]) -> tuple[int, list[str]]:
+        text = test_path.read_text(encoding="utf-8", errors="replace")
+        score = 0
+        reasons: list[str] = []
+        imported_paths = {str(item.get("path", "")) for item in self._python_import_targets(test_path)}
+        rel_source = self.relative_label(source_path)
+        if rel_source in imported_paths:
+            score += 6
+            reasons.append(f"imports {rel_source}")
+        source_modules = self._source_modules_for_path(source_path)
+        for module in source_modules:
+            if re.search(rf"\b(?:from|import)\s+{re.escape(module)}\b", text):
+                score += 5
+                reasons.append(f"imports module {module}")
+                break
+        source_stem = source_path.stem
+        if source_stem and source_stem.lower() in test_path.stem.lower():
+            score += 3
+            reasons.append(f"filename matches {source_stem}")
+        matched_symbols = sorted(symbol for symbol in symbols if symbol and re.search(rf"\b{re.escape(symbol)}\b", text))
+        if matched_symbols:
+            score += min(4, len(matched_symbols) * 2)
+            reasons.append("mentions " + ", ".join(matched_symbols[:4]))
+        return score, reasons
+
+    def _targeted_unittest_command(self, test_path: Path, symbols: set[str]) -> str:
+        test_dir = self.relative_label(test_path.parent)
+        return f"{sys.executable} -m unittest discover -s {test_dir} -p {test_path.name}"
+
+    def select_tests(
+        self,
+        changed_files: str | list[str],
+        changed_symbols: str | list[str] | None = None,
+        limit: int = 8,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        raw_files = [changed_files] if isinstance(changed_files, str) else list(changed_files or [])
+        raw_symbols = [changed_symbols] if isinstance(changed_symbols, str) else list(changed_symbols or [])
+        symbols = {str(symbol).strip() for symbol in raw_symbols if str(symbol).strip()}
+        source_files: list[Path] = []
+        for raw_path in raw_files:
+            try:
+                path = self.resolve_path(str(raw_path), allow_missing=False)
+            except Exception:
+                continue
+            if path.suffix.lower() == ".py" and path.is_file() and not self._path_looks_like_test(path):
+                source_files.append(path)
+        if not source_files:
+            return {"ok": False, "tool": "select_tests", "summary": "No changed Python source files to map to tests."}
+        ranked: list[tuple[int, Path, list[str]]] = []
+        for test_path in self._iter_python_test_files():
+            score = 0
+            reasons: list[str] = []
+            for source_path in source_files:
+                item_score, item_reasons = self._test_matches_source(test_path, source_path, symbols)
+                score += item_score
+                reasons.extend(item_reasons)
+            if score > 0:
+                ranked.append((score, test_path, reasons))
+        ranked.sort(key=lambda item: (-item[0], self.relative_label(item[1])))
+        selected = ranked[: max(1, int(limit))]
+        if not selected:
+            return {
+                "ok": True,
+                "tool": "select_tests",
+                "confidence": "low",
+                "test_commands": [],
+                "summary": "No targeted tests found; use configured run_test.",
+                "output": "(no targeted tests found)",
+            }
+        commands: list[str] = []
+        rows: list[dict[str, Any]] = []
+        for score, test_path, reasons in selected:
+            command = self._targeted_unittest_command(test_path, symbols)
+            commands.append(command)
+            rows.append(
+                {
+                    "path": self.relative_label(test_path),
+                    "command": command,
+                    "score": score,
+                    "reason": "; ".join(dict.fromkeys(reasons)),
+                }
+            )
+        confidence = "high" if selected[0][0] >= 6 else "medium"
+        lines = [f"{row['path']} score={row['score']} command={row['command']} reason={row['reason']}" for row in rows]
+        return {
+            "ok": True,
+            "tool": "select_tests",
+            "confidence": confidence,
+            "changed_files": [self.relative_label(path) for path in source_files],
+            "changed_symbols": sorted(symbols),
+            "test_commands": commands,
+            "tests": rows,
+            "output": "\n".join(lines),
+        }
+
     def _first_non_empty_indent(self, content: str) -> str:
         for line in content.splitlines():
             if line.strip():
@@ -1431,6 +1945,14 @@ class ToolExecutor:
             return content
         lines = content.splitlines(keepends=True)
         return "".join(target_indent + line if line.strip() else line for line in lines)
+
+    def _python_replacement_kind_error(self, kind: str, replacement: str) -> str | None:
+        stripped = replacement.lstrip("\ufeff").lstrip()
+        if kind in {"function", "method"} and not stripped.startswith(("def ", "async def ")):
+            return "Python function/method replacements must include full def source, not a call or expression."
+        if kind == "class" and not stripped.startswith("class "):
+            return "Python class replacements must include full class source."
+        return None
 
     def replace_symbol(self, path: str, symbol: str, content: str) -> dict[str, Any]:
         self._check_interrupted()
@@ -1465,6 +1987,16 @@ class ToolExecutor:
         normalization = None
         if target.suffix.lower() == ".py":
             replacement, normalization = self._normalize_python_write_content(target, replacement)
+            kind_error = self._python_replacement_kind_error(str(found["kind"]), replacement)
+            if kind_error:
+                return {
+                    "ok": False,
+                    "tool": "replace_symbol",
+                    "path": relative_path,
+                    "symbol": found["qualname"],
+                    "kind": found["kind"],
+                    "summary": kind_error,
+                }
             replacement = self._align_symbol_replacement_indent(replacement, lines[start - 1])
             if original.startswith("\ufeff") and start == 1 and not replacement.startswith("\ufeff"):
                 replacement = "\ufeff" + replacement
@@ -1557,6 +2089,16 @@ class ToolExecutor:
             normalization = None
             if target.suffix.lower() == ".py":
                 replacement, normalization = self._normalize_python_write_content(target, replacement)
+                kind_error = self._python_replacement_kind_error(str(found["kind"]), replacement)
+                if kind_error:
+                    return {
+                        "ok": False,
+                        "tool": "replace_symbols",
+                        "path": relative_path,
+                        "symbol": found["qualname"],
+                        "kind": found["kind"],
+                        "summary": kind_error,
+                    }
                 replacement = self._align_symbol_replacement_indent(replacement, lines[start - 1])
                 if original.startswith("\ufeff") and start == 1 and not replacement.startswith("\ufeff"):
                     replacement = "\ufeff" + replacement
@@ -1744,6 +2286,7 @@ class ToolExecutor:
         if not old or not new or not re.match(r"^[A-Za-z_]\w*$", old) or not re.match(r"^[A-Za-z_]\w*$", new):
             return {"ok": False, "tool": "apply_structured_edit", "summary": "rename_symbol_project requires valid old/new identifiers."}
         updates: list[tuple[Path, str, str]] = []
+        already_renamed_files: list[str] = []
         for file_path in self._iter_code_files(base, limit=1000):
             original = file_path.read_text(encoding="utf-8", errors="replace")
             updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
@@ -1752,7 +2295,19 @@ class ToolExecutor:
                 if diagnostic:
                     return {"ok": False, "tool": "apply_structured_edit", "path": self.relative_label(file_path), "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
                 updates.append((file_path, original, updated))
+            elif re.search(rf"\b{re.escape(new)}\b", original):
+                already_renamed_files.append(self.relative_label(file_path))
         if not updates:
+            if already_renamed_files:
+                return {
+                    "ok": True,
+                    "tool": "apply_structured_edit",
+                    "path": self.relative_label(base),
+                    "op": "rename_symbol_project",
+                    "count": 0,
+                    "summary": f"Identifier already renamed from {old} to {new} in {len(already_renamed_files)} file(s).",
+                    "files": already_renamed_files[:20],
+                }
             return {"ok": False, "tool": "apply_structured_edit", "summary": f"Identifier not found: {old}"}
         preview = "\n".join(self._diff_preview(self.relative_label(path), original, updated) for path, original, updated in updates[:12])
         approved, reason = self._approve_mutation(f"Rename {old} to {new} in {len(updates)} file(s)?", preview)
@@ -1811,6 +2366,8 @@ class ToolExecutor:
             original = target.read_text(encoding="utf-8", errors="replace")
             updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
             if count == 0:
+                if re.search(rf"\b{re.escape(new)}\b", original):
+                    return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "count": 0, "summary": f"Identifier already renamed from {old} to {new} in {relative_path}."}
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": f"Identifier not found: {old}"}
             diagnostic = self._python_syntax_diagnostic(target, updated)
             if diagnostic:
@@ -2043,6 +2600,18 @@ class ToolExecutor:
         content, normalization = self._normalize_python_write_content(target, content)
         existing = target.read_text(encoding="utf-8", errors="replace") if target.exists() else ""
         relative_path = self.relative_label(target)
+        dropped_symbols = self._python_dropped_top_level_symbols(target, existing, content)
+        if dropped_symbols:
+            preview_names = ", ".join(dropped_symbols[:6])
+            if len(dropped_symbols) > 6:
+                preview_names = f"{preview_names}, ..."
+            return {
+                "ok": False,
+                "tool": "write_file",
+                "path": relative_path,
+                "summary": "Refusing to overwrite Python file with partial content that drops existing top-level symbols: "
+                f"{preview_names}. Use replace_symbol/replace_symbols for targeted edits, delete_symbol for removals, or provide the complete file.",
+            }
         preview = self._diff_preview(relative_path, existing, content)
         approved, reason = self._approve_mutation(f"Write {relative_path}?", preview)
         if not approved:
@@ -2136,6 +2705,28 @@ class ToolExecutor:
 
     def _python_parse_text(self, content: str) -> str:
         return content[1:] if content.startswith("\ufeff") else content
+
+    def _python_top_level_symbol_names(self, target: Path, content: str) -> list[str]:
+        if target.suffix.lower() != ".py":
+            return []
+        try:
+            tree = ast.parse(self._python_parse_text(content), filename=self.relative_label(target))
+        except SyntaxError:
+            return []
+        names: list[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                names.append(node.name)
+        return names
+
+    def _python_dropped_top_level_symbols(self, target: Path, existing: str, updated: str) -> list[str]:
+        if target.suffix.lower() != ".py" or not existing.strip():
+            return []
+        existing_names = set(self._python_top_level_symbol_names(target, existing))
+        updated_names = set(self._python_top_level_symbol_names(target, updated))
+        if not existing_names or not updated_names:
+            return []
+        return sorted(existing_names - updated_names)
 
     def _looks_like_word_char(self, value: str) -> bool:
         return value.isalnum() or value == "_"
@@ -2326,7 +2917,17 @@ class ToolExecutor:
                 "tool": "run_test",
                 "summary": "No test command is configured. Set --test-cmd or pass a command to run_test.",
             }
-        result = self.run_shell(selected_command, cwd=cwd, timeout=timeout)
+        normalized = None
+        try:
+            result = self.run_shell(selected_command, cwd=cwd, timeout=timeout)
+        except ValueError as exc:
+            if "Path escapes the workspace" not in str(exc) or str(cwd).strip() in {"", "."}:
+                raise
+            result = self.run_shell(selected_command, cwd=".", timeout=timeout)
+            normalized = f"Ignored run_test cwd outside workspace: {cwd}"
         result["tool"] = "run_test"
         result["command"] = selected_command
+        if normalized:
+            result["normalized"] = normalized
+            result["summary"] = normalized if result.get("ok") else f"{normalized}. {result.get('output', '')[:180]}"
         return result

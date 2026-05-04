@@ -21,7 +21,7 @@ except ModuleNotFoundError:
 
 
 _LOADED_MODELS: set[str] = set()
-FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "all")
+FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "trajectory-guards", "contract-guards", "all")
 
 
 def unload_model(model: str) -> None:

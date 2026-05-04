@@ -25,7 +25,7 @@ except ModuleNotFoundError:  # Imported as scripts.coding_benchmark_eval in unit
 
 _LOADED_MODELS: set[str] = set()
 Command = list[str] | str
-FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "all")
+FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "trajectory-guards", "contract-guards", "all")
 FAIL_CLOSED_MESSAGES = {
     "Stopped because grounded final verification could not accept a final answer.",
     "Stopped because assumption audit could not approve a next tool step.",

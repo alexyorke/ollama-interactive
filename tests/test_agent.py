@@ -170,6 +170,230 @@ class AgentTests(unittest.TestCase):
         self.assertIsInstance(call["response_format"], dict)
         self.assertEqual(call["options"], {"num_predict": 256})
 
+    def test_primary_think_defaults_off_for_broad_coding_prompt(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        think = agent._primary_think_override(
+            request_text="Implement this Python exercise, read tests and source, edit implementation files, and run tests.",
+            requires_tools=False,
+            mutation_required=True,
+            test_run_required=True,
+            round_number=1,
+            tool_used_this_turn=False,
+        )
+
+        self.assertFalse(think)
+
+    def test_primary_think_keeps_default_for_simple_non_tool_prompt(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        think = agent._primary_think_override(
+            request_text="Say ok.",
+            requires_tools=False,
+            mutation_required=False,
+            test_run_required=False,
+            round_number=1,
+            tool_used_this_turn=False,
+        )
+
+        self.assertIsNone(think)
+
+    def test_context_pack_preload_requires_path_for_focused_edit_prompt(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack"}):
+            should_preload = agent._should_preload_context_pack(
+                request_text="Fix src/app.py and run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip = agent._should_preload_context_pack(
+                request_text="Implement this Python exercise, read tests and source, edit implementation files, and run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+
+        self.assertTrue(should_preload)
+        self.assertFalse(should_skip)
+
+    def test_trajectory_loop_cap_blocks_fourth_context_tool(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"hello"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt","start":1,"end":1}}',
+                '{"type":"tool","name":"search","arguments":{"query":"world"}}',
+                '{"type":"final","message":"hello world"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect this repo and summarize the relevant text.")
+
+        self.assertEqual(result.message, "hello world")
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "loop-cap" for event in agent.events))
+        self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["read_file", "search", "read_file"])
+
+    def test_trajectory_ground_guard_rejects_ungrounded_mutation_then_allows_after_read(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value():\n    return 'old'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return \'old\'","new":"return \'new\'"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return \'old\'","new":"return \'new\'"}}',
+                '{"type":"final","message":"Updated app.py."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py by changing old to new.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("return 'new'", (root / "app.py").read_text(encoding="utf-8"))
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "ground-before-mutate" for event in agent.events))
+        self.assertTrue(any(event.get("type") == "auto_validation" and event.get("name") == "lint_typecheck" for event in agent.events))
+
+    def test_trajectory_ground_guard_allows_explicit_new_file_creation(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"write_file","arguments":{"path":"new_app.py","content":"def value():\\n    return 1\\n"}}',
+                '{"type":"final","message":"Created new_app.py."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Create new_app.py with a value function.")
+
+        self.assertTrue(result.completed)
+        self.assertTrue((root / "new_app.py").exists())
+        self.assertFalse(any(event.get("type") == "controller_guard" and event.get("guard") == "ground-before-mutate" for event in agent.events))
+        self.assertTrue(any(event.get("type") == "auto_validation" for event in agent.events))
+
+    def test_trajectory_validation_selects_targeted_tests_after_edit(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "pricing.py").write_text("def cart_total(prices):\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_pricing.py").write_text(
+            "import unittest\n"
+            "from src.pricing import cart_total\n\n"
+            "class PricingTests(unittest.TestCase):\n"
+            "    def test_cart_total(self):\n"
+            "        self.assertEqual(cart_total([2, 3]), 5)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/pricing.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"src/pricing.py","old":"return 0","new":"return sum(prices)"}}',
+                '{"type":"final","message":"Updated src/pricing.py and tests passed."}',
+                '{"type":"final","message":"Updated src/pricing.py and tests passed."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix src/pricing.py and run tests.")
+
+        self.assertTrue(result.completed)
+        tool_events = [event for event in agent.events if event.get("type") == "tool_call"]
+        tool_names = [event.get("name") for event in tool_events]
+        self.assertIn("select_tests", tool_names)
+        run_tests = [event for event in tool_events if event.get("name") == "run_test"]
+        self.assertTrue(run_tests)
+        self.assertIn("test_pricing.py", str(run_tests[-1].get("arguments", {}).get("command", "")))
+
+    def test_contract_guards_run_contract_check_before_targeted_tests(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "pricing.py").write_text("def cart_total(prices: list[int]) -> int:\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_pricing.py").write_text(
+            "import unittest\n"
+            "from src.pricing import cart_total\n\n"
+            "class PricingTests(unittest.TestCase):\n"
+            "    def test_cart_total(self):\n"
+            "        self.assertEqual(cart_total([2, 3]), 5)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/pricing.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"src/pricing.py","old":"return 0","new":"return sum(prices)"}}',
+                '{"type":"final","message":"Updated src/pricing.py and tests passed."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "contract-guards"}):
+            result = agent.handle_user("Fix src/pricing.py and run tests.")
+
+        self.assertTrue(result.completed)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertIn("contract_check", tool_names)
+        self.assertIn("select_tests", tool_names)
+        self.assertLess(tool_names.index("contract_check"), tool_names.index("select_tests"))
+
+    def test_contract_guards_fail_closed_on_contract_mismatch(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"replace_symbol","arguments":{"path":"app.py","symbol":"value","content":"def value() -> int:\\n    pass\\n"}}',
+                '{"type":"final","message":"Updated app.py."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "contract-guards"}):
+            result = agent.handle_user("Fix app.py.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("post-edit validation failed", result.message)
+        self.assertIn("may return None", result.message)
+
+    def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+
+        delta = agent._failure_delta_summary(
+            "FAILED test_ops.py::test_value | AssertionError: expected 1 got 0",
+            "FAILED test_ops.py::test_value | AssertionError: expected 1 got 2",
+        )
+
+        self.assertIn("expected 1 got 2", delta)
+        self.assertNotIn("expected 1 got 0", delta)
+
     def test_agent_context_pack_profile_preloads_context(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -1794,6 +2018,40 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("run_test"), 1)
         auto_results = [event for event in agent.events if event["type"] == "tool_result" and event["name"] == "run_test"]
         self.assertTrue(auto_results[0]["auto"])
+
+    def test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "pricing.py").write_text("def cart_total(prices):\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_pricing.py").write_text(
+            "import unittest\n"
+            "from src.pricing import cart_total\n\n"
+            "class PricingTests(unittest.TestCase):\n"
+            "    def test_cart_total(self):\n"
+            "        self.assertEqual(cart_total([2, 3]), 5)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/pricing.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"src/pricing.py","old":"return 0","new":"return sum(prices)"}}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix src/pricing.py.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Ran validation after the latest edit: passed.")
+        tool_events = [event for event in agent.events if event.get("type") == "tool_call"]
+        tool_names = [event.get("name") for event in tool_events]
+        self.assertIn("select_tests", tool_names)
+        run_tests = [event for event in tool_events if event.get("name") == "run_test"]
+        self.assertTrue(run_tests)
+        self.assertIn("test_pricing.py", str(run_tests[-1].get("arguments", {}).get("command", "")))
 
     def test_agent_requires_edits_to_explicitly_named_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

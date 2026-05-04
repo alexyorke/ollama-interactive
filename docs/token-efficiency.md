@@ -197,6 +197,8 @@ Next optimization pass is feature-gated through `OLLAMA_CODE_FEATURE_PROFILE` an
 - `context-pack`: preload a compact repo evidence bundle for broad/edit/test requests before first model turn.
 - `evidence-handles`: keep full tool results in event logs but feed compact `E#` evidence handles back to the model.
 - `structured-edits`: benchmark label for syntax-preserving edit-intent paths in `apply_structured_edit`.
+- `trajectory-guards`: enable controller guards derived from trajectory profiling: read/search loop caps, grounded-before-mutation checks, post-edit auto-validation, and repeated-failure compaction.
+- `contract-guards`: expose compact Python function contracts and run post-edit contract checks before targeted tests.
 - `all`: enable every gated feature.
 
 Default remains `baseline`. A profile is only safe to enable by default after zero pass-to-fail regressions and lower median total tokens on common passing cases.
@@ -206,6 +208,10 @@ Generic additions behind these profiles:
 - Persistent ignored repo index under `.ollama-code/index/` with paths, mtimes, sizes, hashes, symbols, imports, and term vectors.
 - `context_pack(request,path='.',limit=8)` ranks compact snippets, likely tests, git state, and a suggested next tool.
 - `apply_structured_edit` now supports `replace_function_body`, `change_signature`, `add_import_if_missing`, `rename_symbol_project`/`update_callers`, plus existing rename/delete/move/replace ops.
+- `select_tests(changed_files,changed_symbols?,limit=8)` maps changed Python files to focused `unittest discover` commands using imports, filenames, and symbol mentions before falling back to the configured full test command. It is also used internally by post-edit validation.
+- `contract_graph(path='.',symbol?,limit=40)` emits compact Python signatures, return-shape hints, callers/callees, affected tests, and purity hints.
+- `contract_check(changed_files,changed_symbols?,limit=80)` flags obvious Python arity, return annotation, return-shape, async/yield, and missing-return contract issues before targeted tests.
+- `trajectory-guards` records `controller_guard`, `auto_validation`, and `failure_delta` events so token changes can be tied to controller behavior rather than benchmark-specific prompts.
 - Anti-cheat tests scan runtime source for public Aider smoke task names and keep synthetic literals out of coding-accuracy prompts.
 
 Local feature-profile smoke on `gemma3:4b`, debate off, same `issue_fix_hidden_tests` prompt:
@@ -217,12 +223,33 @@ Local feature-profile smoke on `gemma3:4b`, debate off, same `issue_fix_hidden_t
 
 This saved `6,896` total tokens (`-42.7%`) and improved the case from `fail_closed` to `pass`. The raw run is ignored under `scratch/coding-benchmark/feature-profile-local-smoke.json`.
 
+Trajectory guard pass on `granite4.1:8b`, local-small, debate off, reconcile auto:
+
+| Profile | Status | LLM calls | Total tokens | Notes |
+|---|---:|---:|---:|---|
+| `baseline` | 8/8 pass | 23 | 24,075 | `scratch/coding-benchmark/baseline-local-small-granite.json` |
+| `trajectory-guards` | 8/8 pass | 20 | 21,180 | `scratch/coding-benchmark/trajectory-guards-local-small.json` |
+| `all` | 8/8 pass | 18 | 18,740 | `scratch/coding-benchmark/all-with-trajectory-guards-local-small.json` |
+| `all` + targeted validation/safe symbol edits | 8/8 pass | 20 | 21,343 | `scratch/coding-benchmark/all-select-tests-safe-symbol-local-small.json` |
+| `contract-guards` | 8/8 pass | 23 | 24,425 | `scratch/coding-benchmark/contract-guards-local-small.json` |
+| `all` + contract guards | 8/8 pass | 23 | 26,016 | `scratch/coding-benchmark/contract-guards-all-local-small.json` |
+
+This saved `2,895` total tokens (`-12.0%`) and `3` LLM calls with no pass-to-fail regression. Savings came from the two non-zero coding tasks where guards redirected broad reads/whole-file writes toward grounded edits: `issue_fix_hidden_tests` saved `755` tokens and `multi_file_refactor` saved `2,123` tokens.
+
+With all gated features enabled, the same matrix saved `5,335` total tokens (`-22.2%`) and `5` LLM calls versus baseline while preserving 8/8 pass. A failed first `all` run exposed a generic `search("total(")` invalid-regex loop; `search` now falls back to literal `rg -F` on regex parse errors.
+
+The targeted-validation pass kept 8/8 pass after adding `select_tests`, final-chance post-edit validation, idempotent rename handling, and a guard rejecting Python `replace_symbol` function replacements that are not full `def` source. Latest measured savings versus baseline are `2,732` total tokens (`-11.3%`) and `3` LLM calls, with stricter validation coverage.
+
+The contract-guards pass kept 8/8 pass and saved `1,476` total tokens (`-5.7%`) versus its same-run baseline on local-small. The combined `all` profile passed after adding `run_test` cwd normalization, but it was token-neutral/slightly worse in that run, so `contract-guards` should stay feature-gated rather than promoted as default.
+
 ## Validation
 
-- `python -m unittest discover -v`: 259 passed, 3 skipped.
+- `python -m unittest discover -v`: 287 passed, 3 skipped.
 - Added complex multiturn refactor coverage: read code, write implementation and tests, run tests, inspect git status/diff.
 - Added large-code symbol navigation coverage: find symbol, read exact symbol, avoid full-file read, synthesize exact token.
 - Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.
-- `scripts/token_efficiency_eval.py --strict-accuracy`: 84/84 passed; no pass-to-fail regressions; explicit-tool and symbol-summary corpora are zero LLM calls.
+- `scripts/token_efficiency_eval.py --strict-accuracy`: passed; explicit-tool and symbol-summary corpora are zero LLM calls.
 - `scripts/verification_eval.py --strict-on`: passed on `gemma3:4b`, `qwen3:8b`, and `granite4.1:8b`.
 - `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed after adding deterministic search synthesis and exact-newline write normalization.
+- `scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles all --strict-accuracy`: 8/8 passed on remote Ollama through the car-detection SSH tunnel.
+- `scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline contract-guards all --strict-accuracy`: baseline and contract-guards completed 8/8; the full three-profile run hit the shell timeout after writing usable JSON, so `all` was rerun separately and passed 8/8.

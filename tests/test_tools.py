@@ -129,6 +129,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("join string typo", result["summary"])
         self.assertEqual(final_text, 'def f(items):\n    return " ".join(items)\n')
 
+    def test_write_file_rejects_partial_python_overwrite_that_drops_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "list_ops.py"
+            target.write_text(
+                "def append(a, b):\n    return a + b\n\n\ndef reverse(items):\n    return list(reversed(items))\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.write_file("list_ops.py", "def append(a, b):\n    return a + b\n")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("partial content", result["summary"])
+        self.assertIn("reverse", result["summary"])
+
     def test_write_file_rejects_generated_cache_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -300,6 +315,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertLessEqual(len(result["output"].splitlines()), 3)
 
+    def test_search_falls_back_to_literal_when_rg_regex_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pricing.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.search("total(", limit=5)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("total(prices)", str(result["output"]))
+
     def test_code_outline_returns_python_symbols_without_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -454,6 +479,19 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["syntax_ok"])
         self.assertIn("Refusing replace_symbol", result["summary"])
+        self.assertEqual(final_text, original)
+
+    def test_replace_symbol_rejects_bare_expression_for_python_function(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "sample.py"
+        original = "def target(value):\n    return value + 1\n"
+        sample.write_text(original, encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol("sample.py", "target(value)", "renamed_target(value)")
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("full def source", result["summary"])
         self.assertEqual(final_text, original)
 
     def test_replace_symbol_reports_ambiguous_names(self) -> None:
@@ -701,6 +739,84 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("callees: helper", result["output"])
         self.assertIn("caller", result["output"])
 
+    def test_contract_graph_reports_contracts_and_purity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "import subprocess\n\n"
+                "def helper(value: int) -> int:\n"
+                "    return value + 1\n\n"
+                "def target(value: int) -> int:\n"
+                "    return helper(value)\n\n"
+                "def caller() -> int:\n"
+                "    return target(1)\n\n"
+                "def shell() -> None:\n"
+                "    subprocess.run(['echo', 'x'])\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_graph("app.py", "target")
+            all_result = tools.contract_graph("app.py")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("target(value: int)->int", result["output"])
+        self.assertIn("callees: helper", result["output"])
+        self.assertIn("caller", result["output"])
+        self.assertIn("pure_hint", result["output"])
+        self.assertIn("shell", all_result["output"])
+        self.assertIn("impure_hint", all_result["output"])
+
+    def test_contract_check_passes_compatible_pipeline(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def x() -> int:\n"
+                "    return 1\n\n"
+                "def y(value: int) -> int:\n"
+                "    return value + 1\n\n"
+                "def z() -> int:\n"
+                "    return y(x())\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"])
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertIn("contract ok", result["output"])
+
+    def test_contract_check_flags_arity_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def total(items: list[int], tax: int) -> int:\n"
+                "    return sum(items) + tax\n\n"
+                "def checkout() -> int:\n"
+                "    return total([1, 2])\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"], changed_symbols=["total"])
+
+        self.assertFalse(result["ok"])
+        self.assertIn("calls total with 1 positional args", result["output"])
+
+    def test_contract_check_flags_return_annotation_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def values() -> list[int]:\n"
+                "    return {'a': 1}\n\n"
+                "def missing() -> int:\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"])
+
+        self.assertFalse(result["ok"])
+        self.assertIn("returns shape dict", result["output"])
+        self.assertIn("may return None", result["output"])
+
     def test_lint_typecheck_reports_python_syntax_lines(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -710,6 +826,26 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertIn("bad.py:1", result["output"])
+
+    def test_select_tests_maps_python_source_to_importing_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "pricing.py").write_text("def cart_total(prices):\n    return sum(prices)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text(
+                "from src.pricing import cart_total\n\n"
+                "def test_cart_total():\n"
+                "    assert cart_total([1, 2]) == 3\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.select_tests(["src/pricing.py"], changed_symbols=["cart_total"])
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["confidence"], "high")
+        self.assertIn("unittest discover", result["test_commands"][0])
+        self.assertIn("test_pricing.py", result["test_commands"][0])
 
     def test_apply_structured_edit_renames_symbol_mechanically(self) -> None:
         root = self._workspace_scratch()
@@ -722,6 +858,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("def new_name", final_text)
         self.assertIn("RESULT = new_name(1)", final_text)
+
+    def test_apply_structured_edit_rename_symbol_is_idempotent(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def new_name(value):\n    return value\n\nRESULT = new_name(1)\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "rename_symbol", "path": "ops.py", "old": "old_name", "new": "new_name"})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 0)
+        self.assertIn("already renamed", result["summary"])
 
     def test_apply_structured_edit_adds_import(self) -> None:
         root = self._workspace_scratch()
@@ -768,6 +915,19 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("def cart_total", (root / "src" / "pricing.py").read_text(encoding="utf-8"))
         self.assertIn("cart_total", (root / "tests" / "test_pricing.py").read_text(encoding="utf-8"))
+
+    def test_apply_structured_edit_rename_symbol_project_is_idempotent(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "pricing.py").write_text("def cart_total(items):\n    return sum(items)\n", encoding="utf-8")
+        (root / "tests" / "test_pricing.py").write_text("from src.pricing import cart_total\n\nassert cart_total([1]) == 1\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit({"op": "rename_symbol_project", "path": ".", "old": "total", "new": "cart_total"})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["count"], 0)
+        self.assertIn("already renamed", result["summary"])
 
     def test_generate_tests_from_spec_previews_patch_without_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -843,6 +1003,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
+
+    def test_run_test_normalizes_escaped_cwd_to_workspace_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = f'"{sys.executable}" -c "print(789)"'
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test(cwd=str(root.parent / "other-workspace"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["output"], "789")
+        self.assertIn("Ignored run_test cwd outside workspace", result["normalized"])
 
     def test_run_test_requires_configured_or_explicit_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -12,6 +12,8 @@ FEATURE_NAMES = {
     "evidence-handles",
     "num-predict-caps",
     "structured-edits",
+    "trajectory-guards",
+    "contract-guards",
 }
 
 PROFILE_FEATURES: dict[str, set[str]] = {
@@ -21,6 +23,8 @@ PROFILE_FEATURES: dict[str, set[str]] = {
     "evidence-handles": {"evidence-handles"},
     "num-predict-caps": {"num-predict-caps"},
     "structured-edits": {"structured-edits"},
+    "trajectory-guards": {"trajectory-guards"},
+    "contract-guards": {"contract-guards"},
     "all": set(FEATURE_NAMES),
 }
 
