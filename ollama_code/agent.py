@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+import difflib
 import json
 import re
 import time
@@ -3692,6 +3693,33 @@ class OllamaCodeAgent:
             return True
         return False
 
+    def _resolve_sub_agent_model(self, requested_model: str) -> tuple[str, str | None, str | None]:
+        if requested_model == self.model:
+            return requested_model, None, None
+        list_models = getattr(self.client, "list_models", None)
+        if not callable(list_models):
+            return requested_model, None, None
+        try:
+            available = set(str(model) for model in list_models())
+        except OllamaError as exc:
+            return requested_model, None, f"Could not validate sub-agent model: {exc}"
+        if requested_model in available:
+            return requested_model, None, None
+        latest = f"{requested_model}:latest"
+        if latest in available:
+            return latest, f"Normalized sub-agent model {requested_model} to {latest}.", None
+        close_matches = difflib.get_close_matches(requested_model, available, n=1, cutoff=0.92)
+        if close_matches:
+            resolved = close_matches[0]
+            return resolved, f"Normalized sub-agent model {requested_model} to installed model {resolved}.", None
+        if self.model in available:
+            ratio = difflib.SequenceMatcher(None, requested_model.lower(), self.model.lower()).ratio()
+            if ratio >= 0.92:
+                return self.model, f"Normalized sub-agent model {requested_model} to parent model {self.model}.", None
+        available_preview = ", ".join(sorted(available)[:6])
+        suffix = f" Available models include: {available_preview}." if available_preview else ""
+        return requested_model, None, f"Sub-agent model is not installed: {requested_model}.{suffix}"
+
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -3704,6 +3732,11 @@ class OllamaCodeAgent:
             }
         model = arguments.get("model")
         selected_model = self.model if not isinstance(model, str) or not model.strip() else model.strip()
+        model_note: str | None = None
+        if selected_model != self.model:
+            selected_model, model_note, model_error = self._resolve_sub_agent_model(selected_model)
+            if model_error is not None:
+                return {"ok": False, "tool": "run_agent", "summary": model_error, "missing_dependency": "ollama-model"}
         approval_mode = arguments.get("approval_mode", self.tools.approval_mode)
         if approval_mode not in {"ask", "auto", "read-only"}:
             return {
@@ -3752,6 +3785,8 @@ class OllamaCodeAgent:
             "output": result.message,
             "event_count": len(child.events),
         }
+        if model_note:
+            response["model_note"] = model_note
         if not result.completed:
             response["ok"] = False
             response["summary"] = f"Sub-agent failed: {result.message}"

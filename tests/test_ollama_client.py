@@ -179,6 +179,7 @@ class OllamaClientTests(unittest.TestCase):
 
         self.assertEqual(response.content, "ok")
         self.assertEqual(payload["options"]["num_ctx"], 4096)
+        self.assertEqual(payload["options"]["temperature"], 0)
 
     def test_chat_omits_adaptive_num_ctx_for_very_large_prompt(self) -> None:
         client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
@@ -190,7 +191,7 @@ class OllamaClientTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertNotIn("options", payload)
+        self.assertEqual(payload["options"], {"temperature": 0})
 
     def test_chat_allows_num_ctx_env_override(self) -> None:
         client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
@@ -216,7 +217,7 @@ class OllamaClientTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
-        self.assertNotIn("options", payload)
+        self.assertEqual(payload["options"], {"temperature": 0})
 
     def test_chat_merges_explicit_options_with_adaptive_num_ctx(self) -> None:
         client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
@@ -231,6 +232,19 @@ class OllamaClientTests(unittest.TestCase):
         self.assertEqual(payload["options"]["num_ctx"], 4096)
         self.assertEqual(payload["options"]["temperature"], 0)
         self.assertEqual(payload["options"]["num_predict"], 128)
+
+    def test_chat_allows_explicit_temperature_override(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')
+        try:
+            client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}], options={"temperature": 0.2})
+            payload = json.loads(_MalformedResponseHandler.last_request_body.decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(payload["options"]["temperature"], 0.2)
+        self.assertEqual(payload["options"]["num_ctx"], 4096)
 
     def test_chat_streams_thinking_updates(self) -> None:
         body = (

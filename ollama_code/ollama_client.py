@@ -107,8 +107,11 @@ class OllamaClient:
         )
 
     def _chat_options(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+        options: dict[str, Any] = {"temperature": 0}
         num_ctx = self._num_ctx_for_messages(messages)
-        return {"num_ctx": num_ctx} if num_ctx is not None else {}
+        if num_ctx is not None:
+            options["num_ctx"] = num_ctx
+        return options
 
     def _num_ctx_for_messages(self, messages: list[dict[str, str]]) -> int | None:
         configured = os.environ.get(ENV_OLLAMA_CODE_NUM_CTX)

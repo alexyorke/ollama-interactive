@@ -52,6 +52,7 @@ Implementation notes:
 - `context_pack` reuses repo-index records for test hints.
 - Primary prompts compact non-current history even in short conversations, while keeping the current request with a larger cap.
 - Transcript autosave batches tool-call/tool-result state instead of rewriting the full session JSON after every event.
+- Ollama chat requests now default to `temperature=0`; explicit per-call options can still override it.
 
 Second pass adds controller-direct execution for explicit low-ambiguity requests and primary-context compaction for normal model turns. Compared with the first optimized run, the fixed 70-run explicit-tool corpus stayed 70/70 passing and dropped to `0` LLM calls, `0` prompt tokens, and `0` output tokens. These are not model shortcuts for broad coding work; they only fire when the controller can deterministically prove the required tool path and final answer.
 
@@ -230,7 +231,7 @@ After the fix, the same symbol-summary task passes on all tested models and deba
 Next optimization pass is feature-gated through `OLLAMA_CODE_FEATURE_PROFILE` and benchmark `--feature-profiles`, so token cuts can be A/B tested without changing benchmark prompts:
 
 - `schema`: use Ollama JSON Schema response formats for primary, verifier, auditor, reconciler, and rewriter calls.
-- `num-predict-caps`: cap internal output tokens by purpose and set deterministic internal calls to `temperature=0`.
+- `num-predict-caps`: cap internal output tokens by purpose. Chat requests already default to `temperature=0`.
 - `context-pack`: preload a compact repo evidence bundle for broad/edit/test requests before first model turn.
 - `evidence-handles`: keep full tool results in event logs but feed compact `E#` evidence handles back to the model.
 - `structured-edits`: benchmark label for syntax-preserving edit-intent paths in `apply_structured_edit`.

@@ -163,7 +163,7 @@ You can also set the default test command with `OLLAMA_CODE_TEST_CMD`.
 You can disable assumption auditing and grounded verification with `OLLAMA_CODE_DEBATE=off`.
 You can set failed-artifact reconciliation with `OLLAMA_CODE_RECONCILE=off|on|auto`.
 You can override the verifier/rewrite model with `OLLAMA_CODE_VERIFIER_MODEL`.
-The client sends an adaptive `num_ctx` option for normal compact turns so large-context models do not allocate 40K-131K context for tiny prompts. Set `OLLAMA_CODE_NUM_CTX=off` to use the model default, or set an integer such as `8192` to force a fixed context.
+The client sends `temperature=0` by default for reproducible local runs. It also sends an adaptive `num_ctx` option for normal compact turns so large-context models do not allocate 40K-131K context for tiny prompts. Set `OLLAMA_CODE_NUM_CTX=off` to use the model default, or set an integer such as `8192` to force a fixed context.
 
 Profile local Ollama speed with raw load/prompt/generation counters:
 

@@ -25,17 +25,22 @@ class FakeClient:
         script_assumption_audit: bool = False,
         script_final_rewrite: bool = False,
         script_reconciliation: bool = False,
+        models: list[str] | None = None,
     ) -> None:
         self.responses = list(responses)
         self.script_verification = script_verification
         self.script_assumption_audit = script_assumption_audit
         self.script_final_rewrite = script_final_rewrite
         self.script_reconciliation = script_reconciliation
+        self.models = list(models) if models is not None else ["fake-model"]
         self.calls: list[dict[str, object]] = []
         self.interrupt_events: list[object | None] = []
 
     def set_interrupt_event(self, event: object | None) -> None:
         self.interrupt_events.append(event)
+
+    def list_models(self) -> list[str]:
+        return list(self.models)
 
     def chat(
         self,
@@ -638,6 +643,27 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "parent got: helper saw helper data")
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
+
+    def test_agent_normalizes_near_match_subagent_model(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_agent","arguments":{"prompt":"Say ok.","model":"hf.co/batiai/Granite-4.1-8B-GUF:IQ4_XS","approval_mode":"read-only"}}',
+                '{"type":"final","message":"ok"}',
+                '{"type":"final","message":"parent got ok"}',
+            ],
+            models=["fake-model", "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS"],
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        result = agent.handle_user("Use run_agent with the requested model.")
+
+        self.assertEqual(result.message, "parent got ok")
+        tool_result = agent.events[2]["result"]
+        self.assertTrue(tool_result["ok"])
+        self.assertEqual(tool_result["model"], "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS")
+        self.assertIn("Normalized sub-agent model", tool_result["model_note"])
+        self.assertEqual(client.calls[1]["model"], "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS")
 
     def test_agent_skips_assumption_audit_for_explicit_subagent(self) -> None:
         root = self._workspace_scratch()

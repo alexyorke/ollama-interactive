@@ -412,8 +412,8 @@ def scenario_continue_session(repo_root: Path, workspace: Path, model: str) -> N
 def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> None:
     session_file = workspace / "scratch" / "repl.json"
     repl_input = (
-        "Create scratch/repl.txt with exactly the text repl ok followed by a newline.\n"
-        "Use read_file on scratch/repl.txt and reply with the full line.\n"
+        "Create notes/repl.txt with exactly the text repl ok followed by a newline.\n"
+        "Use read_file on notes/repl.txt and reply with the full line.\n"
         "Use search to find repl ok and tell me which file contains it.\n"
         "/save scratch/repl-saved.json\n"
         "/quit\n"
@@ -430,7 +430,7 @@ def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> Non
     session = load_session(session_file)
     saved = workspace / "scratch" / "repl-saved.json"
     require(result.returncode == 0, "multiturn repl failed", stdout=result.stdout, stderr=result.stderr, session=session)
-    require((workspace / "scratch" / "repl.txt").read_text(encoding="utf-8") == "repl ok\n", "repl file content mismatch", stdout=result.stdout, stderr=result.stderr, session=session)
+    require((workspace / "notes" / "repl.txt").read_text(encoding="utf-8") == "repl ok\n", "repl file content mismatch", stdout=result.stdout, stderr=result.stderr, session=session)
     require(saved.exists(), "manual /save did not create transcript", stdout=result.stdout, stderr=result.stderr, session=session)
     require("tool_call" in event_names(session) and "assistant" in event_names(session), "repl transcript missing expected events", stdout=result.stdout, stderr=result.stderr, session=session)
 
