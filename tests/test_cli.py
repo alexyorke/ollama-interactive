@@ -8,7 +8,7 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, ensure_runtime_default_model, handle_meta_command
+from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, ensure_runtime_default_model, handle_meta_command, startup_help_text
 
 
 class DummyAgent:
@@ -167,6 +167,32 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertEqual(agent.model, "gemma3:4b")
         self.assertIn("ollama pull granite4.1:8b", stream.getvalue())
+
+    def test_startup_help_text_explains_basic_usage(self) -> None:
+        agent = DummyAgent()
+
+        text = startup_help_text(agent)
+
+        self.assertIn("Ollama Code", text)
+        self.assertIn("workspace:", text)
+        self.assertIn("model: granite4.1:8b", text)
+        self.assertIn("Type a coding request", text)
+        self.assertIn("/status", text)
+        self.assertIn("/approval ask|auto|read-only", text)
+        self.assertIn("/tools", text)
+        self.assertIn("Press Esc", text)
+
+    def test_help_command_prints_multiline_command_reference(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/help", agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(len(output), 1)
+        self.assertIn("Slash commands:", output[0])
+        self.assertIn("/model <name>", output[0])
+        self.assertIn("/test [command]", output[0])
+        self.assertIn("fix failing tests", output[0])
 
     def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
         stream = io.StringIO()

@@ -348,19 +348,70 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
     renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}. {DEFAULT_MODEL_PULL_HINT}")
 
 
-def print_banner(agent: OllamaCodeAgent) -> None:
-    print("Ollama Code")
-    print(f"workspace: {agent.workspace_root().as_posix()}")
-    print(f"model: {agent.model}")
-    print(f"approval: {agent.approval_mode()}")
-    print(f"debate: {'on' if agent.debate_mode() else 'off'}")
-    print(f"reconcile: {agent.reconcile_mode()}")
+def startup_help_text(agent: OllamaCodeAgent) -> str:
+    lines = [
+        "Ollama Code",
+        f"workspace: {agent.workspace_root().as_posix()}",
+        f"model: {agent.model} | approval: {agent.approval_mode()} | debate: {'on' if agent.debate_mode() else 'off'} | reconcile: {agent.reconcile_mode()}",
+    ]
     if agent.configured_test_command():
-        print(f"test_cmd: {agent.configured_test_command()}")
+        lines.append(f"test_cmd: {agent.configured_test_command()}")
     if agent.session_path() is not None:
-        print(f"session: {agent.session_path().as_posix()}")
-    print("press Esc to interrupt the current model or tool call")
-    print("commands: /help /status /models /model /approval /debate /reconcile /reset /save /sessions /load /git /diff /commit /test /tools /quit")
+        lines.append(f"session: {agent.session_path().as_posix()}")
+    lines.extend(
+        [
+            "",
+            "Type a coding request, for example:",
+            "  fix the failing tests, inspect first, then run tests",
+            "  summarize the changes in this repo",
+            "",
+            "Useful commands:",
+            "  /status                         show current model/workspace/session",
+            "  /model <name>                    switch local Ollama model",
+            "  /approval ask|auto|read-only     control writes and shell commands",
+            "  /test [command]                  run configured or explicit tests",
+            "  /tools                           show available filesystem/code tools",
+            "  /help                            show all slash commands",
+            "  /quit                            exit",
+            "",
+            "Press Esc to interrupt the current model or tool call.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def slash_help_text() -> str:
+    return "\n".join(
+        [
+            "Slash commands:",
+            "  /help                            show this help",
+            "  /status                          show workspace/model/session/config",
+            "  /models                          list local Ollama models",
+            "  /model <name>                    switch model",
+            "  /approval ask|auto|read-only     control writes and shell commands",
+            "  /debate on|off                   toggle tool audits and final verification",
+            "  /reconcile off|on|auto           toggle artifact reconciliation",
+            "  /reset                           clear conversation memory",
+            "  /save [path]                     save transcript",
+            "  /sessions [limit]                list saved sessions",
+            "  /load <path>                     load a saved session",
+            "  /git                             show git status",
+            "  /diff [--cached] [path]          show git diff",
+            "  /commit <message>                commit via git_commit tool",
+            "  /test [command]                  run tests",
+            "  /tools                           show model-facing tools",
+            "  /quit                            exit",
+            "",
+            "Tips:",
+            "  Ask normally: \"fix failing tests, inspect source first, then run tests\".",
+            "  Use /approval read-only for inspection-only sessions.",
+            "  Press Esc during model or tool execution to interrupt.",
+        ]
+    )
+
+
+def print_banner(agent: OllamaCodeAgent) -> None:
+    print(startup_help_text(agent))
 
 
 def _strip_matching_quotes(text: str) -> str:
@@ -379,11 +430,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
     if action in {"/quit", "/exit"}:
         return False
     if action == "/help":
-        writer(
-            "Slash commands: /help /status /models /model <name> /approval <mode> /debate on|off /reconcile off|on|auto /reset /save [path] /sessions [limit] "
-            "/load <path> /git /diff [--cached] [path] /commit <message> /test [command] /tools /quit\nPress Esc during model "
-            "or tool execution to interrupt the current task."
-        )
+        writer(slash_help_text())
         return True
     if action == "/status":
         session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
