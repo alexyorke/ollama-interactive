@@ -8,6 +8,7 @@ import json
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -24,6 +25,8 @@ AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
 WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 CODE_FILE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".cs", ".rb", ".php"}
+REPO_INDEX_VERSION = 2
+FILE_INDEX_VERSION = 1
 SKIP_CODE_DIRS = {
     ".git",
     ".hg",
@@ -39,6 +42,19 @@ SKIP_CODE_DIRS = {
     "venv",
 }
 DENY_MUTATION_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ollama-code"}
+ERROR_CLASS_PATTERNS: dict[str, re.Pattern[str]] = {
+    "missing_dependency": re.compile(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]|No module named ['\"]([^'\"]+)['\"]", re.IGNORECASE),
+    "import_error": re.compile(r"ImportError|cannot import name", re.IGNORECASE),
+    "syntax_error": re.compile(r"SyntaxError|IndentationError|unexpected EOF|invalid syntax", re.IGNORECASE),
+    "test_assertion": re.compile(r"AssertionError|FAILED\s+\S+|FAIL:|E\s+assert", re.IGNORECASE),
+    "invalid_args": re.compile(r"unrecognized arguments|invalid option|unknown option|usage:|error: argument|missing required", re.IGNORECASE),
+    "command_not_found": re.compile(r"command not found|not recognized as (?:an internal|the name)", re.IGNORECASE),
+    "path_missing": re.compile(r"No such file or directory|cannot access|FileNotFoundError|Path does not exist|path .* does not exist", re.IGNORECASE),
+    "cwd_git": re.compile(r"cd: .*No such file|outside workspace|escapes the workspace|not inside a git repository", re.IGNORECASE),
+    "timeout": re.compile(r"timed out|Timeout|exceeded.*timeout|killed", re.IGNORECASE),
+    "permission": re.compile(r"Permission denied|access is denied|Operation not permitted", re.IGNORECASE),
+    "patch_apply": re.compile(r"patch failed|does not apply|git apply.*failed|hunk FAILED|error: patch", re.IGNORECASE),
+}
 
 
 TOOL_DESCRIPTIONS = [
@@ -56,6 +72,21 @@ TOOL_DESCRIPTIONS = [
         "name": "search",
         "arguments": {"query": "regex or plain text", "path": "relative path, default .", "limit": "int, default 100"},
         "description": "Search text in the workspace.",
+    },
+    {
+        "name": "file_search",
+        "arguments": {"query": "filename/path terms", "path": "relative path, default .", "limit": "int, default 100"},
+        "description": "Search cached workspace file paths quickly without reading file contents.",
+    },
+    {
+        "name": "file_index_refresh",
+        "arguments": {"path": "relative path, default .", "limit": "int, default 50000"},
+        "description": "Refresh the persistent workspace file path index for fast future file searches.",
+    },
+    {
+        "name": "everything_search",
+        "arguments": {"query": "Everything search query", "path": "relative path, default .", "limit": "int, default 100"},
+        "description": "Use the native Everything CLI es.exe when installed, constrained to the workspace path.",
     },
     {
         "name": "search_symbols",
@@ -76,6 +107,21 @@ TOOL_DESCRIPTIONS = [
         "name": "repo_index_search",
         "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
         "description": "Search code with compact ranked snippets instead of whole files.",
+    },
+    {
+        "name": "indexed_search",
+        "arguments": {"query": "plain terms or regex-like text", "path": "relative path, default .", "limit": "int, default 100"},
+        "description": "Search cached line snippets from the persistent repo index without scanning every file.",
+    },
+    {
+        "name": "repo_index_refresh",
+        "arguments": {"path": "relative path, default .", "limit": "int, default 1000"},
+        "description": "Refresh the persistent repo index for faster future symbol and text searches.",
+    },
+    {
+        "name": "semgrep_scan",
+        "arguments": {"pattern": "Semgrep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
+        "description": "Run Semgrep structurally when semgrep is installed; useful for syntax-aware code search.",
     },
     {
         "name": "context_pack",
@@ -213,10 +259,16 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "list_files": "list_files(path='.',depth=4,limit=200)",
         "read_file": "read_file(path,start=1,end=200)",
         "search": "search(query,path='.',limit=100)",
+        "file_search": "file_search(query,path='.',limit=100)",
+        "file_index_refresh": "file_index_refresh(path='.',limit=50000)",
+        "everything_search": "everything_search(query,path='.',limit=100)",
         "search_symbols": "search_symbols(query,path='.',limit=50)",
         "code_outline": "code_outline(path,max_symbols=120)",
         "read_symbol": "read_symbol(path,symbol,context=2)",
         "repo_index_search": "repo_index_search(query,path='.',limit=10)",
+        "indexed_search": "indexed_search(query,path='.',limit=100)",
+        "repo_index_refresh": "repo_index_refresh(path='.',limit=1000)",
+        "semgrep_scan": "semgrep_scan(pattern,path='.',lang?,limit=50)",
         "context_pack": "context_pack(request,path='.',limit=8)",
         "find_implementation_target": "find_implementation_target(test_path?,output?,limit=12)",
         "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
@@ -303,10 +355,16 @@ class ToolExecutor:
             "list_files": self.list_files,
             "read_file": self.read_file,
             "search": self.search,
+            "file_search": self.file_search,
+            "file_index_refresh": self.file_index_refresh,
+            "everything_search": self.everything_search,
             "search_symbols": self.search_symbols,
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
             "repo_index_search": self.repo_index_search,
+            "indexed_search": self.indexed_search,
+            "repo_index_refresh": self.repo_index_refresh,
+            "semgrep_scan": self.semgrep_scan,
             "context_pack": self.context_pack,
             "find_implementation_target": self.find_implementation_target,
             "diagnose_test_failure": self.diagnose_test_failure,
@@ -338,7 +396,22 @@ class ToolExecutor:
         except TypeError as exc:
             return {"ok": False, "tool": name, "summary": f"Bad arguments for {name}: {exc}"}
         except Exception as exc:  # pragma: no cover - defensive fallback
-            return {"ok": False, "tool": name, "summary": f"{name} failed: {exc}"}
+            return self._tool_exception_result(name, arguments, exc)
+
+    def _tool_exception_result(self, name: str, arguments: dict[str, Any], exc: Exception) -> dict[str, Any]:
+        summary = f"{name} failed: {exc}"
+        error_class = self.classify_error(summary)
+        result: dict[str, Any] = {"ok": False, "tool": name, "summary": summary, "error_class": error_class}
+        raw_path = ""
+        if isinstance(arguments, dict):
+            for key in ("path", "cwd", "test_path"):
+                value = arguments.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_path = value
+                    break
+        if error_class in {"path_missing", "cwd_git"} and raw_path:
+            result["suggested_paths"] = self._nearest_existing_paths(raw_path)
+        return result
 
     def resolve_path(self, raw_path: str | None, *, allow_missing: bool = True) -> Path:
         candidate = self.workspace_root if not raw_path else self._coerce_input_path(raw_path)
@@ -644,6 +717,203 @@ class ToolExecutor:
             "output": "\n".join(matches) if matches else "(no matches)",
         }
 
+    def _file_index_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "file_index.json"
+
+    def _load_file_index(self) -> dict[str, Any]:
+        cache_path = self._file_index_cache_path()
+        if not cache_path.exists():
+            return {"version": FILE_INDEX_VERSION, "files": {}}
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"version": FILE_INDEX_VERSION, "files": {}}
+        if not isinstance(payload, dict) or payload.get("version") != FILE_INDEX_VERSION or not isinstance(payload.get("files"), dict):
+            return {"version": FILE_INDEX_VERSION, "files": {}}
+        return payload
+
+    def _write_file_index(self, payload: dict[str, Any]) -> None:
+        cache_path = self._file_index_cache_path()
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            payload["version"] = FILE_INDEX_VERSION
+            cache_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        except OSError:
+            return
+
+    def _iter_workspace_files(self, base: Path, *, limit: int = 50000) -> list[Path]:
+        if base.is_file():
+            return [base]
+        files: list[Path] = []
+        for root, dirs, names in os.walk(base):
+            self._check_interrupted()
+            dirs[:] = sorted(directory for directory in dirs if directory not in SKIP_CODE_DIRS)
+            root_path = Path(root)
+            for name in sorted(names):
+                if len(files) >= limit:
+                    return files
+                file_path = root_path / name
+                if not file_path.is_file():
+                    continue
+                if any(part in SKIP_CODE_DIRS for part in file_path.relative_to(self.workspace_root).parts):
+                    continue
+                files.append(file_path)
+        return files
+
+    def _file_index_record(self, file_path: Path) -> dict[str, Any]:
+        stat = file_path.stat()
+        rel = self.relative_label(file_path)
+        return {
+            "path": rel,
+            "name": file_path.name,
+            "suffix": file_path.suffix.lower(),
+            "mtime_ns": int(stat.st_mtime_ns),
+            "size": int(stat.st_size),
+            "terms": self._extract_index_terms(rel.replace("/", " "), limit=80),
+        }
+
+    def _indexed_file_records(self, base: Path, *, limit: int = 50000) -> list[dict[str, Any]]:
+        payload = self._load_file_index()
+        files_payload = payload.setdefault("files", {})
+        assert isinstance(files_payload, dict)
+        changed = False
+        seen: set[str] = set()
+        records: list[dict[str, Any]] = []
+        for file_path in self._iter_workspace_files(base, limit=limit):
+            self._check_interrupted()
+            rel = self.relative_label(file_path)
+            seen.add(rel)
+            stat = file_path.stat()
+            cached = files_payload.get(rel)
+            if not (
+                isinstance(cached, dict)
+                and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+                and cached.get("size") == int(stat.st_size)
+            ):
+                cached = self._file_index_record(file_path)
+                files_payload[rel] = cached
+                changed = True
+            records.append(cached)
+        for rel in list(files_payload):
+            path = self.workspace_root / rel
+            if rel not in seen and (base == self.workspace_root or path == base or base in path.parents):
+                files_payload.pop(rel, None)
+                changed = True
+        if changed:
+            self._write_file_index(payload)
+        return records
+
+    def file_index_refresh(self, path: str = ".", limit: int = 50000) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        records = self._indexed_file_records(base, limit=max(1, int(limit)))
+        return {
+            "ok": True,
+            "tool": "file_index_refresh",
+            "path": self.relative_label(base),
+            "files": len(records),
+            "cache": self.relative_label(self._file_index_cache_path()),
+            "output": f"Indexed {len(records)} file path(s).",
+        }
+
+    def file_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_query = str(query or "").strip()
+        terms = self._extract_index_terms(clean_query, limit=20)
+        if not terms:
+            return {"ok": False, "tool": "file_search", "summary": "file_search requires a non-empty query."}
+        query_lower = clean_query.lower()
+        rows: list[tuple[int, str]] = []
+        for record in self._indexed_file_records(base, limit=50000):
+            rel = str(record.get("path", ""))
+            rel_lower = rel.lower()
+            name_lower = str(record.get("name", "")).lower()
+            record_terms = set(str(term).lower() for term in record.get("terms", []) if isinstance(term, str))
+            score = 0
+            if query_lower and query_lower in rel_lower:
+                score += 30
+            if query_lower and query_lower in name_lower:
+                score += 40
+            for term in terms:
+                if term in record_terms:
+                    score += 10
+                elif term in rel_lower:
+                    score += 5
+                if term in name_lower:
+                    score += 8
+            if score:
+                rows.append((score, rel))
+        ranked = [line for _, line in sorted(rows, key=lambda item: (-item[0], item[1]))[: max(1, int(limit))]]
+        return {
+            "ok": True,
+            "tool": "file_search",
+            "path": self.relative_label(base),
+            "count": len(ranked),
+            "output": "\n".join(ranked) if ranked else "(no file matches)",
+        }
+
+    def _everything_cli_path(self) -> str | None:
+        configured = os.environ.get("EVERYTHING_CLI", "").strip()
+        candidates = [configured] if configured else []
+        found = shutil.which("es.exe") or shutil.which("es")
+        if found:
+            candidates.append(found)
+        if os.name == "nt":
+            candidates.extend(
+                [
+                    r"C:\Program Files\Everything\es.exe",
+                    r"C:\Program Files (x86)\Everything\es.exe",
+                    str(Path.home() / "scoop" / "shims" / "es.exe"),
+                    r"C:\ProgramData\chocolatey\bin\es.exe",
+                ]
+            )
+        for candidate in candidates:
+            if candidate and Path(candidate).exists():
+                return candidate
+        return None
+
+    def everything_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return {"ok": False, "tool": "everything_search", "summary": "everything_search requires a non-empty query."}
+        es_path = self._everything_cli_path()
+        if not es_path:
+            return {
+                "ok": False,
+                "tool": "everything_search",
+                "summary": "Everything CLI es.exe is not installed or not on PATH. Install es.exe or use file_search.",
+            }
+        command = [es_path, "-n", str(max(1, int(limit)) * 5), clean_query]
+        completed = self._run_process(command, cwd=self.workspace_root, timeout=30, shell=False)
+        output = self._collect_process_output(completed)
+        matches: list[str] = []
+        base_resolved = base.resolve()
+        for line in (completed.stdout or "").splitlines():
+            raw = line.strip().strip('"')
+            if not raw:
+                continue
+            try:
+                candidate = Path(raw).resolve()
+            except OSError:
+                continue
+            if candidate == base_resolved or base_resolved in candidate.parents:
+                try:
+                    matches.append(self.relative_label(candidate))
+                except ValueError:
+                    continue
+            if len(matches) >= max(1, int(limit)):
+                break
+        return {
+            "ok": completed.returncode in {0, 1},
+            "tool": "everything_search",
+            "path": self.relative_label(base),
+            "count": len(matches),
+            "output": "\n".join(matches) if matches else ("(no Everything matches)" if completed.returncode in {0, 1} else output),
+        }
+
     def _is_code_file(self, path: Path) -> bool:
         return path.suffix.lower() in CODE_FILE_SUFFIXES and not any(part in SKIP_CODE_DIRS for part in path.parts)
 
@@ -895,6 +1165,17 @@ class ToolExecutor:
         stat = file_path.stat()
         text = file_path.read_text(encoding="utf-8", errors="replace")
         symbols, _, _ = self._code_symbols(file_path)
+        line_index: list[dict[str, Any]] = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            terms = self._extract_index_terms(stripped, limit=40)
+            if not terms:
+                continue
+            line_index.append({"line": line_no, "text": stripped[:220], "terms": terms})
+            if len(line_index) >= 800:
+                break
         return {
             "path": self.relative_label(file_path),
             "mtime_ns": int(stat.st_mtime_ns),
@@ -903,24 +1184,26 @@ class ToolExecutor:
             "symbols": symbols[:300],
             "imports": self._python_imports_for_index(file_path, text),
             "terms": self._extract_index_terms(text),
+            "line_index": line_index,
         }
 
     def _load_repo_index(self) -> dict[str, Any]:
         cache_path = self._repo_index_cache_path()
         if not cache_path.exists():
-            return {"version": 1, "files": {}}
+            return {"version": REPO_INDEX_VERSION, "files": {}}
         try:
             payload = json.loads(cache_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            return {"version": 1, "files": {}}
-        if not isinstance(payload, dict) or payload.get("version") != 1 or not isinstance(payload.get("files"), dict):
-            return {"version": 1, "files": {}}
+            return {"version": REPO_INDEX_VERSION, "files": {}}
+        if not isinstance(payload, dict) or payload.get("version") != REPO_INDEX_VERSION or not isinstance(payload.get("files"), dict):
+            return {"version": REPO_INDEX_VERSION, "files": {}}
         return payload
 
     def _write_repo_index(self, payload: dict[str, Any]) -> None:
         cache_path = self._repo_index_cache_path()
         try:
             cache_path.parent.mkdir(parents=True, exist_ok=True)
+            payload["version"] = REPO_INDEX_VERSION
             cache_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
         except OSError:
             return
@@ -942,6 +1225,7 @@ class ToolExecutor:
                 isinstance(cached, dict)
                 and cached.get("mtime_ns") == int(stat.st_mtime_ns)
                 and cached.get("size") == int(stat.st_size)
+                and isinstance(cached.get("line_index"), list)
             ):
                 cached = self._code_index_record(file_path)
                 files_payload[rel] = cached
@@ -1023,6 +1307,119 @@ class ToolExecutor:
             "path": self.relative_label(base),
             "count": len(ranked_records),
             "output": "\n".join(output) if output else "(no ranked snippets)",
+        }
+
+    def indexed_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        if not terms:
+            return {"ok": False, "tool": "indexed_search", "summary": "indexed_search requires a non-empty query."}
+        limit_value = max(1, int(limit))
+        rows: list[tuple[int, str]] = []
+        for record in self._indexed_code_records(base, limit=1000):
+            rel = str(record.get("path", ""))
+            path_text = rel.lower()
+            for item in record.get("line_index", []):
+                if not isinstance(item, dict):
+                    continue
+                line_terms = set(str(term).lower() for term in item.get("terms", []) if isinstance(term, str))
+                text = str(item.get("text", ""))
+                lowered = text.lower()
+                score = 0
+                for term in terms:
+                    if term in path_text:
+                        score += 3
+                    if term in line_terms:
+                        score += 8
+                    elif term in lowered:
+                        score += 5
+                if score:
+                    rows.append((score, f"{rel}:{item.get('line')}: {text}"))
+        ranked = [line for _, line in sorted(rows, key=lambda item: (-item[0], item[1]))[:limit_value]]
+        return {
+            "ok": True,
+            "tool": "indexed_search",
+            "path": self.relative_label(base),
+            "count": len(ranked),
+            "output": "\n".join(ranked) if ranked else "(no indexed matches)",
+        }
+
+    def repo_index_refresh(self, path: str = ".", limit: int = 1000) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        records = self._indexed_code_records(base, limit=max(1, int(limit)))
+        symbol_count = sum(len(record.get("symbols", [])) for record in records if isinstance(record, dict))
+        line_count = sum(len(record.get("line_index", [])) for record in records if isinstance(record, dict))
+        return {
+            "ok": True,
+            "tool": "repo_index_refresh",
+            "path": self.relative_label(base),
+            "files": len(records),
+            "symbols": symbol_count,
+            "lines": line_count,
+            "cache": self.relative_label(self._repo_index_cache_path()),
+            "output": f"Indexed {len(records)} file(s), {symbol_count} symbol(s), {line_count} searchable line(s).",
+        }
+
+    def _semgrep_lang_for_path(self, base: Path) -> str | None:
+        suffix = base.suffix.lower() if base.is_file() else ""
+        if suffix == ".py":
+            return "python"
+        if suffix in {".js", ".jsx"}:
+            return "javascript"
+        if suffix in {".ts", ".tsx"}:
+            return "typescript"
+        if suffix == ".go":
+            return "go"
+        if suffix == ".rs":
+            return "rust"
+        if suffix == ".java":
+            return "java"
+        return None
+
+    def semgrep_scan(self, pattern: str, path: str = ".", lang: str | None = None, limit: int = 50) -> dict[str, Any]:
+        self._check_interrupted()
+        semgrep = shutil.which("semgrep")
+        if not semgrep:
+            return {"ok": False, "tool": "semgrep_scan", "summary": "semgrep is not installed. Install semgrep to use structural search."}
+        base = self.resolve_path(path, allow_missing=False)
+        clean_pattern = str(pattern or "").strip()
+        if not clean_pattern:
+            return {"ok": False, "tool": "semgrep_scan", "summary": "semgrep_scan requires a pattern."}
+        clean_lang = (lang or self._semgrep_lang_for_path(base) or "python").strip().lower()
+        allowed_langs = {"python", "javascript", "typescript", "go", "rust", "java", "c", "cpp", "csharp", "ruby", "php"}
+        if clean_lang not in allowed_langs:
+            return {"ok": False, "tool": "semgrep_scan", "summary": f"Unsupported semgrep language: {clean_lang}"}
+        command = [semgrep, "--json", "--quiet", "-e", clean_pattern, "--lang", clean_lang, str(base)]
+        completed = self._run_process(command, cwd=self.workspace_root, timeout=60, shell=False)
+        output = self._collect_process_output(completed)
+        try:
+            payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            payload = {}
+        results = payload.get("results") if isinstance(payload, dict) else None
+        rows: list[str] = []
+        if isinstance(results, list):
+            for item in results[: max(1, int(limit))]:
+                if not isinstance(item, dict):
+                    continue
+                start = item.get("start") if isinstance(item.get("start"), dict) else {}
+                extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
+                item_path = str(item.get("path", ""))
+                rel = item_path
+                try:
+                    rel = self.relative_label(Path(item_path))
+                except Exception:
+                    pass
+                rows.append(f"{rel}:{start.get('line', '?')}: {str(extra.get('lines', '')).strip()[:220]}")
+        return {
+            "ok": completed.returncode in {0, 1},
+            "tool": "semgrep_scan",
+            "path": self.relative_label(base),
+            "lang": clean_lang,
+            "count": len(rows),
+            "output": "\n".join(rows) if rows else ("(no semgrep matches)" if completed.returncode in {0, 1} else output),
         }
 
     def context_pack(self, request: str, path: str = ".", limit: int = 8) -> dict[str, Any]:
@@ -1215,6 +1612,8 @@ class ToolExecutor:
         assertions = re.findall(r"(?m)^\s*E\s+assert\s+(.+)$", text)
         unittest_assertions = re.findall(r"AssertionError:\s+([^\n]+)", text)
         exceptions = re.findall(r"(?m)^(?:E\s+)?([A-Za-z_][\w.]+(?:Error|Exception)):\s*(.+)$", text)
+        error_class = self.classify_error(text)
+        missing_dependency = self._missing_dependency_name(text)
         expected_actual: list[str] = []
         for assertion in assertions:
             if "==" in assertion:
@@ -1236,8 +1635,22 @@ class ToolExecutor:
             root_causes.extend(f"assertion mismatch: {item}" for item in expected_actual[: max(1, int(limit))])
         if not root_causes and "ModuleNotFoundError" in text:
             root_causes.append("import/module discovery failure")
+        if missing_dependency:
+            root_causes.insert(0, f"missing dependency: {missing_dependency}")
         targets = self.find_implementation_target(output=text, limit=limit)
+        next_tool = "read_file"
+        if error_class == "syntax_error":
+            next_tool = "lint_typecheck"
+        elif error_class in {"test_assertion", "import_error"}:
+            next_tool = "find_implementation_target"
+        elif error_class == "missing_dependency":
+            next_tool = "fail_closed"
+        elif error_class in {"invalid_args", "command_not_found"}:
+            next_tool = "run_test"
         lines: list[str] = []
+        lines.append(f"class {error_class} next={next_tool}")
+        if missing_dependency:
+            lines.append(f"missing_dependency {missing_dependency}")
         for failure in failures[: max(1, int(limit))]:
             test_id = failure["test"] + (f"::{failure['case']}" if failure["case"] else "")
             lines.append(f"fail {test_id}: {failure['message'] or '(see traceback)'}")
@@ -1250,6 +1663,9 @@ class ToolExecutor:
             "ok": True,
             "tool": "diagnose_test_failure",
             "path": self.relative_label(self.resolve_path(path, allow_missing=False)),
+            "error_class": error_class,
+            "missing_dependency": missing_dependency,
+            "next_tool": next_tool,
             "failures": failures[: max(1, int(limit))],
             "root_causes": root_causes[: max(1, int(limit))],
             "targets": targets.get("targets", []),
@@ -3119,28 +3535,307 @@ class ToolExecutor:
             result["summary"] += f" {diagnostic}"
         return result
 
+    def classify_error(self, text: str) -> str:
+        for name, pattern in ERROR_CLASS_PATTERNS.items():
+            if pattern.search(text):
+                return name
+        return "unknown"
+
+    def _missing_dependency_name(self, text: str) -> str | None:
+        match = ERROR_CLASS_PATTERNS["missing_dependency"].search(text)
+        if not match:
+            return None
+        return next((group for group in match.groups() if group), None)
+
+    def _split_command_for_validation(self, command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
+        try:
+            argv = shlex.split(command, posix=os.name != "nt")
+        except ValueError as exc:
+            return None, {
+                "recognized": False,
+                "valid": False,
+                "family": "shell",
+                "reason": f"Command rejected before execution: invalid quoting ({exc}).",
+            }
+        if not argv:
+            return None, {
+                "recognized": False,
+                "valid": False,
+                "family": "shell",
+                "reason": "Command rejected before execution: empty command.",
+            }
+        return argv, None
+
+    def _command_has_shell_chaining(self, command: str) -> bool:
+        return bool(re.search(r"&&|\|\||[;|<>]", command))
+
+    def _command_path_escapes(self, token: str, cwd: Path) -> bool:
+        if not token or token.startswith("-"):
+            return False
+        if token in {".", ".."} or token.startswith("../") or token.startswith("..\\"):
+            return True
+        if any(ch in token for ch in "*?[]"):
+            return False
+        if re.match(r"^[A-Za-z]+://", token):
+            return False
+        candidate = self._coerce_input_path(token)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        try:
+            resolved = candidate.resolve(strict=False)
+        except OSError:
+            return False
+        root = self.workspace_root.resolve(strict=False)
+        return resolved != root and root not in resolved.parents
+
+    def _validate_path_args(self, argv: list[str], cwd: Path, *, start: int = 1) -> str | None:
+        for token in argv[start:]:
+            if self._command_path_escapes(token, cwd):
+                return f"path escapes workspace: {token}"
+        return None
+
+    def _command_family(self, argv: list[str]) -> str | None:
+        executable = Path(str(argv[0]).strip().strip("'\"")).name.lower()
+        if executable.endswith(".exe"):
+            executable = executable[:-4]
+        if executable in {"git", "pytest", "ruff", "mypy", "pyright", "tsc", "npm", "pnpm", "yarn"}:
+            return executable
+        if executable in {"python", "python3", "py"}:
+            if "-m" in argv:
+                return "python"
+            return "python_exec"
+        return None
+
+    def _unknown_command_error(self, argv: list[str]) -> str | None:
+        executable = str(argv[0]).strip().strip("'\"")
+        if not executable or "=" in executable and not executable.startswith(("./", "../", ".\\", "..\\")):
+            return None
+        shell_builtins = {
+            "alias",
+            "bg",
+            "break",
+            "cd",
+            "command",
+            "continue",
+            "dirs",
+            "echo",
+            "eval",
+            "exit",
+            "export",
+            "false",
+            "fg",
+            "hash",
+            "help",
+            "jobs",
+            "popd",
+            "printf",
+            "pushd",
+            "pwd",
+            "read",
+            "return",
+            "set",
+            "shift",
+            "source",
+            "test",
+            "times",
+            "trap",
+            "true",
+            "type",
+            "ulimit",
+            "umask",
+            "unalias",
+            "unset",
+        }
+        windows_builtins = {"assoc", "call", "cat", "clear", "cls", "copy", "cp", "del", "dir", "erase", "ls", "md", "mkdir", "move", "mv", "rd", "ren", "rm", "rmdir", "type"}
+        name = Path(executable).name.lower()
+        if name in shell_builtins or (os.name == "nt" and name in windows_builtins):
+            return None
+        if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", executable):
+            return None
+        if any(ch in executable for ch in "*?[]"):
+            return None
+        if shutil.which(executable):
+            return None
+        candidate = self._coerce_input_path(executable)
+        if not candidate.is_absolute():
+            candidate = self.workspace_root / candidate
+        if candidate.exists():
+            return None
+        return f"executable not found: {executable}"
+
+    def _validation_result(self, *, family: str, valid: bool, reason: str = "", argv: list[str] | None = None) -> dict[str, Any]:
+        result: dict[str, Any] = {"recognized": True, "valid": valid, "family": family}
+        if argv is not None:
+            result["argv"] = argv
+        if reason:
+            result["reason"] = reason
+        return result
+
+    def _needs_bash_syntax_check(self, command: str, family: str | None) -> bool:
+        if family is not None:
+            return False
+        if os.name == "nt" and self._looks_like_powershell_command(command):
+            return False
+        return bool(
+            "\n" in command
+            or re.search(r"&&|\|\||[;|<>]|[(){}]", command)
+            or re.match(r"\s*(?:if|then|else|elif|fi|for|while|case|function)\b", command)
+        )
+
+    def _bash_syntax_validation(self, command: str) -> dict[str, Any] | None:
+        if os.name == "nt" and self._looks_like_powershell_command(command):
+            return None
+        bash = shutil.which("bash")
+        if not bash:
+            return None
+        if Path(bash).name.lower() not in {"bash", "bash.exe"}:
+            return None
+        try:
+            completed = subprocess.run([bash, "-n", "-c", command], capture_output=True, text=True, timeout=5, check=False)
+        except (OperationInterrupted, subprocess.TimeoutExpired):
+            raise
+        except Exception:
+            return None
+        if completed.returncode == 0:
+            return None
+        output = self._collect_process_output(completed) or "bash syntax check failed"
+        return {
+            "recognized": True,
+            "valid": False,
+            "family": "bash",
+            "reason": "bash -n rejected command syntax: " + self._truncate_text(output, limit=240),
+            "argv": [bash, "-n", "-c", command],
+        }
+
+    def _validate_common_command(self, command: str, cwd: Path) -> tuple[list[str] | None, dict[str, Any]]:
+        argv, split_error = self._split_command_for_validation(command)
+        if split_error is not None:
+            return None, split_error
+        assert argv is not None
+        argv = [str(argv[0]).strip().strip("'\""), *argv[1:]]
+        if "-c" in argv:
+            try:
+                code_index = argv.index("-c") + 1
+                argv[code_index] = str(argv[code_index]).strip().strip("'\"")
+            except IndexError:
+                pass
+        family = self._command_family(argv)
+        if self._needs_bash_syntax_check(command, family):
+            syntax_error = self._bash_syntax_validation(command)
+            if syntax_error is not None:
+                return None, syntax_error
+        if family is None:
+            if os.name == "nt" and self._looks_like_powershell_command(command):
+                return None, {"recognized": False, "valid": True, "family": "powershell"}
+            executable_error = self._unknown_command_error(argv)
+            if executable_error:
+                return None, {"recognized": True, "valid": False, "family": "shell", "reason": executable_error}
+            return None, {"recognized": False, "valid": True, "family": "unknown"}
+        if family not in {"python", "python_exec"} and self._command_has_shell_chaining(command):
+            return None, self._validation_result(family=family, valid=False, reason="shell chaining/redirection is not allowed for validated command families")
+        executable = str(argv[0]).strip().strip("'\"")
+        missing = None if os.path.isabs(executable) else shutil.which(executable)
+        if missing is None and not Path(executable).exists():
+            return None, self._validation_result(family=family, valid=False, reason=f"executable not found: {executable}")
+        path_error = self._validate_path_args(argv, cwd)
+        if path_error:
+            return None, self._validation_result(family=family, valid=False, reason=path_error)
+        if family == "git":
+            subcommand = argv[1] if len(argv) > 1 else ""
+            rejected = {"reset", "clean", "rebase", "push", "checkout", "restore", "switch"}
+            allowed = {"status", "diff", "log", "show", "add", "commit", "branch", "rev-parse"}
+            if subcommand in rejected or subcommand not in allowed:
+                return None, self._validation_result(family=family, valid=False, reason=f"git {subcommand or '(missing)'} is not allowed through run_shell")
+        elif family == "python":
+            try:
+                module = argv[argv.index("-m") + 1]
+            except (ValueError, IndexError):
+                return None, {"recognized": False, "valid": True, "family": "unknown"}
+            if module not in {"unittest", "pytest", "pip"}:
+                return None, {"recognized": False, "valid": True, "family": "unknown"}
+            if module == "pip" and any(part in argv for part in {"install", "uninstall", "download"}):
+                return None, self._validation_result(family=family, valid=False, reason="pip environment mutation is not allowed through run_shell")
+        elif family == "python_exec":
+            pass
+        elif family in {"pytest", "ruff", "mypy", "pyright", "tsc"}:
+            mutating_flags = {"--fix", "--write", "--watch"}
+            if any(flag == token or token.startswith(flag + "=") for flag in mutating_flags for token in argv[1:]):
+                return None, self._validation_result(family=family, valid=False, reason=f"{family} mutating/watch flags are not allowed through run_shell")
+        elif family in {"npm", "pnpm", "yarn"}:
+            allowed_sequences = {("test",), ("run", "test"), ("run", "lint"), ("run", "typecheck")}
+            sequence = tuple(argv[1:3]) if len(argv) > 2 and argv[1] == "run" else tuple(argv[1:2])
+            if sequence not in allowed_sequences:
+                return None, self._validation_result(family=family, valid=False, reason=f"{family} command is not an allowed validation command")
+        return argv, self._validation_result(family=family, valid=True, argv=argv)
+
+    def _nearest_existing_paths(self, raw_path: str, limit: int = 5) -> list[str]:
+        needle = raw_path.replace("\\", "/").strip().strip("'\"")
+        needle_name = Path(needle).name.lower()
+        if not needle_name:
+            return []
+        candidates: list[tuple[int, str]] = []
+        for path in self.workspace_root.rglob("*"):
+            if not path.is_file() and not path.is_dir():
+                continue
+            if any(part in SKIP_CODE_DIRS for part in path.relative_to(self.workspace_root).parts):
+                continue
+            rel = self.relative_label(path)
+            score = 0
+            lowered = rel.lower()
+            if needle.lower() in lowered:
+                score += 4
+            if needle_name and needle_name in Path(rel).name.lower():
+                score += 6
+            if score:
+                candidates.append((score, rel))
+            if len(candidates) > 200:
+                break
+        return [rel for _, rel in sorted(candidates, key=lambda item: (-item[0], item[1]))[:limit]]
+
     def run_shell(self, command: str, cwd: str = ".", timeout: int = 30) -> dict[str, Any]:
         working_dir = self.resolve_path(cwd, allow_missing=False)
         relative_cwd = self.relative_label(working_dir)
+        argv, validation = self._validate_common_command(command, working_dir)
+        if validation.get("valid") is False:
+            reason = str(validation.get("reason") or "invalid command")
+            error_class = "command_not_found" if "executable not found" in reason else "invalid_args"
+            return {
+                "ok": False,
+                "tool": "run_shell",
+                "cwd": relative_cwd,
+                "summary": f"Command rejected before execution: {reason}",
+                "error_class": error_class,
+                "validation": validation,
+            }
         approved, reason = self._approve_shell(command, relative_cwd)
         if not approved:
             return {"ok": False, "tool": "run_shell", "cwd": relative_cwd, "summary": reason}
         run_args: str | list[str] = command
         shell_kwargs: dict[str, Any] = {"shell": True}
+        if validation.get("recognized") is True and argv:
+            run_args = argv
+            shell_kwargs = {"shell": False}
         if os.name == "nt":
             powershell = self._windows_powershell()
-            if powershell and self._looks_like_powershell_command(command):
+            if shell_kwargs.get("shell") is True and powershell and self._looks_like_powershell_command(command):
                 run_args = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
                 shell_kwargs = {"shell": False}
         completed = self._run_process(run_args, cwd=working_dir, timeout=timeout, **shell_kwargs)
         output = self._collect_process_output(completed)
-        return {
+        result = {
             "ok": completed.returncode == 0,
             "tool": "run_shell",
             "cwd": relative_cwd,
             "exit_code": completed.returncode,
             "output": output,
         }
+        if validation.get("recognized") is True:
+            result["validation"] = validation
+        if completed.returncode != 0:
+            result["error_class"] = self.classify_error(output)
+            if result["error_class"] in {"path_missing", "cwd_git"}:
+                result["suggested_paths"] = self._nearest_existing_paths(command)
+        return result
 
     def run_test(self, command: str | None = None, cwd: str = ".", timeout: int = 1200) -> dict[str, Any]:
         selected_command = command.strip() if isinstance(command, str) and command.strip() else self.default_test_command

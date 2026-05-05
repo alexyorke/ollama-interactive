@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shutil
 import subprocess
@@ -654,6 +655,224 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("first_name", first["output"])
         self.assertIn("second_name", second["output"])
 
+    def test_indexed_search_uses_cached_lines_and_invalidates_changed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "ops.py"
+            target.write_text("def first_name():\n    return 'alpha needle'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            first = tools.indexed_search("alpha needle")
+            target.write_text("def second_name():\n    return 'beta needle'\n", encoding="utf-8")
+            second = tools.indexed_search("beta needle")
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertIn("ops.py:2", first["output"])
+        self.assertIn("alpha needle", first["output"])
+        self.assertIn("beta needle", second["output"])
+
+    def test_file_search_uses_cached_paths_and_invalidates_changed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            first_path = root / "src" / "alpha_report.txt"
+            second_path = root / "src" / "beta_report.txt"
+            first_path.write_text("one", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            first = tools.file_search("alpha report")
+            first_path.unlink()
+            second_path.write_text("two", encoding="utf-8")
+            second = tools.file_search("beta report")
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertIn("src/alpha_report.txt", first["output"])
+        self.assertIn("src/beta_report.txt", second["output"])
+        self.assertNotIn("alpha_report", second["output"])
+
+    def test_file_index_refresh_writes_file_path_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "README.md").write_text("hello", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.file_index_refresh()
+            payload = json.loads((root / ".ollama-code" / "index" / "file_index.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["files"], 1)
+        self.assertIn("README.md", payload["files"])
+
+    def test_file_search_respects_path_scope_and_skips_generated_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "node_modules").mkdir()
+            (root / ".ollama-code" / "index").mkdir(parents=True)
+            (root / "src" / "target_config.py").write_text("x = 1\n", encoding="utf-8")
+            (root / "docs" / "target_config.md").write_text("x\n", encoding="utf-8")
+            (root / "node_modules" / "target_config.js").write_text("x\n", encoding="utf-8")
+            (root / ".ollama-code" / "index" / "target_config.json").write_text("{}", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            src_result = tools.file_search("target config", path="src")
+            root_result = tools.file_search("target config")
+
+        self.assertTrue(src_result["ok"])
+        self.assertEqual(src_result["output"], "src/target_config.py")
+        self.assertIn("src/target_config.py", root_result["output"])
+        self.assertIn("docs/target_config.md", root_result["output"])
+        self.assertNotIn("node_modules", root_result["output"])
+        self.assertNotIn(".ollama-code", root_result["output"])
+
+    def test_file_search_prefers_exact_filename_match(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "alpha").mkdir()
+            (root / "alpha" / "notes.py").write_text("x = 1\n", encoding="utf-8")
+            (root / "alpha_notes.py").write_text("x = 2\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.file_search("alpha_notes.py", limit=2)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"].splitlines()[0], "alpha_notes.py")
+
+    def test_everything_search_reports_missing_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch.object(tools, "_everything_cli_path", return_value=None):
+                result = tools.everything_search("README")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("es.exe", result["summary"])
+
+    def test_everything_search_runs_cli_and_filters_to_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            inside = root / "README.md"
+            outside = Path(tmp).parent / f"outside-{uuid4().hex}.txt"
+            inside.write_text("hello", encoding="utf-8")
+            outside.write_text("skip", encoding="utf-8")
+            self.addCleanup(lambda: outside.unlink(missing_ok=True))
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=f"{inside}\n{outside}\n", stderr="")
+            with patch.object(tools, "_everything_cli_path", return_value="es.exe"):
+                with patch.object(tools, "_run_process", return_value=completed) as run_process:
+                    result = tools.everything_search("README", limit=10)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("README.md", result["output"])
+        self.assertNotIn("outside", result["output"])
+        command = run_process.call_args.args[0]
+        self.assertEqual(command[:3], ["es.exe", "-n", "50"])
+        self.assertFalse(run_process.call_args.kwargs["shell"])
+
+    def test_everything_search_uses_configured_cli_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_cli = root / "tools" / "es.exe"
+            fake_cli.parent.mkdir()
+            fake_cli.write_text("", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch.dict("os.environ", {"EVERYTHING_CLI": str(fake_cli)}):
+                with patch("ollama_code.tools.shutil.which", return_value=None):
+                    discovered = tools._everything_cli_path()
+
+        self.assertEqual(discovered, str(fake_cli))
+
+    def test_everything_search_filters_to_requested_subdirectory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            inside = root / "src" / "target.py"
+            outside = root / "docs" / "target.py"
+            inside.write_text("x\n", encoding="utf-8")
+            outside.write_text("x\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=f"{inside}\n{outside}\n", stderr="")
+            with patch.object(tools, "_everything_cli_path", return_value="es.exe"):
+                with patch.object(tools, "_run_process", return_value=completed):
+                    result = tools.everything_search("target.py", path="src", limit=10)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "src/target.py")
+
+    def test_repo_index_refresh_writes_line_index_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.repo_index_refresh()
+            payload = json.loads((root / ".ollama-code" / "index" / "repo_index.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["files"], 1)
+        self.assertIn("line_index", payload["files"]["ops.py"])
+
+    def test_semgrep_scan_reports_missing_semgrep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                result = tools.semgrep_scan("eval(...)")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("semgrep is not installed", result["summary"])
+
+    def test_semgrep_scan_rejects_unsupported_language_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value="semgrep"):
+                with patch.object(tools, "_run_process") as run_process:
+                    result = tools.semgrep_scan("eval(...)", lang="madeuplang")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Unsupported semgrep language", result["summary"])
+        run_process.assert_not_called()
+
+    def test_semgrep_scan_runs_structural_search_and_compacts_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            payload = {
+                "results": [
+                    {
+                        "path": str(root / "ops.py"),
+                        "start": {"line": 1},
+                        "extra": {"lines": "eval('1')"},
+                    }
+                ]
+            }
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+            with patch("ollama_code.tools.shutil.which", return_value="semgrep"):
+                with patch.object(tools, "_run_process", return_value=completed) as run_process:
+                    result = tools.semgrep_scan("eval(...)", lang="python")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("ops.py:1", result["output"])
+        command = run_process.call_args.args[0]
+        self.assertIn("--json", command)
+        self.assertIn("--lang", command)
+        self.assertFalse(run_process.call_args.kwargs["shell"])
+
+    def test_semgrep_scan_reports_cli_error_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(args=[], returncode=2, stdout="", stderr="semgrep parse error")
+            with patch("ollama_code.tools.shutil.which", return_value="semgrep"):
+                with patch.object(tools, "_run_process", return_value=completed):
+                    result = tools.semgrep_scan("eval(...)", lang="python")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("semgrep parse error", result["output"])
+
     def test_find_implementation_target_maps_test_imports_to_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1041,6 +1260,122 @@ class ToolExecutorTests(unittest.TestCase):
         kwargs = run_mock.call_args.kwargs
         self.assertTrue(kwargs["shell"])
 
+    def test_run_shell_rejects_dangerous_validated_git_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value="git"):
+                with patch.object(ToolExecutor, "_run_process") as run_mock:
+                    result = tools.run_shell("git reset --hard")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Command rejected before execution", result["summary"])
+        self.assertEqual(result["validation"]["family"], "git")
+        run_mock.assert_not_called()
+
+    def test_run_shell_rejects_unmatched_quotes_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_run_process") as run_mock:
+                result = tools.run_shell('echo "unterminated')
+
+        self.assertFalse(result["ok"])
+        self.assertIn("invalid quoting", result["summary"])
+        run_mock.assert_not_called()
+
+    def test_run_shell_rejects_bash_syntax_error_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            syntax_result = subprocess.CompletedProcess(
+                args=["bash", "-n", "-c", "if true; then echo hi"],
+                returncode=2,
+                stdout="",
+                stderr="bash: -c: line 2: syntax error: unexpected end of file\n",
+            )
+            with patch("ollama_code.tools.shutil.which", return_value="bash"):
+                with patch("ollama_code.tools.subprocess.run", return_value=syntax_result) as syntax_mock:
+                    with patch.object(ToolExecutor, "_run_process") as run_mock:
+                        result = tools.run_shell("if true; then echo hi")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["validation"]["family"], "bash")
+        self.assertIn("bash -n rejected command syntax", result["summary"])
+        self.assertEqual(syntax_mock.call_count, 1)
+        run_mock.assert_not_called()
+
+    def test_run_shell_bash_checks_then_runs_valid_unknown_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            run_result = subprocess.CompletedProcess(args="echo ok", returncode=0, stdout="ok\n", stderr="")
+            with patch("ollama_code.tools.shutil.which", return_value="bash"):
+                with patch("ollama_code.tools.subprocess.run") as syntax_mock:
+                    with patch.object(ToolExecutor, "_run_process", return_value=run_result) as run_mock:
+                        result = tools.run_shell("echo ok")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "ok")
+        syntax_mock.assert_not_called()
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertTrue(run_mock.call_args.kwargs["shell"])
+
+    def test_run_shell_bash_checks_shell_metachar_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            syntax_result = subprocess.CompletedProcess(args=["bash", "-n", "-c", "echo ok | cat"], returncode=0, stdout="", stderr="")
+            run_result = subprocess.CompletedProcess(args="echo ok | cat", returncode=0, stdout="ok\n", stderr="")
+            with patch("ollama_code.tools.shutil.which", return_value="bash"):
+                with patch("ollama_code.tools.subprocess.run", return_value=syntax_result) as syntax_mock:
+                    with patch.object(ToolExecutor, "_run_process", return_value=run_result) as run_mock:
+                        result = tools.run_shell("echo ok | cat")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "ok")
+        self.assertEqual(syntax_mock.call_count, 1)
+        self.assertEqual(run_mock.call_count, 1)
+        self.assertTrue(run_mock.call_args.kwargs["shell"])
+
+    def test_run_shell_rejects_missing_unknown_executable_after_bash_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            syntax_result = subprocess.CompletedProcess(args=["bash", "-n", "-c", "foozle --help"], returncode=0, stdout="", stderr="")
+
+            def fake_which(name: str) -> str | None:
+                return "bash" if name == "bash" else None
+
+            with patch("ollama_code.tools.shutil.which", side_effect=fake_which):
+                with patch("ollama_code.tools.subprocess.run") as syntax_mock:
+                    with patch.object(ToolExecutor, "_run_process") as run_mock:
+                        result = tools.run_shell("foozle --help")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "command_not_found")
+        self.assertIn("executable not found: foozle", result["summary"])
+        syntax_mock.assert_not_called()
+        run_mock.assert_not_called()
+
+    def test_run_shell_rejects_path_escape_for_validated_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value="pytest"):
+                with patch.object(ToolExecutor, "_run_process") as run_mock:
+                    result = tools.run_shell("pytest ../outside")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("path escapes workspace", result["summary"])
+        run_mock.assert_not_called()
+
+    def test_run_shell_runs_valid_common_command_without_shell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            completed = subprocess.CompletedProcess(args=["git", "status", "--short"], returncode=0, stdout="ok\n", stderr="")
+            with patch("ollama_code.tools.shutil.which", return_value="git"):
+                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                    result = tools.run_shell("git status --short")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["validation"]["family"], "git")
+        self.assertEqual(run_mock.call_args.args[0], ["git", "status", "--short"])
+        self.assertFalse(run_mock.call_args.kwargs["shell"])
+
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_supports_powershell_cmdlets_on_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1086,6 +1421,20 @@ class ToolExecutorTests(unittest.TestCase):
             result = tools.run_test()
         self.assertFalse(result["ok"])
         self.assertIn("No test command", result["summary"])
+
+    def test_diagnose_test_failure_classifies_common_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            syntax = tools.diagnose_test_failure("SyntaxError: invalid syntax\n  File \"app.py\", line 1")
+            missing = tools.diagnose_test_failure("ModuleNotFoundError: No module named 'requests_mock'")
+            invalid = tools.diagnose_test_failure("usage: pytest [options]\nerror: unrecognized arguments: --wat")
+
+        self.assertEqual(syntax["error_class"], "syntax_error")
+        self.assertEqual(syntax["next_tool"], "lint_typecheck")
+        self.assertEqual(missing["error_class"], "missing_dependency")
+        self.assertEqual(missing["missing_dependency"], "requests_mock")
+        self.assertEqual(missing["next_tool"], "fail_closed")
+        self.assertEqual(invalid["error_class"], "invalid_args")
 
     def test_read_only_blocks_shell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

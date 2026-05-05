@@ -101,10 +101,16 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "list_files",
     "read_file",
     "search",
+    "file_search",
+    "file_index_refresh",
+    "everything_search",
     "search_symbols",
     "code_outline",
     "read_symbol",
     "repo_index_search",
+    "indexed_search",
+    "repo_index_refresh",
+    "semgrep_scan",
     "context_pack",
     "find_implementation_target",
     "diagnose_test_failure",
@@ -116,14 +122,14 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "git_status",
     "git_diff",
 }
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "context_pack", "find_implementation_target", "call_graph", "contract_graph"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "indexed_search", "repo_index_refresh", "semgrep_scan", "context_pack", "find_implementation_target", "call_graph", "contract_graph"}
 EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
 TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "generate_tests_from_spec"}
 SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "context_pack", "contract_graph"}
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "read_symbol", "context_pack", "repo_index_search", "find_implementation_target", "diagnose_test_failure", "contract_graph"}
+CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "indexed_search", "repo_index_refresh", "semgrep_scan", "context_pack", "contract_graph"}
+GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "everything_search", "read_symbol", "context_pack", "repo_index_search", "indexed_search", "semgrep_scan", "find_implementation_target", "diagnose_test_failure", "contract_graph"}
 VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "select_tests"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
@@ -131,10 +137,16 @@ MODEL_TOOL_RESULT_LIMITS = {
     "list_files": 500,
     "read_file": 1000,
     "search": 700,
+    "file_search": 700,
+    "file_index_refresh": 400,
+    "everything_search": 700,
     "search_symbols": 700,
     "code_outline": 900,
     "read_symbol": 1100,
     "repo_index_search": 900,
+    "indexed_search": 900,
+    "repo_index_refresh": 500,
+    "semgrep_scan": 900,
     "context_pack": 900,
     "find_implementation_target": 800,
     "diagnose_test_failure": 900,
@@ -2672,7 +2684,7 @@ class OllamaCodeAgent:
         ):
             return False
         if failed_tool_this_turn:
-            if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol", "context_pack"}:
+            if name in CONTEXT_GATHERING_TOOL_NAMES:
                 return False
             if name == "run_test":
                 return True
@@ -2697,7 +2709,7 @@ class OllamaCodeAgent:
             if name == "run_test" and re.search(r"\b(?:run|rerun|execute)\b[^.?!\n]{0,80}\b(?:test|tests|pytest|unittest)\b", request_text, flags=re.IGNORECASE):
                 return False
             return True
-        if name in {"read_file", "list_files", "search", "search_symbols", "code_outline", "read_symbol", "context_pack"}:
+        if name in CONTEXT_GATHERING_TOOL_NAMES:
             if self._request_explicitly_requests_tool(request_text, name):
                 return False
             if forbidden_tool_names:
@@ -2792,6 +2804,99 @@ class OllamaCodeAgent:
         if re.search(r"\b(?:traceback|failed|failing|pytest|unittest|test)\b", request_text, flags=re.IGNORECASE):
             return "Need current-turn evidence before mutation. Call find_implementation_target or diagnose_test_failure, then edit the grounded source. Next JSON only."
         return "Need current-turn evidence before mutation. Read the target file/symbol or call context_pack/repo_index_search first. Next JSON only."
+
+    def _tool_error_class(self, result: dict[str, Any]) -> str:
+        explicit = result.get("error_class")
+        if isinstance(explicit, str) and explicit.strip():
+            return explicit.strip()
+        text = "\n".join(
+            str(result.get(key, ""))
+            for key in ("summary", "output", "diagnostic", "normalized")
+            if result.get(key) is not None
+        )
+        classifier = getattr(self.tools, "classify_error", None)
+        if callable(classifier):
+            try:
+                return str(classifier(text))
+            except Exception:
+                pass
+        return "unknown"
+
+    def _tool_error_arg_key(self, name: str, arguments: dict[str, Any]) -> str:
+        focused_keys = ("path", "cwd", "command", "query", "test_path", "module", "function")
+        focused = {
+            key: arguments.get(key)
+            for key in focused_keys
+            if key in arguments and isinstance(arguments.get(key), (str, int, float, bool))
+        }
+        if not focused:
+            focused = arguments
+        return json.dumps(focused, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+
+    def _matching_repeated_tool_error(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        tool_error_counts: dict[tuple[str, str, str], int],
+    ) -> str | None:
+        if not feature_enabled("trajectory-guards"):
+            return None
+        arg_key = self._tool_error_arg_key(name, arguments)
+        for prior_name, prior_arg_key, error_class in tool_error_counts:
+            if prior_name == name and prior_arg_key == arg_key and tool_error_counts[(prior_name, prior_arg_key, error_class)] >= 2:
+                return error_class
+        return None
+
+    def _remember_tool_error(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+        tool_error_counts: dict[tuple[str, str, str], int],
+    ) -> tuple[str, int]:
+        error_class = self._tool_error_class(result)
+        key = (name, self._tool_error_arg_key(name, arguments), error_class)
+        tool_error_counts[key] = tool_error_counts.get(key, 0) + 1
+        return error_class, tool_error_counts[key]
+
+    def _tool_error_guard_message(self, name: str, error_class: str) -> str:
+        if error_class in {"path_missing", "cwd_git"}:
+            return (
+                f"{name} already failed twice with {error_class}. Do not retry the same path/cwd. "
+                "Call list_files or repo_index_search to find the correct path, or fail closed. Next JSON only."
+            )
+        if error_class == "syntax_error":
+            return (
+                f"{name} already failed twice with syntax_error. Inspect the exact symbol/diagnostic, repair the edit, "
+                "then run lint_typecheck before tests. Next JSON only."
+            )
+        if error_class in {"missing_dependency", "command_not_found"}:
+            return (
+                f"{name} already failed twice with {error_class}. Do not auto-install or retry blindly. "
+                "Report the exact missing dependency/command or choose an available validator. Next JSON only."
+            )
+        return (
+            f"{name} already failed twice with {error_class}. Do not retry the same arguments. "
+            "Use a different tool class, gather new evidence, edit the cause, or fail closed. Next JSON only."
+        )
+
+    def _record_command_validation_event(self, *, name: str, result: dict[str, Any], round_number: int, cached: bool = False) -> None:
+        validation = result.get("validation")
+        if not isinstance(validation, dict):
+            return
+        self._record_event(
+            "command_validation",
+            tool=name,
+            family=validation.get("family"),
+            valid=validation.get("valid"),
+            recognized=validation.get("recognized"),
+            reason=validation.get("reason", ""),
+            argv=validation.get("argv", []),
+            cached=cached,
+            rounds=round_number,
+        )
 
     def _request_forbids_validation(self, text: str) -> bool:
         lowered = text.lower()
@@ -3004,6 +3109,7 @@ class OllamaCodeAgent:
         if not cache_hit:
             self._store_cached_tool_result(name, arguments, result)
         self._invalidate_turn_cache_if_needed(name, result)
+        self._record_command_validation_event(name=name, result=result, round_number=round_number, cached=cache_hit)
         evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
         real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(request_text, name, result)
         if real_tool_use:
@@ -3541,6 +3647,7 @@ class OllamaCodeAgent:
         previous_run_test_failure_summary = ""
         failed_run_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
+        tool_error_counts: dict[tuple[str, str, str], int] = {}
         if self._should_preload_context_pack(
             request_text=text,
             session_memory_request=session_memory_request,
@@ -4228,6 +4335,23 @@ class OllamaCodeAgent:
                     continue
                 cached_result = self._get_cached_tool_result(name, arguments)
                 cache_hit = cached_result is not None
+                repeated_error_class = self._matching_repeated_tool_error(
+                    name=name,
+                    arguments=arguments,
+                    tool_error_counts=tool_error_counts,
+                )
+                if repeated_error_class:
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "tool_error_guard",
+                        guard="repeat-error",
+                        candidate_tool=name,
+                        error_class=repeated_error_class,
+                        arguments=arguments,
+                        rounds=round_number,
+                    )
+                    self.messages.append({"role": "user", "content": self._tool_error_guard_message(name, repeated_error_class)})
+                    continue
                 if self._trajectory_loop_guard_blocks(
                     name=name,
                     arguments=arguments,
@@ -4323,10 +4447,17 @@ class OllamaCodeAgent:
                 if not cache_hit:
                     self._store_cached_tool_result(name, arguments, result)
                 self._invalidate_turn_cache_if_needed(name, result)
+                self._record_command_validation_event(name=name, result=result, round_number=round_number, cached=cache_hit)
                 result_for_feedback = result
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
+                    self._remember_tool_error(
+                        name=name,
+                        arguments=arguments,
+                        result=result,
+                        tool_error_counts=tool_error_counts,
+                    )
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
                 if real_tool_use:
@@ -4469,6 +4600,7 @@ class OllamaCodeAgent:
                     self._record_event("tool_call", name="run_test", arguments=auto_arguments, rounds=round_number, auto=True)
                     tool_calls_this_turn.append({"name": "run_test", "arguments": deepcopy(auto_arguments)})
                     auto_result = self.tools.execute("run_test", auto_arguments)
+                    self._record_command_validation_event(name="run_test", result=auto_result, round_number=round_number, cached=False)
                     evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                     self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True, evidence_id=evidence_id)
                     tool_used_this_turn = True

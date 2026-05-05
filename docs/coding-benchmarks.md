@@ -84,4 +84,5 @@ Raw JSON stays ignored under `scratch/`. Track only concise summaries when resul
 - `coding_accuracy` prompts must not include synthetic marker tokens, exact answer literals, forced tool clauses, or public task-specific answers.
 - Runtime code under `ollama_code/` must not special-case public smoke task names such as `list-ops`, `pig-latin`, or `wordy`.
 - Synthetic exact-answer cases stay marked as `tool_contract`, not coding accuracy.
+- Run `python scripts/anti_cheat_scan.py` before reporting benchmark gains; it checks runtime code for task names/synthetic answer markers and benchmark prompts for leaked answers.
 - Public benchmark results are local smoke only unless official harness/settings are used.

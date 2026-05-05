@@ -329,6 +329,52 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(run_tests)
         self.assertIn("test_pricing.py", str(run_tests[-1].get("arguments", {}).get("command", "")))
 
+    def test_tool_error_guard_blocks_third_duplicate_path_failure(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"missing.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"missing.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"missing.py"}}',
+                '{"type":"final","message":"Path is missing."}',
+                '{"type":"final","message":"Path is missing."}',
+                '{"type":"final","message":"Path is missing."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Check missing.py if useful, but do not loop.")
+
+        self.assertFalse(result.completed)
+        tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "read_file"]
+        self.assertEqual(len(tool_calls), 2)
+        guard_events = [event for event in agent.events if event.get("type") == "tool_error_guard"]
+        self.assertEqual(len(guard_events), 1)
+        self.assertEqual(guard_events[0].get("error_class"), "path_missing")
+
+    def test_command_validation_event_records_rejected_common_command(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"git reset --hard"}}',
+                '{"type":"final","message":"Command rejected."}',
+                '{"type":"final","message":"Command rejected."}',
+                '{"type":"final","message":"Command rejected."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        result = agent.handle_user("Try a shell command if useful and summarize.")
+
+        self.assertFalse(result.completed)
+        validation_events = [event for event in agent.events if event.get("type") == "command_validation"]
+        self.assertEqual(len(validation_events), 1)
+        self.assertFalse(validation_events[0].get("valid"))
+        self.assertEqual(validation_events[0].get("family"), "git")
+
     def test_contract_guards_run_contract_check_before_targeted_tests(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
