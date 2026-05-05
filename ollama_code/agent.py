@@ -89,6 +89,7 @@ VERIFICATION_HISTORY_LIMIT = 1
 VERIFICATION_CONTENT_LIMIT = 2200
 PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT = 12
 PRIMARY_CONTEXT_CONTENT_LIMIT = 900
+PRIMARY_CURRENT_REQUEST_LIMIT = 3600
 MAX_VERIFICATION_RETRIES = 2
 MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
@@ -136,6 +137,11 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "git_diff",
 }
 READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "diagnose_dependency_error", "call_graph", "contract_graph", "discover_validators", "mcp_list_tools"}
+CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
+INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh"}
+STRUCTURAL_SEARCH_TOOL_NAMES = {"semgrep_scan", "ast_search"}
+LSP_TOOL_NAMES = {"lsp_diagnostics", "lsp_definition", "lsp_references"}
+GRAPH_TOOL_NAMES = {"call_graph", "contract_graph"}
 EDIT_TOOL_NAMES = {"edit_intent", "write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
 LOW_LEVEL_EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
 TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "diagnose_dependency_error", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "generate_tests_from_spec"}
@@ -392,6 +398,7 @@ class OllamaCodeAgent:
         self._turn_tool_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._turn_cache_epoch = 0
         self._turn_evidence_counter = 0
+        self._transcript_dirty = False
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
@@ -446,15 +453,23 @@ class OllamaCodeAgent:
             "summarize",
         ]
         if requires_tools or any(term in lowered for term in workspace_terms):
-            selected.update(READ_ONLY_WORKSPACE_TOOL_NAMES)
+            selected.update(CORE_READ_ONLY_WORKSPACE_TOOL_NAMES)
         if self._request_benefits_from_systems_lens(request_text):
             selected.add("systems_lens")
         if re.search(r"\b(?:refactor|signature|type|return|caller|callee|contract|pipeline|pure|function chain)\b", lowered):
-            selected.add("contract_graph")
+            selected.update(GRAPH_TOOL_NAMES)
         if re.search(r"\b(?:library|package|site-packages|stdlib|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
             selected.add("inspect_library_source")
+        if re.search(r"\b(?:ast|ast-grep|semgrep|structural|syntax-aware|codemod|pattern search|api misuse)\b", lowered):
+            selected.update(STRUCTURAL_SEARCH_TOOL_NAMES)
+        if re.search(r"\b(?:lsp|language server|diagnostic|diagnostics|definition|references|go to definition|xref)\b", lowered):
+            selected.update(LSP_TOOL_NAMES)
+        if re.search(r"\b(?:refresh index|reindex|index refresh|fts_refresh|repo_index_refresh|file_index_refresh)\b", lowered):
+            selected.update(INDEX_REFRESH_TOOL_NAMES)
+        if re.search(r"\b(?:everything search|es\.exe)\b", lowered):
+            selected.add("everything_search")
         if mutation_allowed or mutation_required:
-            selected.update(READ_ONLY_WORKSPACE_TOOL_NAMES)
+            selected.update(CORE_READ_ONLY_WORKSPACE_TOOL_NAMES)
             selected.update(EDIT_TOOL_NAMES)
         if test_run_required or re.search(r"\b(?:test|pytest|unittest|run tests?)\b", lowered):
             selected.update(TEST_TOOL_NAMES)
@@ -488,6 +503,7 @@ class OllamaCodeAgent:
         self.messages = self._base_messages()
         self.events = []
         self._reset_turn_cache()
+        self._transcript_dirty = True
         self._autosave()
 
     def set_model(self, model: str) -> None:
@@ -568,6 +584,7 @@ class OllamaCodeAgent:
         events = payload.get("events")
         self.messages = restored_messages
         self.events = list(events) if isinstance(events, list) else []
+        self._transcript_dirty = True
         self._autosave()
 
     def load_session(self, path: str | Path) -> Path:
@@ -631,10 +648,12 @@ class OllamaCodeAgent:
         }
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        if self.session_file is not None and target.resolve(strict=False) == self.session_file.resolve(strict=False):
+            self._transcript_dirty = False
         return target
 
     def _autosave(self) -> None:
-        if self.session_file is not None:
+        if self.session_file is not None and self._transcript_dirty:
             self.save_transcript(self.session_file)
 
     def _record_event(self, event_type: str, **payload: Any) -> None:
@@ -645,7 +664,9 @@ class OllamaCodeAgent:
                 **payload,
             }
         )
-        self._autosave()
+        self._transcript_dirty = True
+        if event_type in {"user", "assistant"}:
+            self._autosave()
 
     def _chat(
         self,
@@ -710,6 +731,7 @@ class OllamaCodeAgent:
         self._pending_llm_call_events = []
         for payload in pending:
             self._record_event("llm_call", **payload)
+        self._autosave()
 
     def _primary_messages_for_model(
         self,
@@ -719,7 +741,7 @@ class OllamaCodeAgent:
         tool_names: set[str] | None = None,
     ) -> list[dict[str, str]]:
         dynamic_system_message = {"role": "system", "content": self._system_prompt_for_tools(tool_names)}
-        if session_memory_request or len(self.messages) <= PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT + 1:
+        if session_memory_request:
             return [dynamic_system_message, *self.messages[1:]]
         system_message = dynamic_system_message
         non_system_messages = self.messages[1:]
@@ -747,10 +769,11 @@ class OllamaCodeAgent:
                 }
             )
         for message in recent_messages:
+            limit = PRIMARY_CURRENT_REQUEST_LIMIT if message is current_turn_request else PRIMARY_CONTEXT_CONTENT_LIMIT
             compacted.append(
                 {
                     "role": str(message.get("role", "")),
-                    "content": self._truncate_text(str(message.get("content", "")), limit=PRIMARY_CONTEXT_CONTENT_LIMIT),
+                    "content": self._truncate_text(str(message.get("content", "")), limit=limit),
                 }
             )
         return compacted
@@ -3272,6 +3295,7 @@ class OllamaCodeAgent:
             successful_tool_results.append({"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result), "evidence_id": evidence_id})
         self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
         self.messages.append({"role": "user", "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use, evidence_id=evidence_id)})
+        self._autosave()
         return result
 
     def _try_handle_simple_source_rewrite(
@@ -4698,6 +4722,7 @@ class OllamaCodeAgent:
                         "content": self._tool_result_feedback_message(name, result_for_feedback, real_tool_use=real_tool_use, evidence_id=evidence_id),
                     }
                 )
+                self._autosave()
                 if self._tool_result_needs_reconciliation(
                     request_text=text,
                     name=name,

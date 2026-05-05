@@ -506,6 +506,78 @@ class AgentTests(unittest.TestCase):
         self.assertIn("systems_lens", selected)
         self.assertNotIn("systems_lens", GROUNDING_EVIDENCE_TOOL_NAMES)
 
+    def test_primary_tools_keep_specialty_tools_out_of_generic_code_prompt(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        selected = agent._primary_tool_names_for_request(
+            "Find the implementation of calculate_discount in this repo.",
+            requires_tools=True,
+            session_memory_request=False,
+            mutation_allowed=False,
+            mutation_required=False,
+            test_run_required=False,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+
+        self.assertIn("repo_index_search", selected)
+        self.assertIn("read_symbol", selected)
+        self.assertNotIn("ast_search", selected)
+        self.assertNotIn("semgrep_scan", selected)
+        self.assertNotIn("lsp_references", selected)
+        self.assertNotIn("mcp_list_tools", selected)
+        self.assertNotIn("fts_refresh", selected)
+
+    def test_primary_tools_add_specialty_tools_by_intent(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        selected = agent._primary_tool_names_for_request(
+            "Use LSP references and ast-grep structural search to inspect this symbol.",
+            requires_tools=True,
+            session_memory_request=False,
+            mutation_allowed=False,
+            mutation_required=False,
+            test_run_required=False,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+
+        self.assertIn("lsp_references", selected)
+        self.assertIn("lsp_definition", selected)
+        self.assertIn("ast_search", selected)
+        self.assertIn("semgrep_scan", selected)
+
+    def test_primary_context_truncates_old_messages_before_recent_limit(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        current_request = "Summarize current request with TOKEN_CURRENT_END."
+        agent.messages.extend(
+            [
+                {"role": "user", "content": "old " + ("x" * 5000) + " TOKEN_OLD_END"},
+                {"role": "user", "content": current_request},
+            ]
+        )
+
+        messages = agent._primary_messages_for_model(
+            session_memory_request=False,
+            current_request=current_request,
+            tool_names={"read_file"},
+        )
+
+        old_message = next(message["content"] for message in messages if message["role"] == "user" and message["content"].startswith("old "))
+        current_message = next(message["content"] for message in messages if "TOKEN_CURRENT_END" in message["content"])
+        self.assertIn("... truncated ...", old_message)
+        self.assertNotIn("TOKEN_OLD_END", old_message)
+        self.assertEqual(current_message, current_request)
+
     def test_primary_prompt_omits_tool_signatures_for_simple_final(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             client = FakeClient(['{"type":"final","message":"done"}'])
@@ -1448,15 +1520,15 @@ class AgentTests(unittest.TestCase):
     def test_agent_synthesizes_file_from_search_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "scratch").mkdir()
-            (root / "scratch" / "repl.txt").write_text("repl ok\n", encoding="utf-8")
+            (root / "notes").mkdir()
+            (root / "notes" / "repl.txt").write_text("repl ok\n", encoding="utf-8")
             client = FakeClient(['{"type":"tool","name":"search","arguments":{"query":"repl ok","path":"."}}'])
             tools = ToolExecutor(root, approval_mode="auto")
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
             result = agent.handle_user("Use search to find repl ok and tell me which file contains it.")
 
-        self.assertEqual(result.message, "scratch/repl.txt contains the match.")
+        self.assertEqual(result.message, "notes/repl.txt contains the match.")
         self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
 
     def test_agent_audits_shell_tool_under_debate(self) -> None:
@@ -1698,6 +1770,37 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(agent.session_file, (root / "scratch" / "session.json").resolve())
         self.assertEqual(saved, (root / "scratch" / "manual.json").resolve())
+
+    def test_autosave_batches_tool_call_and_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            (root / "note.txt").write_text("hello\n", encoding="utf-8")
+            session = root / ".ollama-code" / "sessions" / "batched.json"
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file=session, debate_enabled=False)
+            original_save = agent.save_transcript
+            save_count = 0
+
+            def counted_save(path: str | Path | None = None) -> Path:
+                nonlocal save_count
+                save_count += 1
+                return original_save(path)
+
+            agent.save_transcript = counted_save  # type: ignore[method-assign]
+            result = agent.handle_user("Read note.txt then say done.")
+            payload = json.loads(session.read_text(encoding="utf-8"))
+
+        self.assertEqual(result.message, "done")
+        self.assertLessEqual(save_count, 4)
+        self.assertTrue(any(event.get("type") == "tool_call" and event.get("name") == "read_file" for event in payload["events"]))
+        self.assertTrue(any(event.get("type") == "tool_result" and event.get("name") == "read_file" for event in payload["events"]))
+        self.assertTrue(any(event.get("type") == "assistant" and event.get("content") == "done" for event in payload["events"]))
 
     def test_agent_can_load_saved_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

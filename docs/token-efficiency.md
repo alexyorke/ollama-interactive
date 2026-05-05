@@ -16,6 +16,43 @@ Metrics come from Ollama `/api/chat` response fields: `prompt_eval_count`, `eval
 | Median prompt-token change, matched passing debate-on runs | - | -74.9% |
 | Accuracy regressions | - | 0 |
 
+## Safe Tool-Speed Pass
+
+Latest pass keeps debate, reconciliation, validation, approval gates, and all default-on tools intact. It removes wasted local work around broad scans, prompt palettes, and session writes.
+
+Workspace traversal before this pass was dominated by ignored generated directories:
+
+| Probe | Before | After |
+|---|---:|---:|
+| `_iter_workspace_files(.)` | 14,437 files, 1,044.7 ms | 54 files, 85.05 ms |
+| `_iter_code_files(.)` | first 1,000 files, 172.91 ms; 934 from `scratch/` | 36 files, 70.11 ms |
+
+Prompt palette narrowing keeps tools executable but stops advertising specialty tools for generic code lookup:
+
+| Prompt | Before | After |
+|---|---:|---:|
+| Generic code lookup | 29 tools, 3,165 system chars | 16 tools, 2,640 system chars |
+| Edit + tests | 42 tools, 4,007 system chars | 29 tools, 3,472 system chars |
+| LSP + structural request | n/a | 19 tools, 2,769 system chars |
+
+No-LLM cluttered fixture probe with 2,000 generated files:
+
+| Tool | Time |
+|---|---:|
+| `file_search` | 27.161 ms |
+| `repo_index_search` | 35.531 ms |
+| `fts_refresh` | 69.74 ms |
+| `context_pack` | 28.95 ms |
+| `discover_validators` | 29.942 ms |
+
+Implementation notes:
+
+- Broad enumerators now prefer `git ls-files --cached --others --exclude-standard` when usable and fall back to shared generated-directory skip rules.
+- `repo_index_search` renders from cached symbols and line snippets instead of rereading and reparsing ranked files.
+- `context_pack` reuses repo-index records for test hints.
+- Primary prompts compact non-current history even in short conversations, while keeping the current request with a larger cap.
+- Transcript autosave batches tool-call/tool-result state instead of rewriting the full session JSON after every event.
+
 Second pass adds controller-direct execution for explicit low-ambiguity requests and primary-context compaction for normal model turns. Compared with the first optimized run, the fixed 70-run explicit-tool corpus stayed 70/70 passing and dropped to `0` LLM calls, `0` prompt tokens, and `0` output tokens. These are not model shortcuts for broad coding work; they only fire when the controller can deterministically prove the required tool path and final answer.
 
 Latest compression pass reduced repeated model context without changing public CLI behavior:

@@ -758,6 +758,41 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("node_modules", root_result["output"])
         self.assertNotIn(".ollama-code", root_result["output"])
 
+    def test_broad_repo_tools_skip_generated_and_ignored_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "scratch").mkdir()
+            (root / "verify_scratch").mkdir()
+            (root / "ollama-code-bench-deadbeef").mkdir()
+            (root / "probe-123").mkdir()
+            (root / "tmpabc123").mkdir()
+            (root / "src" / "app.py").write_text("def live_target():\n    return 'ok'\n", encoding="utf-8")
+            for directory in ["scratch", "verify_scratch", "ollama-code-bench-deadbeef", "probe-123", "tmpabc123"]:
+                (root / directory / "ignored_target.py").write_text("def ignored_target():\n    return 'skip'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            real_which = shutil.which
+
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: None if name == "rg" else real_which(name)):
+                search_result = tools.search("ignored_target")
+            file_result = tools.file_search("ignored target")
+            repo_result = tools.repo_index_search("ignored_target")
+            refresh_result = tools.fts_refresh()
+            fts_result = tools.fts_search("ignored_target")
+            context_result = tools.context_pack("find ignored_target")
+            validators = tools.discover_validators()
+            live_result = tools.repo_index_search("live_target")
+
+        for result in [search_result, file_result, repo_result, refresh_result, fts_result, context_result, validators]:
+            self.assertTrue(result["ok"], result)
+        self.assertNotIn("ignored_target", search_result["output"])
+        self.assertNotIn("ignored_target", file_result["output"])
+        self.assertNotIn("ignored_target", repo_result["output"])
+        self.assertNotIn("ignored_target", fts_result["output"])
+        self.assertNotIn("ignored_target.py", context_result["output"])
+        self.assertNotIn("unittest discover", validators["output"])
+        self.assertIn("live_target", live_result["output"])
+
     def test_file_search_prefers_exact_filename_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

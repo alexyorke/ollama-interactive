@@ -74,6 +74,7 @@ SKIP_CODE_DIRS = {
     ".svn",
     ".mypy_cache",
     ".pytest_cache",
+    ".ruff_cache",
     "__pycache__",
     "node_modules",
     "dist",
@@ -82,6 +83,25 @@ SKIP_CODE_DIRS = {
     ".venv",
     "venv",
 }
+SKIP_GENERATED_DIRS = {
+    "scratch",
+    "verify_scratch",
+    "htmlcov",
+    ".tox",
+    ".nox",
+    ".cache",
+}
+SKIP_GENERATED_DIR_PREFIXES = ("ollama-code-", "probe-", "verify_")
+SKIP_GENERATED_DIR_PATTERNS = (re.compile(r"^tmp[0-9a-z_-]+$", re.IGNORECASE),)
+SKIP_WALK_DIRS = SKIP_CODE_DIRS | SKIP_GENERATED_DIRS
+SKIP_WALK_GLOBS = (
+    "!scratch/**",
+    "!verify_scratch/**",
+    "!ollama-code-*/**",
+    "!probe-*/**",
+    "!verify_*/**",
+    "!tmp*/**",
+)
 DENY_MUTATION_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ollama-code"}
 ERROR_CLASS_PATTERNS: dict[str, re.Pattern[str]] = {
     "missing_dependency": re.compile(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]|No module named ['\"]([^'\"]+)['\"]", re.IGNORECASE),
@@ -778,6 +798,116 @@ class ToolExecutor:
             timeout=timeout,
         )
 
+    def _generated_dir_name(self, name: str) -> bool:
+        lowered = name.lower()
+        if lowered in SKIP_WALK_DIRS:
+            return True
+        if lowered.startswith(SKIP_GENERATED_DIR_PREFIXES):
+            return True
+        return any(pattern.match(lowered) for pattern in SKIP_GENERATED_DIR_PATTERNS)
+
+    def _path_has_skipped_part(self, path: Path) -> bool:
+        try:
+            parts = path.resolve(strict=False).relative_to(self.workspace_root).parts
+        except ValueError:
+            parts = path.parts
+        return any(self._generated_dir_name(part) for part in parts)
+
+    def _repo_files_from_git(self, base: Path, *, limit: int, suffixes: set[str] | None = None) -> list[Path] | None:
+        try:
+            top_level = self._run_git(["rev-parse", "--show-toplevel"], timeout=10)
+        except OperationInterrupted:
+            raise
+        except Exception:
+            return None
+        if top_level.returncode != 0 or not top_level.stdout.strip():
+            return None
+        git_root = Path(top_level.stdout.strip()).resolve(strict=False)
+        try:
+            pathspec = base.resolve(strict=False).relative_to(git_root).as_posix()
+        except ValueError:
+            return None
+        if not pathspec:
+            pathspec = "."
+        try:
+            completed = self._run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", pathspec], timeout=20)
+        except OperationInterrupted:
+            raise
+        except Exception:
+            return None
+        if completed.returncode != 0:
+            return None
+        files: list[Path] = []
+        seen: set[str] = set()
+        for raw_path in completed.stdout.split("\0"):
+            self._check_interrupted()
+            if not raw_path:
+                continue
+            file_path = (git_root / raw_path).resolve(strict=False)
+            if suffixes is not None and file_path.suffix.lower() not in suffixes:
+                continue
+            if base.is_file() and file_path != base:
+                continue
+            if not base.is_file() and base != file_path and base not in file_path.parents:
+                continue
+            if file_path != self.workspace_root and self.workspace_root not in file_path.parents:
+                continue
+            if self._path_has_skipped_part(file_path):
+                continue
+            if not file_path.is_file():
+                continue
+            rel_file = self.relative_label(file_path)
+            if rel_file in seen:
+                continue
+            seen.add(rel_file)
+            files.append(file_path)
+            if len(files) >= limit:
+                break
+        if not files and base.exists():
+            try:
+                has_entries = base.is_file() or any(base.iterdir())
+            except OSError:
+                has_entries = False
+            if has_entries:
+                return None
+        return sorted(files, key=self.relative_label)
+
+    def _walk_repo_files(self, base: Path, *, limit: int, suffixes: set[str] | None = None) -> list[Path]:
+        if base.is_file():
+            if self._path_has_skipped_part(base):
+                return []
+            if suffixes is not None and base.suffix.lower() not in suffixes:
+                return []
+            return [base]
+        files: list[Path] = []
+        for root, dirs, names in os.walk(base):
+            self._check_interrupted()
+            dirs[:] = sorted(directory for directory in dirs if not self._generated_dir_name(directory))
+            root_path = Path(root)
+            for name in sorted(names):
+                if len(files) >= limit:
+                    return files
+                file_path = root_path / name
+                if self._path_has_skipped_part(file_path):
+                    continue
+                if suffixes is not None and file_path.suffix.lower() not in suffixes:
+                    continue
+                if file_path.is_file():
+                    files.append(file_path)
+        return files
+
+    def _iter_repo_files(self, base: Path, *, limit: int = 50000, suffixes: set[str] | None = None) -> list[Path]:
+        limit = max(1, int(limit))
+        if base.is_file():
+            return self._walk_repo_files(base, limit=limit, suffixes=suffixes)
+        try:
+            git_files = self._repo_files_from_git(base, limit=limit, suffixes=suffixes)
+        except OperationInterrupted:
+            raise
+        if git_files is not None:
+            return git_files
+        return self._walk_repo_files(base, limit=limit, suffixes=suffixes)
+
     def _ensure_git_repo(self) -> tuple[bool, str | None]:
         probe = self._run_git(["rev-parse", "--is-inside-work-tree"])
         if probe.returncode == 0 and probe.stdout.strip() == "true":
@@ -814,7 +944,7 @@ class ToolExecutor:
                 self._check_interrupted()
                 root_path = Path(root)
                 depth = len(root_path.relative_to(base).parts)
-                dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+                dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not self._generated_dir_name(d))
                 if depth >= max_depth:
                     dirs[:] = []
                 for directory in dirs:
@@ -825,6 +955,8 @@ class ToolExecutor:
                     break
                 for file_name in sorted(files):
                     if file_name.startswith("."):
+                        continue
+                    if self._path_has_skipped_part(root_path / file_name):
                         continue
                     items.append(self.relative_label(root_path / file_name))
                     if len(items) >= limit:
@@ -865,6 +997,8 @@ class ToolExecutor:
             command = ["rg", "-n", "--color", "never", "--no-ignore-parent", "--max-count", str(limit)]
             for directory in sorted(SKIP_CODE_DIRS):
                 command.extend(["--glob", f"!{directory}/**"])
+            for glob in SKIP_WALK_GLOBS:
+                command.extend(["--glob", glob])
             command.extend([query, str(base)])
             result = self._run_process(command, cwd=self.workspace_root, timeout=30)
             if result.returncode not in {0, 1} and "regex parse error" in (result.stderr or ""):
@@ -886,10 +1020,8 @@ class ToolExecutor:
             matcher = lambda text: bool(pattern.search(text))
         except re.error:
             matcher = lambda text: query in text
-        for file_path in sorted(base.rglob("*")):
+        for file_path in self._iter_workspace_files(base, limit=50000):
             self._check_interrupted()
-            if not file_path.is_file() or ".git" in file_path.parts:
-                continue
             for line_no, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
                 self._check_interrupted()
                 if matcher(line):
@@ -930,23 +1062,7 @@ class ToolExecutor:
             return
 
     def _iter_workspace_files(self, base: Path, *, limit: int = 50000) -> list[Path]:
-        if base.is_file():
-            return [base]
-        files: list[Path] = []
-        for root, dirs, names in os.walk(base):
-            self._check_interrupted()
-            dirs[:] = sorted(directory for directory in dirs if directory not in SKIP_CODE_DIRS)
-            root_path = Path(root)
-            for name in sorted(names):
-                if len(files) >= limit:
-                    return files
-                file_path = root_path / name
-                if not file_path.is_file():
-                    continue
-                if any(part in SKIP_CODE_DIRS for part in file_path.relative_to(self.workspace_root).parts):
-                    continue
-                files.append(file_path)
-        return files
+        return self._iter_repo_files(base, limit=limit)
 
     def _file_index_record(self, file_path: Path) -> dict[str, Any]:
         stat = file_path.stat()
@@ -1168,26 +1284,10 @@ class ToolExecutor:
         }
 
     def _is_code_file(self, path: Path) -> bool:
-        return path.suffix.lower() in CODE_FILE_SUFFIXES and not any(part in SKIP_CODE_DIRS for part in path.parts)
+        return path.suffix.lower() in CODE_FILE_SUFFIXES and not self._path_has_skipped_part(path)
 
     def _iter_code_files(self, base: Path, *, limit: int = 200) -> list[Path]:
-        if base.is_file():
-            return [base] if self._is_code_file(base) else []
-        files: list[Path] = []
-        for root, dirs, names in os.walk(base):
-            self._check_interrupted()
-            dirs[:] = sorted(directory for directory in dirs if directory not in SKIP_CODE_DIRS)
-            if len(files) >= limit:
-                break
-            root_path = Path(root)
-            for name in sorted(names):
-                if len(files) >= limit:
-                    break
-                file_path = root_path / name
-                if not self._is_code_file(file_path):
-                    continue
-                files.append(file_path)
-        return files
+        return self._iter_repo_files(base, limit=limit, suffixes=CODE_FILE_SUFFIXES)
 
     def _python_signature(self, lines: list[str], start: int) -> str:
         collected: list[str] = []
@@ -1887,14 +1987,10 @@ class ToolExecutor:
                 matched_symbols.append(str(symbol.get("qualname", "")))
         return score, matched_symbols[:8]
 
-    def repo_index_search(self, query: str, path: str = ".", limit: int = 10) -> dict[str, Any]:
-        self._check_interrupted()
-        base = self.resolve_path(path, allow_missing=False)
-        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
-        if not terms:
-            return {"ok": False, "tool": "repo_index_search", "summary": "repo_index_search requires a non-empty query."}
+    def _repo_index_search_records(self, terms: list[str], base: Path, *, limit: int, records: list[dict[str, Any]]) -> dict[str, Any]:
+        record_by_path = {str(record.get("path")): record for record in records if isinstance(record, dict)}
         scored: list[dict[str, Any]] = []
-        for record in self._indexed_code_records(base, limit=1000):
+        for record in records:
             score, matched_symbols = self._repo_index_score(record, terms)
             if score:
                 scored.append({"score": score, "path": record.get("path"), "symbols": matched_symbols})
@@ -1902,26 +1998,26 @@ class ToolExecutor:
         output: list[str] = []
         for item in ranked_records:
             rel = str(item["path"])
-            file_path = self.workspace_root / rel
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            lines = text.splitlines()
-            symbols, _, _ = self._code_symbols(file_path)
+            record = record_by_path.get(rel)
+            if record is None:
+                continue
             snippets: list[str] = []
             matched_symbol_names = set(item.get("symbols", []))
-            for symbol in symbols:
+            for symbol in record.get("symbols", []):
+                if not isinstance(symbol, dict):
+                    continue
                 haystack = f"{symbol.get('qualname', '')} {symbol.get('signature', '')}".lower()
                 if symbol.get("qualname") in matched_symbol_names or any(term in haystack for term in terms):
-                    start = max(1, int(symbol["start"]) - 1)
-                    end = min(len(lines), int(symbol["start"]) + 1)
                     snippets.append(f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']}: {symbol['signature']}")
-                    for line_no in range(start, end + 1):
-                        snippets.append(f"{rel}:{line_no}: {lines[line_no - 1].strip()[:160]}")
-            for line_no, line in enumerate(lines, start=1):
-                lowered = line.lower()
-                hits = sum(1 for term in terms if term in lowered)
-                if hits:
-                    if len(snippets) < 6:
-                        snippets.append(f"{rel}:{line_no}: {line.strip()[:180]}")
+            for line_item in record.get("line_index", []):
+                if not isinstance(line_item, dict):
+                    continue
+                line_terms = set(str(term).lower() for term in line_item.get("terms", []) if isinstance(term, str))
+                text = str(line_item.get("text", ""))
+                lowered = text.lower()
+                hits = sum(1 for term in terms if term in line_terms or term in lowered)
+                if hits and len(snippets) < 6:
+                    snippets.append(f"{rel}:{line_item.get('line')}: {text[:180]}")
             output.append(f"{item['path']} score={item['score']}")
             output.extend(f"  {snippet}" for snippet in snippets[:6])
         return {
@@ -1931,6 +2027,15 @@ class ToolExecutor:
             "count": len(ranked_records),
             "output": "\n".join(output) if output else "(no ranked snippets)",
         }
+
+    def repo_index_search(self, query: str, path: str = ".", limit: int = 10) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        if not terms:
+            return {"ok": False, "tool": "repo_index_search", "summary": "repo_index_search requires a non-empty query."}
+        records = self._indexed_code_records(base, limit=1000)
+        return self._repo_index_search_records(terms, base, limit=max(1, int(limit)), records=records)
 
     def indexed_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
         self._check_interrupted()
@@ -2231,12 +2336,19 @@ class ToolExecutor:
         query = request.strip()
         if not query:
             return {"ok": False, "tool": "context_pack", "summary": "context_pack requires a non-empty request."}
-        ranked = self.repo_index_search(query, path=self.relative_label(base), limit=limit)
-        test_files = [
-            self.relative_label(file_path)
-            for file_path in self._iter_code_files(base, limit=500)
-            if file_path.suffix.lower() == ".py" and ("test" in file_path.name.lower() or "tests" in file_path.parts)
-        ][: max(1, int(limit))]
+        records = self._indexed_code_records(base, limit=1000)
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        ranked = self._repo_index_search_records(terms, base, limit=max(1, int(limit)), records=records) if terms else {"ok": False, "count": 0, "output": "(no ranked snippets)"}
+        test_files: list[str] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            rel = str(record.get("path", ""))
+            normalized_rel = rel.replace("\\", "/")
+            if rel.endswith(".py") and ("test" in Path(rel).name.lower() or "/tests/" in f"/{normalized_rel}"):
+                test_files.append(rel)
+            if len(test_files) >= max(1, int(limit)):
+                break
         git_summary = ""
         if (self.workspace_root / ".git").exists():
             status = self.git_status()
@@ -3478,8 +3590,15 @@ class ToolExecutor:
             validators.append({"kind": kind, "lang": lang, "command": command, "available": self._available_command(command), "reason": reason})
 
         pyproject = self._read_toml(root / "pyproject.toml")
-        python_files = any(root.rglob("*.py"))
-        python_tests = any(root.rglob("test_*.py")) or any(root.rglob("*_test.py")) or (root / "tests").exists()
+        repo_files = self._iter_repo_files(root, limit=50000)
+        suffixes = {file_path.suffix.lower() for file_path in repo_files}
+        file_names = [file_path.name.lower() for file_path in repo_files]
+        rel_paths = [self.relative_label(file_path).replace("\\", "/").lower() for file_path in repo_files]
+        python_files = ".py" in suffixes
+        python_tests = any(
+            name.startswith("test_") or name.endswith("_test.py") or "/tests/" in f"/{rel}/"
+            for name, rel in zip(file_names, rel_paths)
+        ) or (root / "tests").exists()
         pytest_config = (
             (root / "pytest.ini").exists()
             or (root / "pytest.toml").exists()
@@ -3527,16 +3646,16 @@ class ToolExecutor:
                         add(kind, "javascript", f"{manager} run {name}" if name != "test" else f"{manager} test", f"package.json script: {name}")
             if (root / "tsconfig.json").exists():
                 add("typecheck", "typescript", "tsc --noEmit", "tsconfig.json found.")
-        if (root / "go.mod").exists() or any(root.rglob("*.go")):
+        if (root / "go.mod").exists() or ".go" in suffixes:
             add("test", "go", "go test ./...", "Go module or source files found.")
-        if (root / "Cargo.toml").exists() or any(root.rglob("*.rs")):
+        if (root / "Cargo.toml").exists() or ".rs" in suffixes:
             add("check", "rust", "cargo check", "Cargo project or Rust source files found.")
             add("test", "rust", "cargo test", "Cargo project or Rust source files found.")
         gradlew = "gradlew.bat" if os.name == "nt" else "./gradlew"
-        if (root / "build.gradle").exists() or (root / "settings.gradle").exists() or (root / gradlew).exists() or any(root.rglob("*.java")):
+        if (root / "build.gradle").exists() or (root / "settings.gradle").exists() or (root / gradlew).exists() or ".java" in suffixes:
             command = gradlew + " test" if (root / gradlew).exists() else "gradle test"
             add("test", "java", command, "Gradle/Java project detected.")
-        if (root / "CMakeLists.txt").exists() or any(root.rglob("*.cpp")) or any(root.rglob("*.c")):
+        if (root / "CMakeLists.txt").exists() or ".cpp" in suffixes or ".c" in suffixes:
             if (root / "build").exists():
                 add("test", "cpp", "ctest --test-dir build --output-on-failure", "CMake build directory found.")
             add("setup", "cpp", "cmake -S . -B build", "CMake project detected; creates/updates build dir if run.")
@@ -3570,7 +3689,7 @@ class ToolExecutor:
         managers = []
         if (root / "package.json").exists():
             managers.append(self._package_manager_for(root))
-        if (root / "pyproject.toml").exists() or any(root.rglob("requirements*.txt")):
+        if (root / "pyproject.toml").exists() or any(file_path.name.startswith("requirements") and file_path.suffix == ".txt" for file_path in self._iter_repo_files(root, limit=50000)):
             managers.append("pip")
         if (root / "Cargo.toml").exists():
             managers.append("cargo")
@@ -3604,10 +3723,8 @@ class ToolExecutor:
         diagnostics: list[str] = []
         for raw_path in raw_paths:
             base = self.resolve_path(str(raw_path), allow_missing=False)
-            files = [base] if base.is_file() else [file for suffix in CODE_FILE_SUFFIXES for file in base.rglob(f"*{suffix}")]
+            files = self._iter_code_files(base, limit=50000)
             for file_path in files:
-                if not file_path.is_file() or any(part in SKIP_CODE_DIRS for part in file_path.parts):
-                    continue
                 rel = self.relative_label(file_path)
                 checked.append(rel)
                 text = file_path.read_text(encoding="utf-8", errors="replace")
@@ -3643,8 +3760,8 @@ class ToolExecutor:
 
     def _iter_python_test_files(self) -> list[Path]:
         candidates: list[Path] = []
-        for file_path in sorted(self.workspace_root.rglob("*.py")):
-            if not file_path.is_file() or any(part in SKIP_CODE_DIRS for part in file_path.parts):
+        for file_path in self._iter_code_files(self.workspace_root, limit=50000):
+            if file_path.suffix.lower() != ".py":
                 continue
             rel = self.relative_label(file_path).replace("\\", "/")
             name = file_path.name.lower()
@@ -5382,11 +5499,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         if not needle_name:
             return []
         candidates: list[tuple[int, str]] = []
-        for path in self.workspace_root.rglob("*"):
-            if not path.is_file() and not path.is_dir():
-                continue
-            if any(part in SKIP_CODE_DIRS for part in path.relative_to(self.workspace_root).parts):
-                continue
+        for path in self._iter_workspace_files(self.workspace_root, limit=50000):
             rel = self.relative_label(path)
             score = 0
             lowered = rel.lower()
