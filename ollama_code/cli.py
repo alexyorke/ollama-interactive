@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import shutil
 import shlex
 import sys
 import threading
@@ -156,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconcile", choices=["off", "on", "auto"], default=None, help="Artifact reconciliation after failed tests/edits. Default: auto.")
     parser.add_argument("--verifier-model", default=None, help="Optional model override for grounded final verification and evidence-backed rewrite.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
+    parser.add_argument("--doctor", action="store_true", help="Check Ollama, model, workspace, and optional local tool availability, then exit.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser
 
@@ -380,6 +382,7 @@ def startup_help_text(agent: OllamaCodeAgent) -> str:
             "  /model <name>                    switch local Ollama model",
             "  /approval ask|auto|read-only     control writes and shell commands",
             "  /test [command]                  run configured or explicit tests",
+            "  /doctor                          check first-use setup",
             "  /tools                           show compact model-facing tools",
             "  /help                            show all slash commands",
             "  /quit                            exit",
@@ -401,6 +404,7 @@ def slash_help_text() -> str:
             "  /approval ask|auto|read-only     control writes and shell commands",
             "  /debate on|off                   toggle tool audits and final verification",
             "  /reconcile off|on|auto           toggle artifact reconciliation",
+            "  /doctor                          check Ollama/model/workspace setup",
             "  /reset                           clear conversation memory",
             "  /save [path]                     save transcript",
             "  /sessions [limit]                list saved sessions",
@@ -414,6 +418,7 @@ def slash_help_text() -> str:
             "",
             "Tips:",
             "  Ask normally: \"fix failing tests, inspect source first, then run tests\".",
+            "  Run /doctor if the first request is slow or fails before tool use.",
             "  Use /tools for a compact list; /tools full is verbose.",
             "  Use /approval read-only for inspection-only sessions.",
             "  Press Esc during model or tool execution to interrupt.",
@@ -430,6 +435,62 @@ def _strip_matching_quotes(text: str) -> str:
     if len(stripped) >= 2 and stripped[0] == stripped[-1] and stripped[0] in {'"', "'"}:
         return stripped[1:-1]
     return stripped
+
+
+def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
+    ok = True
+    lines = [
+        "Ollama Code doctor",
+        f"workspace: ok {agent.workspace_root().as_posix()}",
+    ]
+    session = agent.session_path()
+    lines.append(f"session: ok {session.as_posix() if session is not None else '(none)'}")
+    if agent.configured_test_command():
+        lines.append(f"test_cmd: ok {agent.configured_test_command()}")
+    else:
+        lines.append("test_cmd: not configured; use --test-cmd or let discover_validators choose focused commands")
+
+    try:
+        models = agent.list_models()
+    except OllamaError as exc:
+        ok = False
+        lines.append(f"ollama: error {exc}")
+        models = []
+    else:
+        if models:
+            lines.append(f"ollama: ok {len(models)} local model(s)")
+        else:
+            ok = False
+            lines.append(f"ollama: no local models. {DEFAULT_MODEL_PULL_HINT}")
+
+    if models:
+        resolved = _resolve_model_candidate(agent.model, set(models))
+        if resolved is not None:
+            lines.append(f"model: ok {resolved}")
+        else:
+            ok = False
+            lines.append(f"model: missing {agent.model}. {DEFAULT_MODEL_PULL_HINT}")
+
+    optional_tools = {
+        "rg": "fast text search",
+        "fd": "fast file discovery",
+        "ast-grep": "structural search",
+        "semgrep": "structural/security scan",
+        "gitleaks": "secret scan",
+        "trivy": "dependency/security scan",
+        "osv-scanner": "dependency vulnerability scan",
+    }
+    found = [name for name in optional_tools if shutil.which(name)]
+    missing = [name for name in optional_tools if name not in found]
+    if found:
+        lines.append("optional tools: found " + ", ".join(found))
+    if missing:
+        lines.append("optional tools: missing " + ", ".join(missing) + " (safe to install later; adapters fail closed)")
+    if shutil.which("ollama-code"):
+        lines.append("console script: ok ollama-code")
+    else:
+        lines.append("console script: not on PATH; run python -m ollama_code or python -m pip install -e .")
+    return "\n".join(lines), ok
 
 
 def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[str], None]) -> bool | None:
@@ -485,6 +546,10 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
             return True
         agent.set_reconcile_mode(mode)
         writer(f"reconcile set to {agent.reconcile_mode()}")
+        return True
+    if action == "/doctor":
+        report, _ = doctor_report(agent)
+        writer(report)
         return True
     if action == "/reset":
         agent.reset()
@@ -617,6 +682,10 @@ def main(argv: list[str] | None = None) -> int:
         renderer.clear_thinking()
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    if args.doctor:
+        report, ok = doctor_report(agent)
+        print(report)
+        return 0 if ok else 1
     if args.prompt:
         try:
             with InterruptController(lambda _: None).watch() as interrupt_event:

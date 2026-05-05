@@ -46,7 +46,7 @@ You do not need to activate a virtualenv every time just to run the CLI from thi
 You can also run it directly from the checkout without installing a console script:
 
 ```bash
-python -m ollama_code.cli
+python -m ollama_code
 ```
 
 ## Config File
@@ -94,6 +94,12 @@ The built-in default model is `hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`. Install
 
 ```bash
 ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS
+```
+
+Check first-use setup before asking it to edit code:
+
+```bash
+python -m ollama_code --doctor
 ```
 
 One-shot prompt:
@@ -316,6 +322,7 @@ git push origin v0.1.0
 - `/approval ask|auto|read-only`
 - `/debate on|off`
 - `/reconcile off|on|auto`
+- `/doctor`
 - `/reset`
 - `/save [path]`
 - `/sessions [limit]`

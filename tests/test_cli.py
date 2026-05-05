@@ -8,7 +8,7 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, ensure_runtime_default_model, handle_meta_command, startup_help_text
+from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, doctor_report, ensure_runtime_default_model, handle_meta_command, startup_help_text
 from ollama_code.config import DEFAULT_MODEL
 
 
@@ -193,6 +193,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("Type a coding request", text)
         self.assertIn("/status", text)
         self.assertIn("/approval ask|auto|read-only", text)
+        self.assertIn("/doctor", text)
         self.assertIn("/tools", text)
         self.assertIn("Press Esc", text)
 
@@ -206,7 +207,32 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("Slash commands:", output[0])
         self.assertIn("/model <name>", output[0])
         self.assertIn("/test [command]", output[0])
+        self.assertIn("/doctor", output[0])
         self.assertIn("fix failing tests", output[0])
+
+    def test_doctor_report_checks_first_use_setup(self) -> None:
+        agent = DummyAgent()
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            report, ok = doctor_report(agent)
+
+        self.assertTrue(ok)
+        self.assertIn("Ollama Code doctor", report)
+        self.assertIn("workspace: ok", report)
+        self.assertIn("ollama: ok", report)
+        self.assertIn(f"model: ok {DEFAULT_MODEL}", report)
+        self.assertIn("console script: not on PATH", report)
+
+    def test_doctor_command_prints_report(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            handled = handle_meta_command("/doctor", agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(len(output), 1)
+        self.assertIn("Ollama Code doctor", output[0])
 
     def test_tools_command_is_compact_by_default_and_full_on_request(self) -> None:
         agent = DummyAgent()
