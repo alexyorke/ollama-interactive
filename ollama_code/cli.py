@@ -34,11 +34,13 @@ from ollama_code.tools import ToolExecutor
 
 PREFERRED_FALLBACK_MODELS = [
     DEFAULT_MODEL,
-    "batiai/gemma4-26b:iq4",
-    "qwen3:8b",
     "gemma3:4b",
+    "qwen3:8b",
+    "gemma4:e4b",
+    "batiai/gemma4-26b:iq4",
     "gpt-oss:20b",
 ]
+DEFAULT_MODEL_PULL_HINT = f"Install the recommended default with: ollama pull {DEFAULT_MODEL}"
 
 
 class CliStatusRenderer:
@@ -326,6 +328,7 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
         return
     available_models = agent.list_models()
     if not available_models:
+        renderer.status(f"no Ollama models found. {DEFAULT_MODEL_PULL_HINT}")
         return
     available = set(available_models)
     current = _resolve_model_candidate(agent.model, available)
@@ -338,11 +341,11 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
         if resolved is None:
             continue
         agent.set_model(resolved)
-        renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {resolved}")
+        renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {resolved}. {DEFAULT_MODEL_PULL_HINT}")
         return
     fallback = available_models[0]
     agent.set_model(fallback)
-    renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}")
+    renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}. {DEFAULT_MODEL_PULL_HINT}")
 
 
 def print_banner(agent: OllamaCodeAgent) -> None:

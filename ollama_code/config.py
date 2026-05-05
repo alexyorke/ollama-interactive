@@ -8,7 +8,7 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path(".ollama-code") / "config.json"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "batiai/qwen3.6-35b:iq4"
+DEFAULT_MODEL = "granite4.1:8b"
 DEFAULT_APPROVAL_MODE = "ask"
 DEFAULT_MAX_TOOL_ROUNDS = 100
 DEFAULT_MAX_AGENT_DEPTH = 2

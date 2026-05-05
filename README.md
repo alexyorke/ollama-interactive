@@ -55,7 +55,7 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
 ```json
 {
   "host": "http://127.0.0.1:11434",
-  "model": "batiai/qwen3.6-35b:iq4",
+  "model": "granite4.1:8b",
   "verifier_model": "granite4.1:8b",
   "approval": "ask",
   "debate": true,
@@ -87,6 +87,12 @@ Interactive REPL:
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
 ollama-code
+```
+
+The built-in default model is `granite4.1:8b`. Install it once if needed:
+
+```bash
+ollama pull granite4.1:8b
 ```
 
 One-shot prompt:
@@ -335,6 +341,7 @@ git push origin v0.1.0
 - Token profiling is recorded in `llm_call` events, including prompt chars by role and largest prompt messages, so evals can identify input-token waste.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
+- The recommended default coding model is `granite4.1:8b`; install it with `ollama pull granite4.1:8b`.
 - The recommended serial eval order is `gemma3:4b`, `qwen3:8b`, `granite4.1:8b`, then `gemma4:e4b`.
-- On this machine, the tested serial live baselines are `gemma3:4b` and `qwen3:8b` on the WSL Ollama daemon at `127.0.0.1:11434`. If you do not pass `--model` and the built-in preferred default is not installed, the CLI falls back to the first available preferred local model and reports that choice.
+- If you do not pass `--model` and `granite4.1:8b` is not installed, the CLI falls back to the first available preferred local model and prints the pull command for Granite.
 - The Windows-side Ollama install still has no usable local models for this project, so running inside WSL is the simplest path.

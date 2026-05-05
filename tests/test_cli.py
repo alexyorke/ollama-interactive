@@ -8,12 +8,12 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, handle_meta_command
+from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, ensure_runtime_default_model, handle_meta_command
 
 
 class DummyAgent:
     def __init__(self) -> None:
-        self.model = "batiai/qwen3.6-35b:iq4"
+        self.model = "granite4.1:8b"
         self.max_tool_rounds = 100
         self.max_agent_depth = 2
         self._approval = "ask"
@@ -106,7 +106,7 @@ class DummyAgent:
         return "list_files\nread_file"
 
     def list_models(self) -> list[str]:
-        return ["batiai/qwen3.6-35b:iq4", "gemma4:latest"]
+        return ["granite4.1:8b", "gemma4:latest"]
 
 
 class CliCommandTests(unittest.TestCase):
@@ -127,13 +127,13 @@ class CliCommandTests(unittest.TestCase):
         args = build_parser().parse_args([])
         self.assertIsNone(args.max_tool_rounds)
 
-    def test_build_agent_uses_qwen_default_model(self) -> None:
+    def test_build_agent_uses_granite_default_model(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
 
         agent = build_agent(args)
 
-        self.assertEqual(agent.model, "batiai/qwen3.6-35b:iq4")
+        self.assertEqual(agent.model, "granite4.1:8b")
         self.assertEqual(agent.max_tool_rounds, 100)
         self.assertEqual(agent.max_agent_depth, 2)
         self.assertEqual(agent.approval_mode(), "ask")
@@ -154,6 +154,19 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("\x1b[90mfour\x1b[0m", output)
         self.assertIn("\x1b[1A", output)
         self.assertIn("[status] tool read_file {}", output)
+
+    def test_runtime_default_fallback_prints_granite_pull_hint(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root)])
+        agent = DummyAgent()
+        agent.list_models = lambda: ["gemma3:4b"]  # type: ignore[method-assign]
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
+
+        ensure_runtime_default_model(agent, args, renderer)
+
+        self.assertEqual(agent.model, "gemma3:4b")
+        self.assertIn("ollama pull granite4.1:8b", stream.getvalue())
 
     def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
         stream = io.StringIO()
@@ -253,7 +266,7 @@ class CliCommandTests(unittest.TestCase):
         output: list[str] = []
         handled = handle_meta_command("/models", agent, output.append)
         self.assertTrue(handled)
-        self.assertIn("batiai/qwen3.6-35b:iq4", output[0])
+        self.assertIn("granite4.1:8b", output[0])
 
     def test_sessions_command_lists_saved_sessions(self) -> None:
         agent = DummyAgent()
