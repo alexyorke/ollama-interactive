@@ -330,12 +330,13 @@ def _resolve_model_candidate(candidate: str, available: set[str]) -> str | None:
     return None
 
 
-def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespace, renderer: CliStatusRenderer) -> None:
+def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespace, renderer: CliStatusRenderer, *, quiet: bool = False) -> None:
     if not _should_resolve_runtime_default_model(args):
         return
     available_models = agent.list_models()
     if not available_models:
-        renderer.status(f"no Ollama models found. {DEFAULT_MODEL_PULL_HINT}")
+        if not quiet:
+            renderer.status(f"no Ollama models found. {DEFAULT_MODEL_PULL_HINT}")
         return
     available = set(available_models)
     current = _resolve_model_candidate(agent.model, available)
@@ -348,11 +349,13 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
         if resolved is None:
             continue
         agent.set_model(resolved)
-        renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {resolved}. {DEFAULT_MODEL_PULL_HINT}")
+        if not quiet:
+            renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {resolved}. {DEFAULT_MODEL_PULL_HINT}")
         return
     fallback = available_models[0]
     agent.set_model(fallback)
-    renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}. {DEFAULT_MODEL_PULL_HINT}")
+    if not quiet:
+        renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}. {DEFAULT_MODEL_PULL_HINT}")
 
 
 def startup_help_text(agent: OllamaCodeAgent) -> str:
@@ -377,7 +380,7 @@ def startup_help_text(agent: OllamaCodeAgent) -> str:
             "  /model <name>                    switch local Ollama model",
             "  /approval ask|auto|read-only     control writes and shell commands",
             "  /test [command]                  run configured or explicit tests",
-            "  /tools                           show available filesystem/code tools",
+            "  /tools                           show compact model-facing tools",
             "  /help                            show all slash commands",
             "  /quit                            exit",
             "",
@@ -406,11 +409,12 @@ def slash_help_text() -> str:
             "  /diff [--cached] [path]          show git diff",
             "  /commit <message>                commit via git_commit tool",
             "  /test [command]                  run tests",
-            "  /tools                           show model-facing tools",
+            "  /tools [full]                    show compact tools, or full descriptions",
             "  /quit                            exit",
             "",
             "Tips:",
             "  Ask normally: \"fix failing tests, inspect source first, then run tests\".",
+            "  Use /tools for a compact list; /tools full is verbose.",
             "  Use /approval read-only for inspection-only sessions.",
             "  Press Esc during model or tool execution to interrupt.",
         ]
@@ -556,7 +560,8 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(output)
         return True
     if action == "/tools":
-        writer(agent.tool_help())
+        full = _strip_matching_quotes(remainder).lower() == "full"
+        writer(agent.tool_help(compact=not full))
         return True
     writer(f"Unknown command: {command}")
     return True
@@ -600,13 +605,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     renderer = CliStatusRenderer()
+    status_printer = (lambda _message: None) if args.quiet else renderer.status
     try:
-        agent = build_agent(args, status_printer=renderer.status, thinking_printer=renderer.show_thinking)
+        agent = build_agent(args, status_printer=status_printer, thinking_printer=renderer.show_thinking)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     try:
-        ensure_runtime_default_model(agent, args, renderer)
+        ensure_runtime_default_model(agent, args, renderer, quiet=args.quiet)
     except OllamaError as exc:
         renderer.clear_thinking()
         print(f"error: {exc}", file=sys.stderr)

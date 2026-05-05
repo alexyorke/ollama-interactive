@@ -1062,6 +1062,46 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "apply_structured_edit")
         self.assertIn("def add(left: int, right: int) -> int:\n    return left + right", final_text)
 
+    def test_edit_intent_routes_fix_like_full_function_to_symbol_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "calculator.py"
+            sample.write_text("def add(left: int, right: int) -> int:\n    return left - right\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "calculator.py",
+                "fix_function_body",
+                "add",
+                "def add(left: int, right: int) -> int:\n    return left + right\n",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "replace_symbol")
+        self.assertIn("return left + right", final_text)
+        self.assertNotIn("def def", final_text)
+
+    def test_edit_intent_unknown_intent_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "calculator.py"
+            original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "calculator.py",
+                "remove_extra_def_keyword",
+                "def def add(left, right):",
+                "def add(left, right):",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertEqual(final_text, original)
+
     def test_edit_intent_routes_project_rename_to_structured_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

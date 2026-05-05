@@ -418,7 +418,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "write_file": "write_file(path,content)",
         "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
         "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol|replace_function_body|change_signature|...","path":"a.py"})',
-        "edit_intent": "edit_intent(path,intent,target?,replacement?,scope='file',apply=true)",
+        "edit_intent": "edit_intent(path,intent=rename|replace_text|replace_symbol|replace_body|change_signature|add_import,target?,replacement?,scope='file',apply=true)",
         "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
         "browser_smoke": "browser_smoke(url,actions=[],wait_for?,viewport='desktop',screenshot=false)",
         "security_scan": "security_scan(path='.',scanners='auto',limit=80)",
@@ -4351,9 +4351,19 @@ class ToolExecutor:
             return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires target for this intent."}
         if replacement is None and clean_intent != "delete_symbol":
             return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires replacement for this intent."}
-        route = "replace text in file"
-        routed_tool = "replace_in_file"
+        route = ""
+        routed_tool = ""
         operation: dict[str, Any] | None = None
+        text_replace_intents = {
+            "replace",
+            "replace_text",
+            "text",
+            "text_replace",
+            "replace_in_file",
+            "string_replace",
+            "literal_replace",
+            "update_text",
+        }
         if clean_intent in {"rename", "rename_symbol", "rename_symbol_project", "update_callers", "refactor_rename"} and self._looks_like_symbol_name(old) and self._looks_like_symbol_name(new):
             if clean_scope in {"project", "repo", "repository", "all"}:
                 route = "project symbol rename"
@@ -4379,11 +4389,14 @@ class ToolExecutor:
             target_path.suffix.lower() == ".py"
             and self._looks_like_symbol_name(old)
             and self._looks_like_function_body_edit_intent(clean_intent)
-            and not self._looks_like_full_symbol_source(target_path, new)
         ):
-            route = "replace Python function body"
-            routed_tool = "apply_structured_edit"
-            operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
+            if self._looks_like_full_symbol_source(target_path, new):
+                route = "replace symbol source"
+                routed_tool = "replace_symbol"
+            else:
+                route = "replace Python function body"
+                routed_tool = "apply_structured_edit"
+                operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
         elif clean_intent in {"replace_symbol", "replace_function", "replace_class", "symbol"}:
             if self._looks_like_symbol_name(old) and self._looks_like_full_symbol_source(target_path, new):
                 route = "replace symbol source"
@@ -4395,6 +4408,20 @@ class ToolExecutor:
             else:
                 route = "symbol-like request routed to text replace because target/replacement is not full symbol source"
                 routed_tool = "replace_in_file"
+        elif clean_intent in text_replace_intents:
+            route = "replace text in file"
+            routed_tool = "replace_in_file"
+        else:
+            return {
+                "ok": False,
+                "tool": "edit_intent",
+                "path": relative_path,
+                "summary": (
+                    f"Unknown edit_intent intent: {intent}. Use one of rename, replace_text, "
+                    "replace_symbol, replace_body, change_signature, or add_import."
+                ),
+                "error_class": "invalid_args",
+            }
         if not apply:
             return {
                 "ok": True,

@@ -103,8 +103,8 @@ class DummyAgent:
         selected = command or self._test_command
         return {"ok": True, "output": f"ran {selected}"}
 
-    def tool_help(self) -> str:
-        return "list_files\nread_file"
+    def tool_help(self, *, compact: bool = False) -> str:
+        return "list_files()\nread_file(path)" if compact else "list_files\nread_file"
 
     def list_models(self) -> list[str]:
         return [DEFAULT_MODEL, "gemma4:latest"]
@@ -169,6 +169,19 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.model, "gemma3:4b")
         self.assertIn(f"ollama pull {DEFAULT_MODEL}", stream.getvalue())
 
+    def test_runtime_default_fallback_respects_quiet(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+        agent = DummyAgent()
+        agent.list_models = lambda: ["gemma3:4b"]  # type: ignore[method-assign]
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
+
+        ensure_runtime_default_model(agent, args, renderer, quiet=True)
+
+        self.assertEqual(agent.model, "gemma3:4b")
+        self.assertEqual(stream.getvalue(), "")
+
     def test_startup_help_text_explains_basic_usage(self) -> None:
         agent = DummyAgent()
 
@@ -194,6 +207,18 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/model <name>", output[0])
         self.assertIn("/test [command]", output[0])
         self.assertIn("fix failing tests", output[0])
+
+    def test_tools_command_is_compact_by_default_and_full_on_request(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        compact = handle_meta_command("/tools", agent, output.append)
+        full = handle_meta_command("/tools full", agent, output.append)
+
+        self.assertTrue(compact)
+        self.assertTrue(full)
+        self.assertEqual(output[0], "list_files()\nread_file(path)")
+        self.assertEqual(output[1], "list_files\nread_file")
 
     def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
         stream = io.StringIO()
