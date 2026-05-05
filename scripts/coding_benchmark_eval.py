@@ -124,6 +124,41 @@ def tool_calls(session: dict[str, Any]) -> list[str]:
     ]
 
 
+def tool_profile(session: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    totals: dict[str, dict[str, Any]] = {}
+    for event in session.get("events", []):
+        if event.get("type") != "tool_result":
+            continue
+        name = str(event.get("name") or "")
+        if not name:
+            continue
+        raw_duration = event.get("duration_ms")
+        duration_ms = float(raw_duration) if isinstance(raw_duration, (int, float)) else 0.0
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        rows.append(
+            {
+                "name": name,
+                "duration_ms": round(duration_ms, 3),
+                "cached": event.get("cached") is True,
+                "ok": result.get("ok") is True,
+                "summary": str(result.get("summary") or result.get("output") or "")[:160],
+            }
+        )
+        bucket = totals.setdefault(name, {"calls": 0, "duration_ms": 0.0, "failed": 0, "cached": 0})
+        bucket["calls"] += 1
+        bucket["duration_ms"] += duration_ms
+        if result.get("ok") is False:
+            bucket["failed"] += 1
+        if event.get("cached") is True:
+            bucket["cached"] += 1
+    return {
+        "total_duration_ms": round(sum(float(item["duration_ms"]) for item in rows), 3),
+        "by_tool": {name: {**bucket, "duration_ms": round(float(bucket["duration_ms"]), 3)} for name, bucket in sorted(totals.items())},
+        "calls": rows,
+    }
+
+
 def tool_call_args(session: dict[str, Any], tool_name: str) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
     for event in session.get("events", []):
@@ -814,6 +849,7 @@ def evaluate_case(
                     "latency_s": round(elapsed, 2),
                     "usage": usage_totals(session),
                     "tool_calls": tool_calls(session),
+                    "tool_profile": tool_profile(session),
                     "failed_tools": failed_tools(session),
                     "assumption_audits": event_count(session, "assumption_audit"),
                     "assumption_audit_retries": event_count(session, "assumption_audit", verdict="retry"),
@@ -862,6 +898,7 @@ def evaluate_case(
             "latency_s": round(elapsed, 2),
             "usage": usage_totals(session),
             "tool_calls": tool_calls(session),
+            "tool_profile": tool_profile(session),
             "failed_tools": failed_tools(session),
             "assumption_audits": event_count(session, "assumption_audit"),
             "assumption_audit_retries": event_count(session, "assumption_audit", verdict="retry"),

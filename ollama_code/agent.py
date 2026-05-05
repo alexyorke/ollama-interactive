@@ -4,6 +4,7 @@ import ast
 from copy import deepcopy
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,11 +32,13 @@ JSON only:
 Rules:
 - One tool or one final. Relative paths. No fences/thought.
 - Need repo/file/git/shell/edit/agent facts? Use tools; do not guess.
-- Inspect before edit. Write: write_file. Symbol edit: replace_symbol/replace_symbols. Text edit: replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
+- Inspect before edit. Preferred edit: edit_intent. Low-level edits: write_file, replace_symbol/replace_symbols, replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
 - write_file content is raw file text only; no markdown fences, no leading ">" quote markers.
 - For fix/implement + tests: read tests/source, edit implementation, run_test; do not only summarize or loop on reads.
 - If user names a source file/function to fix, edit source, not tests, unless tests are explicitly requested.
-- Code nav: prefer search_symbols, code_outline, then read_symbol before broad read_file; use contract_graph for refactors/signatures. Search/list before broad reads; use ranges.
+- Code nav: use file_search/fd_search and fts_search/repo_index_search to shrink scope; prefer search_symbols, code_outline, then read_symbol before broad read_file; use inspect_library_source for installed Python library internals. Search/list before broad reads; use ranges.
+- Validation/deps: use discover_validators for unknown projects; use diagnose_dependency_error before retrying import/command/path failures.
+- Systems lens: for broad/debug/design/perf/refactor tasks, use systems_lens early; force explicit boundary, observer/metric, categories, state/scale, feedback, delays, stocks/flows, coupling, model limits, and intervention tests.
 - Reuse results; avoid repeat read-only calls unless state changed.
 - Question your assumptions before acting; prove or disprove with tools when possible.
 - Never claim edit/cmd/test/agent success without current-turn success.
@@ -96,24 +99,34 @@ CANDIDATE_CLAIM_LIMIT = 5
 CANDIDATE_CLAIM_TEXT_LIMIT = 180
 VERIFICATION_EVIDENCE_LIMIT = 3
 VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
-MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "git_commit"}
+MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent", "git_commit"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "list_files",
     "read_file",
     "search",
     "file_search",
+    "fd_search",
     "file_index_refresh",
     "everything_search",
     "search_symbols",
     "code_outline",
     "read_symbol",
+    "inspect_library_source",
     "repo_index_search",
+    "fts_search",
+    "fts_refresh",
     "indexed_search",
     "repo_index_refresh",
     "semgrep_scan",
+    "ast_search",
+    "lsp_diagnostics",
+    "lsp_definition",
+    "lsp_references",
     "context_pack",
+    "systems_lens",
     "find_implementation_target",
     "diagnose_test_failure",
+    "diagnose_dependency_error",
     "call_graph",
     "contract_graph",
     "lint_typecheck",
@@ -122,15 +135,16 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "git_status",
     "git_diff",
 }
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "indexed_search", "repo_index_refresh", "semgrep_scan", "context_pack", "find_implementation_target", "call_graph", "contract_graph"}
-EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
-TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "generate_tests_from_spec"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "diagnose_dependency_error", "call_graph", "contract_graph", "discover_validators", "mcp_list_tools"}
+EDIT_TOOL_NAMES = {"edit_intent", "write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
+LOW_LEVEL_EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
+TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "diagnose_dependency_error", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "generate_tests_from_spec"}
 SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "repo_index_search", "indexed_search", "repo_index_refresh", "semgrep_scan", "context_pack", "contract_graph"}
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "everything_search", "read_symbol", "context_pack", "repo_index_search", "indexed_search", "semgrep_scan", "find_implementation_target", "diagnose_test_failure", "contract_graph"}
-VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "select_tests"}
+CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "discover_validators", "mcp_list_tools"}
+GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "diagnose_dependency_error", "contract_graph"}
+VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
 MODEL_TOOL_RESULT_LIMITS = {
@@ -138,28 +152,44 @@ MODEL_TOOL_RESULT_LIMITS = {
     "read_file": 1000,
     "search": 700,
     "file_search": 700,
+    "fd_search": 700,
     "file_index_refresh": 400,
     "everything_search": 700,
     "search_symbols": 700,
     "code_outline": 900,
     "read_symbol": 1100,
+    "inspect_library_source": 1400,
     "repo_index_search": 900,
+    "fts_search": 900,
+    "fts_refresh": 500,
     "indexed_search": 900,
     "repo_index_refresh": 500,
     "semgrep_scan": 900,
+    "ast_search": 900,
+    "lsp_diagnostics": 900,
+    "lsp_definition": 700,
+    "lsp_references": 900,
     "context_pack": 900,
+    "systems_lens": 900,
     "find_implementation_target": 800,
     "diagnose_test_failure": 900,
     "run_function_probe": 700,
     "call_graph": 900,
     "contract_graph": 1000,
     "lint_typecheck": 800,
+    "discover_validators": 800,
+    "diagnose_dependency_error": 800,
     "contract_check": 900,
     "select_tests": 800,
+    "edit_intent": 1000,
     "replace_symbol": 900,
     "replace_symbols": 1000,
     "apply_structured_edit": 1000,
     "generate_tests_from_spec": 1000,
+    "browser_smoke": 900,
+    "security_scan": 900,
+    "mcp_list_tools": 900,
+    "mcp_call": 900,
     "git_status": 700,
     "git_diff": 900,
     "run_shell": 700,
@@ -374,9 +404,11 @@ class OllamaCodeAgent:
         ]
 
     def _system_prompt_for_tools(self, tool_names: set[str] | None) -> str:
+        available = self.tools.available_tool_names()
+        selected = available if tool_names is None else set(tool_names) & available
         return SYSTEM_PROMPT_TEMPLATE.format(
             workspace_root=self.tools.workspace_root.as_posix(),
-            tool_help=format_compact_tool_help(tool_names),
+            tool_help=format_compact_tool_help(selected),
         )
 
     def _primary_tool_names_for_request(
@@ -415,23 +447,35 @@ class OllamaCodeAgent:
         ]
         if requires_tools or any(term in lowered for term in workspace_terms):
             selected.update(READ_ONLY_WORKSPACE_TOOL_NAMES)
-        if feature_enabled("contract-guards") and re.search(r"\b(?:refactor|signature|type|return|caller|callee|contract|pipeline|pure|function chain)\b", lowered):
+        if self._request_benefits_from_systems_lens(request_text):
+            selected.add("systems_lens")
+        if re.search(r"\b(?:refactor|signature|type|return|caller|callee|contract|pipeline|pure|function chain)\b", lowered):
             selected.add("contract_graph")
+        if re.search(r"\b(?:library|package|site-packages|stdlib|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
+            selected.add("inspect_library_source")
         if mutation_allowed or mutation_required:
             selected.update(READ_ONLY_WORKSPACE_TOOL_NAMES)
             selected.update(EDIT_TOOL_NAMES)
         if test_run_required or re.search(r"\b(?:test|pytest|unittest|run tests?)\b", lowered):
             selected.update(TEST_TOOL_NAMES)
+            selected.add("discover_validators")
         if re.search(r"\b(?:shell|command|execute|run exactly|terminal|powershell|bash)\b", lowered):
             selected.update(SHELL_TOOL_NAMES)
+            selected.add("diagnose_dependency_error")
         if re.search(r"\b(?:git|diff|status|commit|staged|working tree)\b", lowered):
             selected.update(GIT_TOOL_NAMES)
+        if re.search(r"\b(?:browser|ui|frontend|page|localhost|url|screenshot|playwright)\b", lowered):
+            selected.add("browser_smoke")
+        if re.search(r"\b(?:security|secret|vulnerab|audit|cve|dependency scan|scanner|gitleaks|trivy|osv)\b", lowered):
+            selected.add("security_scan")
+        if re.search(r"\b(?:mcp|model context protocol)\b", lowered):
+            selected.update({"mcp_list_tools", "mcp_call"})
         if re.search(r"\b(?:agent|subagent|sub-agent|delegate)\b", lowered):
             selected.update(AGENT_TOOL_NAMES)
         selected.update(required_tool_names)
         if "context_pack" not in required_tool_names:
             selected.discard("context_pack")
-            if feature_enabled("context-pack") and (
+            if (
                 mutation_required
                 or test_run_required
                 or self._request_is_broad_or_ambiguous(request_text)
@@ -496,7 +540,7 @@ class OllamaCodeAgent:
         return default_session_dir(self.tools.workspace_root)
 
     def tool_help(self) -> str:
-        return format_tool_help()
+        return format_tool_help(self.tools.available_tool_names())
 
     def list_models(self) -> list[str]:
         return self.client.list_models()
@@ -1956,6 +2000,54 @@ class OllamaCodeAgent:
         arguments: dict[str, Any],
     ) -> tuple[str, dict[str, Any], str | None]:
         lowered = name.strip().lower()
+        if lowered in {"edit_symbol", "fix_symbol", "update_symbol"}:
+            path = arguments.get("path") or arguments.get("file") or arguments.get("filename")
+            symbol = arguments.get("symbol") or arguments.get("name") or arguments.get("function") or arguments.get("target")
+            content = arguments.get("content") or arguments.get("replacement") or arguments.get("new")
+            if isinstance(path, str) and path.strip() and isinstance(symbol, str) and symbol.strip() and isinstance(content, str) and content.strip():
+                return (
+                    "edit_intent",
+                    {
+                        "path": path.strip(),
+                        "intent": "replace_symbol",
+                        "target": symbol.strip(),
+                        "replacement": content,
+                    },
+                    f"Normalized unsupported {name} alias to edit_intent.",
+                )
+        if lowered in {"search_implementation_target", "search_implementation", "implementation_search"}:
+            query = arguments.get("query") or arguments.get("symbol") or arguments.get("target")
+            path = arguments.get("path") or arguments.get("root") or "."
+            if isinstance(query, str) and query.strip():
+                return (
+                    "repo_index_search",
+                    {
+                        "query": query.strip(),
+                        "path": str(path or "."),
+                        "limit": int(arguments.get("limit", 10) or 10),
+                    },
+                    f"Normalized unsupported {name} alias to repo_index_search.",
+                )
+        if lowered in {"edit_implementation_target", "fix_implementation_target", "edit_target", "fix_target"}:
+            path = arguments.get("path") or arguments.get("file") or arguments.get("filename")
+            replacement = arguments.get("replacement") or arguments.get("content") or arguments.get("new")
+            symbol = arguments.get("symbol") or arguments.get("name") or arguments.get("function") or arguments.get("target_symbol")
+            target = symbol if isinstance(symbol, str) and symbol.strip() else arguments.get("target")
+            if isinstance(path, str) and path.strip() and isinstance(replacement, str) and replacement.strip() and isinstance(target, str) and target.strip():
+                normalized_target = target
+                if self._path_looks_like_code_file(path):
+                    target_match = re.match(r"\s*(?:async\s+def|def|class)?\s*([A-Za-z_][\w.]*)", target)
+                    normalized_target = target_match.group(1) if target_match else target.strip()
+                return (
+                    "edit_intent",
+                    {
+                        "path": path.strip(),
+                        "intent": "replace_symbol" if self._path_looks_like_code_file(path) else "replace_text",
+                        "target": normalized_target,
+                        "replacement": replacement,
+                    },
+                    f"Normalized unsupported {name} alias to edit_intent.",
+                )
         if lowered not in {"edit_file", "modify_file", "update_file"}:
             return name, arguments, None
         path = arguments.get("path") or arguments.get("file") or arguments.get("filename")
@@ -2179,6 +2271,18 @@ class OllamaCodeAgent:
             r"\brun_test\b",
         ]
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _request_requires_code_mutation(self, text: str) -> bool:
+        lowered = text.lower()
+        if not self._request_requires_mutation(text):
+            return False
+        return bool(
+            re.search(r"\b(?:fix|implement|patch|repair|refactor|change|update)\b", lowered)
+            and (
+                re.search(r"\b(?:implementation|source|code|bug|failing|failure|hidden tests?)\b", lowered)
+                or re.search(r"\b(?:fix|patch|repair)\b.{0,120}\btests?\b", lowered)
+            )
+        )
 
     def _request_forbids_test_mutation(self, text: str) -> bool:
         lowered = text.lower()
@@ -2552,9 +2656,16 @@ class OllamaCodeAgent:
             normalized = dict(arguments)
             normalized["command"] = self.tools.default_test_command
             return "run_test", normalized, f"Normalized {name} tool alias to the configured run_test command."
-        if name != "run_test" or not self.tools.default_test_command:
+        if name != "run_test":
             return name, arguments, None
         command = str(arguments.get("command", "")).strip()
+        normalized_unittest = self._normalize_unittest_file_command(command)
+        if normalized_unittest:
+            normalized = dict(arguments)
+            normalized["command"] = normalized_unittest
+            return "run_test", normalized, "Normalized unittest file path command to unittest discover."
+        if not self.tools.default_test_command:
+            return name, arguments, None
         lowered_command = command.lower()
         lowered_request = request_text.lower()
         vague_command = lowered_command in {"", "test", "tests", "pytest", "unittest", "python -m unittest", "python3 -m unittest"}
@@ -2564,6 +2675,25 @@ class OllamaCodeAgent:
         normalized = dict(arguments)
         normalized["command"] = self.tools.default_test_command
         return "run_test", normalized, "Normalized vague run_test command to the configured test command."
+
+    def _normalize_unittest_file_command(self, command: str) -> str | None:
+        match = re.match(
+            r"^(?P<prefix>(?:\"[^\"]+\"|'[^']+'|[^\s]+)\s+-m\s+unittest)\s+(?P<path>[^\s]+\.py)\s*$",
+            command.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        raw_path = match.group("path").strip("\"'")
+        try:
+            target = self.tools.resolve_path(raw_path, allow_missing=False)
+        except Exception:
+            return None
+        rel = self.tools.relative_label(target).replace("\\", "/")
+        if "/tests/" not in f"/{rel}" and not target.name.startswith("test_") and not target.name.endswith("_test.py"):
+            return None
+        test_dir = self.tools.relative_label(target.parent)
+        return f"{match.group('prefix')} discover -s {test_dir} -p {target.name}"
 
     def _shell_command_looks_like_test_run(self, command: str) -> bool:
         lowered = command.lower()
@@ -2624,6 +2754,17 @@ class OllamaCodeAgent:
         if any(phrase in lowered for phrase in broad_phrases):
             return True
         return "repo" in lowered and not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)
+
+    def _request_benefits_from_systems_lens(self, text: str) -> bool:
+        if self._request_is_broad_or_ambiguous(text):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:debug|root cause|flaky|regression|perf|performance|slow|throughput|profile|benchmark|architecture|design|workflow|pipeline|integration|refactor|migration|system|systems)\b",
+                text,
+                flags=re.IGNORECASE,
+            )
+        )
 
     def _tool_output_without_line_prefixes(self, text: str) -> str:
         return "\n".join(re.sub(r"^\s*\d+\s+\|\s?", "", line) for line in text.splitlines())
@@ -2754,8 +2895,6 @@ class OllamaCodeAgent:
         tool_calls: list[dict[str, Any]],
         cache_hit: bool,
     ) -> bool:
-        if not feature_enabled("trajectory-guards"):
-            return False
         if name in CONTEXT_GATHERING_TOOL_NAMES and self._context_tool_streak(tool_calls) >= 3:
             return True
         if not cache_hit and self._same_tool_call_count(tool_calls, name, arguments) >= 2:
@@ -2794,7 +2933,9 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]],
         latest_run_test_failed: bool,
     ) -> bool:
-        if not feature_enabled("trajectory-guards") or name not in MUTATING_TOOL_NAMES:
+        if not feature_enabled("trajectory-guards"):
+            return False
+        if name not in MUTATING_TOOL_NAMES:
             return False
         if self._has_grounding_evidence(successful_tool_results=successful_tool_results, latest_run_test_failed=latest_run_test_failed):
             return False
@@ -2840,9 +2981,11 @@ class OllamaCodeAgent:
         arguments: dict[str, Any],
         tool_error_counts: dict[tuple[str, str, str], int],
     ) -> str | None:
-        if not feature_enabled("trajectory-guards"):
-            return None
         arg_key = self._tool_error_arg_key(name, arguments)
+        if name in LOW_LEVEL_EDIT_TOOL_NAMES and "edit_intent" in self.tools.available_tool_names():
+            for prior_name, _prior_arg_key, error_class in tool_error_counts:
+                if prior_name in LOW_LEVEL_EDIT_TOOL_NAMES and tool_error_counts[(prior_name, _prior_arg_key, error_class)] >= 1:
+                    return f"edit_intent:{error_class}"
         for prior_name, prior_arg_key, error_class in tool_error_counts:
             if prior_name == name and prior_arg_key == arg_key and tool_error_counts[(prior_name, prior_arg_key, error_class)] >= 2:
                 return error_class
@@ -2862,6 +3005,11 @@ class OllamaCodeAgent:
         return error_class, tool_error_counts[key]
 
     def _tool_error_guard_message(self, name: str, error_class: str) -> str:
+        if error_class.startswith("edit_intent:"):
+            return (
+                f"A low-level edit already failed with {error_class.split(':', 1)[1]}. "
+                "Use edit_intent with intent, target, replacement, and scope instead of another low-level edit retry. Next JSON only."
+            )
         if error_class in {"path_missing", "cwd_git"}:
             return (
                 f"{name} already failed twice with {error_class}. Do not retry the same path/cwd. "
@@ -2903,7 +3051,7 @@ class OllamaCodeAgent:
         return bool(re.search(r"\b(?:do not|don't|dont|skip|without|no)\b[^.?!\n]{0,80}\b(?:test|tests|pytest|unittest|validation|validate)\b", lowered))
 
     def _post_edit_validation_enabled(self) -> bool:
-        return feature_enabled("trajectory-guards") or feature_enabled("contract-guards")
+        return True
 
     def _auto_validation_plan(
         self,
@@ -2911,13 +3059,16 @@ class OllamaCodeAgent:
         mutated_paths: set[str],
         forbidden_tool_names: set[str],
     ) -> tuple[str, dict[str, Any], str] | None:
-        python_paths = sorted(path for path in mutated_paths if path.endswith(".py"))
-        if python_paths and "lint_typecheck" not in forbidden_tool_names:
-            return "lint_typecheck", {"paths": python_paths}, "syntax check changed Python file(s)"
-        if python_paths and feature_enabled("contract-guards") and "contract_check" not in forbidden_tool_names:
+        code_paths = sorted(path for path in mutated_paths if Path(path).suffix.lower() in CODE_EDIT_SUFFIXES)
+        python_paths = sorted(path for path in code_paths if path.endswith(".py"))
+        if code_paths and "lint_typecheck" not in forbidden_tool_names:
+            return "lint_typecheck", {"paths": code_paths}, "syntax check changed code file(s)"
+        if python_paths and "contract_check" not in forbidden_tool_names:
             return "contract_check", {"changed_files": python_paths}, "contract check changed Python function(s)"
-        if python_paths and "select_tests" not in forbidden_tool_names:
-            return "select_tests", {"changed_files": python_paths}, "select targeted tests for changed Python file(s)"
+        if code_paths and "select_tests" not in forbidden_tool_names:
+            return "select_tests", {"changed_files": code_paths}, "select targeted tests for changed file(s)"
+        if mutated_paths and "discover_validators" not in forbidden_tool_names:
+            return "discover_validators", {"path": "."}, "discover validators for non-code edit"
         if self.tools.default_test_command and "run_test" not in forbidden_tool_names:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
@@ -3105,7 +3256,9 @@ class OllamaCodeAgent:
         self._append_assistant_payload(payload)
         self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
         tool_calls_this_turn.append({"name": name, "arguments": deepcopy(arguments)})
+        started = time.perf_counter()
         result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
         if not cache_hit:
             self._store_cached_tool_result(name, arguments, result)
         self._invalidate_turn_cache_if_needed(name, result)
@@ -3116,7 +3269,7 @@ class OllamaCodeAgent:
             satisfied_tool_names.add(name)
         if self._counts_as_real_tool_use(name, result):
             successful_tool_results.append({"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result), "evidence_id": evidence_id})
-        self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, evidence_id=evidence_id)
+        self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
         self.messages.append({"role": "user", "content": self._tool_result_feedback_message(name, result, real_tool_use=real_tool_use, evidence_id=evidence_id)})
         return result
 
@@ -3498,7 +3651,7 @@ class OllamaCodeAgent:
         required_tool_names: set[str],
         forbidden_tool_names: set[str],
     ) -> bool:
-        if not feature_enabled("context-pack") or session_memory_request or "context_pack" in forbidden_tool_names:
+        if session_memory_request or "context_pack" in forbidden_tool_names:
             return False
         if required_tool_names and "context_pack" not in required_tool_names:
             return False
@@ -3506,6 +3659,8 @@ class OllamaCodeAgent:
             return False
         if "context_pack" in required_tool_names:
             return True
+        if not feature_enabled("context-pack"):
+            return False
         if self._request_is_broad_or_ambiguous(request_text):
             return True
         if (mutation_required or test_run_required) and self._request_mentions_workspace_path(request_text):
@@ -3598,6 +3753,7 @@ class OllamaCodeAgent:
         session_memory_request = self._request_targets_session_memory(text)
         mutation_allowed = self._request_allows_mutation(text)
         mutation_required = self._request_requires_mutation(text)
+        code_mutation_required = self._request_requires_code_mutation(text)
         test_run_required = self._request_requires_test_run(text)
         test_mutation_forbidden = self._request_forbids_test_mutation(text)
         required_mutation_paths = self._requested_mutation_paths(text)
@@ -3797,6 +3953,18 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if code_mutation_required and not any(
+                    Path(path).suffix.lower() in CODE_EDIT_SUFFIXES and not self._path_looks_like_test_file(path)
+                    for path in mutated_paths_this_turn
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The user asked for an implementation/code fix. A docs or test-only edit does not satisfy this request. Edit the relevant source file, then rerun validation. Next JSON only.",
+                        }
+                    )
+                    continue
                 missing_mutation_paths = sorted(required_mutation_paths - mutated_paths_this_turn)
                 if mutation_required and missing_mutation_paths:
                     self._append_assistant_payload(payload)
@@ -3835,24 +4003,6 @@ class OllamaCodeAgent:
                     )
                     continue
                 if (
-                    mutation_required
-                    and test_run_required
-                    and last_successful_run_test_version != mutation_version
-                    and not (
-                        self._post_edit_validation_enabled()
-                        and mutation_verified_this_turn
-                        and not self._request_forbids_validation(text)
-                    )
-                ):
-                    self._append_assistant_payload(payload)
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": "The user asked to run tests. Do not finish until run_test succeeds after the latest file edit. Next JSON only.",
-                        }
-                    )
-                    continue
-                if (
                     self._post_edit_validation_enabled()
                     and mutation_verified_this_turn
                     and last_successful_validation_version != mutation_version
@@ -3863,6 +4013,18 @@ class OllamaCodeAgent:
                         forbidden_tool_names=forbidden_tool_names,
                     )
                     if validation_plan is None:
+                        if not any(Path(path).suffix.lower() in CODE_EDIT_SUFFIXES for path in mutated_paths_this_turn) and not test_run_required:
+                            last_successful_validation_version = mutation_version
+                            mutation_verified_this_turn = False
+                            self._record_event(
+                                "auto_validation",
+                                name="none",
+                                arguments={},
+                                reason="no validator configured for non-code edit",
+                                mutation_version=mutation_version,
+                                rounds=round_number,
+                            )
+                            continue
                         failure = "Stopped because validation was required after edits but no validator is configured."
                         self._record_event("assistant", content=failure, rounds=round_number)
                         self._flush_llm_call_events()
@@ -3922,7 +4084,6 @@ class OllamaCodeAgent:
                     if (
                         validation_name == "lint_typecheck"
                         and validation_result.get("ok") is True
-                        and feature_enabled("contract-guards")
                         and mutated_paths_this_turn
                         and "contract_check" not in forbidden_tool_names
                     ):
@@ -3949,7 +4110,6 @@ class OllamaCodeAgent:
                     if (
                         validation_name in {"lint_typecheck", "contract_check"}
                         and validation_result.get("ok") is True
-                        and self.tools.default_test_command
                         and mutated_paths_this_turn
                         and "select_tests" not in forbidden_tool_names
                         and "run_test" not in forbidden_tool_names
@@ -4013,6 +4173,19 @@ class OllamaCodeAgent:
                         self._record_event("assistant", content=failure, rounds=round_number)
                         self._flush_llm_call_events()
                         return AgentResult(message=failure, rounds=round_number, completed=False)
+                if (
+                    mutation_required
+                    and test_run_required
+                    and last_successful_run_test_version != mutation_version
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The user asked to run tests. Do not finish until run_test succeeds after the latest file edit. Next JSON only.",
+                        }
+                    )
+                    continue
                 if self._final_claims_file_mutation(assistant_text) and not mutation_verified_this_turn:
                     self._append_assistant_payload(payload)
                     self.messages.append(
@@ -4443,7 +4616,9 @@ class OllamaCodeAgent:
                         "arguments": deepcopy(arguments),
                     }
                 )
+                started = time.perf_counter()
                 result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
+                duration_ms = round((time.perf_counter() - started) * 1000, 3)
                 if not cache_hit:
                     self._store_cached_tool_result(name, arguments, result)
                 self._invalidate_turn_cache_if_needed(name, result)
@@ -4493,7 +4668,7 @@ class OllamaCodeAgent:
                         failed_run_test_mutation_version = mutation_version
                         raw_failure = str(result.get("output") or result.get("summary") or "").strip()
                         compact_failure = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
-                        if feature_enabled("trajectory-guards") and previous_run_test_failure_summary and compact_failure:
+                        if previous_run_test_failure_summary and compact_failure:
                             delta = self._failure_delta_summary(previous_run_test_failure_summary, compact_failure)
                             self._record_event(
                                 "failure_delta",
@@ -4515,7 +4690,7 @@ class OllamaCodeAgent:
                         unresolved_syntax_diagnostics[result_path] = str(result.get("diagnostic") or result.get("summary") or "").strip()
                     else:
                         unresolved_syntax_diagnostics.pop(result_path, None)
-                self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, evidence_id=evidence_id)
+                self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
                 self.messages.append(
                     {
                         "role": "user",
@@ -4599,10 +4774,12 @@ class OllamaCodeAgent:
                     self.status_printer("tool run_test {}")
                     self._record_event("tool_call", name="run_test", arguments=auto_arguments, rounds=round_number, auto=True)
                     tool_calls_this_turn.append({"name": "run_test", "arguments": deepcopy(auto_arguments)})
+                    started = time.perf_counter()
                     auto_result = self.tools.execute("run_test", auto_arguments)
+                    duration_ms = round((time.perf_counter() - started) * 1000, 3)
                     self._record_command_validation_event(name="run_test", result=auto_result, round_number=round_number, cached=False)
                     evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
-                    self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True, evidence_id=evidence_id)
+                    self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True, duration_ms=duration_ms, evidence_id=evidence_id)
                     tool_used_this_turn = True
                     satisfied_tool_names.add("run_test")
                     raw_output = str(auto_result.get("output") or auto_result.get("summary") or "").strip()
@@ -4695,7 +4872,6 @@ class OllamaCodeAgent:
                 if (
                     validation_name == "lint_typecheck"
                     and validation_result.get("ok") is True
-                    and feature_enabled("contract-guards")
                     and mutated_paths_this_turn
                     and "contract_check" not in forbidden_tool_names
                 ):
@@ -4722,7 +4898,6 @@ class OllamaCodeAgent:
                 if (
                     validation_name in {"lint_typecheck", "contract_check"}
                     and validation_result.get("ok") is True
-                    and self.tools.default_test_command
                     and mutated_paths_this_turn
                     and "select_tests" not in forbidden_tool_names
                     and "run_test" not in forbidden_tool_names

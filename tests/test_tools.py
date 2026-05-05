@@ -624,6 +624,40 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("calculate_discount", result["output"])
         self.assertNotIn("   1 |", result["output"])
 
+    def test_fts_search_indexes_symbols_headings_and_scopes_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "pricing.py").write_text(
+                "def calculate_discount(cart):\n"
+                "    \"\"\"Seasonal discount calculation.\"\"\"\n"
+                "    return sum(cart) * 0.9\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "guide.md").write_text("# Seasonal Pricing\nUse discount calculation carefully.\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            refresh = tools.fts_refresh()
+            all_result = tools.fts_search("seasonal discount")
+            src_result = tools.fts_search("seasonal", path="src")
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertTrue(all_result["ok"], all_result)
+        self.assertIn("src/pricing.py", all_result["output"])
+        self.assertIn("docs/guide.md", all_result["output"])
+        self.assertIn("calculate_discount", all_result["output"])
+        self.assertIn("src/pricing.py", src_result["output"])
+        self.assertNotIn("docs/guide.md", src_result["output"])
+
+    def test_fd_search_reports_missing_fd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_fd_cli_path", return_value=None):
+                result = tools.fd_search("README")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["missing_dependency"], "fd")
+
     def test_context_pack_returns_ranked_evidence_and_writes_index_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -873,6 +907,256 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("semgrep parse error", result["output"])
 
+    def test_new_default_tools_are_registered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+
+            for name in {
+                "edit_intent",
+                "fd_search",
+                "fts_search",
+                "fts_refresh",
+                "ast_search",
+                "lsp_diagnostics",
+                "lsp_definition",
+                "lsp_references",
+                "inspect_library_source",
+                "systems_lens",
+                "discover_validators",
+                "diagnose_dependency_error",
+                "browser_smoke",
+                "security_scan",
+                "mcp_list_tools",
+                "mcp_call",
+            }:
+                self.assertIn(name, tools.available_tool_names())
+
+    def test_disabled_tool_is_hidden_and_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto", disabled_tools=["browser_smoke"])
+
+            self.assertNotIn("browser_smoke", tools.available_tool_names())
+            result = tools.execute("browser_smoke", {"url": "http://127.0.0.1"})
+
+        self.assertFalse(result["ok"])
+        self.assertIn("disabled", result["summary"])
+
+    def test_systems_lens_frames_complex_task_without_grounding_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.execute(
+                "systems_lens",
+                {
+                    "request": "Debug a slow flaky integration pipeline and decide what to refactor",
+                    "path": ".",
+                    "evidence": "run_test timed out",
+                    "limit": 12,
+                },
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["tool"], "systems_lens")
+        output = result["output"]
+        self.assertIn("boundary=", output)
+        self.assertIn("state=", output)
+        self.assertIn("scale_time=", output)
+        self.assertIn("viewpoints=", output)
+        self.assertIn("coupling=", output)
+        self.assertIn("next_tools=", output)
+        self.assertIn("questions:", output)
+        self.assertIn("observer:", output)
+        self.assertIn("categories:", output)
+        self.assertIn("feedback:", output)
+        self.assertIn("stocks_flows:", output)
+        self.assertIn("delay:", output)
+        self.assertIn("intervention:", output)
+        self.assertIn("debug:", output)
+        self.assertIn("performance:", output)
+        self.assertIn("change:", output)
+        self.assertIn("current_evidence=run_test timed out", output)
+        self.assertIn("What exactly is inside the system", result["questions"][0])
+
+    def test_inspect_library_source_reads_python_source_and_builtin_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            source = tools.execute("inspect_library_source", {"target": "json.loads", "max_lines": 40})
+            builtin = tools.inspect_library_source("builtins.len")
+
+        self.assertTrue(source["ok"], source)
+        self.assertTrue(source["source_available"])
+        self.assertIn("def loads", source["output"])
+        self.assertIn("signature:", source["output"])
+        self.assertTrue(builtin["ok"], builtin)
+        self.assertFalse(builtin["source_available"])
+        self.assertIn("source: unavailable", builtin["output"])
+        self.assertIn("doc:", builtin["output"])
+
+    def test_inspect_library_source_reports_missing_module(self) -> None:
+        missing_name = f"missing_package_{uuid4().hex}"
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            result = tools.inspect_library_source(f"{missing_name}.helper")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["missing_dependency"], missing_name)
+        self.assertEqual(result["error_class"], "missing_dependency")
+
+    def test_ast_search_reports_missing_ast_grep(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                result = tools.ast_search("def $F($$$A): $$$B", lang="python")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["missing_dependency"], "ast-grep")
+
+    def test_lsp_navigation_reports_missing_language_server(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                definition = tools.lsp_definition("ops.py", 1, 5)
+                references = tools.lsp_references("ops.py", 1, 5)
+
+        self.assertFalse(definition["ok"])
+        self.assertEqual(definition["missing_dependency"], "pyright")
+        self.assertFalse(references["ok"])
+        self.assertEqual(references["missing_dependency"], "pyright")
+
+    def test_edit_intent_routes_bad_symbol_target_to_text_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "pricing.py"
+            sample.write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent("pricing.py", "replace_symbol", "return sum(prices)", "return 0")
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "replace_in_file")
+        self.assertIn("return 0", final_text)
+
+    def test_edit_intent_routes_freeform_function_fix_to_body_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "calculator.py"
+            sample.write_text("def add(left: int, right: int) -> int:\n    return left - right\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "calculator.py",
+                "fix the implementation of the add function",
+                "add",
+                "return left + right",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "apply_structured_edit")
+        self.assertIn("def add(left: int, right: int) -> int:\n    return left + right", final_text)
+
+    def test_edit_intent_routes_project_rename_to_structured_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "pricing.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text("from src.pricing import total\n\nassert total([1]) == 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(".", "rename", "total", "cart_total", scope="project")
+
+            source = (root / "src" / "pricing.py").read_text(encoding="utf-8")
+            test = (root / "tests" / "test_pricing.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "apply_structured_edit")
+        self.assertIn("def cart_total", source)
+        self.assertIn("cart_total", test)
+
+    def test_discover_validators_detects_polyglot_projects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "typecheck": "tsc --noEmit"}}), encoding="utf-8")
+            (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+            (root / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n", encoding="utf-8")
+            (root / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+            (root / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.discover_validators()
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("npm test", output)
+        self.assertIn("go test ./...", output)
+        self.assertIn("cargo test", output)
+        self.assertIn("gradle test", output)
+        self.assertIn("cmake -S . -B build", output)
+
+    def test_discover_validators_detects_python_tooling_configs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n\n[tool.mypy]\npython_version='3.12'\n\n[tool.pyright]\ntypeCheckingMode='basic'\n\n[tool.tox]\nlegacy_tox_ini='[tox]\\nenvlist=py312'\n",
+                encoding="utf-8",
+            )
+            (root / "noxfile.py").write_text("import nox\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("pytest --collect-only", output)
+        self.assertIn("pytest", output)
+        self.assertIn("ruff check", output)
+        self.assertIn("mypy .", output)
+        self.assertIn("pyright", output)
+        self.assertIn("tox", output)
+        self.assertIn("nox", output)
+
+    def test_select_tests_returns_language_level_validator_for_go(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+            (root / "calc.go").write_text("package app\nfunc Add(a int, b int) int { return a + b }\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.select_tests(["calc.go"])
+
+        self.assertTrue(result["ok"])
+        self.assertIn("go test ./...", result["test_commands"])
+
+    def test_diagnose_dependency_error_reports_missing_module_and_manager(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.diagnose_dependency_error("ModuleNotFoundError: No module named 'requests'")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["missing_dependency"], "requests")
+        self.assertIn("pip", result["package_managers"])
+
+    def test_browser_and_security_missing_dependencies_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch("ollama_code.tools.subprocess.run", return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="missing")):
+                browser = tools.browser_smoke("http://127.0.0.1")
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                security = tools.security_scan()
+
+        self.assertFalse(browser["ok"])
+        self.assertEqual(browser["missing_dependency"], "playwright")
+        self.assertFalse(security["ok"])
+        self.assertIn("missing_dependency", security)
+
     def test_find_implementation_target_maps_test_imports_to_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -884,6 +1168,18 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn("ops.py", result["output"])
+        self.assertIn("symbol=add", result["output"])
+
+    def test_find_implementation_target_accepts_path_alias_for_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.find_implementation_target(path="src/ops.py", query="add")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("src/ops.py", result["output"])
         self.assertIn("symbol=add", result["output"])
 
     def test_diagnose_test_failure_groups_assertions_and_targets(self) -> None:
@@ -1420,7 +1716,18 @@ class ToolExecutorTests(unittest.TestCase):
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
             result = tools.run_test()
         self.assertFalse(result["ok"])
-        self.assertIn("No test command", result["summary"])
+        self.assertIn("no runnable test validator", result["summary"])
+
+    def test_run_test_discovers_unittest_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text("import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_test()
+        self.assertTrue(result["ok"], result.get("output"))
+        self.assertTrue(result["discovered"])
+        self.assertIn("unittest discover", result["command"])
 
     def test_diagnose_test_failure_classifies_common_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

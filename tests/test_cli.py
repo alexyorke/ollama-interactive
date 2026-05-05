@@ -9,11 +9,12 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, ensure_runtime_default_model, handle_meta_command, startup_help_text
+from ollama_code.config import DEFAULT_MODEL
 
 
 class DummyAgent:
     def __init__(self) -> None:
-        self.model = "granite4.1:8b"
+        self.model = DEFAULT_MODEL
         self.max_tool_rounds = 100
         self.max_agent_depth = 2
         self._approval = "ask"
@@ -106,7 +107,7 @@ class DummyAgent:
         return "list_files\nread_file"
 
     def list_models(self) -> list[str]:
-        return ["granite4.1:8b", "gemma4:latest"]
+        return [DEFAULT_MODEL, "gemma4:latest"]
 
 
 class CliCommandTests(unittest.TestCase):
@@ -127,13 +128,13 @@ class CliCommandTests(unittest.TestCase):
         args = build_parser().parse_args([])
         self.assertIsNone(args.max_tool_rounds)
 
-    def test_build_agent_uses_granite_default_model(self) -> None:
+    def test_build_agent_uses_config_default_model(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
 
         agent = build_agent(args)
 
-        self.assertEqual(agent.model, "granite4.1:8b")
+        self.assertEqual(agent.model, DEFAULT_MODEL)
         self.assertEqual(agent.max_tool_rounds, 100)
         self.assertEqual(agent.max_agent_depth, 2)
         self.assertEqual(agent.approval_mode(), "ask")
@@ -166,7 +167,7 @@ class CliCommandTests(unittest.TestCase):
         ensure_runtime_default_model(agent, args, renderer)
 
         self.assertEqual(agent.model, "gemma3:4b")
-        self.assertIn("ollama pull granite4.1:8b", stream.getvalue())
+        self.assertIn(f"ollama pull {DEFAULT_MODEL}", stream.getvalue())
 
     def test_startup_help_text_explains_basic_usage(self) -> None:
         agent = DummyAgent()
@@ -175,7 +176,7 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertIn("Ollama Code", text)
         self.assertIn("workspace:", text)
-        self.assertIn("model: granite4.1:8b", text)
+        self.assertIn(f"model: {DEFAULT_MODEL}", text)
         self.assertIn("Type a coding request", text)
         self.assertIn("/status", text)
         self.assertIn("/approval ask|auto|read-only", text)
@@ -292,7 +293,7 @@ class CliCommandTests(unittest.TestCase):
         output: list[str] = []
         handled = handle_meta_command("/models", agent, output.append)
         self.assertTrue(handled)
-        self.assertIn("granite4.1:8b", output[0])
+        self.assertIn(DEFAULT_MODEL, output[0])
 
     def test_sessions_command_lists_saved_sessions(self) -> None:
         agent = DummyAgent()

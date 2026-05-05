@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.agent import OllamaCodeAgent, _workspace_roots_match
+from ollama_code.agent import GROUNDING_EVIDENCE_TOOL_NAMES, OllamaCodeAgent, _workspace_roots_match
 from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
 from ollama_code.ollama_client import ChatResponse, TokenUsage
 from ollama_code.tools import ToolExecutor
@@ -123,8 +123,9 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "The file says hello world.")
         self.assertEqual(result.rounds, 2)
-        self.assertEqual(agent.events[1]["type"], "tool_call")
-        self.assertEqual(agent.events[2]["type"], "tool_result")
+        self.assertTrue(any(event.get("type") == "tool_call" and event.get("name") == "read_file" for event in agent.events))
+        tool_result = next(event for event in agent.events if event.get("type") == "tool_result" and event.get("name") == "read_file")
+        self.assertIsInstance(tool_result.get("duration_ms"), float)
 
     def test_agent_records_llm_call_usage_events(self) -> None:
         class UsageClient(FakeClient):
@@ -469,6 +470,9 @@ class AgentTests(unittest.TestCase):
         self.assertIn("prove or disprove with tools", prompt)
         self.assertIn("do not guess", prompt)
         self.assertIn("prefer search_symbols, code_outline, then read_symbol before broad read_file", prompt)
+        self.assertIn("use systems_lens early", prompt)
+        self.assertIn("explicit boundary, observer/metric, categories, state/scale", prompt)
+        self.assertIn("feedback, delays, stocks/flows, coupling, model limits, and intervention tests", prompt)
 
     def test_system_prompt_enables_caveman_lite_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -481,6 +485,26 @@ class AgentTests(unittest.TestCase):
         self.assertIn("caveman-lite concise", prompt)
         self.assertIn("keep code, paths, commands, errors, JSON exact", prompt)
         self.assertIn("syntactically complete", prompt)
+
+    def test_primary_tools_include_systems_lens_for_complex_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        selected = agent._primary_tool_names_for_request(
+            "Profile the slow edit pipeline and debug the controller design.",
+            requires_tools=True,
+            session_memory_request=False,
+            mutation_allowed=False,
+            mutation_required=False,
+            test_run_required=False,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+        self.assertIn("systems_lens", selected)
+        self.assertNotIn("systems_lens", GROUNDING_EVIDENCE_TOOL_NAMES)
 
     def test_primary_prompt_omits_tool_signatures_for_simple_final(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1515,6 +1539,21 @@ class AgentTests(unittest.TestCase):
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(normalizations[0]["normalized_name"], "run_test")
 
+    def test_agent_normalizes_unittest_file_path_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text("import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"run_test","arguments":{"command":"python -m unittest tests/test_sample.py"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Run tests and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], "python -m unittest discover -s tests -p test_sample.py")
+
     def test_agent_preserves_explicit_shell_test_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1735,7 +1774,8 @@ class AgentTests(unittest.TestCase):
             result = agent.handle_user("Create scratch/file.txt with hi and a newline.")
 
         self.assertEqual(result.message, "done")
-        self.assertEqual(agent.events[1]["name"], "write_file")
+        write_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "write_file"]
+        self.assertTrue(write_calls)
         self.assertFalse(any(event.get("name") == "run_shell" for event in agent.events if event["type"] == "tool_call"))
 
     def test_agent_caches_repeated_read_only_tool_calls_within_turn(self) -> None:
@@ -1776,7 +1816,11 @@ class AgentTests(unittest.TestCase):
             result = agent.handle_user("Summarize big.txt.")
 
         self.assertEqual(result.message, "done")
-        tool_feedback = next(message["content"] for message in agent.messages if message["role"] == "user" and message["content"].startswith("Tool result:\n"))
+        tool_feedback = next(
+            message["content"]
+            for message in agent.messages
+            if message["role"] == "user" and "read_file" in message["content"] and "... truncated ..." in message["content"]
+        )
         self.assertIn("... truncated ...", tool_feedback)
         self.assertNotIn(" 200 |", tool_feedback)
 
@@ -1803,7 +1847,7 @@ class AgentTests(unittest.TestCase):
         self.assertIn("[omitted", assistant_tool)
         self.assertIn("do not copy", assistant_tool)
         self.assertNotIn("line 79 TOKEN_FULL_EVENT", assistant_tool)
-        tool_call = next(event for event in agent.events if event["type"] == "tool_call")
+        tool_call = next(event for event in agent.events if event["type"] == "tool_call" and event.get("name") == "write_file")
         self.assertIn("line 79 TOKEN_FULL_EVENT", tool_call["arguments"]["content"])
 
     def test_agent_compacts_run_test_output_to_actionable_failure(self) -> None:
@@ -2176,6 +2220,94 @@ class AgentTests(unittest.TestCase):
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(normalizations[0]["normalized_name"], "write_file")
 
+    def test_agent_normalizes_implementation_edit_alias_to_edit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_implementation_target",
+                            "arguments": {
+                                "path": "app.py",
+                                "symbol": "add",
+                                "replacement": "def add(left, right):\n    return left + right\n",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Inspect app.py, then fix add.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return left + right", final_text)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "edit_intent")
+
+    def test_agent_normalizes_edit_symbol_alias_to_edit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_symbol",
+                            "arguments": {
+                                "path": "app.py",
+                                "symbol": "add",
+                                "content": "def add(left, right):\n    return left + right\n",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Fix add in app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return left + right", final_text)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "edit_intent")
+
+    def test_agent_rejects_docs_only_edit_for_code_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "README.md", "content": "notes\n"}}),
+                    json.dumps({"type": "final", "message": "done"}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}}),
+                    json.dumps({"type": "final", "message": "done"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Fix the bug in the implementation.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "done")
+        self.assertIn("return left + right", final_text)
+        self.assertGreaterEqual(tools.execute_counts.get("write_file", 0), 2)
+
     def test_agent_normalizes_snippet_replace_symbol_to_replace_in_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2493,10 +2625,11 @@ class AgentTests(unittest.TestCase):
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=pass_command)
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
-            result = agent.handle_user(
-                "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
-                "do not edit tests, replace stubs with complete code, run tests with configured test command."
-            )
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user(
+                    "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
+                    "do not edit tests, replace stubs with complete code, run tests with configured test command."
+                )
 
             self.assertEqual(result.message, "list_ops.py fixed; tests passed.")
             self.assertFalse((root / "palindrome_solution.py").exists())

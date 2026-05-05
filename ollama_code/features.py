@@ -30,8 +30,8 @@ PROFILE_FEATURES: dict[str, set[str]] = {
 
 
 def active_feature_profile() -> str:
-    raw = os.environ.get(ENV_OLLAMA_CODE_FEATURE_PROFILE, "baseline").strip().lower()
-    return raw or "baseline"
+    raw = os.environ.get(ENV_OLLAMA_CODE_FEATURE_PROFILE, "all").strip().lower()
+    return raw or "all"
 
 
 def active_features(profile: str | None = None) -> set[str]:

@@ -8,7 +8,8 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = Path(".ollama-code") / "config.json"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "granite4.1:8b"
+DEFAULT_MODEL = "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS"
+OFFICIAL_GRANITE_8B_MODEL = "granite4.1:8b"
 DEFAULT_APPROVAL_MODE = "ask"
 DEFAULT_MAX_TOOL_ROUNDS = 100
 DEFAULT_MAX_AGENT_DEPTH = 2
@@ -36,6 +37,11 @@ class CliConfig:
     test_cmd: str | None = None
     debate: bool | None = None
     reconcile: str | None = None
+    tools_default_enabled: bool = True
+    disabled_tools: tuple[str, ...] = ()
+    mcp_servers: dict[str, Any] | None = None
+    browser_enabled: bool = True
+    security_enabled: bool = True
     path: Path | None = None
 
 
@@ -95,6 +101,24 @@ def _reconcile_config_value(payload: dict[str, Any], path: Path) -> str | None:
     return lowered
 
 
+def _object_config_value(payload: dict[str, Any], key: str, path: Path) -> dict[str, Any] | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f'Config key "{key}" must be a JSON object in {path}')
+    return value
+
+
+def _string_list_config_value(payload: dict[str, Any], key: str, path: Path) -> tuple[str, ...]:
+    value = payload.get(key)
+    if value is None:
+        return ()
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError(f'Config value "{key}" must be a list of strings in {path}')
+    return tuple(item.strip() for item in value if item.strip())
+
+
 def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> CliConfig:
     path = resolve_config_path(workspace_root, raw_path)
     explicit_path = raw_path is not None
@@ -117,6 +141,14 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
         if not isinstance(ollama_payload, dict):
             raise ValueError(f'Config key "ollama" must be a JSON object in {path}')
         data = ollama_payload
+    tools_payload = _object_config_value(payload, "tools", path) or {}
+    mcp_payload = _object_config_value(payload, "mcp", path) or {}
+    browser_payload = _object_config_value(payload, "browser", path) or {}
+    security_payload = _object_config_value(payload, "security", path) or {}
+    mcp_servers = _object_config_value(mcp_payload, "servers", path)
+    tools_default_enabled = _bool_config_value(tools_payload, "default_enabled", path) if tools_payload else None
+    browser_enabled = _bool_config_value(browser_payload, "enabled", path) if browser_payload else None
+    security_enabled = _bool_config_value(security_payload, "enabled", path) if security_payload else None
     return CliConfig(
         host=_config_value(data, "host", path),
         model=_config_value(data, "model", path),
@@ -128,5 +160,10 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
         test_cmd=_config_value(data, "test_cmd", path),
         debate=_bool_config_value(data, "debate", path),
         reconcile=_reconcile_config_value(data, path),
+        tools_default_enabled=True if tools_default_enabled is None else tools_default_enabled,
+        disabled_tools=_string_list_config_value(tools_payload, "disabled", path),
+        mcp_servers=dict(mcp_servers) if mcp_servers is not None else None,
+        browser_enabled=True if browser_enabled is None else browser_enabled,
+        security_enabled=True if security_enabled is None else security_enabled,
         path=path,
     )

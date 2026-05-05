@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import ast
+import configparser
+import dis
 import difflib
 import hashlib
+import importlib
 import inspect
+import io
 import json
 import os
 import re
 import signal
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
 import textwrap
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -24,9 +30,44 @@ ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
 WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
-CODE_FILE_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".cs", ".rb", ".php"}
+CODE_FILE_SUFFIXES = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".rb",
+    ".php",
+    ".swift",
+    ".kt",
+    ".kts",
+}
 REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
+FTS_INDEX_VERSION = 1
+FTS_TEXT_SUFFIXES = CODE_FILE_SUFFIXES | {
+    ".md",
+    ".rst",
+    ".txt",
+    ".toml",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".ini",
+    ".cfg",
+    ".html",
+    ".css",
+    ".scss",
+}
 SKIP_CODE_DIRS = {
     ".git",
     ".hg",
@@ -79,6 +120,11 @@ TOOL_DESCRIPTIONS = [
         "description": "Search cached workspace file paths quickly without reading file contents.",
     },
     {
+        "name": "fd_search",
+        "arguments": {"query": "fd filename pattern", "path": "relative path, default .", "limit": "int, default 100", "kind": "any|file|dir, default any"},
+        "description": "Use fd/fdfind for fast repo-local file discovery when installed.",
+    },
+    {
         "name": "file_index_refresh",
         "arguments": {"path": "relative path, default .", "limit": "int, default 50000"},
         "description": "Refresh the persistent workspace file path index for fast future file searches.",
@@ -104,9 +150,24 @@ TOOL_DESCRIPTIONS = [
         "description": "Read one code symbol body by AST/definition range.",
     },
     {
+        "name": "inspect_library_source",
+        "arguments": {"target": "Python import path like json.loads or json:loads", "context": "lines around source, default 3", "max_lines": "int, default 160", "include_disassembly": "bool, default false"},
+        "description": "Inspect installed Python library source/signature/doc; falls back to bytecode or builtin diagnostics when source is unavailable.",
+    },
+    {
         "name": "repo_index_search",
         "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
         "description": "Search code with compact ranked snippets instead of whole files.",
+    },
+    {
+        "name": "fts_search",
+        "arguments": {"query": "terms or phrase", "path": "relative path, default .", "limit": "int, default 20", "refresh": "bool, default false"},
+        "description": "Search the local SQLite FTS5 cache across paths, symbols, headings, and snippets.",
+    },
+    {
+        "name": "fts_refresh",
+        "arguments": {"path": "relative path, default .", "limit": "int, default 2000"},
+        "description": "Refresh the local SQLite FTS5 cache for fast lexical repository queries.",
     },
     {
         "name": "indexed_search",
@@ -124,13 +185,38 @@ TOOL_DESCRIPTIONS = [
         "description": "Run Semgrep structurally when semgrep is installed; useful for syntax-aware code search.",
     },
     {
+        "name": "ast_search",
+        "arguments": {"pattern": "ast-grep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
+        "description": "Run ast-grep structural search when ast-grep/sg is installed.",
+    },
+    {
+        "name": "lsp_diagnostics",
+        "arguments": {"path": "file or directory, default .", "lang": "optional language", "timeout": "seconds, default 60"},
+        "description": "Run available language-server-style diagnostics without installing tools.",
+    },
+    {
+        "name": "lsp_definition",
+        "arguments": {"path": "file", "line": "1-based line", "column": "1-based column", "limit": "int, default 20"},
+        "description": "Find likely definitions for the symbol at a location using available local indexes.",
+    },
+    {
+        "name": "lsp_references",
+        "arguments": {"path": "file", "line": "1-based line", "column": "1-based column", "limit": "int, default 40"},
+        "description": "Find likely references for the symbol at a location using local search.",
+    },
+    {
         "name": "context_pack",
         "arguments": {"request": "user request or task text", "path": "relative path, default .", "limit": "int, default 8"},
         "description": "Build compact ranked evidence from repo index, tests, imports, symbols, and git state.",
     },
     {
+        "name": "systems_lens",
+        "arguments": {"request": "user request or task text", "path": "relative path, default .", "evidence": "optional current evidence", "limit": "int, default 8"},
+        "description": "Frame complex work with boundary, state, scale, viewpoints, coupling, and validation checks.",
+    },
+    {
         "name": "find_implementation_target",
-        "arguments": {"test_path": "optional test file", "output": "optional failing test output/traceback", "limit": "int, default 12"},
+        "arguments": {"test_path": "optional test file", "path": "optional test/source path alias", "query": "optional symbol/query", "output": "optional failing test output/traceback", "limit": "int, default 12"},
         "description": "Map tests or tracebacks to likely implementation files and symbols.",
     },
     {
@@ -157,6 +243,16 @@ TOOL_DESCRIPTIONS = [
         "name": "lint_typecheck",
         "arguments": {"paths": "path or list of paths, default .", "command": "optional lint/type command", "timeout": "seconds, default 120"},
         "description": "Run deterministic syntax/lint/type checks with exact file lines.",
+    },
+    {
+        "name": "discover_validators",
+        "arguments": {"path": "relative path, default .", "limit": "int, default 12"},
+        "description": "Detect focused test/lint/typecheck commands for Python, JS/TS, Go, Rust, Java, and C/C++ projects.",
+    },
+    {
+        "name": "diagnose_dependency_error",
+        "arguments": {"output": "error output", "path": "relative path, default ."},
+        "description": "Classify missing dependency/import/command/path failures and suggest safe next steps.",
     },
     {
         "name": "contract_check",
@@ -200,9 +296,34 @@ TOOL_DESCRIPTIONS = [
         "description": "Apply a mechanical code edit from an intent JSON, then syntax-check and return diff.",
     },
     {
+        "name": "edit_intent",
+        "arguments": {"path": "relative path", "intent": "rename|replace_text|replace_symbol|replace_body|change_signature|add_import", "target": "old text/symbol", "replacement": "new text/source", "scope": "file|project, default file", "apply": "bool, default true"},
+        "description": "Route an edit intent to the safest low-level edit tool and avoid common symbol/text mixups.",
+    },
+    {
         "name": "generate_tests_from_spec",
         "arguments": {"target_symbol": "symbol under test", "behavior": "expected behavior", "test_path": "optional output test path", "apply": "bool, default false"},
         "description": "Generate a compact pytest test patch from a spec; preview by default, apply only when requested.",
+    },
+    {
+        "name": "browser_smoke",
+        "arguments": {"url": "URL to open", "actions": "optional action list", "wait_for": "optional selector/text", "viewport": "desktop|mobile, default desktop", "screenshot": "bool, default false"},
+        "description": "Run a Playwright smoke check for browser/UI tasks when Playwright is installed.",
+    },
+    {
+        "name": "security_scan",
+        "arguments": {"path": "relative path, default .", "scanners": "auto or scanner list", "limit": "int, default 80", "timeout": "seconds, default 120"},
+        "description": "Run available local security/dependency scanners only when explicitly requested.",
+    },
+    {
+        "name": "mcp_list_tools",
+        "arguments": {"server": "optional configured MCP server name", "timeout": "seconds, default 15"},
+        "description": "List tools exposed by configured MCP servers.",
+    },
+    {
+        "name": "mcp_call",
+        "arguments": {"server": "configured MCP server name", "tool": "tool name", "arguments": "tool arguments object", "timeout": "seconds, default 30"},
+        "description": "Call a configured MCP server tool through a guarded stdio JSON-RPC request.",
     },
     {
         "name": "run_shell",
@@ -246,9 +367,12 @@ TOOL_DESCRIPTIONS = [
 ]
 
 
-def format_tool_help() -> str:
+def format_tool_help(tool_names: Iterable[str] | None = None) -> str:
     lines: list[str] = []
+    allowed = set(tool_names) if tool_names is not None else None
     for tool in TOOL_DESCRIPTIONS:
+        if allowed is not None and tool["name"] not in allowed:
+            continue
         arg_text = ", ".join(f"{key}: {value}" for key, value in tool["arguments"].items())
         lines.append(f"- {tool['name']}({arg_text}) -> {tool['description']}")
     return "\n".join(lines)
@@ -260,22 +384,33 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "read_file": "read_file(path,start=1,end=200)",
         "search": "search(query,path='.',limit=100)",
         "file_search": "file_search(query,path='.',limit=100)",
+        "fd_search": "fd_search(query,path='.',limit=100,kind='any')",
         "file_index_refresh": "file_index_refresh(path='.',limit=50000)",
         "everything_search": "everything_search(query,path='.',limit=100)",
         "search_symbols": "search_symbols(query,path='.',limit=50)",
         "code_outline": "code_outline(path,max_symbols=120)",
         "read_symbol": "read_symbol(path,symbol,context=2)",
+        "inspect_library_source": "inspect_library_source(target,context=3,max_lines=160,include_disassembly=false)",
         "repo_index_search": "repo_index_search(query,path='.',limit=10)",
+        "fts_search": "fts_search(query,path='.',limit=20,refresh=false)",
+        "fts_refresh": "fts_refresh(path='.',limit=2000)",
         "indexed_search": "indexed_search(query,path='.',limit=100)",
         "repo_index_refresh": "repo_index_refresh(path='.',limit=1000)",
         "semgrep_scan": "semgrep_scan(pattern,path='.',lang?,limit=50)",
+        "ast_search": "ast_search(pattern,path='.',lang?,limit=50)",
+        "lsp_diagnostics": "lsp_diagnostics(path='.',lang?,timeout=60)",
+        "lsp_definition": "lsp_definition(path,line,column,limit=20)",
+        "lsp_references": "lsp_references(path,line,column,limit=40)",
         "context_pack": "context_pack(request,path='.',limit=8)",
-        "find_implementation_target": "find_implementation_target(test_path?,output?,limit=12)",
+        "systems_lens": "systems_lens(request,path='.',evidence?,limit=8)",
+        "find_implementation_target": "find_implementation_target(test_path?/path?,query?,output?,limit=12)",
         "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
         "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
         "call_graph": "call_graph(path,symbol?,limit=40)",
         "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
         "lint_typecheck": "lint_typecheck(paths='.',command?,timeout=120)",
+        "discover_validators": "discover_validators(path='.',limit=12)",
+        "diagnose_dependency_error": "diagnose_dependency_error(output,path='.')",
         "contract_check": "contract_check(changed_files,changed_symbols?,limit=80)",
         "select_tests": "select_tests(changed_files,changed_symbols?,limit=8)",
         "replace_symbol": "replace_symbol(path,symbol,content)",
@@ -283,7 +418,12 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "write_file": "write_file(path,content)",
         "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
         "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol|replace_function_body|change_signature|...","path":"a.py"})',
+        "edit_intent": "edit_intent(path,intent,target?,replacement?,scope='file',apply=true)",
         "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
+        "browser_smoke": "browser_smoke(url,actions=[],wait_for?,viewport='desktop',screenshot=false)",
+        "security_scan": "security_scan(path='.',scanners='auto',limit=80)",
+        "mcp_list_tools": "mcp_list_tools(server?,timeout=15)",
+        "mcp_call": "mcp_call(server,tool,arguments={},timeout=30)",
         "run_shell": "run_shell(command,cwd='.',timeout=30)",
         "run_test": "run_test(command?,cwd='.',timeout=1200)",
         "git_status": "git_status(path?)",
@@ -304,12 +444,22 @@ class ToolExecutor:
         input_func: Callable[[str], str] = input,
         agent_runner: AgentRunner | None = None,
         test_command: str | None = None,
+        default_tools_enabled: bool = True,
+        disabled_tools: Iterable[str] | None = None,
+        mcp_servers: dict[str, Any] | None = None,
+        browser_enabled: bool = True,
+        security_enabled: bool = True,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.approval_mode = approval_mode
         self.input_func = input_func
         self.agent_runner = agent_runner
         self.default_test_command = test_command.strip() if isinstance(test_command, str) and test_command.strip() else None
+        self.default_tools_enabled = bool(default_tools_enabled)
+        self.disabled_tools = {str(name).strip() for name in (disabled_tools or []) if str(name).strip()}
+        self.mcp_servers = dict(mcp_servers or {})
+        self.browser_enabled = bool(browser_enabled)
+        self.security_enabled = bool(security_enabled)
         self._interrupt_event: threading.Event | None = None
         self._initial_dirty_paths = self._git_dirty_paths()
 
@@ -339,7 +489,29 @@ class ToolExecutor:
         filtered = {key: value for key, value in arguments.items() if key in accepted}
         return handler(**filtered)
 
+    def is_tool_enabled(self, name: str) -> bool:
+        clean = str(name or "").strip()
+        if not clean:
+            return False
+        if clean in self.disabled_tools:
+            return False
+        if clean.startswith("mcp.") and ("mcp_call" in self.disabled_tools or "mcp" in self.disabled_tools):
+            return False
+        return self.default_tools_enabled
+
+    def available_tool_names(self) -> set[str]:
+        if not self.default_tools_enabled:
+            return set()
+        return {tool["name"] for tool in TOOL_DESCRIPTIONS if self.is_tool_enabled(str(tool["name"]))}
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        if not self.is_tool_enabled(name):
+            return {"ok": False, "tool": name, "summary": f"Tool disabled by config: {name}"}
+        if name.startswith("mcp."):
+            parts = name.split(".", 2)
+            if len(parts) != 3:
+                return {"ok": False, "tool": name, "summary": "MCP dynamic tool names must be mcp.<server>.<tool>."}
+            return self.mcp_call(parts[1], parts[2], arguments)
         if name == "run_agent":
             if self.agent_runner is None:
                 return {"ok": False, "tool": name, "summary": "Sub-agent support is not configured."}
@@ -356,28 +528,44 @@ class ToolExecutor:
             "read_file": self.read_file,
             "search": self.search,
             "file_search": self.file_search,
+            "fd_search": self.fd_search,
             "file_index_refresh": self.file_index_refresh,
             "everything_search": self.everything_search,
             "search_symbols": self.search_symbols,
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
+            "inspect_library_source": self.inspect_library_source,
             "repo_index_search": self.repo_index_search,
+            "fts_search": self.fts_search,
+            "fts_refresh": self.fts_refresh,
             "indexed_search": self.indexed_search,
             "repo_index_refresh": self.repo_index_refresh,
             "semgrep_scan": self.semgrep_scan,
+            "ast_search": self.ast_search,
+            "lsp_diagnostics": self.lsp_diagnostics,
+            "lsp_definition": self.lsp_definition,
+            "lsp_references": self.lsp_references,
             "context_pack": self.context_pack,
+            "systems_lens": self.systems_lens,
             "find_implementation_target": self.find_implementation_target,
             "diagnose_test_failure": self.diagnose_test_failure,
             "run_function_probe": self.run_function_probe,
             "call_graph": self.call_graph,
             "contract_graph": self.contract_graph,
             "lint_typecheck": self.lint_typecheck,
+            "discover_validators": self.discover_validators,
+            "diagnose_dependency_error": self.diagnose_dependency_error,
             "contract_check": self.contract_check,
             "select_tests": self.select_tests,
+            "edit_intent": self.edit_intent,
             "replace_symbol": self.replace_symbol,
             "replace_symbols": self.replace_symbols,
             "apply_structured_edit": self.apply_structured_edit,
             "generate_tests_from_spec": self.generate_tests_from_spec,
+            "browser_smoke": self.browser_smoke,
+            "security_scan": self.security_scan,
+            "mcp_list_tools": self.mcp_list_tools,
+            "mcp_call": self.mcp_call,
             "write_file": self.write_file,
             "replace_in_file": self.replace_in_file,
             "run_shell": self.run_shell,
@@ -853,6 +1041,71 @@ class ToolExecutor:
             "output": "\n".join(ranked) if ranked else "(no file matches)",
         }
 
+    def _fd_cli_path(self) -> str | None:
+        configured = os.environ.get("FD_CLI", "").strip()
+        candidates = [configured] if configured else []
+        found = shutil.which("fd") or shutil.which("fd.exe") or shutil.which("fdfind")
+        if found:
+            candidates.append(found)
+        if os.name == "nt":
+            candidates.extend(
+                [
+                    str(Path.home() / "scoop" / "shims" / "fd.exe"),
+                    r"C:\ProgramData\chocolatey\bin\fd.exe",
+                ]
+            )
+        for candidate in candidates:
+            if candidate and (Path(candidate).exists() or shutil.which(candidate)):
+                return candidate
+        return None
+
+    def fd_search(self, query: str, path: str = ".", limit: int = 100, kind: str = "any") -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return {"ok": False, "tool": "fd_search", "summary": "fd_search requires a non-empty query."}
+        fd_path = self._fd_cli_path()
+        if not fd_path:
+            return self._missing_dependency_result("fd_search", "fd", "fd/fdfind is not installed or not on PATH. Install fd or use file_search.")
+        clean_kind = str(kind or "any").strip().lower()
+        command = [fd_path, "--color", "never", "--strip-cwd-prefix"]
+        if clean_kind in {"file", "f"}:
+            command.extend(["--type", "file"])
+        elif clean_kind in {"dir", "directory", "d"}:
+            command.extend(["--type", "directory"])
+        command.extend([clean_query, str(base)])
+        completed = self._run_process(command, cwd=self.workspace_root, timeout=30, shell=False)
+        output = self._collect_process_output(completed)
+        matches: list[str] = []
+        base_resolved = base.resolve()
+        for line in (completed.stdout or "").splitlines():
+            raw = line.strip().strip('"')
+            if not raw:
+                continue
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = self.workspace_root / candidate
+            try:
+                resolved = candidate.resolve(strict=False)
+            except OSError:
+                continue
+            if resolved != base_resolved and base_resolved not in resolved.parents:
+                continue
+            try:
+                matches.append(self.relative_label(resolved))
+            except ValueError:
+                continue
+            if len(matches) >= max(1, int(limit)):
+                break
+        return {
+            "ok": completed.returncode in {0, 1},
+            "tool": "fd_search",
+            "path": self.relative_label(base),
+            "count": len(matches),
+            "output": "\n".join(matches) if matches else ("(no fd matches)" if completed.returncode in {0, 1} else output),
+        }
+
     def _everything_cli_path(self) -> str | None:
         configured = os.environ.get("EVERYTHING_CLI", "").strip()
         candidates = [configured] if configured else []
@@ -1139,8 +1392,378 @@ class ToolExecutor:
             "output": "\n".join(rendered) if rendered else "(empty symbol)",
         }
 
+    def _safe_signature(self, obj: object) -> str:
+        try:
+            return str(inspect.signature(obj))
+        except (TypeError, ValueError):
+            return ""
+
+    def _library_object_kind(self, obj: object) -> str:
+        if inspect.ismodule(obj):
+            return "module"
+        if inspect.isclass(obj):
+            return "class"
+        if inspect.isfunction(obj):
+            return "function"
+        if inspect.ismethod(obj):
+            return "method"
+        if inspect.isbuiltin(obj):
+            return "builtin"
+        if inspect.ismethoddescriptor(obj):
+            return "method_descriptor"
+        if inspect.isroutine(obj):
+            return "routine"
+        return type(obj).__name__
+
+    def _resolve_library_target(self, target: str) -> tuple[object | None, str, str, str | None]:
+        cleaned = target.strip()
+        if not cleaned:
+            return None, "", "", "target must be a non-empty Python import path."
+        if ":" in cleaned:
+            module_name, qualname = cleaned.split(":", 1)
+            module_name = module_name.strip()
+            qualname = qualname.strip(". ")
+            if not module_name:
+                return None, "", "", f"Missing module in target: {target}"
+            try:
+                module = importlib.import_module(module_name)
+            except ModuleNotFoundError as exc:
+                return None, module_name, qualname, f"Could not import {module_name}: {exc}"
+            except Exception as exc:
+                return None, module_name, qualname, f"Importing {module_name} failed: {exc}"
+            return module, module_name, qualname, None
+
+        parts = [part for part in cleaned.split(".") if part]
+        import_errors: list[str] = []
+        for index in range(len(parts), 0, -1):
+            module_name = ".".join(parts[:index])
+            qualname = ".".join(parts[index:])
+            try:
+                module = importlib.import_module(module_name)
+            except ModuleNotFoundError as exc:
+                import_errors.append(f"{module_name}: {exc}")
+                continue
+            except Exception as exc:
+                return None, module_name, qualname, f"Importing {module_name} failed: {exc}"
+            return module, module_name, qualname, None
+        detail = import_errors[0] if import_errors else cleaned
+        return None, parts[0] if parts else cleaned, ".".join(parts[1:]), f"Could not import any module prefix for {cleaned}: {detail}"
+
+    def _resolve_qualname(self, obj: object, qualname: str) -> tuple[object | None, str | None, str]:
+        current = obj
+        if not qualname:
+            return current, None, ""
+        resolved_parts: list[str] = []
+        for part in qualname.split("."):
+            if not part:
+                continue
+            if not hasattr(current, part):
+                public = [name for name in dir(current) if not name.startswith("_")]
+                close = difflib.get_close_matches(part, public, n=8)
+                hint = f" Close matches: {', '.join(close)}." if close else ""
+                return None, part, f"Attribute not found: {part}.{hint}"
+            current = getattr(current, part)
+            resolved_parts.append(part)
+        return current, None, ".".join(resolved_parts)
+
+    def _object_source_file(self, obj: object) -> str:
+        try:
+            source = inspect.getsourcefile(obj)
+        except (TypeError, OSError):
+            source = None
+        if source:
+            return source
+        try:
+            return inspect.getfile(obj)
+        except (TypeError, OSError):
+            return ""
+
+    def _disassemble_object(self, obj: object, *, max_lines: int) -> str:
+        try:
+            buffer = io.StringIO()
+            dis.dis(obj, file=buffer)
+            lines = buffer.getvalue().splitlines()
+        except (TypeError, AttributeError):
+            return ""
+        if len(lines) > max_lines:
+            lines = lines[:max_lines] + [f"... disassembly truncated at {max_lines} lines ..."]
+        return "\n".join(lines)
+
+    def inspect_library_source(
+        self,
+        target: str,
+        context: int = 3,
+        max_lines: int = 160,
+        include_disassembly: bool = False,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        if not isinstance(target, str) or not target.strip():
+            return {"ok": False, "tool": "inspect_library_source", "summary": "target must be a non-empty Python import path.", "error_class": "invalid_args"}
+        context = max(0, min(50, int(context)))
+        max_lines = max(20, min(400, int(max_lines)))
+        root_obj, module_name, qualname, error = self._resolve_library_target(target)
+        if error is not None or root_obj is None:
+            missing = module_name.split(".", 1)[0] if module_name else target.split(".", 1)[0]
+            return {
+                "ok": False,
+                "tool": "inspect_library_source",
+                "target": target,
+                "summary": error or f"Could not import target: {target}",
+                "error_class": "missing_dependency",
+                "missing_dependency": missing,
+            }
+        obj, missing_attr, resolved_qualname = self._resolve_qualname(root_obj, qualname)
+        if obj is None:
+            return {
+                "ok": False,
+                "tool": "inspect_library_source",
+                "target": target,
+                "module": module_name,
+                "summary": f"{module_name}:{qualname} could not be resolved. {missing_attr or ''}".strip(),
+                "output": resolved_qualname,
+                "error_class": "invalid_args",
+            }
+
+        kind = self._library_object_kind(obj)
+        signature = self._safe_signature(obj)
+        doc = inspect.getdoc(obj) or ""
+        doc_preview = "\n".join(doc.splitlines()[:8])
+        source_file = self._object_source_file(obj)
+        output: list[str] = [
+            f"target: {target}",
+            f"resolved: {module_name}{':' + resolved_qualname if resolved_qualname else ''}",
+            f"kind: {kind}",
+        ]
+        if signature:
+            output.append(f"signature: {signature}")
+        if source_file:
+            output.append(f"file: {source_file}")
+
+        source_available = False
+        line_start: int | None = None
+        line_end: int | None = None
+        try:
+            source_lines, source_start = inspect.getsourcelines(obj)
+            line_start = int(source_start)
+            line_end = line_start + len(source_lines) - 1
+            selected_start = line_start
+            selected_lines = [line.rstrip("\n") for line in source_lines]
+            if source_file and source_file.endswith(".py"):
+                try:
+                    file_lines = Path(source_file).read_text(encoding="utf-8", errors="replace").splitlines()
+                    selected_start = max(1, line_start - context)
+                    selected_end = min(len(file_lines), line_end + context)
+                    selected_lines = file_lines[selected_start - 1 : selected_end]
+                except OSError:
+                    selected_start = line_start
+            if len(selected_lines) > max_lines:
+                selected_lines = selected_lines[:max_lines] + [f"... source truncated at {max_lines} lines ..."]
+            output.append(f"lines: {line_start}-{line_end}")
+            output.extend(f"{line_no:4d} | {line}" for line_no, line in enumerate(selected_lines, start=selected_start))
+            source_available = True
+        except (OSError, TypeError):
+            output.append("source: unavailable")
+
+        disassembly = self._disassemble_object(obj, max_lines=max_lines) if include_disassembly or not source_available else ""
+        if disassembly:
+            output.append("disassembly:")
+            output.extend(disassembly.splitlines())
+        if doc_preview:
+            output.append("doc:")
+            output.append(doc_preview)
+
+        summary = "Source found." if source_available else "Source unavailable; returned signature/doc/disassembly diagnostics where possible."
+        return {
+            "ok": True,
+            "tool": "inspect_library_source",
+            "target": target,
+            "module": module_name,
+            "qualname": resolved_qualname,
+            "kind": kind,
+            "signature": signature,
+            "file": source_file,
+            "line_start": line_start,
+            "line_end": line_end,
+            "source_available": source_available,
+            "summary": summary,
+            "output": "\n".join(output),
+        }
+
     def _repo_index_cache_path(self) -> Path:
         return self.workspace_root / ".ollama-code" / "index" / "repo_index.json"
+
+    def _fts_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "repo_fts.sqlite"
+
+    def _connect_fts(self) -> sqlite3.Connection:
+        cache_path = self._fts_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(cache_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5("
+                "path UNINDEXED, path_text, symbols, headings, text, mtime_ns UNINDEXED, size UNINDEXED)"
+            )
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version', ?)", (str(FTS_INDEX_VERSION),))
+            conn.commit()
+        except sqlite3.OperationalError:
+            conn.close()
+            raise
+        return conn
+
+    def _iter_fts_files(self, base: Path, *, limit: int = 2000) -> list[Path]:
+        files: list[Path] = []
+        for file_path in self._iter_workspace_files(base, limit=limit * 3):
+            self._check_interrupted()
+            if len(files) >= limit:
+                break
+            if file_path.suffix.lower() not in FTS_TEXT_SUFFIXES:
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 512_000:
+                continue
+            files.append(file_path)
+        return files
+
+    def _fts_headings(self, file_path: Path, text: str) -> str:
+        headings: list[str] = []
+        for line in text.splitlines()[:1000]:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if file_path.suffix.lower() in {".md", ".rst"} and stripped.startswith(("#", "##", "###")):
+                headings.append(stripped.lstrip("#").strip())
+            elif re.match(r"^\[[A-Za-z0-9_.-]+\]$", stripped):
+                headings.append(stripped.strip("[]"))
+            if len(headings) >= 80:
+                break
+        return " ".join(headings)
+
+    def _fts_record(self, file_path: Path) -> tuple[str, str, str, str, str, int, int]:
+        stat = file_path.stat()
+        rel = self.relative_label(file_path)
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        if "\x00" in text[:4096]:
+            text = ""
+        symbols = ""
+        if file_path.suffix.lower() in CODE_FILE_SUFFIXES:
+            try:
+                symbol_rows, _, _ = self._code_symbols(file_path)
+                symbols = " ".join(
+                    f"{item.get('kind', '')} {item.get('qualname', '')} {item.get('signature', '')} {item.get('doc', '')}"
+                    for item in symbol_rows[:300]
+                    if isinstance(item, dict)
+                )
+            except OSError:
+                symbols = ""
+        return (
+            rel,
+            rel.replace("/", " "),
+            symbols,
+            self._fts_headings(file_path, text),
+            text[:200_000],
+            int(stat.st_mtime_ns),
+            int(stat.st_size),
+        )
+
+    def _fts_scope(self, base: Path) -> tuple[str, tuple[Any, ...]]:
+        rel = self.relative_label(base)
+        if rel == ".":
+            return "", ()
+        if base.is_file():
+            return " AND path = ?", (rel,)
+        return " AND (path = ? OR path LIKE ?)", (rel, f"{rel}/%")
+
+    def _safe_fts_query(self, query: str) -> str | None:
+        terms = self._extract_index_terms(query, limit=16)
+        if not terms:
+            return None
+        return " OR ".join(f"{term}*" for term in terms)
+
+    def fts_refresh(self, path: str = ".", limit: int = 2000) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        try:
+            conn = self._connect_fts()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("fts_refresh", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        files = self._iter_fts_files(base, limit=max(1, int(limit)))
+        scope_sql, scope_params = self._fts_scope(base)
+        try:
+            if scope_sql:
+                conn.execute("DELETE FROM repo_fts WHERE " + scope_sql.removeprefix(" AND "), scope_params)
+            else:
+                conn.execute("DELETE FROM repo_fts")
+            for file_path in files:
+                conn.execute(
+                    "INSERT INTO repo_fts(path,path_text,symbols,headings,text,mtime_ns,size) VALUES(?,?,?,?,?,?,?)",
+                    self._fts_record(file_path),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        return {
+            "ok": True,
+            "tool": "fts_refresh",
+            "path": self.relative_label(base),
+            "files": len(files),
+            "cache": self.relative_label(self._fts_cache_path()),
+            "output": f"Indexed {len(files)} file(s) into SQLite FTS.",
+        }
+
+    def fts_search(self, query: str, path: str = ".", limit: int = 20, refresh: bool = False) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_query = str(query or "").strip()
+        fts_query = self._safe_fts_query(clean_query)
+        if not fts_query:
+            return {"ok": False, "tool": "fts_search", "summary": "fts_search requires a non-empty query."}
+        if refresh or not self._fts_cache_path().exists():
+            refresh_result = self.fts_refresh(self.relative_label(base), limit=2000)
+            if refresh_result.get("ok") is not True:
+                return refresh_result
+        try:
+            conn = self._connect_fts()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("fts_search", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        scope_sql, scope_params = self._fts_scope(base)
+        limit_value = max(1, int(limit))
+        rows: list[str] = []
+        try:
+            query_sql = (
+                "SELECT path, symbols, headings, snippet(repo_fts, 4, '[', ']', ' ... ', 18), bm25(repo_fts) "
+                "FROM repo_fts WHERE repo_fts MATCH ?"
+                + scope_sql
+                + " ORDER BY 5 LIMIT ?"
+            )
+            records = conn.execute(query_sql, (fts_query, *scope_params, limit_value)).fetchall()
+        except sqlite3.OperationalError:
+            quoted = " OR ".join(f'"{term}"' for term in self._extract_index_terms(clean_query, limit=16))
+            records = conn.execute(query_sql, (quoted, *scope_params, limit_value)).fetchall() if quoted else []
+        finally:
+            conn.close()
+        for rel, symbols, headings, snippet, rank in records:
+            context = str(snippet or "").strip().replace("\n", " ")
+            extras = []
+            if headings:
+                extras.append("headings=" + str(headings)[:120])
+            if symbols:
+                extras.append("symbols=" + str(symbols)[:160])
+            suffix = " " + " ".join(extras) if extras else ""
+            rows.append(f"{rel}: {context[:240]}{suffix}".strip())
+        return {
+            "ok": True,
+            "tool": "fts_search",
+            "path": self.relative_label(base),
+            "count": len(rows),
+            "cache": self.relative_label(self._fts_cache_path()),
+            "output": "\n".join(rows) if rows else "(no FTS matches)",
+        }
 
     def _extract_index_terms(self, text: str, *, limit: int = 900) -> list[str]:
         terms = sorted(set(term.lower() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}|[0-9]+", text)))
@@ -1382,7 +2005,7 @@ class ToolExecutor:
         self._check_interrupted()
         semgrep = shutil.which("semgrep")
         if not semgrep:
-            return {"ok": False, "tool": "semgrep_scan", "summary": "semgrep is not installed. Install semgrep to use structural search."}
+            return self._missing_dependency_result("semgrep_scan", "semgrep", "semgrep is not installed. Install semgrep to use structural search.")
         base = self.resolve_path(path, allow_missing=False)
         clean_pattern = str(pattern or "").strip()
         if not clean_pattern:
@@ -1421,6 +2044,186 @@ class ToolExecutor:
             "count": len(rows),
             "output": "\n".join(rows) if rows else ("(no semgrep matches)" if completed.returncode in {0, 1} else output),
         }
+
+    def _missing_dependency_result(self, tool: str, dependency: str, summary: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "tool": tool,
+            "summary": summary,
+            "missing_dependency": dependency,
+            "error_class": "missing_dependency",
+        }
+
+    def ast_search(self, pattern: str, path: str = ".", lang: str | None = None, limit: int = 50) -> dict[str, Any]:
+        self._check_interrupted()
+        executable = shutil.which("ast-grep") or shutil.which("sg")
+        if not executable:
+            return self._missing_dependency_result("ast_search", "ast-grep", "ast-grep is not installed. Install ast-grep or sg to use AST search.")
+        base = self.resolve_path(path, allow_missing=False)
+        clean_pattern = str(pattern or "").strip()
+        if not clean_pattern:
+            return {"ok": False, "tool": "ast_search", "summary": "ast_search requires a pattern."}
+        clean_lang = (lang or self._semgrep_lang_for_path(base) or "").strip().lower()
+        command = [executable, "--json", "-p", clean_pattern]
+        if clean_lang:
+            command.extend(["--lang", clean_lang])
+        command.append(str(base))
+        completed = self._run_process(command, cwd=self.workspace_root, timeout=60, shell=False)
+        output = self._collect_process_output(completed)
+        rows: list[str] = []
+        try:
+            payload = json.loads(completed.stdout or "[]")
+        except json.JSONDecodeError:
+            payload = None
+        items = payload if isinstance(payload, list) else []
+        for item in items[: max(1, int(limit))]:
+            if not isinstance(item, dict):
+                continue
+            item_path = str(item.get("file") or item.get("path") or "")
+            rel = item_path
+            try:
+                rel = self.relative_label(Path(item_path))
+            except Exception:
+                pass
+            range_payload = item.get("range") if isinstance(item.get("range"), dict) else {}
+            start = range_payload.get("start") if isinstance(range_payload.get("start"), dict) else {}
+            line = int(start.get("line", 0)) + 1 if isinstance(start.get("line"), int) else "?"
+            text = str(item.get("text") or item.get("lines") or "").strip().replace("\n", " ")
+            rows.append(f"{rel}:{line}: {text[:220]}")
+        return {
+            "ok": completed.returncode in {0, 1},
+            "tool": "ast_search",
+            "path": self.relative_label(base),
+            "lang": clean_lang or None,
+            "count": len(rows),
+            "output": "\n".join(rows) if rows else ("(no ast-grep matches)" if completed.returncode in {0, 1} else output),
+        }
+
+    def _language_for_path(self, path: Path) -> str | None:
+        suffix = path.suffix.lower()
+        if suffix == ".py" or (path / "pyproject.toml").exists():
+            return "python"
+        if suffix in {".js", ".jsx"} or (path / "package.json").exists():
+            return "javascript"
+        if suffix in {".ts", ".tsx"} or (path / "tsconfig.json").exists():
+            return "typescript"
+        if suffix == ".go" or (path / "go.mod").exists():
+            return "go"
+        if suffix == ".rs" or (path / "Cargo.toml").exists():
+            return "rust"
+        if suffix == ".java" or (path / "build.gradle").exists() or (path / "gradlew").exists():
+            return "java"
+        if suffix in {".c", ".cc", ".cpp", ".h", ".hpp"} or (path / "CMakeLists.txt").exists():
+            return "cpp"
+        return None
+
+    def _lsp_server_for_lang(self, lang: str | None) -> tuple[str | None, str | None]:
+        mapping = {
+            "python": ("pyright", "pyright"),
+            "javascript": ("typescript-language-server", "typescript-language-server"),
+            "typescript": ("typescript-language-server", "typescript-language-server"),
+            "go": ("gopls", "gopls"),
+            "rust": ("rust-analyzer", "rust-analyzer"),
+            "java": ("jdtls", "jdtls"),
+            "cpp": ("clangd", "clangd"),
+            "c": ("clangd", "clangd"),
+        }
+        key = (lang or "").strip().lower()
+        name, executable = mapping.get(key, (None, None))
+        if executable and not shutil.which(executable):
+            return name, None
+        return name, executable
+
+    def lsp_diagnostics(self, path: str = ".", lang: str | None = None, timeout: int = 60) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_lang = (lang or self._language_for_path(base) or "").strip().lower()
+        server_name, server = self._lsp_server_for_lang(clean_lang)
+        if server_name and server is None:
+            return self._missing_dependency_result("lsp_diagnostics", server_name, f"{server_name} is not installed. Install it to use {clean_lang or 'language'} diagnostics.")
+        if clean_lang == "python":
+            result = self.lint_typecheck(self.relative_label(base), timeout=timeout)
+            result["tool"] = "lsp_diagnostics"
+            result["lang"] = clean_lang
+            result["server"] = server_name
+            return result
+        validators = self.discover_validators(self.relative_label(base), limit=12)
+        diagnostic_commands = [
+            item
+            for item in validators.get("validators", [])
+            if isinstance(item, dict) and item.get("kind") in {"syntax", "typecheck", "lint", "check"} and item.get("available") is True
+        ]
+        if diagnostic_commands:
+            command = str(diagnostic_commands[0].get("command") or "").strip()
+            if command:
+                result = self.run_shell(command, cwd=self.relative_label(base if base.is_dir() else base.parent), timeout=timeout)
+                result["tool"] = "lsp_diagnostics"
+                result["lang"] = clean_lang or None
+                result["server"] = server_name
+                return result
+        return {
+            "ok": True,
+            "tool": "lsp_diagnostics",
+            "path": self.relative_label(base),
+            "lang": clean_lang or None,
+            "server": server_name,
+            "summary": "No available diagnostics command found.",
+            "output": "(no diagnostics command found)",
+        }
+
+    def _identifier_at_location(self, path: Path, line: int, column: int) -> str | None:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        if line < 1 or line > len(lines):
+            return None
+        text = lines[line - 1]
+        index = max(0, min(len(text), column - 1))
+        left = index
+        while left > 0 and re.match(r"\w", text[left - 1]):
+            left -= 1
+        right = index
+        while right < len(text) and re.match(r"\w", text[right]):
+            right += 1
+        token = text[left:right].strip()
+        return token if token else None
+
+    def lsp_definition(self, path: str, line: int, column: int, limit: int = 20) -> dict[str, Any]:
+        target = self.resolve_path(path, allow_missing=False)
+        if target.is_dir():
+            return {"ok": False, "tool": "lsp_definition", "summary": f"{path} is a directory."}
+        clean_lang = self._language_for_path(target)
+        server_name, server = self._lsp_server_for_lang(clean_lang)
+        if server_name and server is None:
+            return self._missing_dependency_result("lsp_definition", server_name, f"{server_name} is not installed. Install it to use {clean_lang or 'language'} definitions.")
+        symbol = self._identifier_at_location(target, int(line), int(column))
+        if not symbol:
+            return {"ok": False, "tool": "lsp_definition", "path": self.relative_label(target), "summary": "No identifier found at location."}
+        matches = self.search_symbols(symbol, path=".", limit=limit)
+        return {
+            "ok": matches.get("ok") is True,
+            "tool": "lsp_definition",
+            "path": self.relative_label(target),
+            "server": server_name,
+            "symbol": symbol,
+            "count": matches.get("count", 0),
+            "output": str(matches.get("output") or "(no definitions found)"),
+        }
+
+    def lsp_references(self, path: str, line: int, column: int, limit: int = 40) -> dict[str, Any]:
+        target = self.resolve_path(path, allow_missing=False)
+        if target.is_dir():
+            return {"ok": False, "tool": "lsp_references", "summary": f"{path} is a directory."}
+        clean_lang = self._language_for_path(target)
+        server_name, server = self._lsp_server_for_lang(clean_lang)
+        if server_name and server is None:
+            return self._missing_dependency_result("lsp_references", server_name, f"{server_name} is not installed. Install it to use {clean_lang or 'language'} references.")
+        symbol = self._identifier_at_location(target, int(line), int(column))
+        if not symbol:
+            return {"ok": False, "tool": "lsp_references", "path": self.relative_label(target), "summary": "No identifier found at location."}
+        result = self.search(rf"\b{re.escape(symbol)}\b", path=".", limit=limit)
+        result["tool"] = "lsp_references"
+        result["server"] = server_name
+        result["symbol"] = symbol
+        return result
 
     def context_pack(self, request: str, path: str = ".", limit: int = 8) -> dict[str, Any]:
         self._check_interrupted()
@@ -1463,6 +2266,175 @@ class ToolExecutor:
             "count": ranked.get("count", 0),
             "suggested_next_tool": suggested,
             "test_files": test_files,
+            "output": "\n".join(lines),
+        }
+
+    def systems_lens(self, request: str, path: str = ".", evidence: str = "", limit: int = 8) -> dict[str, Any]:
+        self._check_interrupted()
+        query = str(request or "").strip()
+        if not query:
+            return {
+                "ok": False,
+                "tool": "systems_lens",
+                "summary": "systems_lens requires a non-empty request.",
+                "error_class": "invalid_args",
+            }
+        base = self.resolve_path(path, allow_missing=False)
+        rel_path = self.relative_label(base)
+        lowered = query.lower()
+        try:
+            limit_value = max(4, min(16, int(limit)))
+        except (TypeError, ValueError):
+            limit_value = 8
+
+        concern_rules = [
+            (
+                r"\b(?:debug|bug|fail|failure|failing|error|exception|traceback|flaky|regression)\b",
+                "debug: separate reproduced state, hidden inputs, validator signal, and likely changed boundary",
+            ),
+            (
+                r"\b(?:perf|performance|slow|latency|throughput|profile|benchmark|token|speed)\b",
+                "performance: measure before/after; split model time, tool time, IO, indexing, and retries",
+            ),
+            (
+                r"\b(?:design|architecture|architect|system|workflow|pipeline|integration)\b",
+                "design: compare component, workflow, dependency, and user-goal viewpoints",
+            ),
+            (
+                r"\b(?:refactor|rename|migration|api|contract|signature|caller|callee)\b",
+                "change: preserve observable contracts; check callers, callees, tests, and configs",
+            ),
+            (
+                r"\b(?:security|secret|vulnerab|audit|permission|auth|token|credential)\b",
+                "security: mark trust boundaries, data flow, secrets, dependency provenance, and write surfaces",
+            ),
+            (
+                r"\b(?:ui|frontend|browser|page|localhost|url|screenshot)\b",
+                "browser/UI: distinguish DOM state, rendered pixels, console/network errors, and user flow",
+            ),
+        ]
+        concerns = [text for pattern, text in concern_rules if re.search(pattern, lowered)]
+        if not concerns:
+            concerns.append("general: start with the smallest useful subsystem and revise the boundary when evidence conflicts")
+        concerns = concerns[:limit_value]
+
+        core_questions = [
+            "boundary: What exactly is inside the system, what is outside, and what excluded factor could still be causal?",
+            "observer: Who is observing or measuring this, and would another role or metric show a different pattern?",
+            "categories: What am I lumping together, and which distinction would change the conclusion?",
+            "state: Which variables define the current condition, and which are merely symptoms?",
+            "history: How did the system get here, and what earlier decision or hidden input could still be acting?",
+            "feedback: What loop keeps regenerating the behavior, and what does it reinforce or dampen?",
+            "delay: When should causes show up as effects, and are we measuring too early or too late?",
+            "stocks_flows: What is accumulating or draining, and did inflow, outflow, or both change?",
+            "coupling: Which parts affect each other unexpectedly, and where can changes propagate?",
+            "incentives: Why is the behavior locally rational under each actor's information and constraints?",
+            "model_limits: What does this explanation omit, and what observation would disconfirm it?",
+            "intervention: After the fix, how will the system adapt and what second-order problem might appear?",
+        ]
+        question_rules = [
+            (
+                r"\b(?:debug|bug|fail|failure|failing|error|exception|traceback|flaky|regression)\b",
+                [
+                    "feedback: What loop keeps regenerating the failure after the first symptom appears?",
+                    "coupling: Which dependency or interface is more connected than the code shape suggests?",
+                    "decomposition: Is the failure in one component, or in interaction between components?",
+                    "history: What recent change, delayed effect, or hidden input could explain the current state?",
+                ],
+            ),
+            (
+                r"\b(?:perf|performance|slow|latency|throughput|profile|benchmark|token|speed)\b",
+                [
+                    "stocks_flows: What is accumulating: calls, tokens, retries, subprocess startup, IO, cache misses, or waits?",
+                    "delay: Are we measuring before warmup, cache fill, server startup, or delayed feedback completes?",
+                    "measurement: Could the metric reward fewer calls while hiding longer wall-clock, or vice versa?",
+                    "intervention: After optimization, what new bottleneck or behavior will appear?",
+                ],
+            ),
+            (
+                r"\b(?:design|architecture|architect|system|workflow|pipeline|integration)\b",
+                [
+                    "abstraction: Is this a code, architecture, product, workflow, dependency, or controller problem?",
+                    "invariants: What behavior persists if the team, tool, model, metric, process, or module changes?",
+                    "perspectives: What does engineering, tests, users, operations, and maintainers each reveal or hide?",
+                    "local_rationality: Which locally reasonable behavior creates the global dysfunction?",
+                ],
+            ),
+            (
+                r"\b(?:refactor|rename|migration|api|contract|signature|caller|callee)\b",
+                [
+                    "invariants: Which external contracts must stay unchanged across the transformation?",
+                    "second_order: What behavior changes after callers and tests adapt to this refactor?",
+                    "burden_shift: Is this fix removing the cause, or adding a workaround that lowers pressure to fix it?",
+                    "coupling: Where can this change propagate unexpectedly?",
+                ],
+            ),
+            (
+                r"\b(?:security|secret|vulnerab|audit|permission|auth|token|credential)\b",
+                [
+                    "trust_boundary: Where do data, credentials, permissions, and network effects cross boundaries?",
+                    "observer: Could logs, scanners, or tests miss the behavior an attacker would exploit?",
+                    "intervention: Who benefits, who pays, and how might actors adapt after the fix?",
+                    "disconfirm: What evidence would show the issue is absent rather than merely unobserved?",
+                ],
+            ),
+            (
+                r"\b(?:ui|frontend|browser|page|localhost|url|screenshot)\b",
+                [
+                    "observer: Is the issue visible in DOM, rendered pixels, console, network, accessibility tree, or user flow?",
+                    "delay: Does async loading, hydration, animation, caching, or debounce hide cause and effect?",
+                    "state: Which route, viewport, auth, local storage, server state, and data response define this UI state?",
+                    "measurement: Could screenshots pass while interaction or accessibility fails?",
+                ],
+            ),
+        ]
+        selected_questions = list(core_questions)
+        for pattern, questions in question_rules:
+            if re.search(pattern, lowered):
+                selected_questions.extend(questions)
+        selected_questions = list(dict.fromkeys(selected_questions))[:limit_value]
+
+        next_tools = ["context_pack", "file_search/fts_search", "search_symbols/code_outline/read_symbol"]
+        if any("debug:" in item for item in concerns):
+            next_tools.extend(["discover_validators", "run_test", "diagnose_test_failure"])
+        if any("performance:" in item for item in concerns):
+            next_tools.extend(["discover_validators", "profile one focused command before/after"])
+        if any("design:" in item for item in concerns):
+            next_tools.extend(["repo_index_search", "contract_graph/call_graph"])
+        if any("change:" in item for item in concerns):
+            next_tools.extend(["contract_graph", "edit_intent", "select_tests"])
+        if any("security:" in item for item in concerns):
+            next_tools.append("security_scan when explicitly requested")
+        if any("browser/UI:" in item for item in concerns):
+            next_tools.append("browser_smoke for localhost/UI tasks")
+        deduped_tools = list(dict.fromkeys(next_tools))[:limit_value]
+
+        evidence_text = self._truncate_text(str(evidence or "").strip().replace("\r\n", "\n"), limit=500)
+        lines = [
+            "systems_lens:",
+            f"boundary=Treat {rel_path} as the current system; dependencies, commands, tests, model behavior, and user workflow are environment until evidence shows coupling.",
+            "state=Track inputs, outputs, config, git diff, failing traces, validators, and tool/model results as separate state dimensions.",
+            "scale_time=Name whether the issue is line/symbol/file/repo/runtime/user-flow scale; measure current behavior before claiming improvement.",
+            "viewpoints=user goal; implementation contract; tests/validators; runtime/dependencies; controller/tool loop.",
+            "coupling=Assume independence is unproven. Use search, xref, validators, and traces to find strong connections.",
+            "model_limit=Every search/read/graph is a projection. Avoid over-lumping the whole repo and over-splitting into line-by-line noise.",
+            "stop_rule=Stop using a heuristic when it stops producing new evidence after a focused retry; switch representation/tool.",
+            "concerns:",
+        ]
+        lines.extend(f"- {item}" for item in concerns)
+        lines.append("questions:")
+        lines.extend(f"- {item}" for item in selected_questions)
+        lines.append("next_tools=" + ", ".join(deduped_tools))
+        if evidence_text:
+            lines.append("current_evidence=" + evidence_text)
+        return {
+            "ok": True,
+            "tool": "systems_lens",
+            "path": rel_path,
+            "summary": "Framed task boundary, observer, categories, state, scale, feedback, coupling, model limits, and validation checks.",
+            "concerns": concerns,
+            "questions": selected_questions,
+            "next_tools": deduped_tools,
             "output": "\n".join(lines),
         }
 
@@ -1549,12 +2521,30 @@ class ToolExecutor:
     def find_implementation_target(
         self,
         test_path: str | None = None,
+        path: str | None = None,
+        query: str | None = None,
         output: str | None = None,
         traceback: str | None = None,
         limit: int = 12,
     ) -> dict[str, Any]:
         self._check_interrupted()
         targets: list[dict[str, Any]] = []
+        if test_path is None and isinstance(path, str) and path.strip():
+            test_path = path
+        if isinstance(test_path, str) and test_path.strip():
+            try:
+                direct = self.resolve_path(test_path, allow_missing=False)
+                if direct.suffix.lower() in CODE_FILE_SUFFIXES and not self._path_looks_like_test(direct):
+                    symbol = str(query or "").strip()
+                    return {
+                        "ok": True,
+                        "tool": "find_implementation_target",
+                        "count": 1,
+                        "targets": [{"path": self.relative_label(direct), "symbol": symbol, "reason": "direct source path"}],
+                        "output": f"{self.relative_label(direct)}" + (f" symbol={symbol}" if symbol else "") + " reason=direct source path",
+                    }
+            except Exception:
+                pass
         raw_output = "\n".join(part for part in [output, traceback] if isinstance(part, str) and part.strip())
         if raw_output:
             targets.extend(self._traceback_targets(raw_output))
@@ -2425,6 +3415,185 @@ class ToolExecutor:
             "output": "\n".join(lines) if lines else "(no call graph entries found)",
         }
 
+    def _package_manager_for(self, base: Path) -> str:
+        root = base if base.is_dir() else base.parent
+        if (root / "pnpm-lock.yaml").exists():
+            return "pnpm"
+        if (root / "yarn.lock").exists():
+            return "yarn"
+        return "npm"
+
+    def _project_root_for(self, base: Path) -> Path:
+        start = base if base.is_dir() else base.parent
+        markers = {"pyproject.toml", "pytest.ini", "package.json", "go.mod", "Cargo.toml", "build.gradle", "settings.gradle", "CMakeLists.txt"}
+        for candidate in [start, *start.parents]:
+            if candidate == self.workspace_root or self.workspace_root in candidate.parents:
+                if any((candidate / marker).exists() for marker in markers):
+                    return candidate
+                if candidate == self.workspace_root:
+                    break
+        return start
+
+    def _available_command(self, command: str) -> bool:
+        try:
+            argv = shlex.split(command, posix=os.name != "nt")
+        except ValueError:
+            return False
+        if not argv:
+            return False
+        executable = argv[0]
+        if executable.startswith(("./", ".\\")):
+            return (self.workspace_root / executable).exists()
+        return shutil.which(executable) is not None or Path(executable).exists()
+
+    def _read_toml(self, path: Path) -> dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            return tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            return {}
+
+    def _toml_tool_section(self, payload: dict[str, Any], name: str) -> bool:
+        tool = payload.get("tool") if isinstance(payload, dict) else None
+        return isinstance(tool, dict) and isinstance(tool.get(name), dict)
+
+    def _ini_has_section(self, path: Path, prefixes: tuple[str, ...]) -> bool:
+        if not path.exists():
+            return False
+        parser = configparser.ConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except configparser.Error:
+            return False
+        return any(section == prefix or section.startswith(prefix + ":") for section in parser.sections() for prefix in prefixes)
+
+    def discover_validators(self, path: str = ".", limit: int = 12) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        root = self._project_root_for(base)
+        validators: list[dict[str, Any]] = []
+
+        def add(kind: str, lang: str, command: str, reason: str) -> None:
+            validators.append({"kind": kind, "lang": lang, "command": command, "available": self._available_command(command), "reason": reason})
+
+        pyproject = self._read_toml(root / "pyproject.toml")
+        python_files = any(root.rglob("*.py"))
+        python_tests = any(root.rglob("test_*.py")) or any(root.rglob("*_test.py")) or (root / "tests").exists()
+        pytest_config = (
+            (root / "pytest.ini").exists()
+            or (root / "pytest.toml").exists()
+            or self._toml_tool_section(pyproject, "pytest")
+            or self._toml_tool_section(pyproject, "pytest.ini_options")
+        )
+        if python_files or pyproject or pytest_config:
+            add("syntax", "python", f"{sys.executable} -m py_compile", "Python files found; lint_typecheck does exact syntax checks internally.")
+            if pytest_config:
+                add("collect", "python", f"{sys.executable} -m pytest --collect-only -q", "pytest config found.")
+                add("test", "python", f"{sys.executable} -m pytest", "pytest config found.")
+            if python_tests:
+                add("test", "python", f"{sys.executable} -m unittest discover -s tests -v", "Python unittest discovery.")
+            if (
+                (root / "ruff.toml").exists()
+                or (root / ".ruff.toml").exists()
+                or self._toml_tool_section(pyproject, "ruff")
+                or shutil.which("ruff")
+            ):
+                add("lint", "python", "ruff check .", "ruff config or executable found.")
+            if (
+                (root / "mypy.ini").exists()
+                or (root / ".mypy.ini").exists()
+                or self._ini_has_section(root / "setup.cfg", ("mypy",))
+                or self._toml_tool_section(pyproject, "mypy")
+            ):
+                add("typecheck", "python", "mypy .", "mypy config found.")
+            if (root / "pyrightconfig.json").exists() or self._toml_tool_section(pyproject, "pyright"):
+                add("typecheck", "python", "pyright", "pyright config found.")
+            if (root / "tox.ini").exists() or self._toml_tool_section(pyproject, "tox"):
+                add("test", "python", "tox", "tox config found.")
+            if (root / "noxfile.py").exists():
+                add("test", "python", "nox", "noxfile.py found.")
+        package_json = root / "package.json"
+        if package_json.exists():
+            manager = self._package_manager_for(root)
+            try:
+                package = json.loads(package_json.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                package = {}
+            scripts = package.get("scripts") if isinstance(package, dict) else {}
+            if isinstance(scripts, dict):
+                for name, kind in (("typecheck", "typecheck"), ("lint", "lint"), ("test", "test")):
+                    if name in scripts:
+                        add(kind, "javascript", f"{manager} run {name}" if name != "test" else f"{manager} test", f"package.json script: {name}")
+            if (root / "tsconfig.json").exists():
+                add("typecheck", "typescript", "tsc --noEmit", "tsconfig.json found.")
+        if (root / "go.mod").exists() or any(root.rglob("*.go")):
+            add("test", "go", "go test ./...", "Go module or source files found.")
+        if (root / "Cargo.toml").exists() or any(root.rglob("*.rs")):
+            add("check", "rust", "cargo check", "Cargo project or Rust source files found.")
+            add("test", "rust", "cargo test", "Cargo project or Rust source files found.")
+        gradlew = "gradlew.bat" if os.name == "nt" else "./gradlew"
+        if (root / "build.gradle").exists() or (root / "settings.gradle").exists() or (root / gradlew).exists() or any(root.rglob("*.java")):
+            command = gradlew + " test" if (root / gradlew).exists() else "gradle test"
+            add("test", "java", command, "Gradle/Java project detected.")
+        if (root / "CMakeLists.txt").exists() or any(root.rglob("*.cpp")) or any(root.rglob("*.c")):
+            if (root / "build").exists():
+                add("test", "cpp", "ctest --test-dir build --output-on-failure", "CMake build directory found.")
+            add("setup", "cpp", "cmake -S . -B build", "CMake project detected; creates/updates build dir if run.")
+        selected = validators[: max(1, int(limit))]
+        lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
+        return {
+            "ok": True,
+            "tool": "discover_validators",
+            "path": self.relative_label(root),
+            "count": len(selected),
+            "validators": selected,
+            "output": "\n".join(lines) if lines else "(no validators discovered)",
+        }
+
+    def diagnose_dependency_error(self, output: str, path: str = ".") -> dict[str, Any]:
+        text = str(output or "")
+        base = self.resolve_path(path, allow_missing=True)
+        root = self._project_root_for(base if base.exists() else self.workspace_root)
+        error_class = self.classify_error(text)
+        missing = self._missing_dependency_name(text)
+        command_match = re.search(r"(?:command not found|not recognized as (?:an internal|the name)|executable not found):?\s*['\"]?([A-Za-z0-9_.-]+)", text, flags=re.IGNORECASE)
+        command = command_match.group(1) if command_match else None
+        import_match = re.search(r"cannot import name ['\"]?([^'\"\s]+)", text, flags=re.IGNORECASE)
+        imported = import_match.group(1) if import_match else None
+        suggested_paths: list[str] = []
+        if error_class in {"path_missing", "cwd_git"}:
+            path_match = re.search(r"(?:No such file or directory|FileNotFoundError|Path does not exist):?\s*['\"]?([^'\"\n]+)", text, flags=re.IGNORECASE)
+            if path_match:
+                suggested_paths = self._nearest_existing_paths(path_match.group(1))
+        validators = self.discover_validators(self.relative_label(root), limit=6)
+        managers = []
+        if (root / "package.json").exists():
+            managers.append(self._package_manager_for(root))
+        if (root / "pyproject.toml").exists() or any(root.rglob("requirements*.txt")):
+            managers.append("pip")
+        if (root / "Cargo.toml").exists():
+            managers.append("cargo")
+        if (root / "go.mod").exists():
+            managers.append("go")
+        facts = {
+            "error_class": error_class,
+            "missing_dependency": missing or command or imported,
+            "missing_command": command,
+            "missing_import": imported,
+            "package_managers": sorted(set(managers)),
+            "suggested_paths": suggested_paths,
+            "validator_commands": [item.get("command") for item in validators.get("validators", []) if isinstance(item, dict)][:6],
+        }
+        lines = [f"{key}={value}" for key, value in facts.items() if value]
+        return {
+            "ok": True,
+            "tool": "diagnose_dependency_error",
+            **facts,
+            "summary": f"Classified failure as {error_class}. Do not install automatically; report or use an available validator.",
+            "output": "\n".join(lines) if lines else f"error_class={error_class}",
+        }
+
     def lint_typecheck(self, paths: str | list[str] = ".", command: str | None = None, timeout: int = 120) -> dict[str, Any]:
         if isinstance(command, str) and command.strip():
             result = self.run_shell(command.strip(), timeout=timeout)
@@ -2435,22 +3604,27 @@ class ToolExecutor:
         diagnostics: list[str] = []
         for raw_path in raw_paths:
             base = self.resolve_path(str(raw_path), allow_missing=False)
-            files = [base] if base.is_file() else list(base.rglob("*.py"))
+            files = [base] if base.is_file() else [file for suffix in CODE_FILE_SUFFIXES for file in base.rglob(f"*{suffix}")]
             for file_path in files:
                 if not file_path.is_file() or any(part in SKIP_CODE_DIRS for part in file_path.parts):
                     continue
                 rel = self.relative_label(file_path)
                 checked.append(rel)
                 text = file_path.read_text(encoding="utf-8", errors="replace")
-                diagnostic = self._python_syntax_diagnostic(file_path, text)
-                if diagnostic:
-                    diagnostics.append(diagnostic)
+                if file_path.suffix.lower() == ".py":
+                    diagnostic = self._python_syntax_diagnostic(file_path, text)
+                    if diagnostic:
+                        diagnostics.append(diagnostic)
+                elif file_path.suffix.lower() in {".js", ".jsx"} and shutil.which("node"):
+                    completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
+                    if completed.returncode != 0:
+                        diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=500))
         return {
             "ok": not diagnostics,
             "tool": "lint_typecheck",
             "checked": checked,
             "diagnostics": diagnostics,
-            "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} Python file(s)",
+            "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} code file(s)",
         }
 
     def _test_module_for_path(self, test_path: Path) -> str:
@@ -2523,6 +3697,7 @@ class ToolExecutor:
         raw_symbols = [changed_symbols] if isinstance(changed_symbols, str) else list(changed_symbols or [])
         symbols = {str(symbol).strip() for symbol in raw_symbols if str(symbol).strip()}
         source_files: list[Path] = []
+        non_python_files: list[Path] = []
         for raw_path in raw_files:
             try:
                 path = self.resolve_path(str(raw_path), allow_missing=False)
@@ -2530,8 +3705,38 @@ class ToolExecutor:
                 continue
             if path.suffix.lower() == ".py" and path.is_file() and not self._path_looks_like_test(path):
                 source_files.append(path)
+            elif path.suffix.lower() in CODE_FILE_SUFFIXES and path.is_file():
+                non_python_files.append(path)
         if not source_files:
-            return {"ok": False, "tool": "select_tests", "summary": "No changed Python source files to map to tests."}
+            if non_python_files:
+                root = self._project_root_for(non_python_files[0])
+                validators = self.discover_validators(self.relative_label(root), limit=8)
+                commands = [
+                    str(item.get("command"))
+                    for item in validators.get("validators", [])
+                    if isinstance(item, dict) and item.get("kind") == "test" and item.get("command")
+                ][: max(1, int(limit))]
+                rows = [
+                    {
+                        "path": self.relative_label(path),
+                        "command": commands[0] if commands else "",
+                        "score": 1,
+                        "reason": "language-level validator discovery",
+                    }
+                    for path in non_python_files[: max(1, int(limit))]
+                ]
+                return {
+                    "ok": True,
+                    "tool": "select_tests",
+                    "confidence": "low" if not commands else "medium",
+                    "changed_files": [self.relative_label(path) for path in non_python_files],
+                    "changed_symbols": sorted(symbols),
+                    "test_commands": commands,
+                    "tests": rows,
+                    "summary": "Selected language-level test commands from discover_validators." if commands else "No targeted tests found; use configured run_test.",
+                    "output": "\n".join(commands) if commands else "(no targeted tests found)",
+                }
+            return {"ok": False, "tool": "select_tests", "summary": "No changed source files to map to tests."}
         ranked: list[tuple[int, Path, list[str]]] = []
         for test_path in self._iter_python_test_files():
             score = 0
@@ -3101,6 +4306,116 @@ class ToolExecutor:
             return {"ok": True, "tool": "apply_structured_edit", "op": op, "path": source_rel, "to_path": dest_rel, "summary": f"Moved {symbol} to {dest_rel}.", "diff": preview}
         return {"ok": False, "tool": "apply_structured_edit", "summary": f"Unsupported structured edit op: {op or '(missing)'}"}
 
+    def _wrap_routed_edit_result(self, routed_tool: str, route: str, result: dict[str, Any]) -> dict[str, Any]:
+        wrapped = dict(result)
+        wrapped["tool"] = "edit_intent"
+        wrapped["routed_tool"] = routed_tool
+        wrapped["route"] = route
+        summary = str(wrapped.get("summary") or wrapped.get("output") or "").strip()
+        wrapped["summary"] = f"{route}: {summary}" if summary else route
+        return wrapped
+
+    def _looks_like_symbol_name(self, value: str) -> bool:
+        return bool(re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", value.strip()))
+
+    def _looks_like_full_symbol_source(self, target: Path, value: str) -> bool:
+        stripped = value.lstrip()
+        if target.suffix.lower() == ".py":
+            return stripped.startswith(("def ", "async def ", "class "))
+        return bool(re.match(r"(?:export\s+)?(?:async\s+)?(?:function|class)\s+\w+", stripped))
+
+    def _looks_like_function_body_edit_intent(self, intent: str) -> bool:
+        normalized = re.sub(r"[^a-z0-9_]+", "_", intent.lower())
+        words = {word for word in normalized.split("_") if word}
+        return bool(words & {"body", "implementation", "function", "method", "fix", "correct", "update"})
+
+    def edit_intent(
+        self,
+        path: str,
+        intent: str,
+        target: str | None = None,
+        replacement: str | None = None,
+        scope: str = "file",
+        apply: bool = True,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        target_path = self.resolve_path(path, allow_missing=False)
+        relative_path = self.relative_label(target_path)
+        clean_intent = str(intent or "").strip().lower().replace("-", "_")
+        old = str(target or "").strip()
+        new = "" if replacement is None else str(replacement)
+        clean_scope = str(scope or "file").strip().lower()
+        if not clean_intent:
+            return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires an intent."}
+        if not old and clean_intent not in {"add_import", "add_import_if_missing"}:
+            return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires target for this intent."}
+        if replacement is None and clean_intent != "delete_symbol":
+            return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires replacement for this intent."}
+        route = "replace text in file"
+        routed_tool = "replace_in_file"
+        operation: dict[str, Any] | None = None
+        if clean_intent in {"rename", "rename_symbol", "rename_symbol_project", "update_callers", "refactor_rename"} and self._looks_like_symbol_name(old) and self._looks_like_symbol_name(new):
+            if clean_scope in {"project", "repo", "repository", "all"}:
+                route = "project symbol rename"
+                routed_tool = "apply_structured_edit"
+                operation = {"op": "rename_symbol_project", "path": relative_path, "old": old, "new": new}
+            else:
+                route = "identifier text rename in file"
+                routed_tool = "replace_in_file"
+        elif clean_intent in {"replace_body", "replace_function_body", "function_body"}:
+            route = "replace Python function body"
+            routed_tool = "apply_structured_edit"
+            operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
+        elif clean_intent in {"change_signature", "replace_signature", "signature"}:
+            route = "change Python function signature"
+            routed_tool = "apply_structured_edit"
+            operation = {"op": "change_signature", "path": relative_path, "symbol": old, "signature": new}
+        elif clean_intent in {"add_import", "add_import_if_missing"}:
+            statement = new.strip() or old
+            route = "add import if missing"
+            routed_tool = "apply_structured_edit"
+            operation = {"op": "add_import_if_missing", "path": relative_path, "statement": statement}
+        elif (
+            target_path.suffix.lower() == ".py"
+            and self._looks_like_symbol_name(old)
+            and self._looks_like_function_body_edit_intent(clean_intent)
+            and not self._looks_like_full_symbol_source(target_path, new)
+        ):
+            route = "replace Python function body"
+            routed_tool = "apply_structured_edit"
+            operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
+        elif clean_intent in {"replace_symbol", "replace_function", "replace_class", "symbol"}:
+            if self._looks_like_symbol_name(old) and self._looks_like_full_symbol_source(target_path, new):
+                route = "replace symbol source"
+                routed_tool = "replace_symbol"
+            elif target_path.suffix.lower() == ".py" and self._looks_like_symbol_name(old):
+                route = "replace Python function body"
+                routed_tool = "apply_structured_edit"
+                operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
+            else:
+                route = "symbol-like request routed to text replace because target/replacement is not full symbol source"
+                routed_tool = "replace_in_file"
+        if not apply:
+            return {
+                "ok": True,
+                "tool": "edit_intent",
+                "path": relative_path,
+                "route": route,
+                "routed_tool": routed_tool,
+                "output": f"{route} -> {routed_tool}",
+            }
+        if operation is not None:
+            return self._wrap_routed_edit_result(routed_tool, route, self.apply_structured_edit(operation))
+        if routed_tool == "replace_symbol":
+            return self._wrap_routed_edit_result(routed_tool, route, self.replace_symbol(relative_path, old, new))
+        replace_all = clean_scope in {"project", "repo", "repository", "all"} or clean_intent in {"rename", "rename_symbol", "refactor_rename"}
+        match_whole_word = self._looks_like_symbol_name(old) and self._looks_like_symbol_name(new) and "(" not in old
+        return self._wrap_routed_edit_result(
+            "replace_in_file",
+            route,
+            self.replace_in_file(relative_path, old, new, replace_all=replace_all, match_whole_word=match_whole_word),
+        )
+
     def generate_tests_from_spec(
         self,
         target_symbol: str,
@@ -3535,6 +4850,255 @@ class ToolExecutor:
             result["summary"] += f" {diagnostic}"
         return result
 
+    def browser_smoke(
+        self,
+        url: str,
+        actions: list[dict[str, Any]] | None = None,
+        wait_for: str | None = None,
+        viewport: str = "desktop",
+        screenshot: bool = False,
+    ) -> dict[str, Any]:
+        if not self.browser_enabled:
+            return {"ok": False, "tool": "browser_smoke", "summary": "browser_smoke is disabled by config."}
+        clean_url = str(url or "").strip()
+        if not clean_url:
+            return {"ok": False, "tool": "browser_smoke", "summary": "browser_smoke requires a URL."}
+        probe = subprocess.run([sys.executable, "-c", "import playwright.sync_api"], capture_output=True, text=True, timeout=10, check=False)
+        if probe.returncode != 0:
+            return self._missing_dependency_result("browser_smoke", "playwright", "Playwright is not installed. Install playwright and browsers to use browser_smoke.")
+        artifact_path = None
+        if screenshot:
+            artifact_dir = self.workspace_root / ".ollama-code" / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            digest = hashlib.sha1(clean_url.encode("utf-8", errors="ignore")).hexdigest()[:10]
+            artifact_path = artifact_dir / f"browser-{digest}-{int(time.time())}.png"
+        payload = {
+            "url": clean_url,
+            "actions": actions or [],
+            "wait_for": wait_for,
+            "viewport": viewport,
+            "screenshot": str(artifact_path) if artifact_path else None,
+        }
+        script = r'''
+import json, sys
+from playwright.sync_api import sync_playwright
+payload = json.loads(sys.stdin.read())
+events = {"console_errors": [], "page_errors": [], "failed_requests": []}
+with sync_playwright() as p:
+    browser = p.chromium.launch(headless=True)
+    size = {"width": 390, "height": 844} if payload.get("viewport") == "mobile" else {"width": 1280, "height": 720}
+    page = browser.new_page(viewport=size)
+    page.on("console", lambda msg: events["console_errors"].append(msg.text) if msg.type == "error" else None)
+    page.on("pageerror", lambda exc: events["page_errors"].append(str(exc)))
+    page.on("requestfailed", lambda req: events["failed_requests"].append(req.url))
+    page.goto(payload["url"], wait_until="networkidle", timeout=30000)
+    for action in payload.get("actions") or []:
+        kind = action.get("type") or action.get("action")
+        selector = action.get("selector")
+        if kind == "click" and selector:
+            page.click(selector, timeout=10000)
+        elif kind == "fill" and selector:
+            page.fill(selector, str(action.get("text", "")), timeout=10000)
+        elif kind == "press" and selector:
+            page.press(selector, str(action.get("key", "Enter")), timeout=10000)
+    wait_for = payload.get("wait_for")
+    if wait_for:
+        if wait_for.startswith("text="):
+            page.get_by_text(wait_for[5:]).wait_for(timeout=10000)
+        else:
+            page.wait_for_selector(wait_for, timeout=10000)
+    if payload.get("screenshot"):
+        page.screenshot(path=payload["screenshot"], full_page=True)
+    title = page.title()
+    body = page.locator("body").inner_text(timeout=10000)[:1000] if page.locator("body").count() else ""
+    browser.close()
+print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
+'''
+        completed = subprocess.run([sys.executable, "-c", script], input=json.dumps(payload), capture_output=True, text=True, timeout=45, check=False)
+        output = self._collect_process_output(completed)
+        try:
+            result_payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            result_payload = {}
+        problems = []
+        for key in ("console_errors", "page_errors", "failed_requests"):
+            values = result_payload.get(key)
+            if isinstance(values, list) and values:
+                problems.append(f"{key}={len(values)}")
+        lines = [
+            f"title={result_payload.get('title', '')}",
+            self._truncate_text(str(result_payload.get("body", "")).replace("\n", " | "), limit=700),
+        ]
+        if artifact_path:
+            lines.append(f"screenshot={self.relative_label(artifact_path)}")
+        if problems:
+            lines.append("problems=" + ", ".join(problems))
+        return {
+            "ok": completed.returncode == 0 and not problems,
+            "tool": "browser_smoke",
+            "url": clean_url,
+            "screenshot": self.relative_label(artifact_path) if artifact_path else None,
+            "summary": "Browser smoke passed." if completed.returncode == 0 and not problems else "Browser smoke found issues or failed.",
+            "output": "\n".join(line for line in lines if line) if completed.returncode == 0 else output,
+        }
+
+    def security_scan(self, path: str = ".", scanners: str | list[str] = "auto", limit: int = 80, timeout: int = 120) -> dict[str, Any]:
+        if not self.security_enabled:
+            return {"ok": False, "tool": "security_scan", "summary": "security_scan is disabled by config."}
+        base = self.resolve_path(path, allow_missing=False)
+        requested = [scanners] if isinstance(scanners, str) else list(scanners or [])
+        requested_names = {part.strip().lower() for item in requested for part in str(item).split(",") if part.strip()}
+        available: list[tuple[str, list[str]]] = []
+        if ("auto" in requested_names or "gitleaks" in requested_names) and shutil.which("gitleaks"):
+            available.append(("gitleaks", ["gitleaks", "detect", "--source", str(base), "--redact", "--no-git"]))
+        if ("auto" in requested_names or "pip-audit" in requested_names) and shutil.which("pip-audit") and ((base / "pyproject.toml").exists() if base.is_dir() else True):
+            available.append(("pip-audit", ["pip-audit"]))
+        if ("auto" in requested_names or "npm" in requested_names or "npm-audit" in requested_names) and shutil.which("npm") and ((base / "package.json").exists() if base.is_dir() else (base.parent / "package.json").exists()):
+            available.append(("npm audit", ["npm", "audit", "--json"]))
+        if ("auto" in requested_names or "osv-scanner" in requested_names) and shutil.which("osv-scanner"):
+            available.append(("osv-scanner", ["osv-scanner", "--recursive", str(base)]))
+        if ("auto" in requested_names or "trivy" in requested_names) and shutil.which("trivy"):
+            available.append(("trivy", ["trivy", "fs", "--quiet", str(base)]))
+        if not available:
+            return self._missing_dependency_result("security_scan", "security scanner", "No supported security scanners found on PATH.")
+        outputs: list[str] = []
+        ok = True
+        for name, command in available[: max(1, int(limit))]:
+            completed = self._run_process(command, cwd=base if base.is_dir() else base.parent, timeout=timeout, shell=False)
+            output = self._truncate_text(self._collect_process_output(completed), limit=1200)
+            outputs.append(f"## {name} exit={completed.returncode}\n{output}")
+            if completed.returncode not in {0}:
+                ok = False
+        return {
+            "ok": ok,
+            "tool": "security_scan",
+            "path": self.relative_label(base),
+            "count": len(outputs),
+            "summary": "Security scan completed." if ok else "Security scan completed with findings or scanner errors.",
+            "output": "\n\n".join(outputs),
+        }
+
+    def _mcp_server_payload(self, server: str) -> dict[str, Any] | None:
+        payload = self.mcp_servers.get(server)
+        return payload if isinstance(payload, dict) else None
+
+    def _mcp_server_command(self, server: str) -> tuple[list[str] | None, dict[str, str], str | None]:
+        payload = self._mcp_server_payload(server)
+        if payload is None:
+            return None, {}, f"MCP server is not configured: {server}"
+        command = payload.get("command")
+        if not isinstance(command, str) or not command.strip():
+            return None, {}, f"MCP server {server} requires a command."
+        args = payload.get("args") if isinstance(payload.get("args"), list) else []
+        argv = [command.strip(), *(str(arg) for arg in args)]
+        executable = shutil.which(argv[0]) if not Path(argv[0]).is_absolute() else argv[0]
+        if not executable or not Path(executable).exists() and shutil.which(argv[0]) is None:
+            return None, {}, f"executable not found: {argv[0]}"
+        env_payload = payload.get("env") if isinstance(payload.get("env"), dict) else {}
+        env = {str(key): str(value) for key, value in env_payload.items()}
+        return argv, env, None
+
+    def _mcp_request(self, server: str, requests: list[dict[str, Any]], timeout: int) -> tuple[bool, list[dict[str, Any]], str]:
+        argv, extra_env, error = self._mcp_server_command(server)
+        if error:
+            return False, [], error
+        assert argv is not None
+        env = os.environ.copy()
+        env.update(extra_env)
+        input_text = "".join(json.dumps(request, separators=(",", ":")) + "\n" for request in requests)
+        try:
+            completed = subprocess.run(
+                argv,
+                cwd=self.workspace_root,
+                input=input_text,
+                text=True,
+                capture_output=True,
+                timeout=max(1, int(timeout)),
+                env=env,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return False, [], f"MCP server {server} timed out after {timeout}s."
+        except Exception as exc:
+            return False, [], str(exc)
+        wanted_ids = {request.get("id") for request in requests if "id" in request}
+        responses: list[dict[str, Any]] = []
+        for line in completed.stdout.splitlines():
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if payload.get("id") in wanted_ids:
+                responses.append(payload)
+        if completed.returncode not in {0} and not responses:
+            stderr = completed.stderr.strip()
+            summary = stderr or completed.stdout.strip() or f"MCP server {server} exited with {completed.returncode}."
+            return False, responses, self._truncate_text(summary, limit=800)
+        return True, responses, completed.stderr.strip()
+
+    def mcp_list_tools(self, server: str | None = None, timeout: int = 15) -> dict[str, Any]:
+        servers = [server] if isinstance(server, str) and server.strip() else sorted(self.mcp_servers)
+        if not servers:
+            return {"ok": False, "tool": "mcp_list_tools", "summary": "No MCP servers configured.", "missing_dependency": "mcp.servers"}
+        rows: list[str] = []
+        for name in servers:
+            ok, responses, error = self._mcp_request(
+                name,
+                [
+                    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "ollama-code", "version": "0.1.0"}}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+                ],
+                timeout,
+            )
+            if not ok:
+                rows.append(f"{name}: {error}")
+                continue
+            tools_payload = next((item.get("result", {}).get("tools") for item in responses if item.get("id") == 2), [])
+            if isinstance(tools_payload, list):
+                for item in tools_payload:
+                    if isinstance(item, dict):
+                        rows.append(f"mcp.{name}.{item.get('name')}: {str(item.get('description') or '')[:120]}")
+            elif error:
+                rows.append(f"{name}: {error[:200]}")
+        return {"ok": True, "tool": "mcp_list_tools", "count": len(rows), "output": "\n".join(rows) if rows else "(no MCP tools returned)"}
+
+    def mcp_call(self, server: str, tool: str, arguments: dict[str, Any] | None = None, timeout: int = 30) -> dict[str, Any]:
+        if not isinstance(arguments, dict):
+            arguments = {}
+        tool_name = str(tool or "").strip()
+        server_name = str(server or "").strip()
+        if not server_name or not tool_name:
+            return {"ok": False, "tool": "mcp_call", "summary": "mcp_call requires server and tool."}
+        approved, reason = self._approve_shell(f"mcp {server_name}.{tool_name}", ".")
+        if not approved:
+            return {"ok": False, "tool": "mcp_call", "summary": reason}
+        ok, responses, error = self._mcp_request(
+            server_name,
+            [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "ollama-code", "version": "0.1.0"}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": tool_name, "arguments": arguments}},
+            ],
+            timeout,
+        )
+        if not ok:
+            missing = "mcp server" if "not configured" in error else None
+            result = {"ok": False, "tool": "mcp_call", "server": server_name, "mcp_tool": tool_name, "summary": error}
+            if missing:
+                result["missing_dependency"] = missing
+            return result
+        response = next((item for item in responses if item.get("id") == 2), {})
+        if response.get("error"):
+            return {"ok": False, "tool": "mcp_call", "server": server_name, "mcp_tool": tool_name, "summary": json.dumps(response.get("error"), ensure_ascii=True)[:800]}
+        return {
+            "ok": True,
+            "tool": "mcp_call",
+            "server": server_name,
+            "mcp_tool": tool_name,
+            "output": self._truncate_text(json.dumps(response.get("result", {}), ensure_ascii=True), limit=1600),
+        }
+
     def classify_error(self, text: str) -> str:
         for name, pattern in ERROR_CLASS_PATTERNS.items():
             if pattern.search(text):
@@ -3598,7 +5162,7 @@ class ToolExecutor:
         executable = Path(str(argv[0]).strip().strip("'\"")).name.lower()
         if executable.endswith(".exe"):
             executable = executable[:-4]
-        if executable in {"git", "pytest", "ruff", "mypy", "pyright", "tsc", "npm", "pnpm", "yarn"}:
+        if executable in {"git", "pytest", "ruff", "mypy", "pyright", "tsc", "npm", "pnpm", "yarn", "go", "cargo", "gradle", "gradlew", "gradlew.bat", "cmake", "ctest", "node"}:
             return executable
         if executable in {"python", "python3", "py"}:
             if "-m" in argv:
@@ -3761,6 +5325,23 @@ class ToolExecutor:
             mutating_flags = {"--fix", "--write", "--watch"}
             if any(flag == token or token.startswith(flag + "=") for flag in mutating_flags for token in argv[1:]):
                 return None, self._validation_result(family=family, valid=False, reason=f"{family} mutating/watch flags are not allowed through run_shell")
+        elif family == "go":
+            if tuple(argv[1:2]) != ("test",):
+                return None, self._validation_result(family=family, valid=False, reason="go command is not an allowed validation command")
+        elif family == "cargo":
+            if tuple(argv[1:2]) not in {("test",), ("check",)}:
+                return None, self._validation_result(family=family, valid=False, reason="cargo command is not an allowed validation command")
+        elif family in {"gradle", "gradlew", "gradlew.bat"}:
+            if "test" not in argv[1:]:
+                return None, self._validation_result(family=family, valid=False, reason="gradle command is not an allowed validation command")
+        elif family == "cmake":
+            if "-S" not in argv or "-B" not in argv:
+                return None, self._validation_result(family=family, valid=False, reason="cmake command must be a configure/check command")
+        elif family == "ctest":
+            pass
+        elif family == "node":
+            if "--check" not in argv[1:]:
+                return None, self._validation_result(family=family, valid=False, reason="node command is not an allowed validation command")
         elif family in {"npm", "pnpm", "yarn"}:
             allowed_sequences = {("test",), ("run", "test"), ("run", "lint"), ("run", "typecheck")}
             sequence = tuple(argv[1:3]) if len(argv) > 2 and argv[1] == "run" else tuple(argv[1:2])
@@ -3839,12 +5420,26 @@ class ToolExecutor:
 
     def run_test(self, command: str | None = None, cwd: str = ".", timeout: int = 1200) -> dict[str, Any]:
         selected_command = command.strip() if isinstance(command, str) and command.strip() else self.default_test_command
+        discovered = None
         if not selected_command:
-            return {
-                "ok": False,
-                "tool": "run_test",
-                "summary": "No test command is configured. Set --test-cmd or pass a command to run_test.",
-            }
+            validators = self.discover_validators(cwd)
+            candidates = [
+                item
+                for item in validators.get("validators", [])
+                if isinstance(item, dict) and item.get("kind") == "test" and item.get("command") and item.get("available") is True
+            ]
+            preferred = [item for item in candidates if "unittest discover" in str(item.get("command", ""))]
+            selected = (preferred or candidates)[:1]
+            if selected:
+                selected_command = str(selected[0]["command"])
+                discovered = validators
+            else:
+                return {
+                    "ok": False,
+                    "tool": "run_test",
+                    "summary": "No test command is configured and no runnable test validator was discovered. Set --test-cmd or pass a command to run_test.",
+                    "validators": validators.get("validators", []),
+                }
         normalized = None
         try:
             result = self.run_shell(selected_command, cwd=cwd, timeout=timeout)
@@ -3855,6 +5450,14 @@ class ToolExecutor:
             normalized = f"Ignored run_test cwd outside workspace: {cwd}"
         result["tool"] = "run_test"
         result["command"] = selected_command
+        if discovered is not None:
+            result["discovered"] = True
+            result["validators"] = discovered.get("validators", [])
+            prefix = f"Discovered test command: {selected_command}."
+            if result.get("ok"):
+                result["summary"] = prefix
+            else:
+                result["summary"] = f"{prefix} {result.get('output', '')[:180]}"
         if normalized:
             result["normalized"] = normalized
             result["summary"] = normalized if result.get("ok") else f"{normalized}. {result.get('output', '')[:180]}"

@@ -6,7 +6,7 @@ It gives the model a guarded tool loop for:
 
 - listing files
 - reading files
-- searching the workspace
+- searching the workspace with `rg`, optional `fd`, and a local SQLite FTS cache
 - searching code symbols, showing compact code outlines, and reading exact function/class bodies
 - writing or replacing file content
 - running shell commands
@@ -16,6 +16,7 @@ It gives the model a guarded tool loop for:
 - running nested sub-agents for scoped subtasks
 - running default-on tool-step assumption audits plus claim-aware risky final verification and evidence-backed rewrite
 - running artifact reconciliation after failed tests or validator-like tools
+- using optional local integrations such as ast-grep, Semgrep, LSP-style navigation, MCP stdio servers, Playwright smoke checks, and security scanners when installed
 
 By default it asks before edits or shell commands. You can switch to `--approval auto` for hands-off runs.
 Sessions are also auto-saved locally under `.ollama-code/sessions`, so you can continue or resume prior work.
@@ -55,8 +56,8 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
 ```json
 {
   "host": "http://127.0.0.1:11434",
-  "model": "granite4.1:8b",
-  "verifier_model": "granite4.1:8b",
+  "model": "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS",
+  "verifier_model": "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS",
   "approval": "ask",
   "debate": true,
   "reconcile": "auto",
@@ -89,10 +90,10 @@ export OLLAMA_HOST=127.0.0.1:11434
 ollama-code
 ```
 
-The built-in default model is `granite4.1:8b`. Install it once if needed:
+The built-in default model is `hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`. Install it once if needed:
 
 ```bash
-ollama pull granite4.1:8b
+ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS
 ```
 
 One-shot prompt:
@@ -338,10 +339,12 @@ git push origin v0.1.0
 - Tool-heavy turns run with thinking disabled by default to cut latency and token use. Simple non-tool turns still use the normal Ollama thinking path.
 - Repeated read-only tool calls in one user turn are cached, and only compact tool-result summaries are fed back into the model. Full raw tool results still stay in the transcript and event log.
 - Code navigation tools (`search_symbols`, `code_outline`, `read_symbol`) let the model inspect relevant functions/classes instead of reading full files. `replace_symbol` can mechanically replace one function/class/method by symbol range and rejects Python replacements that would break file syntax. Python uses AST ranges; other common code files use a lightweight definition fallback.
+- `inspect_library_source` lets the model inspect installed Python library functions/classes by import path, with signature/doc/disassembly fallback for builtins or C extensions where source is unavailable.
+- `systems_lens` gives the model compact systems questions for broad debugging, design, refactor, and performance tasks: boundary, observer/metric, categories, state/scale, feedback, delays, stocks/flows, coupling, model limits, and intervention effects. It guides planning but does not count as file evidence before edits.
 - Token profiling is recorded in `llm_call` events, including prompt chars by role and largest prompt messages, so evals can identify input-token waste.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
-- The recommended default coding model is `granite4.1:8b`; install it with `ollama pull granite4.1:8b`.
+- The recommended default coding model is `hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`; install it with `ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`.
 - The recommended serial eval order is `gemma3:4b`, `qwen3:8b`, `granite4.1:8b`, then `gemma4:e4b`.
-- If you do not pass `--model` and `granite4.1:8b` is not installed, the CLI falls back to the first available preferred local model and prints the pull command for Granite.
+- If you do not pass `--model` and the default IQ4_XS Granite quant is not installed, the CLI falls back to the first available preferred local model and prints the pull command.
 - The Windows-side Ollama install still has no usable local models for this project, so running inside WSL is the simplest path.

@@ -201,16 +201,18 @@ Next optimization pass is feature-gated through `OLLAMA_CODE_FEATURE_PROFILE` an
 - `contract-guards`: expose compact Python function contracts and run post-edit contract checks before targeted tests.
 - `all`: enable every gated feature.
 
-Default remains `baseline`. A profile is only safe to enable by default after zero pass-to-fail regressions and lower median total tokens on common passing cases.
+The normal CLI defaults to `all`; benchmark scripts still pass `OLLAMA_CODE_FEATURE_PROFILE` explicitly so `baseline` and other profiles remain available for A/B runs.
 
 Generic additions behind these profiles:
 
 - Persistent ignored repo index under `.ollama-code/index/` with paths, mtimes, sizes, hashes, symbols, imports, and term vectors.
-- `file_index_refresh(path='.',limit=50000)` and `file_search(query,path='.',limit=100)` provide an Everything-style cached filename/path index for fast local file discovery without reading file contents.
+- `file_index_refresh(path='.',limit=50000)`, `file_search(query,path='.',limit=100)`, and optional `fd_search(query,path='.',limit=100,kind='any')` provide fast local file discovery without reading file contents.
+- `fts_refresh(path='.',limit=2000)` and `fts_search(query,path='.',limit=20,refresh=false)` maintain a repo-local SQLite FTS5 cache over paths, symbols, headings, and compact text snippets.
 - `everything_search(query,path='.',limit=100)` integrates with the native Everything CLI `es.exe` when installed, then filters matches back to the workspace; if `es.exe` is unavailable, use `file_search`.
 - `repo_index_refresh(path='.',limit=1000)` refreshes that index on demand, and `indexed_search(query,path='.',limit=100)` searches cached line snippets without rescanning every file.
 - `semgrep_scan(pattern,path='.',lang?,limit=50)` provides optional syntax-aware structural search when Semgrep is installed; if it is absent, the tool fails closed with an install-needed diagnostic instead of falling back to broad reads.
 - `context_pack(request,path='.',limit=8)` ranks compact snippets, likely tests, git state, and a suggested next tool.
+- `systems_lens(request,path='.',evidence?,limit=8)` frames complex tasks as explicit systems questions around boundary, observer/metric, categories, state, history/scale, feedback, delays, stocks/flows, coupling, incentives, model limits, disconfirmation, and intervention effects.
 - `apply_structured_edit` now supports `replace_function_body`, `change_signature`, `add_import_if_missing`, `rename_symbol_project`/`update_callers`, plus existing rename/delete/move/replace ops.
 - `select_tests(changed_files,changed_symbols?,limit=8)` maps changed Python files to focused `unittest discover` commands using imports, filenames, and symbol mentions before falling back to the configured full test command. It is also used internally by post-edit validation.
 - `contract_graph(path='.',symbol?,limit=40)` emits compact Python signatures, return-shape hints, callers/callees, affected tests, and purity hints.

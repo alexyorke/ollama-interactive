@@ -63,6 +63,31 @@ def tool_calls(session: dict[str, Any]) -> list[str]:
     ]
 
 
+def tool_profile(session: dict[str, Any]) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    totals: dict[str, dict[str, Any]] = {}
+    for event in session.get("events", []):
+        if event.get("type") != "tool_result":
+            continue
+        name = str(event.get("name") or "")
+        raw_duration = event.get("duration_ms")
+        duration_ms = float(raw_duration) if isinstance(raw_duration, (int, float)) else 0.0
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        rows.append({"name": name, "duration_ms": round(duration_ms, 3), "cached": event.get("cached") is True, "ok": result.get("ok") is True})
+        bucket = totals.setdefault(name, {"calls": 0, "duration_ms": 0.0, "failed": 0, "cached": 0})
+        bucket["calls"] += 1
+        bucket["duration_ms"] += duration_ms
+        if result.get("ok") is False:
+            bucket["failed"] += 1
+        if event.get("cached") is True:
+            bucket["cached"] += 1
+    return {
+        "total_duration_ms": round(sum(float(item["duration_ms"]) for item in rows), 3),
+        "by_tool": {name: {**bucket, "duration_ms": round(float(bucket["duration_ms"]), 3)} for name, bucket in sorted(totals.items())},
+        "calls": rows,
+    }
+
+
 def final_assistant_message(session: dict[str, Any]) -> str:
     for event in reversed(session.get("events", [])):
         if event.get("type") == "assistant" and isinstance(event.get("content"), str):
@@ -402,6 +427,7 @@ def evaluate_case(
             "latency_s": round(elapsed, 2),
             "usage": usage,
             "tool_calls": tool_calls(session),
+            "tool_profile": tool_profile(session),
             "assumption_audits": sum(1 for event in session.get("events", []) if event.get("type") == "assumption_audit"),
             "assumption_audit_retries": sum(1 for event in session.get("events", []) if event.get("type") == "assumption_audit" and event.get("verdict") == "retry"),
             "verification_retries": sum(1 for event in session.get("events", []) if event.get("type") == "verification" and event.get("verdict") == "retry"),

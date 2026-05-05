@@ -25,6 +25,7 @@ from ollama_code.config import (
     ENV_OLLAMA_CODE_TEST_CMD,
     ENV_OLLAMA_CODE_VERIFIER_MODEL,
     ENV_OLLAMA_HOST,
+    OFFICIAL_GRANITE_8B_MODEL,
     load_config,
 )
 from ollama_code.interrupts import InterruptController, OperationInterrupted
@@ -34,6 +35,7 @@ from ollama_code.tools import ToolExecutor
 
 PREFERRED_FALLBACK_MODELS = [
     DEFAULT_MODEL,
+    OFFICIAL_GRANITE_8B_MODEL,
     "gemma3:4b",
     "qwen3:8b",
     "gemma4:e4b",
@@ -276,6 +278,11 @@ def build_agent(
         approval_mode=approval,
         input_func=input_func,
         test_command=test_command,
+        default_tools_enabled=config.tools_default_enabled,
+        disabled_tools=config.disabled_tools,
+        mcp_servers=config.mcp_servers,
+        browser_enabled=config.browser_enabled,
+        security_enabled=config.security_enabled,
     )
     resolved_status_printer = status_printer or ((lambda message: None) if args.quiet else (lambda message: print(f"[status] {message}")))
     agent = OllamaCodeAgent(

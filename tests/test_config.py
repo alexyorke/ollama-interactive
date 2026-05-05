@@ -112,6 +112,30 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Config file not found"):
                 build_agent(args)
 
+    def test_build_agent_reads_tooling_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".ollama-code").mkdir(parents=True)
+            (root / ".ollama-code" / "config.json").write_text(
+                json.dumps(
+                    {
+                        "tools": {"default_enabled": True, "disabled": ["browser_smoke"]},
+                        "mcp": {"servers": {"demo": {"command": "demo-mcp"}}},
+                        "browser": {"enabled": False},
+                        "security": {"enabled": False},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            parser = build_parser()
+            args = parser.parse_args(["--cwd", str(root), "--quiet"])
+            agent = build_agent(args)
+
+        self.assertNotIn("browser_smoke", agent.tools.available_tool_names())
+        self.assertEqual(agent.tools.mcp_servers["demo"]["command"], "demo-mcp")
+        self.assertFalse(agent.tools.browser_enabled)
+        self.assertFalse(agent.tools.security_enabled)
+
 
 class _FakeOllamaHandler(BaseHTTPRequestHandler):
     requests: list[dict[str, object]] = []
