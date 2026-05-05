@@ -54,6 +54,16 @@ CODE_FILE_SUFFIXES = {
 REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
 FTS_INDEX_VERSION = 1
+INDEX_MUTATING_TOOL_NAMES = {
+    "write_file",
+    "replace_symbol",
+    "replace_symbols",
+    "replace_in_file",
+    "apply_structured_edit",
+    "edit_intent",
+    "generate_tests_from_spec",
+    "run_shell",
+}
 FTS_TEXT_SUFFIXES = CODE_FILE_SUFFIXES | {
     ".md",
     ".rst",
@@ -469,6 +479,7 @@ class ToolExecutor:
         mcp_servers: dict[str, Any] | None = None,
         browser_enabled: bool = True,
         security_enabled: bool = True,
+        indexer: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
         self.approval_mode = approval_mode
@@ -480,6 +491,7 @@ class ToolExecutor:
         self.mcp_servers = dict(mcp_servers or {})
         self.browser_enabled = bool(browser_enabled)
         self.security_enabled = bool(security_enabled)
+        self.indexer = indexer
         self._interrupt_event: threading.Event | None = None
         self._initial_dirty_paths = self._git_dirty_paths()
 
@@ -491,6 +503,9 @@ class ToolExecutor:
 
     def set_test_command(self, command: str | None) -> None:
         self.default_test_command = command.strip() if isinstance(command, str) and command.strip() else None
+
+    def set_indexer(self, indexer: Any | None) -> None:
+        self.indexer = indexer
 
     def _truncate_text(self, text: str, *, limit: int) -> str:
         if len(text) <= limit:
@@ -598,7 +613,9 @@ class ToolExecutor:
         if handler is None:
             return {"ok": False, "tool": name, "summary": f"Unknown tool: {name}"}
         try:
-            return self._call_tool_handler(handler, arguments)
+            result = self._call_tool_handler(handler, arguments)
+            self._notify_indexer_after_tool(name, arguments, result)
+            return result
         except OperationInterrupted:
             return {"ok": False, "tool": name, "summary": "Interrupted by user.", "interrupted": True}
         except TypeError as exc:
@@ -620,6 +637,28 @@ class ToolExecutor:
         if error_class in {"path_missing", "cwd_git"} and raw_path:
             result["suggested_paths"] = self._nearest_existing_paths(raw_path)
         return result
+
+    def _notify_indexer_after_tool(self, name: str, arguments: dict[str, Any], result: dict[str, Any]) -> None:
+        indexer = self.indexer
+        if indexer is None or name not in INDEX_MUTATING_TOOL_NAMES or result.get("ok") is not True:
+            return
+        if name == "run_shell":
+            refresh = getattr(indexer, "request_refresh", None)
+            if callable(refresh):
+                refresh("run_shell completed")
+            return
+        paths: set[str] = set()
+        for source in (result, arguments):
+            for key in ("path", "test_path"):
+                value = source.get(key) if isinstance(source, dict) else None
+                if isinstance(value, str) and value.strip():
+                    paths.add(value.strip())
+            value = source.get("paths") if isinstance(source, dict) else None
+            if isinstance(value, list):
+                paths.update(str(item).strip() for item in value if str(item).strip())
+        notify = getattr(indexer, "notify_paths", None)
+        if paths and callable(notify):
+            notify(paths)
 
     def resolve_path(self, raw_path: str | None, *, allow_missing: bool = True) -> Path:
         candidate = self.workspace_root if not raw_path else self._coerce_input_path(raw_path)
@@ -1701,6 +1740,7 @@ class ToolExecutor:
         conn = sqlite3.connect(cache_path)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=2000")
             conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
             conn.execute(
                 "CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5("

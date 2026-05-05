@@ -72,6 +72,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(replace["ok"])
         self.assertEqual(final_text, "goodbye\n")
 
+    def test_mutating_tools_notify_indexer(self) -> None:
+        class FakeIndexer:
+            def __init__(self) -> None:
+                self.paths: list[str] = []
+
+            def notify_paths(self, paths: object) -> None:
+                self.paths.extend(str(path) for path in paths)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            indexer = FakeIndexer()
+            tools = ToolExecutor(root, approval_mode="auto", indexer=indexer)
+            result = tools.execute("write_file", {"path": "note.txt", "content": "hello\n"})
+
+        self.assertTrue(result["ok"])
+        self.assertIn("note.txt", indexer.paths)
+
     def test_write_file_reports_python_syntax_error_without_blocking_write(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

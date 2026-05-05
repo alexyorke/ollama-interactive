@@ -29,6 +29,7 @@ from ollama_code.config import (
     OFFICIAL_GRANITE_8B_MODEL,
     load_config,
 )
+from ollama_code.indexer import BackgroundIndexer
 from ollama_code.interrupts import InterruptController, OperationInterrupted
 from ollama_code.ollama_client import OllamaClient, OllamaError
 from ollama_code.sessions import latest_session_path, load_transcript_payload, new_session_path, resolve_transcript_path
@@ -157,6 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reconcile", choices=["off", "on", "auto"], default=None, help="Artifact reconciliation after failed tests/edits. Default: auto.")
     parser.add_argument("--verifier-model", default=None, help="Optional model override for grounded final verification and evidence-backed rewrite.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
+    parser.add_argument("--no-indexer", action="store_true", help="Disable the background repo indexer for this run.")
     parser.add_argument("--doctor", action="store_true", help="Check Ollama, model, workspace, and optional local tool availability, then exit.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser
@@ -275,6 +277,14 @@ def build_agent(
     explicit_test_command = _non_empty_string(args.test_cmd)
     if explicit_test_command:
         test_command = explicit_test_command
+    resolved_status_printer = status_printer or ((lambda message: None) if args.quiet else (lambda message: print(f"[status] {message}")))
+    indexer = BackgroundIndexer(
+        workspace_root,
+        enabled=config.indexer_enabled and not args.no_indexer,
+        watch=config.indexer_watch,
+        poll_interval_ms=config.indexer_poll_interval_ms,
+        status_printer=resolved_status_printer,
+    )
     tools = ToolExecutor(
         workspace_root,
         approval_mode=approval,
@@ -285,8 +295,8 @@ def build_agent(
         mcp_servers=config.mcp_servers,
         browser_enabled=config.browser_enabled,
         security_enabled=config.security_enabled,
+        indexer=indexer,
     )
-    resolved_status_printer = status_printer or ((lambda message: None) if args.quiet else (lambda message: print(f"[status] {message}")))
     agent = OllamaCodeAgent(
         client=client,
         tools=tools,
@@ -361,10 +371,12 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
 
 
 def startup_help_text(agent: OllamaCodeAgent) -> str:
+    index_status = agent.index_status()
+    index_label = "on" if index_status.get("enabled") else "off"
     lines = [
         "Ollama Code",
         f"workspace: {agent.workspace_root().as_posix()}",
-        f"model: {agent.model} | approval: {agent.approval_mode()} | debate: {'on' if agent.debate_mode() else 'off'} | reconcile: {agent.reconcile_mode()}",
+        f"model: {agent.model} | approval: {agent.approval_mode()} | debate: {'on' if agent.debate_mode() else 'off'} | reconcile: {agent.reconcile_mode()} | indexer: {index_label}",
     ]
     if agent.configured_test_command():
         lines.append(f"test_cmd: {agent.configured_test_command()}")
@@ -383,6 +395,7 @@ def startup_help_text(agent: OllamaCodeAgent) -> str:
             "  /approval ask|auto|read-only     control writes and shell commands",
             "  /test [command]                  run configured or explicit tests",
             "  /doctor                          check first-use setup",
+            "  /index status|refresh|stop|start  manage the repo-local search indexer",
             "  /tools                           show compact model-facing tools",
             "  /help                            show all slash commands",
             "  /quit                            exit",
@@ -405,6 +418,7 @@ def slash_help_text() -> str:
             "  /debate on|off                   toggle tool audits and final verification",
             "  /reconcile off|on|auto           toggle artifact reconciliation",
             "  /doctor                          check Ollama/model/workspace setup",
+            "  /index status|refresh|stop|start  manage the repo-local search indexer",
             "  /reset                           clear conversation memory",
             "  /save [path]                     save transcript",
             "  /sessions [limit]                list saved sessions",
@@ -419,6 +433,7 @@ def slash_help_text() -> str:
             "Tips:",
             "  Ask normally: \"fix failing tests, inspect source first, then run tests\".",
             "  Run /doctor if the first request is slow or fails before tool use.",
+            "  The background indexer keeps file/repo/FTS search caches hot under .ollama-code/index.",
             "  Use /tools for a compact list; /tools full is verbose.",
             "  Use /approval read-only for inspection-only sessions.",
             "  Press Esc during model or tool execution to interrupt.",
@@ -471,6 +486,13 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
             ok = False
             lines.append(f"model: missing {agent.model}. {DEFAULT_MODEL_PULL_HINT}")
 
+    index_status = agent.index_status()
+    if index_status.get("enabled"):
+        state = "ready" if index_status.get("ready") else ("starting" if index_status.get("running") else "idle")
+        lines.append(f"indexer: ok enabled ({state}); cache={index_status.get('cache_dir')}")
+    else:
+        lines.append("indexer: disabled")
+
     optional_tools = {
         "rg": "fast text search",
         "fd": "fast file discovery",
@@ -491,6 +513,18 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
     else:
         lines.append("console script: not on PATH; run python -m ollama_code or python -m pip install -e .")
     return "\n".join(lines), ok
+
+
+def _format_index_status(status: dict[str, object]) -> str:
+    if status.get("ok") is False and not status.get("enabled"):
+        return str(status.get("summary", "indexer disabled"))
+    running = "yes" if status.get("running") else "no"
+    ready = "yes" if status.get("ready") else "no"
+    enabled = "yes" if status.get("enabled") else "no"
+    pending = status.get("pending_paths", 0)
+    refresh_count = status.get("refresh_count", 0)
+    summary = status.get("summary", "")
+    return f"indexer enabled={enabled} running={running} ready={ready} pending={pending} refreshes={refresh_count} summary={summary}"
 
 
 def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[str], None]) -> bool | None:
@@ -550,6 +584,25 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
     if action == "/doctor":
         report, _ = doctor_report(agent)
         writer(report)
+        return True
+    if action == "/index":
+        command = _strip_matching_quotes(remainder).lower() or "status"
+        if command == "status":
+            writer(_format_index_status(agent.index_status()))
+            return True
+        if command == "refresh":
+            result = agent.refresh_index()
+            writer(str(result.get("summary", "index refresh queued")))
+            return True
+        if command == "stop":
+            agent.stop_indexer()
+            writer("indexer stopped")
+            return True
+        if command == "start":
+            started = agent.start_indexer()
+            writer("indexer started" if started else "indexer disabled")
+            return True
+        writer("Usage: /index status|refresh|stop|start")
         return True
     if action == "/reset":
         agent.reset()
@@ -634,36 +687,40 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
 
 def run_repl(agent: OllamaCodeAgent, *, quiet: bool = False, renderer: CliStatusRenderer | None = None) -> int:
     renderer = renderer or CliStatusRenderer()
+    agent.start_indexer()
     if not quiet:
         print_banner(agent)
     interrupt_controller = InterruptController()
-    while True:
-        try:
-            raw = input("ollama-code> ").strip()
-        except EOFError:
-            print()
-            return 0
-        if not raw:
-            continue
-        try:
-            with interrupt_controller.watch() as interrupt_event:
-                agent.set_interrupt_event(interrupt_event)
-                handled = handle_meta_command(raw, agent, renderer.write)
-                if handled is False:
-                    return 0
-                if handled is True:
-                    continue
-                result = agent.handle_user(raw)
-        except OllamaError as exc:
-            renderer.clear_thinking()
-            print(f"error: {exc}", file=sys.stderr)
-            return 1
-        except OperationInterrupted:
-            renderer.write("interrupted")
-            continue
-        finally:
-            agent.set_interrupt_event(None)
-        renderer.write(result.message)
+    try:
+        while True:
+            try:
+                raw = input("ollama-code> ").strip()
+            except EOFError:
+                print()
+                return 0
+            if not raw:
+                continue
+            try:
+                with interrupt_controller.watch() as interrupt_event:
+                    agent.set_interrupt_event(interrupt_event)
+                    handled = handle_meta_command(raw, agent, renderer.write)
+                    if handled is False:
+                        return 0
+                    if handled is True:
+                        continue
+                    result = agent.handle_user(raw)
+            except OllamaError as exc:
+                renderer.clear_thinking()
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            except OperationInterrupted:
+                renderer.write("interrupted")
+                continue
+            finally:
+                agent.set_interrupt_event(None)
+            renderer.write(result.message)
+    finally:
+        agent.stop_indexer()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -687,6 +744,7 @@ def main(argv: list[str] | None = None) -> int:
         print(report)
         return 0 if ok else 1
     if args.prompt:
+        agent.start_indexer()
         try:
             with InterruptController(lambda _: None).watch() as interrupt_event:
                 agent.set_interrupt_event(interrupt_event)
@@ -701,6 +759,7 @@ def main(argv: list[str] | None = None) -> int:
             return 130
         finally:
             agent.set_interrupt_event(None)
+            agent.stop_indexer()
         renderer.write(result.message)
         return 0
     return run_repl(agent, quiet=args.quiet, renderer=renderer)

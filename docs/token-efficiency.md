@@ -53,6 +53,7 @@ Implementation notes:
 - Primary prompts compact non-current history even in short conversations, while keeping the current request with a larger cap.
 - Transcript autosave batches tool-call/tool-result state instead of rewriting the full session JSON after every event.
 - Ollama chat requests now default to `temperature=0`; explicit per-call options can still override it.
+- A default-on background indexer keeps `.ollama-code/index` warm for file, repo, line-snippet, and SQLite FTS searches; it is non-LLM, repo-local, and writes only index files.
 
 Second pass adds controller-direct execution for explicit low-ambiguity requests and primary-context compaction for normal model turns. Compared with the first optimized run, the fixed 70-run explicit-tool corpus stayed 70/70 passing and dropped to `0` LLM calls, `0` prompt tokens, and `0` output tokens. These are not model shortcuts for broad coding work; they only fire when the controller can deterministically prove the required tool path and final answer.
 
@@ -244,6 +245,7 @@ The normal CLI defaults to `all`; benchmark scripts still pass `OLLAMA_CODE_FEAT
 Generic additions behind these profiles:
 
 - Persistent ignored repo index under `.ollama-code/index/` with paths, mtimes, sizes, hashes, symbols, imports, and term vectors.
+- A quiet background indexer starts with the CLI by default and refreshes these caches initially, on notified mutation paths, and by cheap polling. Disable it with `"indexer": {"enabled": false}` or `--no-indexer`.
 - `file_index_refresh(path='.',limit=50000)`, `file_search(query,path='.',limit=100)`, and optional `fd_search(query,path='.',limit=100,kind='any')` provide fast local file discovery without reading file contents.
 - `fts_refresh(path='.',limit=2000)` and `fts_search(query,path='.',limit=20,refresh=false)` maintain a repo-local SQLite FTS5 cache over paths, symbols, headings, and compact text snippets.
 - `everything_search(query,path='.',limit=100)` integrates with the native Everything CLI `es.exe` when installed, then filters matches back to the workspace; if `es.exe` is unavailable, use `file_search`.

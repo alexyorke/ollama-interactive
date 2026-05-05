@@ -42,6 +42,9 @@ class CliConfig:
     mcp_servers: dict[str, Any] | None = None
     browser_enabled: bool = True
     security_enabled: bool = True
+    indexer_enabled: bool = True
+    indexer_watch: bool = True
+    indexer_poll_interval_ms: int = 5000
     path: Path | None = None
 
 
@@ -145,10 +148,14 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
     mcp_payload = _object_config_value(payload, "mcp", path) or {}
     browser_payload = _object_config_value(payload, "browser", path) or {}
     security_payload = _object_config_value(payload, "security", path) or {}
+    indexer_payload = _object_config_value(payload, "indexer", path) or {}
     mcp_servers = _object_config_value(mcp_payload, "servers", path)
     tools_default_enabled = _bool_config_value(tools_payload, "default_enabled", path) if tools_payload else None
     browser_enabled = _bool_config_value(browser_payload, "enabled", path) if browser_payload else None
     security_enabled = _bool_config_value(security_payload, "enabled", path) if security_payload else None
+    indexer_enabled = _bool_config_value(indexer_payload, "enabled", path) if indexer_payload else None
+    indexer_watch = _bool_config_value(indexer_payload, "watch", path) if indexer_payload else None
+    indexer_poll_interval_ms = _int_config_value(indexer_payload, "poll_interval_ms", path) if indexer_payload else None
     return CliConfig(
         host=_config_value(data, "host", path),
         model=_config_value(data, "model", path),
@@ -165,5 +172,8 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
         mcp_servers=dict(mcp_servers) if mcp_servers is not None else None,
         browser_enabled=True if browser_enabled is None else browser_enabled,
         security_enabled=True if security_enabled is None else security_enabled,
+        indexer_enabled=True if indexer_enabled is None else indexer_enabled,
+        indexer_watch=True if indexer_watch is None else indexer_watch,
+        indexer_poll_interval_ms=indexer_poll_interval_ms or 5000,
         path=path,
     )

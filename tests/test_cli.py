@@ -109,6 +109,27 @@ class DummyAgent:
     def list_models(self) -> list[str]:
         return [DEFAULT_MODEL, "gemma4:latest"]
 
+    def index_status(self) -> dict[str, object]:
+        return {
+            "ok": True,
+            "enabled": True,
+            "running": False,
+            "ready": True,
+            "pending_paths": 0,
+            "refresh_count": 1,
+            "summary": "indexed files=2 code=1 fts=2",
+            "cache_dir": str((Path.cwd() / ".ollama-code" / "index").resolve(strict=False)),
+        }
+
+    def refresh_index(self) -> dict[str, object]:
+        return {"ok": True, "summary": "index refresh queued"}
+
+    def start_indexer(self) -> bool:
+        return True
+
+    def stop_indexer(self) -> None:
+        return
+
 
 class CliCommandTests(unittest.TestCase):
     def _workspace_scratch(self) -> Path:
@@ -194,6 +215,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/status", text)
         self.assertIn("/approval ask|auto|read-only", text)
         self.assertIn("/doctor", text)
+        self.assertIn("/index", text)
         self.assertIn("/tools", text)
         self.assertIn("Press Esc", text)
 
@@ -208,6 +230,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/model <name>", output[0])
         self.assertIn("/test [command]", output[0])
         self.assertIn("/doctor", output[0])
+        self.assertIn("/index", output[0])
         self.assertIn("fix failing tests", output[0])
 
     def test_doctor_report_checks_first_use_setup(self) -> None:
@@ -221,6 +244,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("workspace: ok", report)
         self.assertIn("ollama: ok", report)
         self.assertIn(f"model: ok {DEFAULT_MODEL}", report)
+        self.assertIn("indexer: ok enabled", report)
         self.assertIn("console script: not on PATH", report)
 
     def test_doctor_command_prints_report(self) -> None:
@@ -245,6 +269,24 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(full)
         self.assertEqual(output[0], "list_files()\nread_file(path)")
         self.assertEqual(output[1], "list_files\nread_file")
+
+    def test_index_command_reports_and_controls_indexer(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        status = handle_meta_command("/index status", agent, output.append)
+        refresh = handle_meta_command("/index refresh", agent, output.append)
+        stop = handle_meta_command("/index stop", agent, output.append)
+        start = handle_meta_command("/index start", agent, output.append)
+
+        self.assertTrue(status)
+        self.assertTrue(refresh)
+        self.assertTrue(stop)
+        self.assertTrue(start)
+        self.assertIn("indexer enabled=yes", output[0])
+        self.assertEqual(output[1], "index refresh queued")
+        self.assertEqual(output[2], "indexer stopped")
+        self.assertEqual(output[3], "indexer started")
 
     def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
         stream = io.StringIO()

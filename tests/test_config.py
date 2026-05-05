@@ -123,6 +123,7 @@ class ConfigTests(unittest.TestCase):
                         "mcp": {"servers": {"demo": {"command": "demo-mcp"}}},
                         "browser": {"enabled": False},
                         "security": {"enabled": False},
+                        "indexer": {"enabled": False, "watch": False, "poll_interval_ms": 2500},
                     }
                 ),
                 encoding="utf-8",
@@ -135,6 +136,9 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(agent.tools.mcp_servers["demo"]["command"], "demo-mcp")
         self.assertFalse(agent.tools.browser_enabled)
         self.assertFalse(agent.tools.security_enabled)
+        self.assertFalse(agent.index_status()["enabled"])
+        self.assertFalse(agent.index_status()["watch"])
+        self.assertEqual(agent.index_status()["poll_interval_ms"], 2500)
 
 
 class _FakeOllamaHandler(BaseHTTPRequestHandler):

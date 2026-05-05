@@ -553,6 +553,33 @@ class OllamaCodeAgent:
     def session_path(self) -> Path | None:
         return self.session_file
 
+    def start_indexer(self) -> bool:
+        indexer = getattr(self.tools, "indexer", None)
+        start = getattr(indexer, "start", None)
+        return bool(start()) if callable(start) else False
+
+    def stop_indexer(self) -> None:
+        indexer = getattr(self.tools, "indexer", None)
+        stop = getattr(indexer, "stop", None)
+        if callable(stop):
+            stop()
+
+    def refresh_index(self) -> dict[str, Any]:
+        indexer = getattr(self.tools, "indexer", None)
+        refresh = getattr(indexer, "request_refresh", None)
+        status = getattr(indexer, "status", None)
+        if callable(refresh):
+            refresh("manual")
+            return {"ok": True, "summary": "index refresh queued", "status": status() if callable(status) else {}}
+        return {"ok": False, "summary": "indexer is not configured"}
+
+    def index_status(self) -> dict[str, Any]:
+        indexer = getattr(self.tools, "indexer", None)
+        status = getattr(indexer, "status", None)
+        if callable(status):
+            return {"ok": True, **status()}
+        return {"ok": False, "enabled": False, "summary": "indexer is not configured"}
+
     def session_directory(self) -> Path:
         return default_session_dir(self.tools.workspace_root)
 

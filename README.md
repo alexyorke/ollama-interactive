@@ -6,7 +6,7 @@ It gives the model a guarded tool loop for:
 
 - listing files
 - reading files
-- searching the workspace with `rg`, optional `fd`, and a local SQLite FTS cache
+- searching the workspace with `rg`, optional `fd`, and a repo-local background SQLite/FTS index
 - searching code symbols, showing compact code outlines, and reading exact function/class bodies
 - writing or replacing file content
 - running shell commands
@@ -64,7 +64,12 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
   "max_tool_rounds": 100,
   "max_agent_depth": 2,
   "timeout": 300,
-  "test_cmd": "python -m unittest -v"
+  "test_cmd": "python -m unittest -v",
+  "indexer": {
+    "enabled": true,
+    "watch": true,
+    "poll_interval_ms": 5000
+  }
 }
 ```
 
@@ -164,6 +169,8 @@ You can disable assumption auditing and grounded verification with `OLLAMA_CODE_
 You can set failed-artifact reconciliation with `OLLAMA_CODE_RECONCILE=off|on|auto`.
 You can override the verifier/rewrite model with `OLLAMA_CODE_VERIFIER_MODEL`.
 The client sends `temperature=0` by default for reproducible local runs. It also sends an adaptive `num_ctx` option for normal compact turns so large-context models do not allocate 40K-131K context for tiny prompts. Set `OLLAMA_CODE_NUM_CTX=off` to use the model default, or set an integer such as `8192` to force a fixed context.
+
+The background indexer is on by default. It keeps `.ollama-code/index` warm for `file_search`, `repo_index_search`, `indexed_search`, and `fts_search`; it never executes project code and can be disabled with `"indexer": {"enabled": false}` or `--no-indexer`.
 
 Profile local Ollama speed with raw load/prompt/generation counters:
 
