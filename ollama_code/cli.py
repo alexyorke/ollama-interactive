@@ -733,12 +733,13 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
-    try:
-        ensure_runtime_default_model(agent, args, renderer, quiet=args.quiet)
-    except OllamaError as exc:
-        renderer.clear_thinking()
-        print(f"error: {exc}", file=sys.stderr)
-        return 1
+    if not args.doctor:
+        try:
+            ensure_runtime_default_model(agent, args, renderer, quiet=args.quiet)
+        except OllamaError as exc:
+            renderer.clear_thinking()
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     if args.doctor:
         report, ok = doctor_report(agent)
         print(report)

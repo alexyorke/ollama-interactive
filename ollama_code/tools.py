@@ -512,6 +512,15 @@ class ToolExecutor:
             return text
         return text[: max(0, limit - 18)] + "... truncated ..."
 
+    def _coerce_int(self, value: Any, *, default: int, minimum: int = 1) -> int:
+        if isinstance(value, bool):
+            return default
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(minimum, parsed)
+
     def _call_tool_handler(self, handler: Callable[..., dict[str, Any]], arguments: dict[str, Any]) -> dict[str, Any]:
         signature = inspect.signature(handler)
         if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
@@ -975,6 +984,8 @@ class ToolExecutor:
     def list_files(self, path: str = ".", max_depth: int = 4, limit: int = 200) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
+        safe_max_depth = self._coerce_int(max_depth, default=4, minimum=0)
+        safe_limit = self._coerce_int(limit, default=200, minimum=1)
         if base.is_file():
             items = [self.relative_label(base)]
         else:
@@ -984,13 +995,13 @@ class ToolExecutor:
                 root_path = Path(root)
                 depth = len(root_path.relative_to(base).parts)
                 dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not self._generated_dir_name(d))
-                if depth >= max_depth:
+                if depth >= safe_max_depth:
                     dirs[:] = []
                 for directory in dirs:
                     items.append(f"{self.relative_label(root_path / directory)}/")
-                    if len(items) >= limit:
+                    if len(items) >= safe_limit:
                         break
-                if len(items) >= limit:
+                if len(items) >= safe_limit:
                     break
                 for file_name in sorted(files):
                     if file_name.startswith("."):
@@ -998,9 +1009,9 @@ class ToolExecutor:
                     if self._path_has_skipped_part(root_path / file_name):
                         continue
                     items.append(self.relative_label(root_path / file_name))
-                    if len(items) >= limit:
+                    if len(items) >= safe_limit:
                         break
-                if len(items) >= limit:
+                if len(items) >= safe_limit:
                     break
         return {
             "ok": True,
@@ -1016,8 +1027,8 @@ class ToolExecutor:
         if target.is_dir():
             return {"ok": False, "tool": "read_file", "summary": f"{path} is a directory."}
         lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
-        safe_start = max(1, start)
-        safe_end = max(safe_start, end)
+        safe_start = self._coerce_int(start, default=1, minimum=1)
+        safe_end = max(safe_start, self._coerce_int(end, default=200, minimum=1))
         selected = lines[safe_start - 1 : safe_end]
         rendered = [f"{index:4d} | {line}" for index, line in enumerate(selected, start=safe_start)]
         return {
@@ -1056,9 +1067,15 @@ class ToolExecutor:
         matches: list[str] = []
         try:
             pattern = re.compile(query)
-            matcher = lambda text: bool(pattern.search(text))
+
+            def matcher(text: str) -> bool:
+                return bool(pattern.search(text))
+
         except re.error:
-            matcher = lambda text: query in text
+
+            def matcher(text: str) -> bool:
+                return query in text
+
         for file_path in self._iter_workspace_files(base, limit=50000):
             self._check_interrupted()
             for line_no, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
@@ -1432,10 +1449,16 @@ class ToolExecutor:
         base = self.resolve_path(path, allow_missing=False)
         try:
             pattern = re.compile(query, flags=re.IGNORECASE)
-            matcher = lambda text: bool(pattern.search(text))
+
+            def matcher(text: str) -> bool:
+                return bool(pattern.search(text))
+
         except re.error:
             lowered = query.lower()
-            matcher = lambda text: lowered in text.lower()
+
+            def matcher(text: str) -> bool:
+                return lowered in text.lower()
+
         matches: list[str] = []
         for file_path in self._iter_code_files(base):
             symbols, _, _ = self._code_symbols(file_path)
@@ -3586,17 +3609,21 @@ class ToolExecutor:
                     break
         return start
 
-    def _available_command(self, command: str) -> bool:
+    def _available_command(self, command: str, cwd: Path | None = None) -> bool:
         try:
             argv = shlex.split(command, posix=os.name != "nt")
         except ValueError:
             return False
         if not argv:
             return False
-        executable = argv[0]
+        executable = str(argv[0]).strip().strip("'\"")
+        working_dir = cwd or self.workspace_root
         if executable.startswith(("./", ".\\")):
-            return (self.workspace_root / executable).exists()
-        return shutil.which(executable) is not None or Path(executable).exists()
+            return (working_dir / executable).exists()
+        candidate = Path(executable)
+        if candidate.is_absolute():
+            return candidate.exists()
+        return shutil.which(executable) is not None or (working_dir / executable).exists() or (self.workspace_root / executable).exists()
 
     def _read_toml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
@@ -3627,7 +3654,7 @@ class ToolExecutor:
         validators: list[dict[str, Any]] = []
 
         def add(kind: str, lang: str, command: str, reason: str) -> None:
-            validators.append({"kind": kind, "lang": lang, "command": command, "available": self._available_command(command), "reason": reason})
+            validators.append({"kind": kind, "lang": lang, "command": command, "available": self._available_command(command, cwd=root), "reason": reason})
 
         pyproject = self._read_toml(root / "pyproject.toml")
         repo_files = self._iter_repo_files(root, limit=50000)
@@ -5354,7 +5381,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             return "python_exec"
         return None
 
-    def _unknown_command_error(self, argv: list[str]) -> str | None:
+    def _unknown_command_error(self, argv: list[str], cwd: Path) -> str | None:
         executable = str(argv[0]).strip().strip("'\"")
         if not executable or "=" in executable and not executable.startswith(("./", "../", ".\\", "..\\")):
             return None
@@ -5406,10 +5433,19 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             return None
         candidate = self._coerce_input_path(executable)
         if not candidate.is_absolute():
-            candidate = self.workspace_root / candidate
+            candidate = cwd / candidate
         if candidate.exists():
             return None
         return f"executable not found: {executable}"
+
+    def _executable_available_for_cwd(self, executable: str, cwd: Path) -> bool:
+        clean = str(executable or "").strip().strip("'\"")
+        if not clean:
+            return False
+        candidate = Path(clean)
+        if candidate.is_absolute():
+            return candidate.exists()
+        return shutil.which(clean) is not None or (cwd / clean).exists() or (self.workspace_root / clean).exists()
 
     def _validation_result(self, *, family: str, valid: bool, reason: str = "", argv: list[str] | None = None) -> dict[str, Any]:
         result: dict[str, Any] = {"recognized": True, "valid": valid, "family": family}
@@ -5475,15 +5511,14 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         if family is None:
             if os.name == "nt" and self._looks_like_powershell_command(command):
                 return None, {"recognized": False, "valid": True, "family": "powershell"}
-            executable_error = self._unknown_command_error(argv)
+            executable_error = self._unknown_command_error(argv, cwd)
             if executable_error:
                 return None, {"recognized": True, "valid": False, "family": "shell", "reason": executable_error}
             return None, {"recognized": False, "valid": True, "family": "unknown"}
         if family not in {"python", "python_exec"} and self._command_has_shell_chaining(command):
             return None, self._validation_result(family=family, valid=False, reason="shell chaining/redirection is not allowed for validated command families")
         executable = str(argv[0]).strip().strip("'\"")
-        missing = None if os.path.isabs(executable) else shutil.which(executable)
-        if missing is None and not Path(executable).exists():
+        if not self._executable_available_for_cwd(executable, cwd):
             return None, self._validation_result(family=family, valid=False, reason=f"executable not found: {executable}")
         path_error = self._validate_path_args(argv, cwd)
         if path_error:
@@ -5556,6 +5591,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
     def run_shell(self, command: str, cwd: str = ".", timeout: int = 30) -> dict[str, Any]:
         working_dir = self.resolve_path(cwd, allow_missing=False)
         relative_cwd = self.relative_label(working_dir)
+        timeout_value = self._coerce_int(timeout, default=30, minimum=1)
         argv, validation = self._validate_common_command(command, working_dir)
         if validation.get("valid") is False:
             reason = str(validation.get("reason") or "invalid command")
@@ -5581,7 +5617,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             if shell_kwargs.get("shell") is True and powershell and self._looks_like_powershell_command(command):
                 run_args = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
                 shell_kwargs = {"shell": False}
-        completed = self._run_process(run_args, cwd=working_dir, timeout=timeout, **shell_kwargs)
+        completed = self._run_process(run_args, cwd=working_dir, timeout=timeout_value, **shell_kwargs)
         output = self._collect_process_output(completed)
         result = {
             "ok": completed.returncode == 0,
@@ -5599,6 +5635,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return result
 
     def run_test(self, command: str | None = None, cwd: str = ".", timeout: int = 1200) -> dict[str, Any]:
+        timeout_value = self._coerce_int(timeout, default=1200, minimum=1)
         selected_command = command.strip() if isinstance(command, str) and command.strip() else self.default_test_command
         discovered = None
         if not selected_command:
@@ -5622,11 +5659,11 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
                 }
         normalized = None
         try:
-            result = self.run_shell(selected_command, cwd=cwd, timeout=timeout)
+            result = self.run_shell(selected_command, cwd=cwd, timeout=timeout_value)
         except ValueError as exc:
             if "Path escapes the workspace" not in str(exc) or str(cwd).strip() in {"", "."}:
                 raise
-            result = self.run_shell(selected_command, cwd=".", timeout=timeout)
+            result = self.run_shell(selected_command, cwd=".", timeout=timeout_value)
             normalized = f"Ignored run_test cwd outside workspace: {cwd}"
         result["tool"] = "run_test"
         result["command"] = selected_command

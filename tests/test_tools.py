@@ -8,7 +8,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -312,6 +311,34 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["path"], "nested/file.txt")
         self.assertIn("hello", result["output"])
+
+    def test_read_file_accepts_numeric_string_line_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "sample.txt"
+            target.write_text("one\ntwo\nthree\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.execute("read_file", {"path": "sample.txt", "start": "2", "end": "2"})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["start"], 2)
+        self.assertEqual(result["end"], 2)
+        self.assertIn("two", result["output"])
+        self.assertNotIn("one", result["output"])
+
+    def test_list_files_accepts_numeric_string_limits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "nested").mkdir()
+            (root / "nested" / "child.txt").write_text("x\n", encoding="utf-8")
+            (root / "top.txt").write_text("x\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.execute("list_files", {"max_depth": "0", "limit": "1"})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["count"], 1)
 
     def test_search_uses_python_fallback_when_rg_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1191,6 +1218,22 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("gradle test", output)
         self.assertIn("cmake -S . -B build", output)
 
+    def test_discover_validators_checks_local_wrappers_in_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            project = workspace / "service"
+            project.mkdir()
+            (project / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
+            (project / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
+            (project / "gradlew.bat").write_text("@echo off\n", encoding="utf-8")
+            tools = ToolExecutor(workspace, approval_mode="auto")
+
+            result = tools.discover_validators("service", limit=20)
+
+        wrapper_command = "gradlew.bat test" if os.name == "nt" else "./gradlew test"
+        self.assertTrue(result["ok"], result)
+        self.assertIn(f"{wrapper_command} available=True", result["output"])
+
     def test_discover_validators_detects_python_tooling_configs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1724,7 +1767,6 @@ class ToolExecutorTests(unittest.TestCase):
     def test_run_shell_rejects_missing_unknown_executable_after_bash_check(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
-            syntax_result = subprocess.CompletedProcess(args=["bash", "-n", "-c", "foozle --help"], returncode=0, stdout="", stderr="")
 
             def fake_which(name: str) -> str | None:
                 return "bash" if name == "bash" else None
@@ -1750,6 +1792,25 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("path escapes workspace", result["summary"])
         run_mock.assert_not_called()
+
+    def test_run_shell_validates_local_executable_relative_to_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "service"
+            project.mkdir()
+            (project / "gradlew.bat").write_text("@echo off\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(args=["gradlew.bat", "test"], returncode=0, stdout="ok\n", stderr="")
+
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                    result = tools.run_shell("gradlew.bat test", cwd="service", timeout="7")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["validation"]["family"], "gradlew.bat")
+        self.assertEqual(run_mock.call_args.args[0], ["gradlew.bat", "test"])
+        self.assertEqual(run_mock.call_args.kwargs["cwd"], project)
+        self.assertEqual(run_mock.call_args.kwargs["timeout"], 7)
 
     def test_run_shell_runs_valid_common_command_without_shell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -3778,13 +3778,26 @@ class OllamaCodeAgent:
                 "tool": "run_agent",
                 "summary": f"Sub-agent approval_mode cannot be more permissive than the parent ({parent_approval}).",
             }
-        max_tool_rounds = arguments.get("max_tool_rounds", self.max_tool_rounds)
-        if not isinstance(max_tool_rounds, int) or max_tool_rounds < 1:
+        raw_max_tool_rounds = arguments.get("max_tool_rounds", self.max_tool_rounds)
+        if isinstance(raw_max_tool_rounds, bool):
+            return {"ok": False, "tool": "run_agent", "summary": "max_tool_rounds must be a positive integer."}
+        try:
+            max_tool_rounds = int(raw_max_tool_rounds)
+        except (TypeError, ValueError):
+            return {"ok": False, "tool": "run_agent", "summary": "max_tool_rounds must be a positive integer."}
+        if max_tool_rounds < 1:
             return {"ok": False, "tool": "run_agent", "summary": "max_tool_rounds must be a positive integer."}
         child_tools = ToolExecutor(
             self.tools.workspace_root,
             approval_mode=approval_mode,
             input_func=self.tools.input_func,
+            test_command=self.tools.default_test_command,
+            default_tools_enabled=self.tools.default_tools_enabled,
+            disabled_tools=self.tools.disabled_tools,
+            mcp_servers=self.tools.mcp_servers,
+            browser_enabled=self.tools.browser_enabled,
+            security_enabled=self.tools.security_enabled,
+            indexer=getattr(self.tools, "indexer", None),
         )
         child = OllamaCodeAgent(
             client=self.client,
@@ -3888,7 +3901,6 @@ class OllamaCodeAgent:
         latest_run_test_failed = False
         latest_run_test_failure_summary = ""
         previous_run_test_failure_summary = ""
-        failed_run_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
         tool_error_counts: dict[tuple[str, str, str], int] = {}
         if self._should_preload_context_pack(
@@ -4246,12 +4258,10 @@ class OllamaCodeAgent:
                             last_successful_run_test_version = mutation_version
                             latest_run_test_failed = False
                             latest_run_test_failure_summary = ""
-                            failed_run_test_mutation_version = None
                     else:
                         if validation_name == "run_test":
                             raw_failure = str(validation_result.get("output") or validation_result.get("summary") or "").strip()
                             latest_run_test_failed = True
-                            failed_run_test_mutation_version = mutation_version
                             latest_run_test_failure_summary = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
                         failure = "Stopped because post-edit validation failed."
                         summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
@@ -4748,11 +4758,9 @@ class OllamaCodeAgent:
                         latest_run_test_failed = False
                         latest_run_test_failure_summary = ""
                         previous_run_test_failure_summary = ""
-                        failed_run_test_mutation_version = None
                     else:
                         last_failed_run_test_key = self._run_test_repeat_key(arguments, mutation_version)
                         latest_run_test_failed = True
-                        failed_run_test_mutation_version = mutation_version
                         raw_failure = str(result.get("output") or result.get("summary") or "").strip()
                         compact_failure = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
                         if previous_run_test_failure_summary and compact_failure:
@@ -4883,14 +4891,12 @@ class OllamaCodeAgent:
                         last_successful_run_test_version = mutation_version
                         latest_run_test_failed = False
                         latest_run_test_failure_summary = ""
-                        failed_run_test_mutation_version = None
                         message = "Ran tests after the latest edit: passed."
                         self._record_event("assistant_synthesized", content=message, tool="run_test", rounds=round_number, auto=True)
                         self._record_event("assistant", content=message, rounds=round_number)
                         self._flush_llm_call_events()
                         return AgentResult(message=message, rounds=round_number, completed=True)
                     latest_run_test_failed = True
-                    failed_run_test_mutation_version = mutation_version
                     latest_run_test_failure_summary = self._compact_run_test_output(raw_output, limit=520) if raw_output else ""
                     message = "Stopped because final-chance run_test failed."
                     if latest_run_test_failure_summary:

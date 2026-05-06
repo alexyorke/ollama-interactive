@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ollama_code.cli import build_agent, build_parser
+from ollama_code.config import load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -111,6 +112,16 @@ class ConfigTests(unittest.TestCase):
             args = parser.parse_args(["--cwd", str(root), "--config", "missing.json", "--quiet"])
             with self.assertRaisesRegex(ValueError, "Config file not found"):
                 build_agent(args)
+
+    def test_integer_config_rejects_json_boolean(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / ".ollama-code" / "config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"timeout": True}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, 'Config value "timeout" must be a positive integer'):
+                load_config(root)
 
     def test_build_agent_reads_tooling_config(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

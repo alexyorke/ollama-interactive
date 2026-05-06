@@ -8,7 +8,7 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, doctor_report, ensure_runtime_default_model, handle_meta_command, startup_help_text
+from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, doctor_report, ensure_runtime_default_model, handle_meta_command, main, startup_help_text
 from ollama_code.config import DEFAULT_MODEL
 
 
@@ -257,6 +257,18 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(len(output), 1)
         self.assertIn("Ollama Code doctor", output[0])
+
+    def test_main_doctor_skips_runtime_model_resolution(self) -> None:
+        agent = DummyAgent()
+        stream = io.StringIO()
+
+        with patch("ollama_code.cli.build_agent", return_value=agent):
+            with patch("ollama_code.cli.ensure_runtime_default_model", side_effect=AssertionError("should not resolve model")):
+                with patch("sys.stdout", stream):
+                    exit_code = main(["--doctor", "--quiet"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("Ollama Code doctor", stream.getvalue())
 
     def test_tools_command_is_compact_by_default_and_full_on_request(self) -> None:
         agent = DummyAgent()

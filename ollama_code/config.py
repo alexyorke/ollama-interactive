@@ -71,7 +71,7 @@ def _int_config_value(payload: dict[str, Any], key: str, path: Path) -> int | No
     value = payload.get(key)
     if value is None:
         return None
-    if not isinstance(value, int) or value < 1:
+    if type(value) is not int or value < 1:
         raise ValueError(f'Config value "{key}" must be a positive integer in {path}')
     return value
 

@@ -23,6 +23,40 @@ Sessions are also auto-saved locally under `.ollama-code/sessions`, so you can c
 
 ## Install
 
+Runtime requirements:
+
+- Python 3.10+
+- Ollama running somewhere reachable by `OLLAMA_HOST`
+- `git` for git-aware status/diff/commit helpers
+- `ripgrep` (`rg`) recommended for fast search; the CLI has slower fallbacks when it is missing
+
+The Python package intentionally has no required third-party Python dependencies. Optional adapters such as `fd`, `ast-grep`, Semgrep, Playwright, Gitleaks, Trivy, OSV-Scanner, and language servers are detected at runtime and fail closed with install guidance when missing.
+
+Fresh Ubuntu/Debian quickstart:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3 python3-venv git ripgrep ca-certificates
+git clone https://github.com/alexyorke/ollama-interactive.git
+cd ollama-interactive
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+ollama-code --help
+ollama-code --doctor
+```
+
+If Ollama is not installed or no model is pulled yet, `--doctor` will report that and print the default pull hint. Install Ollama separately, start the daemon, then pull the default model:
+
+```bash
+ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS
+```
+
+Vagrant is not needed by the CLI itself. To test inside a Vagrant VM, install Vagrant plus a provider such as VirtualBox or Hyper-V on the host first, then run the same Linux quickstart inside the guest.
+
+Editable install in an already prepared Python environment:
+
 ```bash
 python -m pip install -e .
 ```

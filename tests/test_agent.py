@@ -644,6 +644,28 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.events[1]["name"], "run_agent")
         self.assertEqual(agent.events[2]["result"]["tool"], "run_agent")
 
+    def test_subagent_inherits_parent_tool_configuration(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("helper data\n", encoding="utf-8")
+        marker = root / "marker.txt"
+        code = "from pathlib import Path; Path('marker.txt').write_text('ok\\n')"
+        command = f'"{sys.executable}" -c "{code}"'
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_test","arguments":{}}',
+                '{"type":"final","message":"child done"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=command, disabled_tools=["read_file"])
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent._run_sub_agent({"prompt": "Read note.txt and run tests.", "approval_mode": "auto", "max_tool_rounds": "2"})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(marker.read_text(encoding="utf-8"), "ok\n")
+        system_prompt = client.calls[0]["messages"][0]["content"]
+        self.assertNotIn("read_file(path", str(system_prompt))
+
     def test_agent_normalizes_near_match_subagent_model(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(
