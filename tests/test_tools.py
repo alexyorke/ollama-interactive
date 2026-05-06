@@ -582,6 +582,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return a + b", final_text)
         self.assertIn("return a * b", final_text)
 
+    def test_replace_symbols_normalizes_permuted_existing_parameter_order(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def foldl(function, list, initial):\n    pass\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbols(
+            "ops.py",
+            [
+                {
+                    "symbol": "foldl",
+                    "content": (
+                        "def foldl(function, initial, list):\n"
+                        "    accumulator = initial\n"
+                        "    for item in list:\n"
+                        "        accumulator = function(accumulator, item)\n"
+                        "    return accumulator\n"
+                    ),
+                }
+            ],
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized replacement signature", result["summary"])
+        self.assertIn("def foldl(function, list, initial):", final_text)
+        self.assertIn("for item in list:", final_text)
+
     def test_replace_symbols_rejects_python_syntax_error_without_writing(self) -> None:
         root = self._workspace_scratch()
         sample = root / "ops.py"
@@ -1230,6 +1257,29 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text.count("def translate"), 1)
         self.assertIn("return text + 'ay'", final_text)
 
+    def test_replace_body_routes_import_plus_matching_function_without_nested_def(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "wordy.py"
+            sample.write_text("def answer(question):\n    return None\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "wordy.py",
+                "replace_body",
+                "answer",
+                "import re\n\n"
+                "def answer(question):\n"
+                "    match = re.search(r'-?\\d+', question)\n"
+                "    return int(match.group(0)) if match else None\n",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(final_text.count("def answer"), 1)
+        self.assertIn("    import re\n", final_text)
+        self.assertIn("return int(match.group(0))", final_text)
+
     def test_replace_body_full_mismatched_function_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1433,9 +1483,9 @@ class ToolExecutorTests(unittest.TestCase):
                 "ops.py",
                 "foldl",
                 (
-                    "def foldl(function, initial, list):\n"
+                    "def foldl(function, values, initial):\n"
                     "    accumulator = initial\n"
-                    "    for item in list:\n"
+                    "    for item in values:\n"
                     "        accumulator = function(accumulator, item)\n"
                     "    return accumulator\n"
                 ),
@@ -1582,6 +1632,65 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("foldr:", result["output"])
         self.assertIn("reverse:", result["output"])
 
+    def test_run_test_example_probes_report_value_and_type_mismatches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "variable_length_quantity.py").write_text(
+                "def encode(numbers):\n"
+                "    return bytes(numbers)\n",
+                encoding="utf-8",
+            )
+            (root / "variable_length_quantity_test.py").write_text(
+                "import unittest\nfrom variable_length_quantity import encode\n\n"
+                "class VlqTest(unittest.TestCase):\n"
+                "    def test_two_single_byte_values(self):\n"
+                "        self.assertEqual(encode([0x40, 0x7F]), [0x40, 0x7F])\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_test_example_probes("variable_length_quantity.py", "variable_length_quantity_test.py", limit=4)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("encode([64, 127])", result["output"])
+        self.assertIn("expected [64, 127] (list)", result["output"])
+        self.assertIn("got b'@\\x7f' (bytes)", result["output"])
+
+    def test_run_test_example_probes_handle_raises_and_stateful_scenarios(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "grade_school.py").write_text(
+                "class School:\n"
+                "    def __init__(self):\n"
+                "        self.students = []\n"
+                "    def add_student(self, name, grade):\n"
+                "        self.students.append(name)\n"
+                "    def roster(self):\n"
+                "        return self.students\n"
+                "\n"
+                "def fail():\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "grade_school_test.py").write_text(
+                "import unittest\nfrom grade_school import School, fail\n\n"
+                "class GradeSchoolTest(unittest.TestCase):\n"
+                "    def test_student_is_added(self):\n"
+                "        school = School()\n"
+                "        school.add_student(name='Aimee', grade=2)\n"
+                "        expected = ['Aimee']\n"
+                "        self.assertEqual(school.roster(), expected)\n"
+                "    def test_raises(self):\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            fail()\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_test_example_probes("grade_school.py", "grade_school_test.py", limit=4)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("fail() expected raises ValueError", result["output"])
+        self.assertNotIn("school.roster() expected", result["output"])
+
     def test_contract_check_static_sanity_catches_python_edit_defects(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1614,6 +1723,35 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("calls missing self._clean_number()", output)
         self.assertIn("shadowing method head()", output)
         self.assertIn("still has stub body", output)
+
+    def test_contract_check_catches_constructor_arity_and_placeholder_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "robot_name.py").write_text(
+                "class Robot:\n"
+                "    def __init__(self, name):\n"
+                "        self.name = name\n",
+                encoding="utf-8",
+            )
+            (root / "robot_name_test.py").write_text(
+                "from robot_name import Robot\n\n"
+                "def test_robot():\n"
+                "    return Robot()\n",
+                encoding="utf-8",
+            )
+            (root / "scale_generator.py").write_text(
+                "class Scale:\n"
+                "    def chromatic(self):\n"
+                "        # Placeholder implementation in a real scenario.\n"
+                "        return [f'Note_{i}' for i in range(12)]\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["robot_name.py", "scale_generator.py"], limit=20)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("calls Robot with 0 positional args; expected 1", result["output"])
+        self.assertIn("placeholder", result["output"].lower())
 
     def test_contract_check_allows_nested_helper_closure_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

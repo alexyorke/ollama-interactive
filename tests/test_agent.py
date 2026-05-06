@@ -165,6 +165,8 @@ class AgentTests(unittest.TestCase):
         self.assertGreater(llm_calls[0]["message_count"], 0)
         self.assertIn("system", llm_calls[0]["prompt_chars_by_role"])
         self.assertGreater(llm_calls[0]["top_prompt_messages"][0]["chars"], 0)
+        telemetry_types = [event["type"] for event in agent.llm_telemetry_events]
+        self.assertIn("llm_call_started", telemetry_types)
 
     def test_agent_uses_schema_and_num_predict_feature_profile(self) -> None:
         root = self._workspace_scratch()
@@ -3056,6 +3058,60 @@ class AgentTests(unittest.TestCase):
         self.assertIn("return left + right", final_text)
         self.assertIn("return left - right", final_text)
 
+    def test_bulk_stub_guard_allows_repeated_partial_edit_after_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n\n\ndef sub(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add, sub\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_math(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "        self.assertEqual(sub(3, 1), 2)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            partial_edit = {
+                "type": "tool",
+                "name": "edit_intent",
+                "arguments": {"path": "app.py", "intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            }
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps(partial_edit),
+                    json.dumps(partial_edit),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_symbols",
+                            "arguments": {
+                                "path": "app.py",
+                                "replacements": [
+                                    {"symbol": "sub", "content": "def sub(left, right):\n    return left - right\n"},
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+
+            result = agent.handle_user("Implement app.py and run tests.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        guards = [event for event in agent.events if event.get("guard") == "bulk-stub-complete-edit"]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("return left + right", final_text)
+        self.assertIn("return left - right", final_text)
+
     def test_static_sanity_guard_blocks_tests_after_bad_python_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3091,6 +3147,42 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(guards), 1)
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("undefined local/global name 'missing_name'", feedback)
+
+    def test_example_probe_guard_blocks_full_tests_after_wrong_return_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "transpose.py").write_text("def transpose(text):\n    pass\n", encoding="utf-8")
+            (root / "transpose_test.py").write_text(
+                "import unittest\nfrom transpose import transpose\n\n"
+                "class TransposeTest(unittest.TestCase):\n"
+                "    def test_two_characters_in_a_row(self):\n"
+                "        self.assertEqual(transpose('A1'), 'A\\n1')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "transpose.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "transpose_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "transpose.py", "intent": "replace_body", "target": "transpose", "replacement": "return []"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "transpose.py", "intent": "replace_body", "target": "transpose", "replacement": "return '\\n'.join(text)"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+
+            result = agent.handle_user("Implement transpose.py and run tests.")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+        guards = [event for event in agent.events if event.get("guard") == "example-probe-before-test"]
+        self.assertEqual(len(guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("transpose('A1') expected 'A\\n1' (str), got [] (list)", feedback)
 
     def test_agent_normalizes_replace_symbol_text_edit_on_non_code_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

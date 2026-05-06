@@ -3328,6 +3328,128 @@ class ToolExecutor:
             "output": "\n".join(lines) if lines else "(no unittest examples extracted)",
         }
 
+    def _split_test_example(self, example: str) -> tuple[str, str, str]:
+        if " -> " in example:
+            expr, expected = example.split(" -> ", 1)
+            return "value", expr.strip(), expected.strip()
+        match = re.match(r"^(?P<expr>.+?)\s+raises\s+(?P<raises>[A-Za-z_][\w.]*)(?:\((?P<message>.*)\))?$", example)
+        if match:
+            expected = str(match.group("raises") or "").strip()
+            message = str(match.group("message") or "").strip()
+            if message:
+                expected += f"({message})"
+            return "raises", str(match.group("expr") or "").strip(), expected
+        return "", "", ""
+
+    def _test_example_probe_expressions(self, examples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for item in examples:
+            if not isinstance(item, dict):
+                continue
+            kind, expr, expected = self._split_test_example(str(item.get("example") or ""))
+            if not kind or not expr or not expected:
+                continue
+            rows.append(
+                {
+                    "kind": kind,
+                    "expr": expr,
+                    "expected": expected,
+                    "symbol": str(item.get("symbol") or ""),
+                    "line": int(item.get("line") or 1),
+                }
+            )
+            if len(rows) >= max(1, int(limit)):
+                break
+        return rows
+
+    def run_test_example_probes(self, source_path: str, test_path: str, limit: int = 10, timeout: int = 30) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": True, "tool": "run_function_probe", "probe_kind": "test_examples", "output": "(no Python test examples)"}
+        extracted = self.test_spec_extract(self.relative_label(test_file), self.relative_label(source_file), limit=max(1, min(int(limit), 24)))
+        if extracted.get("ok") is not True:
+            return {"ok": True, "tool": "run_function_probe", "probe_kind": "test_examples", "output": str(extracted.get("summary") or "")}
+        probes = self._test_example_probe_expressions(list(extracted.get("examples") or []), limit=max(1, min(int(limit), 24)))
+        if not probes:
+            return {"ok": True, "tool": "run_function_probe", "probe_kind": "test_examples", "output": "(no executable examples extracted)"}
+        module = self._module_name_for_source_path(self.relative_label(source_file))
+        script = (
+            "import importlib,json,os,sys,traceback\n"
+            "workspace=os.getcwd(); sys.path.insert(0, workspace); sys.path.insert(0, os.path.join(workspace, 'src'))\n"
+            f"module_name={json.dumps(module)}\n"
+            f"probes={json.dumps(probes)}\n"
+            "rows=[]\n"
+            "try:\n"
+            "    mod=importlib.import_module(module_name)\n"
+            "    ns={'module': mod}\n"
+            "    for name in dir(mod):\n"
+            "        if not name.startswith('_'):\n"
+            "            ns[name]=getattr(mod,name)\n"
+            "    for probe in probes:\n"
+            "        expr=probe['expr']; expected_text=probe['expected']; kind=probe['kind']\n"
+            "        try:\n"
+            "            parts=[part.strip() for part in expr.split(';') if part.strip()]\n"
+            "            local_ns=dict(ns)\n"
+            "            for statement in parts[:-1]:\n"
+            "                exec(statement, local_ns)\n"
+            "            if kind == 'raises':\n"
+            "                expected_name=expected_text.split('(',1)[0]\n"
+            "                expected_message=None\n"
+            "                if '(' in expected_text and expected_text.endswith(')'):\n"
+            "                    expected_message=expected_text.split('(',1)[1][:-1]\n"
+            "                    try:\n"
+            "                        expected_message=eval(expected_message, local_ns)\n"
+            "                    except Exception:\n"
+            "                        pass\n"
+            "                try:\n"
+            "                    value=eval(parts[-1], local_ns)\n"
+            "                    rows.append({'expression':expr,'ok':False,'expected':'raises '+expected_name,'actual':repr(value),'actual_type':type(value).__name__,'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
+            "                except Exception as exc:\n"
+            "                    type_ok=type(exc).__name__ == expected_name or exc.__class__.__name__ == expected_name\n"
+            "                    message_ok=expected_message is None or str(exc) == str(expected_message)\n"
+            "                    rows.append({'expression':expr,'ok':bool(type_ok and message_ok),'expected':'raises '+expected_name,'actual':'raises '+type(exc).__name__,'actual_message':str(exc),'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
+            "            else:\n"
+            "                value=eval(parts[-1], local_ns)\n"
+            "                try:\n"
+            "                    expected=eval(expected_text, local_ns)\n"
+            "                except Exception:\n"
+            "                    expected=expected_text\n"
+            "                rows.append({'expression':expr,'ok':value == expected,'expected':repr(expected),'expected_type':type(expected).__name__,'actual':repr(value),'actual_type':type(value).__name__,'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
+            "        except Exception as exc:\n"
+            "            rows.append({'expression':expr,'ok':False,'expected':expected_text,'actual':'ERROR '+type(exc).__name__+': '+str(exc),'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
+            "except Exception as exc:\n"
+            "    rows.append({'expression':'<import>','ok':False,'expected':'import '+module_name,'actual':'ERROR '+type(exc).__name__+': '+str(exc),'symbol':'','line':1})\n"
+            "print(json.dumps(rows, ensure_ascii=False))\n"
+        )
+        completed = self._run_process([sys.executable, "-c", script], cwd=self.workspace_root, timeout=max(1, int(timeout)))
+        try:
+            rows = json.loads(completed.stdout.strip())
+        except json.JSONDecodeError:
+            rows = []
+        mismatches = [row for row in rows if isinstance(row, dict) and not row.get("ok")]
+        lines: list[str] = []
+        for row in mismatches[: max(1, min(int(limit), 24))]:
+            symbol = f"{row.get('symbol')}: " if row.get("symbol") else ""
+            lines.append(
+                f"{symbol}{row.get('expression')} expected {row.get('expected')}"
+                f" ({row.get('expected_type', '')}), got {row.get('actual')} ({row.get('actual_type', '')})"
+            )
+        if not lines:
+            lines = [f"example probes ok: {len(rows)}"]
+        return {
+            "ok": completed.returncode == 0 and not mismatches,
+            "tool": "run_function_probe",
+            "probe_kind": "test_examples",
+            "module": module,
+            "source_path": self.relative_label(source_file),
+            "test_path": self.relative_label(test_file),
+            "results": rows,
+            "output": "\n".join(lines),
+            "summary": "\n".join(lines),
+        }
+
     def run_function_probe(
         self,
         module: str,
@@ -3443,6 +3565,32 @@ class ToolExecutor:
                     self._visit_function(node, "function", is_async=True)
 
                 def visit_ClassDef(self, node: ast.ClassDef) -> Any:
+                    qualname = ".".join([*self.stack, node.name])
+                    init_node = next((child for child in node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "__init__"), None)
+                    if init_node is not None:
+                        args = self.outer._contract_args(init_node.args)
+                        if args and str(args[0].get("name")) in {"self", "cls"}:
+                            args = args[1:]
+                        arity = self.outer._callable_arity_without_receiver(init_node.args)
+                    else:
+                        args = []
+                        arity = {"min": 0, "max": 0, "has_vararg": False, "has_kwarg": False}
+                    definitions[f"{rel}:{qualname}"] = {
+                        "path": rel,
+                        "symbol": qualname,
+                        "name": node.name,
+                        "kind": "class",
+                        "line": int(getattr(node, "lineno", 1)),
+                        "end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1))),
+                        "args": args,
+                        "arity": arity,
+                        "returns": node.name,
+                        "return_shapes": [f"call:{node.name}"],
+                        "purity": "unknown",
+                        "is_async": False,
+                        "has_yield": False,
+                        "node": node,
+                    }
                     previous = list(self.stack)
                     self.stack.append(node.name)
                     self.generic_visit(node)
@@ -3539,6 +3687,15 @@ class ToolExecutor:
             "has_vararg": args.vararg is not None,
             "has_kwarg": args.kwarg is not None,
         }
+
+    def _callable_arity_without_receiver(self, args: ast.arguments) -> dict[str, Any]:
+        arity = self._callable_arity(args)
+        positional = [*args.posonlyargs, *args.args]
+        if positional and positional[0].arg in {"self", "cls"}:
+            arity["min"] = max(0, int(arity.get("min", 0)) - 1)
+            if isinstance(arity.get("max"), int):
+                arity["max"] = max(0, int(arity["max"]) - 1)
+        return arity
 
     def _call_name(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name):
@@ -4071,6 +4228,24 @@ class ToolExecutor:
                 break
         return diagnostics[: max(1, int(limit))]
 
+    def _python_placeholder_text_diagnostics(self, rel: str, text: str, limit: int) -> list[str]:
+        diagnostics: list[str] = []
+        patterns = [
+            (r"\bplaceholder implementation\b", "placeholder implementation text remains"),
+            (r"\bin a real scenario\b", "speculative placeholder text remains"),
+            (r"\bNote_(?:Interval_)?\b", "fake generated note placeholder remains"),
+            (r"\bTODO\b|\bstub\b|\byour code\b", "TODO/stub placeholder text remains"),
+        ]
+        for index, line in enumerate(text.splitlines(), start=1):
+            lowered = line.lower()
+            for pattern, message in patterns:
+                if re.search(pattern, line, flags=re.IGNORECASE):
+                    diagnostics.append(f"{rel}:{index} {message}: {lowered.strip()[:100]}")
+                    break
+            if len(diagnostics) >= max(1, int(limit)):
+                break
+        return diagnostics[: max(1, int(limit))]
+
     def contract_check(
         self,
         changed_files: list[str] | str,
@@ -4093,8 +4268,10 @@ class ToolExecutor:
         syntax_or_static_diagnostics: list[str] = []
         for path in python_files:
             rel = self.relative_label(path)
+            text = path.read_text(encoding="utf-8", errors="replace")
+            syntax_or_static_diagnostics.extend(self._python_placeholder_text_diagnostics(rel, text, limit))
             try:
-                tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"), filename=rel)
+                tree = ast.parse(text, filename=rel)
             except SyntaxError as exc:
                 syntax_or_static_diagnostics.append(f"{rel}:{exc.lineno or 1} Python syntax error: {exc.msg}")
                 continue
@@ -5267,11 +5444,21 @@ class ToolExecutor:
                 }
             sanity_error = self._python_function_replacement_sanity_diagnostic(target, str(found["qualname"]), replacement)
             if sanity_error:
+                normalized_signature = self._canonical_signature_order_replacement_if_safe(
+                    target,
+                    str(found["qualname"]),
+                    replacement,
+                    sanity_error,
+                )
+                if normalized_signature:
+                    replacement = normalized_signature
+                    normalization = (normalization + " " if normalization else "") + "Normalized replacement signature to the existing public parameter order."
+                    sanity_error = self._python_function_replacement_sanity_diagnostic(target, str(found["qualname"]), replacement)
                 normalized_foldr = self._canonical_foldr_replacement_if_safe(target, str(found["qualname"]), sanity_error)
                 if normalized_foldr:
                     replacement = normalized_foldr
                     normalization = (normalization + " " if normalization else "") + "Normalized foldr reducer order to the canonical right fold."
-                else:
+                elif sanity_error:
                     return {
                         "ok": False,
                         "tool": "replace_symbol",
@@ -5385,11 +5572,21 @@ class ToolExecutor:
                     }
                 sanity_error = self._python_function_replacement_sanity_diagnostic(target, str(found["qualname"]), replacement)
                 if sanity_error:
+                    normalized_signature = self._canonical_signature_order_replacement_if_safe(
+                        target,
+                        str(found["qualname"]),
+                        replacement,
+                        sanity_error,
+                    )
+                    if normalized_signature:
+                        replacement = normalized_signature
+                        normalization = (normalization + " " if normalization else "") + "Normalized replacement signature to the existing public parameter order."
+                        sanity_error = self._python_function_replacement_sanity_diagnostic(target, str(found["qualname"]), replacement)
                     normalized_foldr = self._canonical_foldr_replacement_if_safe(target, str(found["qualname"]), sanity_error)
                     if normalized_foldr:
                         replacement = normalized_foldr
                         normalization = (normalization + " " if normalization else "") + "Normalized foldr reducer order to the canonical right fold."
-                    else:
+                    elif sanity_error:
                         return {
                             "ok": False,
                             "tool": "replace_symbols",
@@ -5552,6 +5749,38 @@ class ToolExecutor:
             return None
         return body[0].name
 
+    def _routable_full_python_function_replacement(self, source: str) -> tuple[str, str] | None:
+        stripped = textwrap.dedent(source or "").strip()
+        if not stripped:
+            return None
+        try:
+            tree = ast.parse(stripped)
+        except SyntaxError:
+            return None
+        body = [node for node in tree.body if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))]
+        functions = [node for node in body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1:
+            return None
+        if any(not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Import, ast.ImportFrom)) for node in body):
+            return None
+        function = functions[0]
+        lines = stripped.splitlines()
+        start = min([int(getattr(decorator, "lineno", function.lineno)) for decorator in function.decorator_list] + [int(function.lineno)])
+        end = int(getattr(function, "end_lineno", function.lineno))
+        function_lines = lines[start - 1 : end]
+        import_lines: list[str] = []
+        for node in body:
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            node_start = int(getattr(node, "lineno", 1))
+            node_end = int(getattr(node, "end_lineno", node_start))
+            if node_start < start:
+                import_lines.extend(lines[node_start - 1 : node_end])
+        if import_lines and function_lines:
+            header, rest = function_lines[0], function_lines[1:]
+            function_lines = [header, *["    " + line if line.strip() else "" for line in import_lines], *rest]
+        return function.name, "\n".join(function_lines) + "\n"
+
     def _normalize_python_body_replacement(self, body: str) -> str:
         normalized = textwrap.dedent(body).strip("\n")
         normalized = self._repair_common_python_join_typo(normalized)
@@ -5672,6 +5901,45 @@ class ToolExecutor:
             or self._foldr_argument_order_diagnostic(node, body)
         )
 
+    def _canonical_signature_order_replacement_if_safe(self, target: Path, symbol: str, replacement: str, diagnostic: str) -> str:
+        if "Replacement changes signature" not in diagnostic:
+            return ""
+        node = self._python_function_node(target, symbol)
+        if node is None:
+            return ""
+        try:
+            tree = ast.parse(self._python_parse_text(replacement))
+        except SyntaxError:
+            return ""
+        candidates = [child for child in tree.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(candidates) != 1:
+            return ""
+        candidate = candidates[0]
+        if candidate.name != node.name:
+            return ""
+        existing_params = self._python_parameter_sequence(node)
+        replacement_params = self._python_parameter_sequence(candidate)
+        if (
+            replacement_params == existing_params
+            or sorted(replacement_params) != sorted(existing_params)
+            or any(param.startswith("*") for param in [*existing_params, *replacement_params])
+            or node.args.defaults
+            or candidate.args.defaults
+            or node.args.kw_defaults
+            or candidate.args.kw_defaults
+        ):
+            return ""
+        lines = replacement.splitlines()
+        header_index = int(getattr(candidate, "lineno", 1)) - 1
+        if header_index < 0 or header_index >= len(lines):
+            return ""
+        header = lines[header_index]
+        match = re.match(rf"^(\s*(?:async\s+)?def\s+{re.escape(candidate.name)}\s*)\([^)]*\)(\s*(?:->\s*[^:]+)?\s*:\s*)$", header)
+        if not match:
+            return ""
+        lines[header_index] = f"{match.group(1)}({', '.join(existing_params)}){match.group(2)}"
+        return "\n".join(lines) + ("\n" if replacement.endswith(("\n", "\r")) else "")
+
     def _canonical_foldr_replacement_if_safe(self, target: Path, symbol: str, diagnostic: str) -> str:
         if "foldr reducer arguments look reversed" not in diagnostic:
             return ""
@@ -5705,8 +5973,9 @@ class ToolExecutor:
         header_indent = lines[int(getattr(node, "lineno", 1)) - 1][: len(lines[int(getattr(node, "lineno", 1)) - 1]) - len(lines[int(getattr(node, "lineno", 1)) - 1].lstrip())]
         body_indent = header_indent + "    "
         normalized = self._normalize_python_body_replacement(body)
-        full_function_name = self._single_full_python_function_name(normalized)
-        if full_function_name is not None:
+        routable_function = self._routable_full_python_function_replacement(normalized)
+        if routable_function is not None:
+            full_function_name, full_function_source = routable_function
             wanted = symbol.split(".")[-1]
             if full_function_name != wanted:
                 return {
@@ -5717,7 +5986,7 @@ class ToolExecutor:
                     "error_class": "invalid_args",
                     "summary": f"replace_function_body received full function {full_function_name!r}, but target is {wanted!r}. Target the matching function or use replace_symbol.",
                 }
-            routed = self.replace_symbol(relative_path, symbol, normalized)
+            routed = self.replace_symbol(relative_path, symbol, full_function_source)
             routed = dict(routed)
             routed["tool"] = "apply_structured_edit"
             routed["op"] = "replace_function_body"

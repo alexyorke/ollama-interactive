@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,12 @@ import difflib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from ollama_code.ollama_client import OllamaClient, OllamaError  # noqa: E402
 
 try:
     from coding_benchmark_eval import comparison_rows, failed_tools, tests_run, tool_calls, usage_totals
@@ -38,6 +45,22 @@ HARD_POLYGLOT_TASKS = (
 
 def _run(command: list[str], cwd: Path, *, timeout: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+
+
+def warm_model(model: str, *, timeout: int = 120) -> dict[str, Any]:
+    started = time.perf_counter()
+    try:
+        client = OllamaClient(timeout=timeout)
+        response = client.chat(
+            model=model,
+            messages=[{"role": "user", "content": "Reply with {}."}],
+            response_format="json",
+            think=False,
+            options={"num_predict": 8},
+        )
+        return {"ok": True, "latency_s": round(time.perf_counter() - started, 2), "model": response.model}
+    except (OllamaError, OSError, TimeoutError) as exc:
+        return {"ok": False, "latency_s": round(time.perf_counter() - started, 2), "error": str(exc)[:300]}
 
 
 def ensure_polyglot_repo(cache_dir: Path, *, repo_url: str = POLYGLOT_REPO_URL) -> Path:
@@ -95,9 +118,24 @@ def _detach_model_visible_meta(workspace: Path) -> Path | None:
         return None
     detached = workspace.parent / f"{workspace.name}-evaluator-meta"
     if detached.exists():
-        shutil.rmtree(detached, ignore_errors=True)
-    shutil.move(str(meta), str(detached))
+        _rmtree_force(detached)
+    try:
+        meta.rename(detached)
+    except OSError:
+        shutil.copytree(meta, detached)
+        _rmtree_force(meta)
     return detached
+
+
+def _rmtree_force(path: Path) -> None:
+    def onexc(function: Any, failed_path: str, _excinfo: Any) -> None:
+        try:
+            os.chmod(failed_path, 0o700)
+            function(failed_path)
+        except OSError:
+            raise
+
+    shutil.rmtree(path, onexc=onexc)
 
 
 def _evaluator_meta_snippets(meta_dir: Path | None, *, max_files: int = 3, max_chars: int = 1000) -> list[dict[str, str]]:
@@ -187,6 +225,7 @@ def failure_classes(
     calls: list[str],
     failures: list[dict[str, Any]],
     final_source_snippets: list[dict[str, Any]] | None = None,
+    session_events: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     if status == "pass" and final_tests_returncode == 0:
         return []
@@ -194,6 +233,15 @@ def failure_classes(
     mutating = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent"}
     if timed_out:
         classes.add("timeout")
+        events = session_events or []
+        has_started = any(item.get("type") == "llm_call_started" for item in events)
+        has_finished = any(item.get("type") == "llm_call" for item in events)
+        if not has_started:
+            classes.add("subprocess_kill_before_agent")
+        elif not has_finished:
+            classes.add("active_generation_timeout")
+        elif calls:
+            classes.add("controller_loop_timeout")
         if status != "pass" and not any(call in mutating for call in calls):
             classes.add("timeout_before_edit")
     for item in failures:
@@ -242,6 +290,7 @@ def evaluate_polyglot_python_task(
         session_file = workspace / "scratch" / "session.json"
         session_file.parent.mkdir(parents=True, exist_ok=True)
         test_cmd = python_exercism_test_cmd()
+        warmup = warm_model(model)
         started = time.perf_counter()
         initial = _run(test_cmd, workspace, timeout=120)
         cli_cmd = [
@@ -284,6 +333,7 @@ def evaluate_polyglot_python_task(
         final_tests_returncode = int(final_tests.returncode)
         final_source_snippets = _final_source_snippets(workspace)
         meta_snippets = _evaluator_meta_snippets(evaluator_meta)
+        session_events = list(session.get("events") or []) + list(session.get("llm_telemetry_events") or [])
         if not keep_workspace and evaluator_meta is not None:
             shutil.rmtree(evaluator_meta, ignore_errors=True)
         return {
@@ -310,8 +360,10 @@ def evaluate_polyglot_python_task(
                 calls=calls,
                 failures=failures,
                 final_source_snippets=final_source_snippets,
+                session_events=session_events,
             ),
             "tests_run": tests_run(session),
+            "model_warmup": warmup,
             "changed_source_diffs": _changed_source_diffs(source, workspace),
             "final_source_snippets": final_source_snippets,
             "evaluator_meta_snippets": meta_snippets,

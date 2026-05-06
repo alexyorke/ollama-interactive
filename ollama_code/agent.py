@@ -433,6 +433,7 @@ class OllamaCodeAgent:
         self.debate_enabled = debate_enabled
         self.reconcile_mode_setting = self._normalize_reconcile_mode(reconcile_mode)
         self.events: list[dict[str, Any]] = []
+        self.llm_telemetry_events: list[dict[str, Any]] = []
         self._pending_llm_call_events: list[dict[str, Any]] = []
         self._interrupt_event: threading.Event | None = None
         self._turn_tool_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
@@ -546,6 +547,7 @@ class OllamaCodeAgent:
     def reset(self) -> None:
         self.messages = self._base_messages()
         self.events = []
+        self.llm_telemetry_events = []
         self.tools.clear_todos()
         self._reset_turn_cache()
         self._transcript_dirty = True
@@ -660,9 +662,11 @@ class OllamaCodeAgent:
                 raise ValueError("Saved session contains a malformed message.")
             restored_messages.append({"role": role, "content": content})
         events = payload.get("events")
+        llm_telemetry_events = payload.get("llm_telemetry_events")
         todos = payload.get("todos")
         self.messages = restored_messages
         self.events = list(events) if isinstance(events, list) else []
+        self.llm_telemetry_events = list(llm_telemetry_events) if isinstance(llm_telemetry_events, list) else []
         self.tools.set_todos(todos if isinstance(todos, list) else [])
         self._transcript_dirty = True
         self._autosave()
@@ -726,6 +730,7 @@ class OllamaCodeAgent:
             "todos": self.tools.todo_snapshot(),
             "messages": self.messages,
             "events": self.events,
+            "llm_telemetry_events": self.llm_telemetry_events,
         }
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -749,6 +754,16 @@ class OllamaCodeAgent:
         if event_type in {"user", "assistant"}:
             self._autosave()
 
+    def _record_llm_telemetry(self, event_type: str, **payload: Any) -> None:
+        self.llm_telemetry_events.append(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "type": event_type,
+                **payload,
+            }
+        )
+        self._transcript_dirty = True
+
     def _chat(
         self,
         *,
@@ -765,14 +780,6 @@ class OllamaCodeAgent:
         effective_options = options_for_purpose(purpose, primary_can_emit_large_payload=primary_can_emit_large_payload)
         if options:
             effective_options.update(options)
-        response = self.client.chat(
-            model=model,
-            messages=messages,
-            response_format=effective_response_format,
-            on_thinking=on_thinking,
-            think=think,
-            options=effective_options or None,
-        )
         prompt_chars = sum(len(str(message.get("content", ""))) for message in messages)
         prompt_chars_by_role: dict[str, int] = {}
         top_messages: list[dict[str, Any]] = []
@@ -789,6 +796,48 @@ class OllamaCodeAgent:
                 }
             )
         top_messages = sorted(top_messages, key=lambda item: int(item["chars"]), reverse=True)[:5]
+        started_at = datetime.now(timezone.utc).isoformat()
+        self._record_llm_telemetry(
+            "llm_call_started",
+            purpose=purpose,
+            requested_model=model,
+            message_count=len(messages),
+            prompt_chars=prompt_chars,
+            prompt_chars_by_role=prompt_chars_by_role,
+            top_prompt_messages=top_messages,
+            think=think,
+            response_format="schema" if isinstance(effective_response_format, dict) else effective_response_format,
+            options=effective_options,
+            started_at=started_at,
+        )
+        if isinstance(self.client, OllamaClient):
+            self._autosave()
+        partial_state = {"thinking_chars": 0}
+
+        def thinking_recorder(text: str) -> None:
+            if on_thinking is not None:
+                on_thinking(text)
+            current_len = len(text)
+            if current_len - int(partial_state["thinking_chars"]) >= 400:
+                partial_state["thinking_chars"] = current_len
+                self._record_llm_telemetry(
+                    "llm_partial",
+                    purpose=purpose,
+                    requested_model=model,
+                    thinking_chars=current_len,
+                    preview=text[-300:],
+                )
+                if isinstance(self.client, OllamaClient):
+                    self._autosave()
+
+        response = self.client.chat(
+            model=model,
+            messages=messages,
+            response_format=effective_response_format,
+            on_thinking=thinking_recorder if on_thinking is not None else None,
+            think=think,
+            options=effective_options or None,
+        )
         payload = {
             "purpose": purpose,
             "model": response.model,
@@ -1852,7 +1901,7 @@ class OllamaCodeAgent:
         return "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
 
     def _run_test_repair_packet(self, output: str, successful_tool_results: list[dict[str, Any]] | None = None) -> dict[str, str]:
-        packet = {"diagnosis": "", "likely_targets": "", "source_excerpt": "", "remaining_stubs": "", "test_examples": "", "static_sanity": ""}
+        packet = {"diagnosis": "", "likely_targets": "", "source_excerpt": "", "remaining_stubs": "", "test_examples": "", "static_sanity": "", "repair_matrix": ""}
         if not output.strip():
             return packet
         diagnosis_result: dict[str, Any] = {}
@@ -1893,6 +1942,11 @@ class OllamaCodeAgent:
         examples = self._test_examples_from_context(successful_tool_results or [])
         if examples:
             packet["test_examples"] = examples
+        for source_path in context_paths[:2]:
+            probe = self._test_example_probe_from_context(source_path, successful_tool_results or [], limit=8)
+            if probe and probe.get("ok") is False:
+                packet["repair_matrix"] = "Repair matrix: " + self._truncate_text(str(probe.get("output") or probe.get("summary") or ""), limit=700)
+                break
         packet["source_excerpt"] = self._test_failure_source_excerpt(output)
         return packet
 
@@ -1963,6 +2017,18 @@ class OllamaCodeAgent:
         if not outputs:
             return ""
         return "Test examples: " + self._truncate_text(" | ".join(outputs), limit=1100)
+
+    def _test_example_probe_from_context(self, source_path: str, successful_tool_results: list[dict[str, Any]], *, limit: int = 8) -> dict[str, Any] | None:
+        for test_path in self._recent_test_paths(successful_tool_results)[:2]:
+            try:
+                result = self.tools.run_test_example_probes(source_path=source_path, test_path=test_path, limit=limit, timeout=20)
+            except Exception:
+                continue
+            output = str(result.get("output") or result.get("summary") or "")
+            if "no executable examples" in output or "no Python test examples" in output:
+                continue
+            return result
+        return None
 
     def _remaining_stub_targets(self, targets: object) -> list[str]:
         if not isinstance(targets, list):
@@ -4875,9 +4941,11 @@ class OllamaCodeAgent:
         latest_run_test_failure_summary = ""
         previous_run_test_failure_summary = ""
         failed_test_context_reads = 0
+        bulk_stub_guard_counts: dict[str, int] = {}
         failed_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
         unresolved_static_diagnostics: dict[str, str] = {}
+        unresolved_probe_diagnostics: dict[str, str] = {}
         tool_error_counts: dict[tuple[str, str, str], int] = {}
         if self._should_preload_context_pack(
             request_text=text,
@@ -5130,6 +5198,20 @@ class OllamaCodeAgent:
                             "content": "Python static sanity issues remain after edits: "
                             + self._truncate_text(diagnostics, limit=520)
                             + ". Fix them before final answer. Next JSON only.",
+                        }
+                    )
+                    continue
+                if mutation_required and unresolved_probe_diagnostics:
+                    self._append_assistant_payload(payload)
+                    diagnostics = "; ".join(
+                        f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_probe_diagnostics.items())
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Post-edit example probes still fail: "
+                            + self._truncate_text(diagnostics, limit=620)
+                            + ". Fix those concrete mismatches before final answer. Next JSON only.",
                         }
                     )
                     continue
@@ -5667,6 +5749,27 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if name == "run_test" and unresolved_probe_diagnostics and (mutation_required or code_mutation_required) and test_run_required:
+                    self._append_assistant_payload(payload)
+                    diagnostics = "; ".join(
+                        f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_probe_diagnostics.items())
+                    )
+                    self._record_event(
+                        "controller_guard",
+                        guard="example-probe-before-test",
+                        candidate_tool=name,
+                        forced_next_classes=["implementation_edit", "validation"],
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not rerun full tests while extracted examples already fail: "
+                            + self._truncate_text(diagnostics, limit=620)
+                            + ". Fix the implementation first. Next JSON only.",
+                        }
+                    )
+                    continue
                 if (
                     latest_run_test_failed
                     and mutation_required
@@ -5697,16 +5800,20 @@ class OllamaCodeAgent:
                 ):
                     bulk_stub_message = self._bulk_stub_repair_guard_message(name, arguments, successful_tool_results)
                     if bulk_stub_message:
-                        self._append_assistant_payload(payload)
-                        self._record_event(
-                            "controller_guard",
-                            guard="bulk-stub-complete-edit",
-                            candidate_tool=name,
-                            forced_next_classes=["implementation_edit", "validation"],
-                            rounds=round_number,
-                        )
-                        self.messages.append({"role": "user", "content": bulk_stub_message})
-                        continue
+                        bulk_stub_guard_key = f"{name}:{bulk_stub_message}"
+                        seen_bulk_stub_guard = bulk_stub_guard_counts.get(bulk_stub_guard_key, 0)
+                        bulk_stub_guard_counts[bulk_stub_guard_key] = seen_bulk_stub_guard + 1
+                        if seen_bulk_stub_guard == 0:
+                            self._append_assistant_payload(payload)
+                            self._record_event(
+                                "controller_guard",
+                                guard="bulk-stub-complete-edit",
+                                candidate_tool=name,
+                                forced_next_classes=["implementation_edit", "validation"],
+                                rounds=round_number,
+                            )
+                            self.messages.append({"role": "user", "content": bulk_stub_message})
+                            continue
                 if (
                     latest_run_test_failed
                     and (mutation_required or code_mutation_required)
@@ -5862,9 +5969,13 @@ class OllamaCodeAgent:
                 self._invalidate_turn_cache_if_needed(name, result)
                 self._record_command_validation_event(name=name, result=result, round_number=round_number, cached=cache_hit)
                 result_for_feedback = result
+                post_tool_feedback: list[str] = []
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
+                    if name in MUTATING_TOOL_NAMES and latest_run_test_failed and (mutation_required or code_mutation_required):
+                        failed_test_context_reads = 0
+                        failed_test_mutation_version = mutation_version
                     self._remember_tool_error(
                         name=name,
                         arguments=arguments,
@@ -5938,6 +6049,7 @@ class OllamaCodeAgent:
                     if result.get("syntax_ok") is False:
                         unresolved_syntax_diagnostics[result_path] = str(result.get("diagnostic") or result.get("summary") or "").strip()
                         unresolved_static_diagnostics.pop(result_path, None)
+                        unresolved_probe_diagnostics.pop(result_path, None)
                     else:
                         unresolved_syntax_diagnostics.pop(result_path, None)
                         try:
@@ -5946,8 +6058,32 @@ class OllamaCodeAgent:
                             static_result = {}
                         if static_result.get("ok") is False:
                             unresolved_static_diagnostics[result_path] = str(static_result.get("output") or static_result.get("summary") or "").strip()
+                            unresolved_probe_diagnostics.pop(result_path, None)
                         else:
                             unresolved_static_diagnostics.pop(result_path, None)
+                            if test_run_required and (mutation_required or code_mutation_required):
+                                probe_result = self._test_example_probe_from_context(result_path, successful_tool_results, limit=20)
+                                if probe_result is not None:
+                                    self._record_event(
+                                        "tool_result",
+                                        name="run_function_probe",
+                                        result=probe_result,
+                                        rounds=round_number,
+                                        cached=False,
+                                        auto=True,
+                                        duration_ms=0,
+                                        evidence_id=None,
+                                    )
+                                    if probe_result.get("ok") is False:
+                                        probe_text = str(probe_result.get("output") or probe_result.get("summary") or "").strip()
+                                        unresolved_probe_diagnostics[result_path] = probe_text
+                                        post_tool_feedback.append(
+                                            "Post-edit example probes failed: "
+                                            + self._truncate_text(probe_text, limit=620)
+                                            + ". Fix these concrete mismatches before rerunning full tests. Next JSON only."
+                                        )
+                                    else:
+                                        unresolved_probe_diagnostics.pop(result_path, None)
                 self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
                 self.messages.append(
                     {
@@ -5961,6 +6097,8 @@ class OllamaCodeAgent:
                         ),
                     }
                 )
+                for feedback in post_tool_feedback:
+                    self.messages.append({"role": "user", "content": feedback})
                 if (
                     latest_run_test_failed
                     and (mutation_required or code_mutation_required)
@@ -6050,6 +6188,8 @@ class OllamaCodeAgent:
                     and self.tools.default_test_command
                     and last_successful_run_test_version != mutation_version
                     and not unresolved_syntax_diagnostics
+                    and not unresolved_static_diagnostics
+                    and not unresolved_probe_diagnostics
                     and not (required_mutation_paths - mutated_paths_this_turn)
                 ):
                     auto_arguments: dict[str, Any] = {}

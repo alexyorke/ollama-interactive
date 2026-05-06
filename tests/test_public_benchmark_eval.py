@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import public_benchmark_eval as public_bench
 
@@ -71,10 +72,40 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
             final_tests_returncode=1,
             calls=["list_files", "read_file", "run_test"],
             failures=[],
+            session_events=[{"type": "llm_call_started"}],
         )
 
         self.assertIn("timeout", classes)
         self.assertIn("timeout_before_edit", classes)
+        self.assertIn("active_generation_timeout", classes)
+
+    def test_failure_classes_split_timeout_phase(self) -> None:
+        before_agent = public_bench.failure_classes(
+            status="fail",
+            timed_out=True,
+            final_tests_returncode=1,
+            calls=[],
+            failures=[],
+            session_events=[],
+        )
+        controller_loop = public_bench.failure_classes(
+            status="fail",
+            timed_out=True,
+            final_tests_returncode=1,
+            calls=["read_file", "run_test"],
+            failures=[],
+            session_events=[{"type": "llm_call_started"}, {"type": "llm_call"}],
+        )
+
+        self.assertIn("subprocess_kill_before_agent", before_agent)
+        self.assertIn("controller_loop_timeout", controller_loop)
+
+    def test_warm_model_reports_failure_without_raising(self) -> None:
+        with patch.object(public_bench.OllamaClient, "chat", side_effect=public_bench.OllamaError("offline")):
+            result = public_bench.warm_model("missing-model", timeout=1)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("offline", result["error"])
 
     def test_failure_classes_empty_for_passing_final_state(self) -> None:
         classes = public_bench.failure_classes(
