@@ -2999,10 +2999,10 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "fixed")
         read_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "read_file"]
-        self.assertEqual(len(read_calls), 4)
+        self.assertEqual(len(read_calls), 3)
         self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
         guards = [event for event in agent.events if event.get("guard") == "no-edit-after-failed-test"]
-        self.assertEqual(len(guards), 1)
+        self.assertEqual(len(guards), 2)
         self.assertIn("return left + right", final_text)
 
     def test_bulk_stub_guard_blocks_rerun_until_compact_stub_file_is_done(self) -> None:
@@ -3024,8 +3024,19 @@ class AgentTests(unittest.TestCase):
                     json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
                     json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
                     json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "add", "replacement": "return left + right"}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
-                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "sub", "replacement": "return left - right"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_symbols",
+                            "arguments": {
+                                "path": "app.py",
+                                "replacements": [
+                                    {"symbol": "add", "content": "def add(left, right):\n    return left + right\n"},
+                                    {"symbol": "sub", "content": "def sub(left, right):\n    return left - right\n"},
+                                ],
+                            },
+                        }
+                    ),
                     json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
                     json.dumps({"type": "final", "message": "fixed"}),
                 ]
@@ -3037,12 +3048,49 @@ class AgentTests(unittest.TestCase):
             final_text = (root / "app.py").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "fixed")
-        self.assertEqual(tools.execute_counts.get("edit_intent"), 2)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), None)
+        self.assertEqual(tools.execute_counts.get("replace_symbols"), 1)
         self.assertEqual(tools.execute_counts.get("run_test"), 2)
-        guards = [event for event in agent.events if event.get("guard") == "bulk-stub-repair"]
+        guards = [event for event in agent.events if event.get("guard") == "bulk-stub-complete-edit"]
         self.assertEqual(len(guards), 1)
         self.assertIn("return left + right", final_text)
         self.assertIn("return left - right", final_text)
+
+    def test_static_sanity_guard_blocks_tests_after_bad_python_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def make():\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import make\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_make(self):\n"
+                "        self.assertEqual(make(), 'ok')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "make", "replacement": "return missing_name"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "make", "replacement": "return 'ok'"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+
+            result = agent.handle_user("Implement app.py and run tests.")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+        guards = [event for event in agent.events if event.get("guard") == "static-sanity-before-test"]
+        self.assertEqual(len(guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("undefined local/global name 'missing_name'", feedback)
 
     def test_agent_normalizes_replace_symbol_text_edit_on_non_code_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

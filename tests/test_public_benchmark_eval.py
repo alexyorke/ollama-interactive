@@ -50,14 +50,43 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
                 {"name": "replace_body", "summary": "Unknown tool: replace_body"},
                 {"name": "run_test", "summary": "Command rejected before execution: path escapes workspace: ."},
                 {"name": "edit_intent", "summary": "Python syntax error: SyntaxError: unterminated string literal"},
+                {"name": "contract_check", "summary": "Static sanity: app.py:2 make reads undefined local/global name 'missing'"},
             ],
+            final_source_snippets=[{"path": "app.py", "content": "def answer():\n    pass\n"}],
         )
 
         self.assertIn("invalid_tool", classes)
         self.assertIn("invalid_args", classes)
         self.assertIn("syntax_edit", classes)
+        self.assertIn("syntax_rejected", classes)
+        self.assertIn("static_sanity_failed", classes)
+        self.assertIn("partial_stub_completion", classes)
         self.assertIn("no_edit_attempted", classes)
         self.assertIn("tests_still_failing", classes)
+
+    def test_failure_classes_distinguishes_timeout_before_edit(self) -> None:
+        classes = public_bench.failure_classes(
+            status="fail",
+            timed_out=True,
+            final_tests_returncode=1,
+            calls=["list_files", "read_file", "run_test"],
+            failures=[],
+        )
+
+        self.assertIn("timeout", classes)
+        self.assertIn("timeout_before_edit", classes)
+
+    def test_failure_classes_empty_for_passing_final_state(self) -> None:
+        classes = public_bench.failure_classes(
+            status="pass",
+            timed_out=False,
+            final_tests_returncode=0,
+            calls=["run_test"],
+            failures=[{"name": "run_test", "summary": "earlier failure"}],
+            final_source_snippets=[{"path": "app.py", "content": "def answer():\n    return 42\n"}],
+        )
+
+        self.assertEqual(classes, [])
 
     def test_source_snapshots_exclude_tests_and_report_diffs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

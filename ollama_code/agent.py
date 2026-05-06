@@ -1852,7 +1852,7 @@ class OllamaCodeAgent:
         return "Tests failed. Inspect/edit evidence, then rerun configured run_test. Next JSON only."
 
     def _run_test_repair_packet(self, output: str, successful_tool_results: list[dict[str, Any]] | None = None) -> dict[str, str]:
-        packet = {"diagnosis": "", "likely_targets": "", "source_excerpt": "", "remaining_stubs": "", "test_examples": ""}
+        packet = {"diagnosis": "", "likely_targets": "", "source_excerpt": "", "remaining_stubs": "", "test_examples": "", "static_sanity": ""}
         if not output.strip():
             return packet
         diagnosis_result: dict[str, Any] = {}
@@ -1884,6 +1884,12 @@ class OllamaCodeAgent:
             stubs = self._stub_targets_for_paths(context_paths)
             if stubs and not packet["remaining_stubs"]:
                 packet["remaining_stubs"] = self._remaining_stubs_text(stubs)
+            try:
+                sanity = self.tools.contract_check(context_paths, limit=8)
+            except Exception:
+                sanity = {}
+            if sanity.get("ok") is False:
+                packet["static_sanity"] = "Static sanity: " + self._truncate_text(str(sanity.get("output") or sanity.get("summary") or ""), limit=520)
         examples = self._test_examples_from_context(successful_tool_results or [])
         if examples:
             packet["test_examples"] = examples
@@ -1903,7 +1909,7 @@ class OllamaCodeAgent:
             return ""
         hint = "Remaining stubs: " + ", ".join(stubs[:12]) + "."
         if len(stubs) > 1:
-            hint += " Implement all listed stubs in the compact source file before more reads."
+            hint += " Implement all listed stubs in the compact source file in one replace_symbols or full-file edit before more reads or tests."
         return hint
 
     def _recent_source_paths(self, successful_tool_results: list[dict[str, Any]]) -> list[str]:
@@ -3441,10 +3447,24 @@ class OllamaCodeAgent:
 
     def _failed_test_no_edit_guard_message(self, successful_tool_results: list[dict[str, Any]]) -> str:
         target = self._failed_test_edit_target_hint(successful_tool_results)
+        repair_packet = self._run_test_repair_packet(latest_run_test_output := self._latest_failed_run_test_output(successful_tool_results), successful_tool_results=successful_tool_results)
+        packet_text = self._format_run_test_repair_packet(repair_packet) if latest_run_test_output else ""
         return (
             "Tests are failing and source/tests have already been inspected. Stop reading. "
-            f"Edit {target} now, preferably all remaining stubs in one edit_intent or replace_symbols call, then rerun run_test. Next JSON only."
+            f"Edit {target} now, preferably all remaining stubs in one replace_symbols or full-file edit, then rerun run_test. "
+            + packet_text
+            + " Next JSON only."
         )
+
+    def _latest_failed_run_test_output(self, successful_tool_results: list[dict[str, Any]]) -> str:
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "run_test":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is True:
+                continue
+            return str(result.get("output") or result.get("summary") or "")
+        return ""
 
     def _edit_covers_bulk_stubs(self, name: str, arguments: dict[str, Any], path: str, stub_symbols: set[str]) -> bool:
         arg_path = str(arguments.get("path") or arguments.get("file") or arguments.get("filename") or "").strip().replace("\\", "/").lstrip("./")
@@ -3484,7 +3504,7 @@ class OllamaCodeAgent:
             ordered = ", ".join(sorted(symbols))
             return (
                 f"Tests failed and {path} still has unimplemented stubs: {ordered}. "
-                "Implement every remaining stub in that file before rerunning run_test. Next JSON only."
+                "Implement every remaining stub in that file together with replace_symbols or a full-file edit before rerunning run_test. Next JSON only."
             )
         return ""
 
@@ -4857,6 +4877,7 @@ class OllamaCodeAgent:
         failed_test_context_reads = 0
         failed_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
+        unresolved_static_diagnostics: dict[str, str] = {}
         tool_error_counts: dict[tuple[str, str, str], int] = {}
         if self._should_preload_context_pack(
             request_text=text,
@@ -5089,6 +5110,25 @@ class OllamaCodeAgent:
                             "role": "user",
                             "content": "Python syntax errors remain after edits: "
                             + self._truncate_text(diagnostics, limit=320)
+                            + ". Fix them before final answer. Next JSON only.",
+                        }
+                    )
+                    continue
+                if mutation_required and unresolved_static_diagnostics:
+                    diagnostics = "; ".join(
+                        f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_static_diagnostics.items())
+                    )
+                    if not test_run_required:
+                        failure = "Stopped because post-edit validation failed. " + self._truncate_text(diagnostics, limit=520)
+                        self._record_event("assistant", content=failure, rounds=round_number)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=failure, rounds=round_number, completed=False)
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Python static sanity issues remain after edits: "
+                            + self._truncate_text(diagnostics, limit=520)
                             + ". Fix them before final answer. Next JSON only.",
                         }
                     )
@@ -5606,6 +5646,27 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if name == "run_test" and unresolved_static_diagnostics and (mutation_required or code_mutation_required) and test_run_required:
+                    self._append_assistant_payload(payload)
+                    diagnostics = "; ".join(
+                        f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_static_diagnostics.items())
+                    )
+                    self._record_event(
+                        "controller_guard",
+                        guard="static-sanity-before-test",
+                        candidate_tool=name,
+                        forced_next_classes=["implementation_edit", "validation"],
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Do not run tests while Python static sanity issues are already known: "
+                            + self._truncate_text(diagnostics, limit=520)
+                            + ". Fix the implementation first. Next JSON only.",
+                        }
+                    )
+                    continue
                 if (
                     latest_run_test_failed
                     and mutation_required
@@ -5632,8 +5693,26 @@ class OllamaCodeAgent:
                     latest_run_test_failed
                     and (mutation_required or code_mutation_required)
                     and test_run_required
+                    and name in MUTATING_TOOL_NAMES
+                ):
+                    bulk_stub_message = self._bulk_stub_repair_guard_message(name, arguments, successful_tool_results)
+                    if bulk_stub_message:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="bulk-stub-complete-edit",
+                            candidate_tool=name,
+                            forced_next_classes=["implementation_edit", "validation"],
+                            rounds=round_number,
+                        )
+                        self.messages.append({"role": "user", "content": bulk_stub_message})
+                        continue
+                if (
+                    latest_run_test_failed
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
                     and failed_test_mutation_version == mutation_version
-                    and failed_test_context_reads >= 2
+                    and failed_test_context_reads >= 1
                     and name in CONTEXT_GATHERING_TOOL_NAMES
                 ):
                     self._append_assistant_payload(payload)
@@ -5858,8 +5937,17 @@ class OllamaCodeAgent:
                 if name in MUTATING_TOOL_NAMES and result.get("ok") is True and result_path.endswith(".py"):
                     if result.get("syntax_ok") is False:
                         unresolved_syntax_diagnostics[result_path] = str(result.get("diagnostic") or result.get("summary") or "").strip()
+                        unresolved_static_diagnostics.pop(result_path, None)
                     else:
                         unresolved_syntax_diagnostics.pop(result_path, None)
+                        try:
+                            static_result = self.tools.contract_check([result_path], limit=8)
+                        except Exception:
+                            static_result = {}
+                        if static_result.get("ok") is False:
+                            unresolved_static_diagnostics[result_path] = str(static_result.get("output") or static_result.get("summary") or "").strip()
+                        else:
+                            unresolved_static_diagnostics.pop(result_path, None)
                 self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
                 self.messages.append(
                     {
@@ -5878,7 +5966,7 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                     and failed_test_mutation_version == mutation_version
-                    and failed_test_context_reads == 2
+                    and failed_test_context_reads == 1
                     and name in CONTEXT_GATHERING_TOOL_NAMES
                 ):
                     self._record_event(
@@ -6015,7 +6103,7 @@ class OllamaCodeAgent:
             and (mutation_required or code_mutation_required)
             and test_run_required
             and failed_test_mutation_version == mutation_version
-            and failed_test_context_reads >= 2
+            and failed_test_context_reads >= 1
         ):
             failure = (
                 "Stopped because tests failed and the controller blocked further read-only looping. "

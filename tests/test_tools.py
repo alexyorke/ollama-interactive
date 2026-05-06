@@ -1368,6 +1368,86 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("foldr reducer arguments look reversed", result["summary"])
         self.assertEqual(final_text, original)
 
+    def test_replace_symbols_normalizes_reversed_recursive_foldr_reducer_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            sample.write_text("def foldr(function, list, initial):\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_symbols(
+                "ops.py",
+                [
+                    {
+                        "symbol": "foldr",
+                        "content": (
+                            "def foldr(function, list, initial):\n"
+                            "    if not list:\n"
+                            "        return initial\n"
+                            "    return function(list[0], foldr(function, list[1:], initial))\n"
+                        ),
+                    }
+                ],
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized foldr reducer order", result["summary"])
+        self.assertIn("for item in reversed(list):", final_text)
+        self.assertIn("accumulator = function(accumulator, item)", final_text)
+
+    def test_replace_symbol_normalizes_helper_recursive_reversed_foldr_reducer_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            sample.write_text("def foldr(function, list, initial):\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_symbol(
+                "ops.py",
+                "foldr",
+                (
+                    "def foldr(function, list, initial):\n"
+                    "    def folder(item, rest):\n"
+                    "        if not rest:\n"
+                    "            return initial\n"
+                    "        return function(item, folder(rest[0], rest[1:]))\n"
+                    "    return folder(list[0], list[1:]) if list else initial\n"
+                ),
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized foldr reducer order", result["summary"])
+        self.assertIn("for item in reversed(list):", final_text)
+        self.assertIn("accumulator = function(accumulator, item)", final_text)
+
+    def test_replace_symbol_rejects_accidental_signature_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            original = "def foldl(function, list, initial):\n    pass\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.replace_symbol(
+                "ops.py",
+                "foldl",
+                (
+                    "def foldl(function, initial, list):\n"
+                    "    accumulator = initial\n"
+                    "    for item in list:\n"
+                    "        accumulator = function(accumulator, item)\n"
+                    "    return accumulator\n"
+                ),
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertIn("changes signature", result["summary"])
+        self.assertEqual(final_text, original)
+
     def test_edit_intent_routes_fix_like_full_function_to_symbol_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1415,6 +1495,142 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("keep(lambda value: value > 1, [1, 2]) -> [2]", output)
         self.assertIn("answer('What is 52 cubed?') raises ValueError", output)
         self.assertIn("answer('What is?') raises ValueError", output)
+
+    def test_test_spec_extract_resolves_local_expected_values_and_messages(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "transpose.py").write_text("def transpose(text):\n    pass\n", encoding="utf-8")
+            (root / "transpose_test.py").write_text(
+                "import unittest\nfrom transpose import transpose\n\n"
+                "class TransposeTest(unittest.TestCase):\n"
+                "    def test_row(self):\n"
+                "        text = 'A1'\n"
+                "        expected = 'A\\n1'\n"
+                "        self.assertEqual(transpose(text), expected)\n"
+                "    def test_bad(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            transpose('bad')\n"
+                "        self.assertEqual(err.exception.args[0], 'invalid input')\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("transpose_test.py", source_path="transpose.py", limit=10)
+
+        self.assertTrue(result["ok"], result)
+        output = result["output"]
+        self.assertIn("transpose('A1') -> 'A\\n1'", output)
+        self.assertIn("transpose('bad') raises ValueError('invalid input')", output)
+
+    def test_test_spec_extract_captures_stateful_object_scenarios(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "grade_school.py").write_text(
+                "class School:\n"
+                "    def add_student(self, name, grade):\n"
+                "        pass\n"
+                "    def roster(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "grade_school_test.py").write_text(
+                "import unittest\nfrom grade_school import School\n\n"
+                "class GradeSchoolTest(unittest.TestCase):\n"
+                "    def test_student_is_added(self):\n"
+                "        school = School()\n"
+                "        school.add_student(name='Aimee', grade=2)\n"
+                "        expected = ['Aimee']\n"
+                "        self.assertEqual(school.roster(), expected)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("grade_school_test.py", source_path="grade_school.py", limit=10)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("school = School(); school.add_student(name='Aimee', grade=2); school.roster() -> ['Aimee']", result["output"])
+
+    def test_test_spec_extract_balances_examples_across_symbols(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "list_ops.py").write_text(
+                "def append(a, b):\n    pass\n"
+                "def foldr(function, values, initial):\n    pass\n"
+                "def reverse(values):\n    pass\n",
+                encoding="utf-8",
+            )
+            (root / "list_ops_test.py").write_text(
+                "import unittest\nfrom list_ops import append, foldr, reverse\n\n"
+                "class ListOpsTest(unittest.TestCase):\n"
+                "    def test_append_one(self):\n"
+                "        self.assertEqual(append([], []), [])\n"
+                "    def test_append_two(self):\n"
+                "        self.assertEqual(append([1], [2]), [1, 2])\n"
+                "    def test_append_three(self):\n"
+                "        self.assertEqual(append([3], []), [3])\n"
+                "    def test_append_four(self):\n"
+                "        self.assertEqual(append([], [4]), [4])\n"
+                "    def test_foldr(self):\n"
+                "        self.assertEqual(foldr(lambda acc, el: el + acc, ['e'], '!'), 'e!')\n"
+                "    def test_reverse(self):\n"
+                "        self.assertEqual(reverse([1, 2]), [2, 1])\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("list_ops_test.py", source_path="list_ops.py", limit=4)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("append:", result["output"])
+        self.assertIn("foldr:", result["output"])
+        self.assertIn("reverse:", result["output"])
+
+    def test_contract_check_static_sanity_catches_python_edit_defects(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "robot_name.py").write_text(
+                "class Robot:\n"
+                "    def __init__(self):\n"
+                "        self.name = name\n",
+                encoding="utf-8",
+            )
+            (root / "phone_number.py").write_text(
+                "class PhoneNumber:\n"
+                "    def __init__(self, number):\n"
+                "        self.number = self._clean_number(number)\n",
+                encoding="utf-8",
+            )
+            (root / "linked.py").write_text(
+                "class LinkedList:\n"
+                "    def __init__(self):\n"
+                "        self.head = None\n"
+                "    def head(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["robot_name.py", "phone_number.py", "linked.py"])
+
+        self.assertFalse(result["ok"], result)
+        output = result["output"]
+        self.assertIn("undefined local/global name 'name'", output)
+        self.assertIn("calls missing self._clean_number()", output)
+        self.assertIn("shadowing method head()", output)
+        self.assertIn("still has stub body", output)
+
+    def test_contract_check_allows_nested_helper_closure_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text(
+                "def foldr(function, list, initial):\n"
+                "    if not list:\n"
+                "        return initial\n"
+                "    def folder(item):\n"
+                "        return function(item, folder(list[1:]))\n"
+                "    return folder(list[0])\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["ops.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
 
     def test_broad_scans_skip_public_benchmark_meta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

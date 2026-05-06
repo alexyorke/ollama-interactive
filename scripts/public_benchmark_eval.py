@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import shutil
 import subprocess
@@ -156,10 +157,45 @@ def _changed_source_diffs(source: Path, workspace: Path, *, max_files: int = 8, 
     return diffs
 
 
-def failure_classes(*, status: str, timed_out: bool, final_tests_returncode: int, calls: list[str], failures: list[dict[str, Any]]) -> list[str]:
+def _source_has_stub(content: str) -> bool:
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = [
+            child
+            for child in node.body
+            if not (isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant) and isinstance(child.value.value, str))
+        ]
+        if not body or len(body) == 1 and isinstance(body[0], ast.Pass):
+            return True
+        if len(body) == 1 and isinstance(body[0], ast.Return):
+            value = body[0].value
+            if value is None or (isinstance(value, ast.Constant) and value.value is None):
+                return True
+    return False
+
+
+def failure_classes(
+    *,
+    status: str,
+    timed_out: bool,
+    final_tests_returncode: int,
+    calls: list[str],
+    failures: list[dict[str, Any]],
+    final_source_snippets: list[dict[str, Any]] | None = None,
+) -> list[str]:
+    if status == "pass" and final_tests_returncode == 0:
+        return []
     classes: set[str] = set()
+    mutating = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent"}
     if timed_out:
         classes.add("timeout")
+        if status != "pass" and not any(call in mutating for call in calls):
+            classes.add("timeout_before_edit")
     for item in failures:
         summary = str(item.get("summary") or "")
         name = str(item.get("name") or "")
@@ -170,13 +206,17 @@ def failure_classes(*, status: str, timed_out: bool, final_tests_returncode: int
             classes.add("invalid_args")
         if "syntaxerror" in summary or "indentationerror" in summary or "syntax error" in lowered:
             classes.add("syntax_edit")
+            classes.add("syntax_rejected")
+        if "static sanity" in lowered or "undefined local/global" in lowered or "still has stub body" in lowered or "shadowing method" in lowered:
+            classes.add("static_sanity_failed")
         if name == "run_test":
             classes.add("tests_still_failing")
-    mutating = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent"}
     if status != "pass" and not any(call in mutating for call in calls):
         classes.add("no_edit_attempted")
     if final_tests_returncode != 0:
         classes.add("tests_still_failing")
+    if final_source_snippets and any(_source_has_stub(str(item.get("content") or "")) for item in final_source_snippets):
+        classes.add("partial_stub_completion")
     return sorted(classes)
 
 
@@ -242,6 +282,7 @@ def evaluate_polyglot_python_task(
         calls = tool_calls(session)
         failures = failed_tools(session)
         final_tests_returncode = int(final_tests.returncode)
+        final_source_snippets = _final_source_snippets(workspace)
         meta_snippets = _evaluator_meta_snippets(evaluator_meta)
         if not keep_workspace and evaluator_meta is not None:
             shutil.rmtree(evaluator_meta, ignore_errors=True)
@@ -268,10 +309,11 @@ def evaluate_polyglot_python_task(
                 final_tests_returncode=final_tests_returncode,
                 calls=calls,
                 failures=failures,
+                final_source_snippets=final_source_snippets,
             ),
             "tests_run": tests_run(session),
             "changed_source_diffs": _changed_source_diffs(source, workspace),
-            "final_source_snippets": _final_source_snippets(workspace),
+            "final_source_snippets": final_source_snippets,
             "evaluator_meta_snippets": meta_snippets,
             "evaluator_meta": str(evaluator_meta) if keep_workspace and evaluator_meta is not None else "",
             "workspace": str(workspace) if keep_workspace else "",
