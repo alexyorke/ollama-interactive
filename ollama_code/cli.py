@@ -411,6 +411,7 @@ def startup_help_text(agent: OllamaCodeAgent) -> str:
             "  /help                            show all slash commands",
             "  /quit                            exit",
             "",
+            "Repo search, validator discovery, todos, and verified-function cards are enabled by default.",
             "Press Esc to interrupt the current model or tool call.",
         ]
     )
@@ -445,7 +446,7 @@ def slash_help_text() -> str:
             "Tips:",
             "  Ask normally: \"fix failing tests, inspect source first, then run tests\".",
             "  Run /doctor if the first request is slow or fails before tool use.",
-            "  The background indexer keeps file/repo/FTS search caches hot under .ollama-code/index.",
+            "  The background indexer keeps file/repo/FTS and verified-function search caches hot under .ollama-code/index.",
             "  Use /tools for a compact list; /tools full is verbose.",
             "  Use /approval read-only for inspection-only sessions.",
             "  Press Esc during model or tool execution to interrupt.",
@@ -507,6 +508,29 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
         lines.append(f"indexer: ok enabled ({state}); cache={index_status.get('cache_dir')}")
     else:
         lines.append("indexer: disabled")
+
+    available_tools: set[str] | None = None
+    tools = getattr(agent, "tools", None)
+    available = getattr(tools, "available_tool_names", None)
+    if callable(available):
+        try:
+            available_tools = {str(name) for name in available()}
+        except Exception:
+            available_tools = None
+    if available_tools is not None:
+        verified_tools = {
+            "verified_function_index",
+            "verified_function_search",
+            "verified_function_show",
+            "verify_function_contract",
+            "compose_verified_functions",
+            "promote_verified_function",
+        }
+        missing_verified = sorted(verified_tools - available_tools)
+        if missing_verified:
+            lines.append("verified functions: disabled/missing " + ", ".join(missing_verified))
+        else:
+            lines.append("verified functions: ok default-on Python cards; cache=.ollama-code/index/verified_functions.sqlite")
 
     optional_tools = {
         "rg": "fast text search",

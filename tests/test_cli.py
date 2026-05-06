@@ -14,6 +14,17 @@ from ollama_code.config import DEFAULT_MODEL
 
 class DummyAgent:
     def __init__(self) -> None:
+        class ToolView:
+            def available_tool_names(self) -> set[str]:
+                return {
+                    "verified_function_index",
+                    "verified_function_search",
+                    "verified_function_show",
+                    "verify_function_contract",
+                    "compose_verified_functions",
+                    "promote_verified_function",
+                }
+
         self.model = DEFAULT_MODEL
         self.max_tool_rounds = 100
         self.max_agent_depth = 2
@@ -27,6 +38,7 @@ class DummyAgent:
         self._session_path = Path("session.json").resolve()
         self._test_command = "python -m unittest -v"
         self._todos = "1. [pending] inspect\n2. [completed] setup"
+        self.tools = ToolView()
 
     def workspace_root(self) -> Path:
         return self._workspace
@@ -169,6 +181,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.approval_mode(), "ask")
         self.assertTrue(agent.debate_mode())
         self.assertEqual(agent.reconcile_mode(), "auto")
+        self.assertTrue(agent.index_status()["enabled"])
+        for name in (
+            "verified_function_index",
+            "verified_function_search",
+            "verified_function_show",
+            "verify_function_contract",
+            "compose_verified_functions",
+            "promote_verified_function",
+        ):
+            self.assertIn(name, agent.tools.available_tool_names())
 
     def test_status_renderer_shows_last_three_thinking_lines_and_clears_on_status(self) -> None:
         stream = io.StringIO()
@@ -240,6 +262,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/index", text)
         self.assertIn("/todos", text)
         self.assertIn("/tools", text)
+        self.assertIn("verified-function cards are enabled by default", text)
         self.assertIn("Press Esc", text)
 
     def test_help_command_prints_multiline_command_reference(self) -> None:
@@ -273,6 +296,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("ollama: ok", report)
         self.assertIn(f"model: ok {DEFAULT_MODEL}", report)
         self.assertIn("indexer: ok enabled", report)
+        self.assertIn("verified functions: ok default-on", report)
         self.assertIn("console script: not on PATH", report)
 
     def test_doctor_command_prints_report(self) -> None:

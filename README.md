@@ -101,6 +101,10 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
   "max_agent_depth": 2,
   "timeout": 300,
   "test_cmd": "python -m unittest -v",
+  "tools": {
+    "default_enabled": true,
+    "disabled": []
+  },
   "indexer": {
     "enabled": true,
     "watch": true,
