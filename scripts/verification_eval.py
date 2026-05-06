@@ -192,7 +192,7 @@ def evaluate_case(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial verification on/off evals against real Ollama Code models.")
-    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b", "gemma4:e4b"], help="Models to test serially.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "gemma3:4b", "qwen3:8b"], help="Models to test serially.")
     parser.add_argument("--modes", nargs="+", choices=["on", "off"], default=["off", "on"], help="Verification modes to run.")
     parser.add_argument("--verifier-model", default=None, help="Optional verifier/rewrite model override to use serially.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-run timeout in seconds.")

@@ -71,7 +71,7 @@ def _long_prompt(lines: int) -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Profile Ollama local inference with raw API duration counters.")
     parser.add_argument("--host", default="http://127.0.0.1:11434")
-    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b"])
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "gemma3:4b", "qwen3:8b"])
     parser.add_argument("--output", type=Path)
     parser.add_argument("--long-lines", type=int, default=800)
     parser.add_argument("--keep-loaded", action="store_true")

@@ -68,6 +68,10 @@ def build_workspace(root: Path) -> None:
     init_git_repo(root)
 
 
+def python_command(*args: str) -> str:
+    return subprocess.list2cmdline([sys.executable, *args])
+
+
 def run_cli(
     repo_root: Path,
     workspace: Path,
@@ -185,17 +189,22 @@ def scenario_search(repo_root: Path, workspace: Path, model: str) -> None:
 
 def scenario_shell(repo_root: Path, workspace: Path, model: str) -> None:
     session_file = workspace / ".ollama-code" / "shell.json"
+    command = python_command("-c", "import os; print(os.getcwd()); print(6*7)")
     result = run_cli(
         repo_root,
         workspace,
         model,
-        "Use run_shell to execute exactly: pwd && python3 -c 'print(6*7)'. Then tell me the number and the directory.",
+        f"Use run_shell to execute exactly: {command}. Then tell me the number and the directory.",
         session_file=session_file,
     )
     session = load_session(session_file)
     shells = tool_results(session, "run_shell")
     require(result, lambda r: "[status] tool run_shell" in r.stdout and "42" in r.stdout, "shell scenario failed")
-    if not any(item.get("ok") and "42" in str(item.get("output", "")) and str(workspace).replace("\\", "/") in str(item.get("output", "")) for item in shells):
+    expected_workspace = str(workspace).replace("\\", "/")
+    if not any(
+        item.get("ok") and "42" in str(item.get("output", "")) and expected_workspace in str(item.get("output", "")).replace("\\", "/")
+        for item in shells
+    ):
         raise AssertionError(f"shell tool output was not captured correctly\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}")
 
 
@@ -207,7 +216,7 @@ def scenario_run_test(repo_root: Path, workspace: Path, model: str) -> None:
         model,
         "Use run_test and tell me whether the test suite passed.",
         session_file=session_file,
-        extra_args=["--test-cmd", "python3 -m unittest discover -s tests -v"],
+        extra_args=["--test-cmd", python_command("-m", "unittest", "discover", "-s", "tests", "-v")],
     )
     session = load_session(session_file)
     tests = tool_results(session, "run_test")
@@ -381,7 +390,7 @@ def resolve_requested_models(requested: list[str], available: set[str]) -> list[
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run live Ollama Code smoke tests against real local models.")
-    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b", "gemma4:e4b"], help="Models to test.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "gemma3:4b", "qwen3:8b"], help="Models to test.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -412,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
             for scenario in scenarios:
                 print(f"[live]   {scenario.__name__}")
                 scenario(repo_root, workspace, model)
-            print(f"[live]   scenario_subagent")
+            print("[live]   scenario_subagent")
             scenario_subagent(repo_root, workspace, model, model)
         unload_model(model)
         _LOADED_MODELS.discard(model)

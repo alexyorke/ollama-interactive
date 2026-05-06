@@ -26,6 +26,7 @@ from ollama_code.config import (
     ENV_OLLAMA_CODE_TEST_CMD,
     ENV_OLLAMA_CODE_VERIFIER_MODEL,
     ENV_OLLAMA_HOST,
+    GRANITE_IQ4_XS_MODEL,
     OFFICIAL_GRANITE_8B_MODEL,
     load_config,
 )
@@ -37,10 +38,10 @@ from ollama_code.tools import ToolExecutor
 
 PREFERRED_FALLBACK_MODELS = [
     DEFAULT_MODEL,
+    GRANITE_IQ4_XS_MODEL,
     OFFICIAL_GRANITE_8B_MODEL,
     "gemma3:4b",
     "qwen3:8b",
-    "gemma4:e4b",
     "batiai/gemma4-26b:iq4",
     "gpt-oss:20b",
 ]

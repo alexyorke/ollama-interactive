@@ -1496,6 +1496,23 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 0)
         self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
 
+    def test_agent_does_not_treat_do_not_modify_as_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "docs" / "spec.md").write_text("MAGIC_TOKEN appears here.\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"read_file","arguments":{"path":"docs/spec.md"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Do not modify any files. Read docs/spec.md, and report the exact uppercase token that already exists in the file. Then reply with that token only."
+            )
+
+        self.assertEqual(result.message, "MAGIC_TOKEN")
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
     def test_agent_normalizes_target_line_read_and_synthesizes_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1516,6 +1533,21 @@ class AgentTests(unittest.TestCase):
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_calls[0]["arguments"], {"path": "docs/large.md", "start": 245, "end": 255})
         self.assertFalse(any(event["type"] == "tool_normalized" for event in agent.events))
+
+    def test_agent_synthesizes_exact_lowercase_line_after_read_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "notes").mkdir()
+            (root / "notes" / "alpha.txt").write_text("ORBIT\nsecond line\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use read_file on notes/alpha.txt and reply with exactly the text on line 2.")
+
+        self.assertEqual(result.message, "second line")
+        self.assertEqual(len(client.calls), 0)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
 
     def test_agent_normalizes_exact_shell_command_and_synthesizes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1540,6 +1572,28 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 0)
         normalized = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(len(normalized), 0)
+
+    def test_agent_synthesizes_exact_shell_output_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            exact_command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.getcwd()); print(6*7)",
+                ]
+            )
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me the number and the directory."
+            )
+
+        self.assertIn("42", result.message)
+        self.assertIn(str(root), result.message)
+        self.assertEqual(len(client.calls), 0)
 
     def test_agent_synthesizes_exact_shell_artifact_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2282,7 +2282,12 @@ class OllamaCodeAgent:
         read_only_patterns = [
             r"\bdo not edit\b(?!\s+(?:tests?|test files?)\b)",
             r"\bdon't edit\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bdo not modify\b",
+            r"\bdon't modify\b",
+            r"\bdo not change\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bdon't change\b(?!\s+(?:tests?|test files?)\b)",
             r"\bwithout editing\b(?!\s+(?:tests?|test files?)\b)",
+            r"\bwithout modifying\b",
             r"\bwithout changing\b(?!\s+(?:tests?|test files?)\b)",
             r"\bno changes\b",
             r"\bread-only\b",
@@ -2567,11 +2572,26 @@ class OllamaCodeAgent:
         lowered = text.lower()
         return "token" in lowered and ("only" in lowered or "exact marker" in lowered or "exact token" in lowered)
 
+    def _request_asks_exact_line_text(self, text: str) -> bool:
+        lowered = text.lower()
+        if "line" not in lowered or "exact" not in lowered:
+            return False
+        return any(phrase in lowered for phrase in ["text on line", "line text", "line only", "that line only"])
+
     def _extract_uppercase_token_from_output(self, output: str) -> str | None:
         for token in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", output):
             if token in {"OK"}:
                 continue
             return token
+        return None
+
+    def _extract_numbered_line_from_output(self, output: str, line_number: int) -> str | None:
+        for line in output.splitlines():
+            match = re.match(r"\s*(\d+)\s+\|\s?(.*)$", line)
+            if not match:
+                continue
+            if int(match.group(1)) == line_number:
+                return match.group(2)
         return None
 
     def _extract_return_value_from_symbol_output(self, output: str) -> str | None:
@@ -3194,6 +3214,11 @@ class OllamaCodeAgent:
                 token = self._extract_uppercase_token_from_output(output)
                 if token:
                     return token
+            target_line_read = self._requested_target_line_read(request_text)
+            if target_line_read is not None and self._request_asks_exact_line_text(request_text):
+                line_text = self._extract_numbered_line_from_output(output, target_line_read.line)
+                if line_text is not None:
+                    return line_text
             if name == "read_symbol" and "return" in request_text.lower() and "value" in request_text.lower():
                 value = self._extract_return_value_from_symbol_output(output)
                 if value:
@@ -3232,6 +3257,11 @@ class OllamaCodeAgent:
             if "printed word" in request_text.lower() or "output" in request_text.lower():
                 return f"Exit code: {result.get('exit_code')}. Output: {output}."
             return f"Exit code: {result.get('exit_code')}."
+
+        if name == "run_shell" and result.get("ok") is True and self._requested_exact_shell_command(request_text):
+            output = str(result.get("output", "")).strip()
+            if output and any(phrase in request_text.lower() for phrase in ["tell me", "reply with", "output"]):
+                return output
 
         if name == "search" and result.get("ok") is True:
             lowered = request_text.lower()
@@ -3613,7 +3643,10 @@ class OllamaCodeAgent:
             return None
 
         read_path = target_line_read.path if target_line_read is not None else self._requested_read_file_path(request_text)
-        if read_path and "read_file" not in forbidden_tool_names and (self._request_asks_token_only(request_text) or self._request_expects_exact_tool_error(request_text)):
+        exact_line_read_requested = target_line_read is not None and self._request_asks_exact_line_text(request_text)
+        if read_path and "read_file" not in forbidden_tool_names and (
+            self._request_asks_token_only(request_text) or self._request_expects_exact_tool_error(request_text) or exact_line_read_requested
+        ):
             if target_line_read is not None:
                 read_args = {"path": target_line_read.path, "start": target_line_read.start, "end": target_line_read.end}
             else:

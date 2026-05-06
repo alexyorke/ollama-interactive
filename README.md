@@ -50,7 +50,7 @@ ollama-code --doctor
 If Ollama is not installed or no model is pulled yet, `--doctor` will report that and print the default pull hint. Install Ollama separately, start the daemon, then pull the default model:
 
 ```bash
-ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS
+ollama pull gemma4:e4b
 ```
 
 Vagrant is not needed by the CLI itself. To test inside a Vagrant VM, install Vagrant plus a provider such as VirtualBox or Hyper-V on the host first, then run the same Linux quickstart inside the guest.
@@ -90,8 +90,8 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
 ```json
 {
   "host": "http://127.0.0.1:11434",
-  "model": "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS",
-  "verifier_model": "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS",
+  "model": "gemma4:e4b",
+  "verifier_model": "gemma4:e4b",
   "approval": "ask",
   "debate": true,
   "reconcile": "auto",
@@ -129,10 +129,10 @@ export OLLAMA_HOST=127.0.0.1:11434
 ollama-code
 ```
 
-The built-in default model is `hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`. Install it once if needed:
+The built-in default model is `gemma4:e4b`. Install it once if needed:
 
 ```bash
-ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS
+ollama pull gemma4:e4b
 ```
 
 Check first-use setup before asking it to edit code:
@@ -392,7 +392,6 @@ git push origin v0.1.0
 - Token profiling is recorded in `llm_call` events, including prompt chars by role and largest prompt messages, so evals can identify input-token waste.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
-- The recommended default coding model is `hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`; install it with `ollama pull hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS`.
-- The recommended serial eval order is `gemma3:4b`, `qwen3:8b`, `granite4.1:8b`, then `gemma4:e4b`.
-- If you do not pass `--model` and the default IQ4_XS Granite quant is not installed, the CLI falls back to the first available preferred local model and prints the pull command.
-- The Windows-side Ollama install still has no usable local models for this project, so running inside WSL is the simplest path.
+- The recommended default coding model is `gemma4:e4b`; install it with `ollama pull gemma4:e4b`.
+- The recommended serial eval order is `gemma4:e4b`, `granite4.1:8b`, `gemma3:4b`, then `qwen3:8b`.
+- If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back to the first available preferred local model and prints the pull command.
