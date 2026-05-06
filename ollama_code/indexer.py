@@ -166,19 +166,21 @@ class BackgroundIndexer:
         file_result = tools.file_index_refresh(".", limit=self.max_files)
         repo_result = tools.repo_index_refresh(".", limit=self.code_limit)
         fts_result = tools.fts_refresh(".", limit=self.fts_limit)
-        ok = all(result.get("ok") is True for result in (file_result, repo_result, fts_result))
+        verified_result = tools.verified_function_index(".", limit=self.code_limit)
+        ok = all(result.get("ok") is True for result in (file_result, repo_result, fts_result, verified_result))
         summary = (
             f"indexed files={file_result.get('files', 0)} "
             f"code={repo_result.get('files', 0)} "
-            f"fts={fts_result.get('files', 0)}"
+            f"fts={fts_result.get('files', 0)} "
+            f"verified={verified_result.get('cards', 0)}"
         )
         with self._lock:
             self._ready = ok
-            self._last_error = None if ok else str(fts_result.get("summary") or repo_result.get("summary") or file_result.get("summary"))
+            self._last_error = None if ok else str(verified_result.get("summary") or fts_result.get("summary") or repo_result.get("summary") or file_result.get("summary"))
             self._last_summary = summary if ok else self._last_error or summary
             self._last_indexed_at = time.time()
             self._refresh_count += 1
-        return {"ok": ok, "summary": summary, "file_index": file_result, "repo_index": repo_result, "fts": fts_result}
+        return {"ok": ok, "summary": summary, "file_index": file_result, "repo_index": repo_result, "fts": fts_result, "verified_functions": verified_result}
 
     def _refresh_paths(self, tools: ToolExecutor, paths: Iterable[str]) -> dict[str, Any]:
         updated = 0
@@ -195,6 +197,8 @@ class BackgroundIndexer:
             suffix = target.suffix.lower()
             if suffix in CODE_FILE_SUFFIXES:
                 tools.repo_index_refresh(rel, limit=1)
+                if suffix == ".py":
+                    tools.verified_function_index(rel, limit=100)
             if suffix in FTS_TEXT_SUFFIXES:
                 tools.fts_refresh(rel, limit=1)
             updated += 1

@@ -22,6 +22,7 @@ import threading
 import textwrap
 import time
 import tomllib
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -55,6 +56,7 @@ CODE_FILE_SUFFIXES = {
 REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
 FTS_INDEX_VERSION = 1
+VERIFIED_FUNCTION_INDEX_VERSION = 1
 INDEX_MUTATING_TOOL_NAMES = {
     "write_file",
     "replace_symbol",
@@ -299,6 +301,36 @@ TOOL_DESCRIPTIONS = [
         "description": "Show compact function contracts, callers/callees, return-shape, and purity hints.",
     },
     {
+        "name": "verified_function_index",
+        "arguments": {"path": "relative path, default .", "limit": "int, default 500"},
+        "description": "Build repo-local Python verified-function cards in the SQLite card index.",
+    },
+    {
+        "name": "verified_function_search",
+        "arguments": {"query": "behavior/function query", "signature": "optional signature terms", "examples": "optional examples text/list", "path": "relative path, default .", "limit": "int, default 10"},
+        "description": "Search repo-local verified/probable/unverified function cards; retrieval is not proof.",
+    },
+    {
+        "name": "verified_function_show",
+        "arguments": {"id": "card id or prefix"},
+        "description": "Show a verified-function card, evidence, source excerpt, and stale/fresh hash status.",
+    },
+    {
+        "name": "verify_function_contract",
+        "arguments": {"path": "Python source file", "symbol": "function/method symbol"},
+        "description": "Recheck one function card with purity, contract checks, doc probes, and focused tests.",
+    },
+    {
+        "name": "compose_verified_functions",
+        "arguments": {"goal": "desired behavior", "candidates": "list of card ids or search result ids"},
+        "description": "Plan glue-code composition from verified function cards without editing files.",
+    },
+    {
+        "name": "promote_verified_function",
+        "arguments": {"path": "Python source file", "symbol": "function/method symbol"},
+        "description": "Promote one Python function to verified only after static checks plus probes/tests pass.",
+    },
+    {
         "name": "lint_typecheck",
         "arguments": {"paths": "path or list of paths, default .", "command": "optional lint/type command", "timeout": "seconds, default 120"},
         "description": "Run deterministic syntax/lint/type checks with exact file lines.",
@@ -470,6 +502,12 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
         "call_graph": "call_graph(path,symbol?,limit=40)",
         "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
+        "verified_function_index": "verified_function_index(path='.',limit=500)",
+        "verified_function_search": "verified_function_search(query,signature?,examples?,path='.',limit=10)",
+        "verified_function_show": "verified_function_show(id)",
+        "verify_function_contract": "verify_function_contract(path,symbol)",
+        "compose_verified_functions": "compose_verified_functions(goal,candidates)",
+        "promote_verified_function": "promote_verified_function(path,symbol)",
         "lint_typecheck": "lint_typecheck(paths='.',command?,timeout=120)",
         "discover_validators": "discover_validators(path='.',limit=12)",
         "diagnose_dependency_error": "diagnose_dependency_error(output,path='.')",
@@ -642,6 +680,12 @@ class ToolExecutor:
             "run_function_probe": self.run_function_probe,
             "call_graph": self.call_graph,
             "contract_graph": self.contract_graph,
+            "verified_function_index": self.verified_function_index,
+            "verified_function_search": self.verified_function_search,
+            "verified_function_show": self.verified_function_show,
+            "verify_function_contract": self.verify_function_contract,
+            "compose_verified_functions": self.compose_verified_functions,
+            "promote_verified_function": self.promote_verified_function,
             "lint_typecheck": self.lint_typecheck,
             "discover_validators": self.discover_validators,
             "diagnose_dependency_error": self.diagnose_dependency_error,
@@ -3802,6 +3846,583 @@ class ToolExecutor:
             "diagnostics": diagnostics[: max(1, int(limit))],
             "output": output,
             "summary": output,
+        }
+
+    def _verified_function_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "verified_functions.sqlite"
+
+    def _connect_verified_functions(self) -> sqlite3.Connection:
+        cache_path = self._verified_function_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(cache_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS verified_functions("
+            "id TEXT PRIMARY KEY,"
+            "language TEXT NOT NULL,"
+            "source_path TEXT NOT NULL,"
+            "symbol TEXT NOT NULL,"
+            "name TEXT NOT NULL,"
+            "hash TEXT NOT NULL,"
+            "proof_level TEXT NOT NULL,"
+            "card_json TEXT NOT NULL,"
+            "updated_at TEXT NOT NULL)"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS verified_function_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT OR REPLACE INTO verified_function_meta(key,value) VALUES('version',?)",
+            (str(VERIFIED_FUNCTION_INDEX_VERSION),),
+        )
+        try:
+            conn.execute(
+                "CREATE VIRTUAL TABLE IF NOT EXISTS verified_function_fts USING fts5("
+                "id UNINDEXED,name,signature,summary,properties,examples,source_path,symbol)"
+            )
+        except sqlite3.OperationalError:
+            conn.close()
+            raise
+        conn.commit()
+        return conn
+
+    def _verified_function_id(self, source_path: str, symbol: str) -> str:
+        digest = hashlib.sha1(f"python:{source_path}:{symbol}".encode("utf-8")).hexdigest()[:16]
+        leaf = symbol.split(".")[-1].replace("_", "-")
+        leaf = re.sub(r"[^A-Za-z0-9-]+", "-", leaf).strip("-").lower() or "function"
+        return f"py-{leaf}-{digest}"
+
+    def _module_name_for_source_path(self, source_path: str) -> str:
+        rel = source_path.replace("\\", "/")
+        if rel.endswith(".py"):
+            rel = rel[:-3]
+        if rel.endswith("/__init__"):
+            rel = rel[: -len("/__init__")]
+        elif rel == "__init__":
+            rel = ""
+        if rel.startswith("src/"):
+            rel = rel[4:]
+        return rel.replace("/", ".")
+
+    def _symbol_source_hash(self, source_path: str, line: int, end: int) -> str:
+        target = self.resolve_path(source_path, allow_missing=False)
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+        body = "\n".join(lines[max(0, line - 1) : max(line - 1, end)]) + "\n"
+        return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    def _docstring_probe_examples(self, node: ast.FunctionDef | ast.AsyncFunctionDef, leaf: str) -> list[dict[str, Any]]:
+        doc = ast.get_docstring(node) or ""
+        if not doc:
+            return []
+        examples: list[dict[str, Any]] = []
+        lines = doc.splitlines()
+        index = 0
+        while index < len(lines):
+            stripped = lines[index].strip()
+            if not stripped.startswith(">>> "):
+                index += 1
+                continue
+            expression = stripped[4:].strip()
+            expected = ""
+            cursor = index + 1
+            while cursor < len(lines):
+                candidate = lines[cursor].strip()
+                if candidate.startswith(">>> "):
+                    break
+                if candidate and not candidate.startswith("..."):
+                    expected = candidate
+                    break
+                cursor += 1
+            if expression and expected and expression.startswith(f"{leaf}("):
+                examples.append(
+                    {
+                        "source": "docstring",
+                        "expression": expression,
+                        "probe_expression": "fn(" + expression[len(leaf) + 1 :],
+                        "expected_repr": expected,
+                        "example": f"{expression} -> {expected}",
+                    }
+                )
+            index = max(cursor, index + 1)
+        return examples[:12]
+
+    def _test_examples_for_card(self, source_path: str, leaf: str, tests: list[str]) -> list[dict[str, Any]]:
+        examples: list[dict[str, Any]] = []
+        for test_path in tests[:4]:
+            result = self.test_spec_extract(test_path=test_path, source_path=source_path, limit=24)
+            if result.get("ok") is not True:
+                continue
+            for item in result.get("examples", []):
+                if not isinstance(item, dict) or str(item.get("symbol")) != leaf:
+                    continue
+                examples.append(
+                    {
+                        "source": "unittest",
+                        "test_path": test_path,
+                        "line": item.get("line"),
+                        "example": item.get("example"),
+                    }
+                )
+                if len(examples) >= 12:
+                    return examples
+        return examples
+
+    def _verified_function_card_for_item(self, item: dict[str, Any], contracts: dict[str, Any]) -> dict[str, Any]:
+        source_path = str(item["path"])
+        symbol = str(item["symbol"])
+        leaf = str(item["name"])
+        line = int(item.get("line") or 1)
+        end = int(item.get("end") or line)
+        node = item.get("node")
+        doc = ast.get_docstring(node) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) else ""
+        summary = next((part.strip() for part in (doc or "").splitlines() if part.strip()), "")
+        if not summary:
+            summary = f"{symbol} in {source_path}"
+        tests = list(contracts.get("tests_by_symbol", {}).get(leaf, []))[:8]
+        key = f"{source_path}:{symbol}"
+        dependencies = sorted({str(call.get("name")) for call in contracts.get("calls_by_def", {}).get(key, []) if call.get("name")})[:24]
+        examples: list[dict[str, Any]] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            examples.extend(self._docstring_probe_examples(node, leaf))
+        examples.extend(self._test_examples_for_card(source_path, leaf, tests))
+        shapes = list(item.get("return_shapes", []))
+        properties = [
+            f"returns={item.get('returns') or 'Any'}",
+            f"return_shapes={','.join(shapes) if shapes else 'unknown'}",
+            f"purity={item.get('purity')}",
+        ]
+        if tests:
+            properties.append("affected_tests=" + ",".join(tests[:4]))
+        proof_level = "probable" if item.get("purity") == "pure_hint" else "unverified"
+        return {
+            "id": self._verified_function_id(source_path, symbol),
+            "name": leaf,
+            "language": "python",
+            "signature": self._contract_signature(item),
+            "purity": str(item.get("purity") or "unknown"),
+            "summary": self._truncate_text(summary, limit=240),
+            "examples": examples,
+            "properties": properties,
+            "dependencies": dependencies,
+            "proof_level": proof_level,
+            "source_path": source_path,
+            "symbol": symbol,
+            "line": line,
+            "hash": self._symbol_source_hash(source_path, line, end),
+            "verified_at": "",
+        }
+
+    def _verified_function_upsert(self, conn: sqlite3.Connection, card: dict[str, Any]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        card_json = json.dumps(card, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            "INSERT OR REPLACE INTO verified_functions(id,language,source_path,symbol,name,hash,proof_level,card_json,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                card["id"],
+                card["language"],
+                card["source_path"],
+                card["symbol"],
+                card["name"],
+                card["hash"],
+                card["proof_level"],
+                card_json,
+                now,
+            ),
+        )
+        conn.execute("DELETE FROM verified_function_fts WHERE id=?", (card["id"],))
+        conn.execute(
+            "INSERT INTO verified_function_fts(id,name,signature,summary,properties,examples,source_path,symbol) VALUES(?,?,?,?,?,?,?,?)",
+            (
+                card["id"],
+                card["name"],
+                card["signature"],
+                card["summary"],
+                "\n".join(str(item) for item in card.get("properties", [])),
+                "\n".join(str(item.get("example") or item) for item in card.get("examples", []) if isinstance(item, dict)),
+                card["source_path"],
+                card["symbol"],
+            ),
+        )
+
+    def _verified_function_card_from_row(self, row: sqlite3.Row | tuple[Any, ...]) -> dict[str, Any]:
+        raw = row["card_json"] if isinstance(row, sqlite3.Row) else row[0]
+        data = json.loads(str(raw))
+        return data if isinstance(data, dict) else {}
+
+    def _verified_function_lookup(self, conn: sqlite3.Connection, raw_id: str) -> tuple[dict[str, Any] | None, str | None]:
+        clean = raw_id.strip()
+        if not clean:
+            return None, "verified_function_show requires a card id."
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT card_json FROM verified_functions WHERE id=?", (clean,)).fetchall()
+        if not rows:
+            rows = conn.execute("SELECT card_json FROM verified_functions WHERE id LIKE ? ORDER BY id LIMIT 3", (clean + "%",)).fetchall()
+        if not rows:
+            return None, f"No verified function card found for id: {clean}"
+        if len(rows) > 1:
+            ids = [self._verified_function_card_from_row(row).get("id", "") for row in rows]
+            return None, "Ambiguous card id prefix: " + ", ".join(str(item) for item in ids if item)
+        return self._verified_function_card_from_row(rows[0]), None
+
+    def _verified_function_current_hash(self, card: dict[str, Any]) -> str | None:
+        source_path = str(card.get("source_path") or "")
+        symbol = str(card.get("symbol") or "")
+        if not source_path or not symbol:
+            return None
+        try:
+            target = self.resolve_path(source_path, allow_missing=False)
+        except Exception:
+            return None
+        contracts = self._python_function_contracts(target)
+        for item in contracts.get("definitions", {}).values():
+            if item.get("symbol") == symbol or item.get("name") == symbol:
+                return self._symbol_source_hash(str(item["path"]), int(item.get("line") or 1), int(item.get("end") or item.get("line") or 1))
+        return None
+
+    def _verified_function_stale(self, card: dict[str, Any]) -> bool:
+        current = self._verified_function_current_hash(card)
+        return current is None or current != card.get("hash")
+
+    def _verified_card_in_scope(self, card: dict[str, Any], base: Path) -> bool:
+        source = str(card.get("source_path") or "").replace("\\", "/")
+        if not source:
+            return False
+        base_rel = self.relative_label(base).replace("\\", "/") if base.exists() else "."
+        if base.is_file():
+            return source == base_rel
+        return base_rel in {"", "."} or source == base_rel or source.startswith(base_rel.rstrip("/") + "/")
+
+    def verified_function_index(self, path: str = ".", limit: int = 500) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        try:
+            conn = self._connect_verified_functions()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("verified_function_index", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        contracts = self._python_function_contracts(base, limit=max(1, int(limit)))
+        definitions = list(contracts.get("definitions", {}).values())
+        conn.row_factory = sqlite3.Row
+        existing_rows = conn.execute("SELECT card_json FROM verified_functions").fetchall()
+        existing = {str(card.get("id")): card for card in (self._verified_function_card_from_row(row) for row in existing_rows) if card.get("id")}
+        seen: set[str] = set()
+        indexed = 0
+        stale = 0
+        with conn:
+            for item in definitions[: max(1, int(limit))]:
+                self._check_interrupted()
+                try:
+                    card = self._verified_function_card_for_item(item, contracts)
+                except Exception:
+                    continue
+                previous = existing.get(str(card["id"]))
+                if previous and previous.get("proof_level") == "verified":
+                    if previous.get("hash") == card.get("hash"):
+                        card = previous
+                    else:
+                        card = dict(previous)
+                        card["proof_level"] = "unverified"
+                        properties = list(card.get("properties", []))
+                        if "stale: source changed" not in properties:
+                            properties.append("stale: source changed")
+                        card["properties"] = properties
+                        stale += 1
+                self._verified_function_upsert(conn, card)
+                seen.add(str(card["id"]))
+                indexed += 1
+            for card in existing.values():
+                if str(card.get("id")) in seen or not self._verified_card_in_scope(card, base):
+                    continue
+                marked = dict(card)
+                marked["proof_level"] = "unverified"
+                properties = list(marked.get("properties", []))
+                if "stale: source missing or no longer indexed" not in properties:
+                    properties.append("stale: source missing or no longer indexed")
+                marked["properties"] = properties
+                self._verified_function_upsert(conn, marked)
+                stale += 1
+        conn.close()
+        return {
+            "ok": True,
+            "tool": "verified_function_index",
+            "path": self.relative_label(base),
+            "cards": indexed,
+            "stale": stale,
+            "cache": self.relative_label(self._verified_function_cache_path()),
+            "summary": f"verified function cards indexed={indexed} stale={stale}",
+            "output": f"indexed={indexed}\nstale={stale}\ncache={self.relative_label(self._verified_function_cache_path())}",
+        }
+
+    def verified_function_search(
+        self,
+        query: str,
+        signature: str | None = None,
+        examples: str | list[Any] | None = None,
+        path: str = ".",
+        limit: int = 10,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        if not self._verified_function_cache_path().exists():
+            refresh = self.verified_function_index(self.relative_label(base), limit=500)
+            if refresh.get("ok") is not True:
+                return refresh
+        example_text = " ".join(str(item) for item in examples) if isinstance(examples, list) else str(examples or "")
+        clean_query = " ".join(part for part in [query, signature or "", example_text] if str(part).strip()).strip()
+        fts_query = self._safe_fts_query(clean_query)
+        if not fts_query:
+            return {"ok": False, "tool": "verified_function_search", "summary": "verified_function_search requires a non-empty query."}
+        try:
+            conn = self._connect_verified_functions()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("verified_function_search", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        conn.row_factory = sqlite3.Row
+        limit_value = max(1, int(limit))
+        try:
+            rows = conn.execute(
+                "SELECT c.card_json,bm25(verified_function_fts) AS rank "
+                "FROM verified_function_fts JOIN verified_functions c ON c.id=verified_function_fts.id "
+                "WHERE verified_function_fts MATCH ? ORDER BY rank LIMIT ?",
+                (fts_query, limit_value * 4),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            like = "%" + clean_query.replace("%", "").replace("_", "") + "%"
+            rows = conn.execute(
+                "SELECT card_json,0 AS rank FROM verified_functions WHERE card_json LIKE ? ORDER BY id LIMIT ?",
+                (like, limit_value * 4),
+            ).fetchall()
+        cards: list[dict[str, Any]] = []
+        terms = {term.lower() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", clean_query)}
+        for row in rows:
+            card = self._verified_function_card_from_row(row)
+            if not card or not self._verified_card_in_scope(card, base):
+                continue
+            score = 0
+            if str(card.get("name", "")).lower() in terms:
+                score += 8
+            if signature and signature.lower() in str(card.get("signature", "")).lower():
+                score += 4
+            if card.get("proof_level") == "verified":
+                score += 3
+            elif card.get("proof_level") == "probable":
+                score += 1
+            card = dict(card)
+            card["stale"] = self._verified_function_stale(card)
+            card["_score"] = score
+            cards.append(card)
+        cards.sort(key=lambda item: (-int(item.get("_score", 0)), str(item.get("source_path")), str(item.get("symbol"))))
+        selected = cards[:limit_value]
+        lines = [
+            f"{card['id']} {card['proof_level']}{' stale' if card.get('stale') else ' fresh'} {card['purity']} "
+            f"{card['signature']} @ {card['source_path']}:{card['line']} - {card['summary']}"
+            for card in selected
+        ]
+        for card in selected:
+            card.pop("_score", None)
+        conn.close()
+        return {
+            "ok": True,
+            "tool": "verified_function_search",
+            "query": query,
+            "count": len(selected),
+            "cards": selected,
+            "output": "\n".join(lines) if lines else "(no verified function cards found)",
+        }
+
+    def verified_function_show(self, id: str) -> dict[str, Any]:
+        self._check_interrupted()
+        try:
+            conn = self._connect_verified_functions()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("verified_function_show", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        card, error = self._verified_function_lookup(conn, id)
+        conn.close()
+        if error or card is None:
+            return {"ok": False, "tool": "verified_function_show", "summary": error or "Card not found."}
+        stale = self._verified_function_stale(card)
+        try:
+            source = self.read_symbol(str(card.get("source_path")), str(card.get("symbol")), include_context=1)
+            excerpt = str(source.get("output") or source.get("summary") or "")
+        except FileNotFoundError:
+            excerpt = "(source file missing)"
+        evidence = [
+            f"proof_level={card.get('proof_level')}",
+            f"purity={card.get('purity')}",
+            f"hash_status={'stale' if stale else 'fresh'}",
+            f"examples={len(card.get('examples') or [])}",
+        ]
+        lines = [
+            f"{card.get('id')} {card.get('proof_level')} {'stale' if stale else 'fresh'}",
+            f"{card.get('signature')} @ {card.get('source_path')}:{card.get('line')}",
+            str(card.get("summary") or ""),
+            "evidence: " + ", ".join(evidence),
+            self._truncate_text(excerpt, limit=1200),
+        ]
+        return {
+            "ok": True,
+            "tool": "verified_function_show",
+            "id": card.get("id"),
+            "card": card,
+            "stale": stale,
+            "source_excerpt": excerpt,
+            "output": "\n".join(line for line in lines if line),
+        }
+
+    def _definition_for_symbol(self, path: str, symbol: str) -> tuple[dict[str, Any] | None, dict[str, Any], str | None]:
+        target = self.resolve_path(path, allow_missing=False)
+        if target.suffix.lower() != ".py":
+            return None, {}, "Python source files only."
+        contracts = self._python_function_contracts(target)
+        matches = [
+            item
+            for item in contracts.get("definitions", {}).values()
+            if item.get("symbol") == symbol or str(item.get("symbol", "")).endswith(f".{symbol}") or item.get("name") == symbol
+        ]
+        if not matches:
+            return None, contracts, f"No Python function symbol found for {symbol} in {self.relative_label(target)}."
+        matches.sort(key=lambda item: (str(item.get("symbol")) != symbol, len(str(item.get("symbol")))))
+        return matches[0], contracts, None
+
+    def _probe_docstring_examples(self, card: dict[str, Any]) -> tuple[bool, list[str]]:
+        doc_examples = [
+            item for item in card.get("examples", [])
+            if isinstance(item, dict) and item.get("source") == "docstring" and item.get("probe_expression")
+        ]
+        if not doc_examples:
+            return False, []
+        module = self._module_name_for_source_path(str(card.get("source_path")))
+        leaf = str(card.get("name"))
+        expressions = [str(item["probe_expression"]) for item in doc_examples]
+        probe = self.run_function_probe(module=module, function=leaf, expressions=expressions, timeout=30)
+        rows = probe.get("results", []) if isinstance(probe.get("results"), list) else []
+        diagnostics: list[str] = []
+        passed = probe.get("ok") is True and len(rows) == len(doc_examples)
+        for item, row in zip(doc_examples, rows):
+            expected = str(item.get("expected_repr"))
+            actual = str(row.get("repr") if isinstance(row, dict) else "")
+            if actual != expected:
+                passed = False
+                diagnostics.append(f"probe {item.get('expression')} expected {expected} got {actual or row}")
+        return passed, diagnostics or [str(probe.get("output") or "docstring probes passed")]
+
+    def verify_function_contract(self, path: str, symbol: str) -> dict[str, Any]:
+        self._check_interrupted()
+        item, contracts, error = self._definition_for_symbol(path, symbol)
+        if error or item is None:
+            return {"ok": False, "tool": "verify_function_contract", "summary": error or "Function not found."}
+        card = self._verified_function_card_for_item(item, contracts)
+        rel = str(card["source_path"])
+        leaf = str(card["name"])
+        contract = self.contract_check([rel], changed_symbols=[leaf])
+        pure = card.get("purity") == "pure_hint"
+        probe_passed, probe_evidence = self._probe_docstring_examples(card)
+        selected = self.select_tests([rel], changed_symbols=[leaf], limit=1)
+        test_passed = False
+        test_evidence = str(selected.get("summary") or "")
+        commands = selected.get("test_commands") if isinstance(selected.get("test_commands"), list) else []
+        if commands:
+            test_result = self.run_test(str(commands[0]), timeout=1200)
+            test_passed = test_result.get("ok") is True
+            test_evidence = str(test_result.get("summary") or test_result.get("output") or "")
+        diagnostics: list[str] = []
+        if not pure:
+            diagnostics.append("purity is not pure_hint")
+        if contract.get("ok") is not True:
+            diagnostics.append(str(contract.get("summary") or contract.get("output") or "contract_check failed"))
+        if probe_evidence and not probe_passed:
+            diagnostics.extend(probe_evidence)
+        has_executable_evidence = probe_passed or test_passed
+        if not has_executable_evidence:
+            diagnostics.append("no passing executable docstring probe or focused test evidence")
+        proof_level = "verified" if pure and contract.get("ok") is True and has_executable_evidence and not diagnostics else "probable" if pure and contract.get("ok") is True else "unverified"
+        verified_at = datetime.now(timezone.utc).isoformat() if proof_level == "verified" else ""
+        card["proof_level"] = proof_level
+        card["verified_at"] = verified_at
+        card["properties"] = list(card.get("properties", [])) + [
+            f"contract_check={'pass' if contract.get('ok') is True else 'fail'}",
+            f"docstring_probe={'pass' if probe_passed else 'missing_or_fail'}",
+            f"focused_test={'pass' if test_passed else 'missing_or_fail'}",
+        ]
+        evidence = {
+            "contract_check": contract.get("output"),
+            "docstring_probe": probe_evidence,
+            "focused_test": test_evidence,
+            "diagnostics": diagnostics,
+        }
+        return {
+            "ok": proof_level == "verified",
+            "tool": "verify_function_contract",
+            "proof_level": proof_level,
+            "card": card,
+            "evidence": evidence,
+            "summary": "verified" if proof_level == "verified" else "not verified: " + "; ".join(diagnostics),
+            "output": json.dumps({"proof_level": proof_level, "diagnostics": diagnostics, "card": card}, indent=2),
+        }
+
+    def promote_verified_function(self, path: str, symbol: str) -> dict[str, Any]:
+        self._check_interrupted()
+        verified = self.verify_function_contract(path, symbol)
+        if verified.get("ok") is not True:
+            result = dict(verified)
+            result["tool"] = "promote_verified_function"
+            result["summary"] = "Promotion rejected: " + str(verified.get("summary") or "verification failed")
+            return result
+        try:
+            conn = self._connect_verified_functions()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("promote_verified_function", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        card = dict(verified["card"])
+        with conn:
+            self._verified_function_upsert(conn, card)
+        conn.close()
+        return {
+            "ok": True,
+            "tool": "promote_verified_function",
+            "id": card["id"],
+            "card": card,
+            "summary": f"Promoted {card['symbol']} to verified.",
+            "output": f"{card['id']} verified {card['signature']} @ {card['source_path']}:{card['line']}",
+        }
+
+    def compose_verified_functions(self, goal: str, candidates: list[str] | str) -> dict[str, Any]:
+        self._check_interrupted()
+        raw_ids = [candidates] if isinstance(candidates, str) else list(candidates or [])
+        ids = [str(item).strip() for raw in raw_ids for item in str(raw).split(",") if str(item).strip()]
+        if not ids:
+            return {"ok": False, "tool": "compose_verified_functions", "summary": "compose_verified_functions requires candidate card ids."}
+        try:
+            conn = self._connect_verified_functions()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("compose_verified_functions", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        cards: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for raw_id in ids:
+            card, error = self._verified_function_lookup(conn, raw_id)
+            if card is None:
+                missing.append(error or raw_id)
+                continue
+            card = dict(card)
+            card["stale"] = self._verified_function_stale(card)
+            cards.append(card)
+        conn.close()
+        lines = [f"Goal: {goal.strip()}", "Composition plan:"]
+        for index, card in enumerate(cards, start=1):
+            status = str(card.get("proof_level"))
+            if card.get("stale"):
+                status = "unverified"
+            lines.append(f"{index}. Use {card.get('signature')} from {card.get('source_path')} [{status}]")
+        unsafe = [card for card in cards if card.get("proof_level") != "verified" or card.get("stale")]
+        if unsafe:
+            lines.append("Missing adapters/verification: re-promote or replace unverified/stale candidates before trusting generated glue.")
+        else:
+            lines.append("All candidates are verified/fresh; write only glue and run composition tests.")
+        if missing:
+            lines.append("Missing cards: " + "; ".join(missing))
+        return {
+            "ok": not missing,
+            "tool": "compose_verified_functions",
+            "goal": goal,
+            "cards": cards,
+            "missing": missing,
+            "output": "\n".join(lines),
         }
 
     def call_graph(self, path: str = ".", symbol: str | None = None, limit: int = 40) -> dict[str, Any]:

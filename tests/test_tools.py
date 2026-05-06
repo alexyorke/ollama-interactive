@@ -1006,6 +1006,12 @@ class ToolExecutorTests(unittest.TestCase):
                 "discover_validators",
                 "diagnose_dependency_error",
                 "test_spec_extract",
+                "verified_function_index",
+                "verified_function_search",
+                "verified_function_show",
+                "verify_function_contract",
+                "compose_verified_functions",
+                "promote_verified_function",
                 "browser_smoke",
                 "security_scan",
                 "mcp_list_tools",
@@ -1681,6 +1687,140 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("pure_hint", result["output"])
         self.assertIn("shell", all_result["output"])
         self.assertIn("impure_hint", all_result["output"])
+
+    def test_verified_function_index_search_and_show_cards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "utils.py").write_text(
+                '''
+def normalize_phone(value: str) -> str:
+    """Normalize phone digits for lookup."""
+    return "".join(ch for ch in value if ch.isdigit())
+
+def noisy(value: str) -> str:
+    print(value)
+    return value
+'''.lstrip(),
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            indexed = tools.verified_function_index()
+            search = tools.verified_function_search("phone lookup")
+            card_id = search["cards"][0]["id"]
+            shown = tools.verified_function_show(card_id)
+
+        self.assertTrue(indexed["ok"])
+        self.assertGreaterEqual(indexed["cards"], 2)
+        self.assertTrue(search["ok"])
+        self.assertIn("normalize_phone", search["output"])
+        self.assertEqual(search["cards"][0]["proof_level"], "probable")
+        self.assertTrue(shown["ok"])
+        self.assertFalse(shown["stale"])
+        self.assertIn("Normalize phone digits", shown["output"])
+
+    def test_promote_verified_function_with_docstring_probe_and_stale_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "math_utils.py"
+            target.write_text(
+                '''
+def double(value: int) -> int:
+    """Double an integer.
+
+    >>> double(3)
+    6
+    """
+    return value * 2
+'''.lstrip(),
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            promoted = tools.promote_verified_function("math_utils.py", "double")
+            shown_fresh = tools.verified_function_show(promoted["id"])
+            target.write_text(target.read_text(encoding="utf-8").replace("value * 2", "value * 3"), encoding="utf-8")
+            shown_stale = tools.verified_function_show(promoted["id"])
+
+        self.assertTrue(promoted["ok"], promoted.get("summary"))
+        self.assertEqual(promoted["card"]["proof_level"], "verified")
+        self.assertFalse(shown_fresh["stale"])
+        self.assertTrue(shown_stale["stale"])
+
+    def test_verify_function_contract_rejects_failing_docstring_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "math_utils.py").write_text(
+                '''
+def double(value: int) -> int:
+    """Double an integer.
+
+    >>> double(3)
+    7
+    """
+    return value * 2
+'''.lstrip(),
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.verify_function_contract("math_utils.py", "double")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("expected 7 got 6", result["summary"])
+
+    def test_promote_verified_function_with_focused_unittest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "math_utils.py").write_text(
+                "def triple(value: int) -> int:\n"
+                "    return value * 3\n",
+                encoding="utf-8",
+            )
+            (root / "test_math_utils.py").write_text(
+                "import unittest\n"
+                "from math_utils import triple\n\n"
+                "class MathTests(unittest.TestCase):\n"
+                "    def test_triple(self):\n"
+                "        self.assertEqual(triple(3), 9)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.promote_verified_function("math_utils.py", "triple")
+
+        self.assertTrue(result["ok"], result.get("summary"))
+        self.assertEqual(result["card"]["proof_level"], "verified")
+        self.assertIn("focused_test=pass", result["card"]["properties"])
+
+    def test_compose_verified_functions_labels_unverified_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "utils.py").write_text(
+                "def strip_name(value: str) -> str:\n"
+                "    return value.strip()\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            search = tools.verified_function_search("strip name")
+            card_id = search["cards"][0]["id"]
+
+            result = tools.compose_verified_functions("clean a customer name", [card_id])
+
+        self.assertTrue(result["ok"])
+        self.assertIn("strip_name", result["output"])
+        self.assertIn("Missing adapters/verification", result["output"])
+
+    def test_verify_function_contract_reports_missing_symbol(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "utils.py").write_text("def present():\n    return 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.verify_function_contract("utils.py", "missing")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("No Python function symbol", result["summary"])
 
     def test_contract_check_passes_compatible_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

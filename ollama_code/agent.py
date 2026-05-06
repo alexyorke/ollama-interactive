@@ -129,6 +129,7 @@ QUESTION_PLANNER_EVIDENCE_LIMIT = 5
 QUESTION_PLANNER_MAX_QUESTIONS = 3
 TODO_TOOL_NAMES = {"todo_read", "todo_write"}
 MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent", "git_commit"}
+VERIFIED_FUNCTION_TOOL_NAMES = {"verified_function_index", "verified_function_search", "verified_function_show", "verify_function_contract", "compose_verified_functions", "promote_verified_function"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "list_files",
     "read_file",
@@ -158,15 +159,18 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "diagnose_dependency_error",
     "call_graph",
     "contract_graph",
+    "verified_function_search",
+    "verified_function_show",
+    "compose_verified_functions",
     "lint_typecheck",
     "contract_check",
     "select_tests",
     "git_status",
     "git_diff",
 }
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "diagnose_dependency_error", "call_graph", "contract_graph", "discover_validators", "mcp_list_tools"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
 CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
-INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh"}
+INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh", "verified_function_index"}
 STRUCTURAL_SEARCH_TOOL_NAMES = {"semgrep_scan", "ast_search"}
 LSP_TOOL_NAMES = {"lsp_diagnostics", "lsp_definition", "lsp_references"}
 GRAPH_TOOL_NAMES = {"call_graph", "contract_graph"}
@@ -176,9 +180,9 @@ TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "test_spec_extract", "di
 SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "discover_validators", "test_spec_extract", "mcp_list_tools"}
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "diagnose_dependency_error", "contract_graph"}
-VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
+CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "mcp_list_tools"}
+GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
+VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "verify_function_contract", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
 MODEL_TOOL_RESULT_LIMITS = {
@@ -210,6 +214,12 @@ MODEL_TOOL_RESULT_LIMITS = {
     "run_function_probe": 700,
     "call_graph": 900,
     "contract_graph": 1000,
+    "verified_function_index": 500,
+    "verified_function_search": 1200,
+    "verified_function_show": 1400,
+    "verify_function_contract": 1400,
+    "compose_verified_functions": 1200,
+    "promote_verified_function": 1200,
     "lint_typecheck": 800,
     "discover_validators": 800,
     "diagnose_dependency_error": 800,
@@ -490,6 +500,8 @@ class OllamaCodeAgent:
             selected.add("systems_lens")
         if re.search(r"\b(?:refactor|signature|type|return|caller|callee|contract|pipeline|pure|function chain)\b", lowered):
             selected.update(GRAPH_TOOL_NAMES)
+        if re.search(r"\b(?:verified|known utilit|reusable function|verified function|function card|compose|lego|legos|do not invent|don't invent|dont invent|pure function|purity)\b", lowered):
+            selected.update(VERIFIED_FUNCTION_TOOL_NAMES)
         if re.search(r"\b(?:library|package|site-packages|stdlib|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
             selected.add("inspect_library_source")
         if re.search(r"\b(?:ast|ast-grep|semgrep|structural|syntax-aware|codemod|pattern search|api misuse)\b", lowered):

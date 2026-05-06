@@ -658,6 +658,7 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("lsp_references", selected)
         self.assertNotIn("mcp_list_tools", selected)
         self.assertNotIn("fts_refresh", selected)
+        self.assertNotIn("verified_function_search", selected)
 
     def test_primary_tools_add_specialty_tools_by_intent(self) -> None:
         root = self._workspace_scratch()
@@ -680,6 +681,28 @@ class AgentTests(unittest.TestCase):
         self.assertIn("lsp_definition", selected)
         self.assertIn("ast_search", selected)
         self.assertIn("semgrep_scan", selected)
+
+    def test_primary_tools_add_verified_function_tools_by_intent(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        selected = agent._primary_tool_names_for_request(
+            "Find a verified reusable function card and compose it; do not invent code.",
+            requires_tools=True,
+            session_memory_request=False,
+            mutation_allowed=False,
+            mutation_required=False,
+            test_run_required=False,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+
+        self.assertIn("verified_function_search", selected)
+        self.assertIn("verified_function_show", selected)
+        self.assertIn("compose_verified_functions", selected)
+        self.assertIn("promote_verified_function", selected)
 
     def test_primary_tools_include_todos_for_complex_work(self) -> None:
         root = self._workspace_scratch()

@@ -8,6 +8,7 @@ It gives the model a guarded tool loop for:
 - reading files
 - searching the workspace with `rg`, optional `fd`, and a repo-local background SQLite/FTS index
 - searching code symbols, showing compact code outlines, and reading exact function/class bodies
+- indexing and searching repo-local verified function cards for reusable Python utilities
 - writing or replacing file content
 - running shell commands
 - running a configured test command
@@ -206,7 +207,9 @@ You can set failed-artifact reconciliation with `OLLAMA_CODE_RECONCILE=off|on|au
 You can override the verifier/rewrite model with `OLLAMA_CODE_VERIFIER_MODEL`.
 The client sends `temperature=0` by default for reproducible local runs. It also sends an adaptive `num_ctx` option for normal compact turns so large-context models do not allocate 40K-131K context for tiny prompts. Set `OLLAMA_CODE_NUM_CTX=off` to use the model default, or set an integer such as `8192` to force a fixed context.
 
-The background indexer is on by default. It keeps `.ollama-code/index` warm for `file_search`, `repo_index_search`, `indexed_search`, and `fts_search`; it never executes project code and can be disabled with `"indexer": {"enabled": false}` or `--no-indexer`.
+The background indexer is on by default. It keeps `.ollama-code/index` warm for `file_search`, `repo_index_search`, `indexed_search`, `fts_search`, and `verified_function_search`; it never executes project code and can be disabled with `"indexer": {"enabled": false}` or `--no-indexer`.
+
+The verified function library stores Python cards in `.ollama-code/index/verified_functions.sqlite`. Retrieval finds candidate utilities only; trust is labeled as `verified`, `probable`, or `unverified` from source hashes, purity hints, extracted examples, probes, and focused tests.
 
 Profile local Ollama speed with raw load/prompt/generation counters:
 
