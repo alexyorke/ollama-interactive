@@ -437,7 +437,7 @@ def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> Non
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run stricter end-to-end checks against a real Ollama Code model.")
-    parser.add_argument("--model", default="batiai/gemma4-26b:iq4", help="Model to test.")
+    parser.add_argument("--model", default="gemma4:e4b", help="Model to test.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent

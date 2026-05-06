@@ -99,6 +99,36 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertIn("context-planner", recommendation_ids)
         self.assertIn("loop-cap", recommendation_ids)
 
+    def test_summarize_dataset_counts_mechanical_turn_candidates(self) -> None:
+        rows = [
+            {
+                "trajectory": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "search", "arguments": "{}"}}]},
+                    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}]},
+                ]
+            },
+            {
+                "trajectory": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "git_status", "arguments": "{}"}}]},
+                    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "git_diff", "arguments": "{}"}}]},
+                ]
+            },
+            {
+                "trajectory": [
+                    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "read_file", "arguments": "{}"}}]},
+                    {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "replace_symbol", "arguments": "{}"}}]},
+                ]
+            },
+        ]
+
+        summary = profile._summarize_dataset("sample", "openhands", rows)
+
+        self.assertEqual(summary["mechanical_turn_candidates_pct"], 66.67)
+        self.assertEqual(summary["mechanical_turn_category_counts"]["read_search_only"], 1)
+        self.assertEqual(summary["mechanical_turn_category_counts"]["git_only"], 1)
+        recommendation_ids = {item["id"] for item in summary["recommendations"]}
+        self.assertIn("mechanical-router", recommendation_ids)
+
     def test_portfolio_recommendations_merge_by_id(self) -> None:
         datasets = [
             {

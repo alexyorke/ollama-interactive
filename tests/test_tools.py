@@ -1005,6 +1005,7 @@ class ToolExecutorTests(unittest.TestCase):
                 "systems_lens",
                 "discover_validators",
                 "diagnose_dependency_error",
+                "test_spec_extract",
                 "browser_smoke",
                 "security_scan",
                 "mcp_list_tools",
@@ -1177,6 +1178,190 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "apply_structured_edit")
         self.assertIn("def add(left: int, right: int) -> int:\n    return left + right", final_text)
 
+    def test_edit_intent_normalizes_signature_like_body_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "list_ops.py"
+            sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent("list_ops.py", "replace_body", "append(list1, list2)", "return list1 + list2")
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("return list1 + list2", final_text)
+
+    def test_edit_intent_normalizes_def_like_body_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "list_ops.py"
+            sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent("list_ops.py", "replace_body", "def append(list1, list2):", "return list1 + list2")
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("return list1 + list2", final_text)
+
+    def test_replace_body_full_matching_function_replaces_symbol_not_nested_def(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "pig_latin.py"
+            sample.write_text("def translate(text):\n    return None\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "pig_latin.py",
+                "replace_body",
+                "translate",
+                "def translate(text):\n    return text + 'ay'\n",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Routed full function replacement", result["summary"])
+        self.assertEqual(final_text.count("def translate"), 1)
+        self.assertIn("return text + 'ay'", final_text)
+
+    def test_replace_body_full_mismatched_function_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "pig_latin.py"
+            original = "def translate(text):\n    return None\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "pig_latin.py",
+                "replace_body",
+                "translate",
+                "def encode(text):\n    return text + 'ay'\n",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertEqual(final_text, original)
+
+    def test_apply_structured_edit_replace_body_full_function_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "app.py"
+            original = "def add(left, right):\n    return None\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            ok = tools.apply_structured_edit(
+                {"op": "replace_function_body", "path": "app.py", "symbol": "add", "body": "def add(left, right):\n    return left + right\n"}
+            )
+            bad = tools.apply_structured_edit(
+                {"op": "replace_function_body", "path": "app.py", "symbol": "add", "body": "def subtract(left, right):\n    return left - right\n"}
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(ok["ok"], ok)
+        self.assertEqual(ok["routed_tool"], "replace_symbol")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error_class"], "invalid_args")
+        self.assertEqual(final_text.count("def add"), 1)
+        self.assertIn("return left + right", final_text)
+
+    def test_edit_intent_repairs_common_join_typo_in_body_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "joiner.py"
+            sample.write_text("def join_items(items):\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent("joiner.py", "replace_body", "join_items", "return '.join(items)")
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn('return " ".join(items)', final_text)
+
+    def test_edit_intent_dedents_body_even_with_unindented_comments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            sample.write_text("def keep(values):\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "ops.py",
+                "replace_body",
+                "keep",
+                "    return [value for value in values]\n\n# model note that should not break indentation",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("def keep(values):\n    return [value for value in values]\n\n    # model note", final_text)
+        self.assertNotIn("\n        return [value", final_text)
+
+    def test_edit_intent_rejects_calling_shadowed_builtin_parameter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            original = "def map_values(function, list):\n    pass\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "ops.py",
+                "replace_body",
+                "map_values",
+                "return list(map(function, list))",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertIn("shadows the Python builtin", result["summary"])
+        self.assertEqual(final_text, original)
+
+    def test_edit_intent_rejects_ignoring_initial_parameter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            original = "def foldr(function, list, initial):\n    pass\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "ops.py",
+                "replace_body",
+                "foldr",
+                "result = None\nfor item in reversed(list):\n    result = function(item) if result is None else function(item, result)\nreturn result",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertIn("initial", result["summary"])
+        self.assertEqual(final_text, original)
+
+    def test_edit_intent_rejects_reversed_foldr_reducer_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "ops.py"
+            original = "def foldr(function, list, initial):\n    pass\n"
+            sample.write_text(original, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "ops.py",
+                "replace_body",
+                "foldr",
+                "result = initial\nfor item in reversed(list):\n    result = function(item, result)\nreturn result",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertIn("foldr reducer arguments look reversed", result["summary"])
+        self.assertEqual(final_text, original)
+
     def test_edit_intent_routes_fix_like_full_function_to_symbol_replace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1196,6 +1381,51 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "replace_symbol")
         self.assertIn("return left + right", final_text)
         self.assertNotIn("def def", final_text)
+
+    def test_test_spec_extract_parses_unittest_examples_and_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wordy.py").write_text("def answer(question):\n    pass\n\n\ndef keep(function, values):\n    pass\n", encoding="utf-8")
+            (root / "wordy_test.py").write_text(
+                "import unittest\nfrom wordy import answer, keep as wordy_keep\n\n"
+                "class WordyTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(answer('What is 1 plus 1?'), 2)\n"
+                "    def test_alias(self):\n"
+                "        self.assertEqual(wordy_keep(lambda value: value > 1, [1, 2]), [2])\n"
+                "    def test_bad(self):\n"
+                "        with self.assertRaises(ValueError):\n"
+                "            answer('What is 52 cubed?')\n"
+                "    def test_direct_raises(self):\n"
+                "        self.assertRaises(ValueError, answer, 'What is?')\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("wordy_test.py", source_path="wordy.py", limit=10)
+
+        self.assertTrue(result["ok"], result)
+        output = result["output"]
+        self.assertIn("answer('What is 1 plus 1?') -> 2", output)
+        self.assertIn("keep(lambda value: value > 1, [1, 2]) -> [2]", output)
+        self.assertIn("answer('What is 52 cubed?') raises ValueError", output)
+        self.assertIn("answer('What is?') raises ValueError", output)
+
+    def test_broad_scans_skip_public_benchmark_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".meta").mkdir()
+            (root / ".meta" / "example.py").write_text("SECRET_REFERENCE = 1\n", encoding="utf-8")
+            (root / "exercise.py").write_text("def answer():\n    pass\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            listed = tools.list_files()
+            searched = tools.search("SECRET_REFERENCE")
+            indexed = tools.repo_index_refresh()
+
+        self.assertNotIn(".meta", listed["output"])
+        self.assertEqual(searched["output"], "(no matches)")
+        self.assertTrue(indexed["ok"], indexed)
+        self.assertEqual(indexed["files"], 1)
 
     def test_edit_intent_unknown_intent_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1887,6 +2117,20 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
+
+    def test_run_test_allows_unittest_discover_dot_start_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sample_test.py").write_text(
+                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_test(f"{sys.executable} -m unittest discover -s . -p *_test.py -v")
+
+        self.assertTrue(result["ok"], result.get("summary") or result.get("output"))
+        self.assertEqual(result["tool"], "run_test")
+        self.assertNotIn("path escapes workspace", str(result.get("summary", "")))
 
     def test_run_test_normalizes_escaped_cwd_to_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -120,6 +120,7 @@ Precedence:
 - when resuming a saved session, the saved model wins unless `--model` is provided
 - `OLLAMA_HOST`, `OLLAMA_CODE_MODEL`, `OLLAMA_CODE_VERIFIER_MODEL`, `OLLAMA_CODE_TEST_CMD`, `OLLAMA_CODE_DEBATE`, `OLLAMA_CODE_RECONCILE`, and `OLLAMA_CODE_NUM_CTX` override the config file for one-off runs
 - otherwise the CLI falls back to `.ollama-code/config.json`, then the built-in defaults
+- if the built-in default is not installed, runtime fallback only chooses a known preferred local model; pass `--model` for custom `hf.co/...` or vendor tags
 
 ## Run
 
@@ -397,4 +398,4 @@ git push origin v0.1.0
 - `todo_read` and `todo_write` give the model a Claude Code-style in-session checklist for complex tasks. Todo state is saved in session transcripts, does not touch workspace files, and is shown to the model only when the current request benefits from it.
 - The recommended default coding model is `gemma4:e4b`; install it with `ollama pull gemma4:e4b`.
 - The recommended serial eval order is `gemma4:e4b`, `granite4.1:8b`, `gemma3:4b`, then `qwen3:8b`.
-- If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back to the first available preferred local model and prints the pull command.
+- If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back only to a known preferred local model and prints the pull command. Custom `hf.co/...` or vendor tags are never selected implicitly; pass `--model` for those.

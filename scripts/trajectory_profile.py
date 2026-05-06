@@ -321,6 +321,24 @@ def _detect_context_loop(categories: list[str]) -> bool:
     return False
 
 
+def _mechanical_turn_category(categories: list[str]) -> str | None:
+    real_categories = [category for category in categories if category != "submit"]
+    if not real_categories or any(category == "edit" for category in real_categories):
+        return None
+    unique = set(real_categories)
+    if unique <= {"read", "search"}:
+        return "read_search_only"
+    if unique <= {"test"}:
+        return "test_only"
+    if unique <= {"git"}:
+        return "git_only"
+    if unique <= {"read", "search", "test"} and "test" in unique:
+        return "context_then_test_no_edit"
+    if unique <= {"read", "search", "git"} and "git" in unique:
+        return "context_then_git_no_edit"
+    return None
+
+
 def _trajectory_metrics(events: list[Event]) -> dict[str, Any]:
     tool_events = [event for event in events if event.kind == "tool_call"]
     tool_names = [event.name for event in tool_events if event.name]
@@ -332,6 +350,7 @@ def _trajectory_metrics(events: list[Event]) -> dict[str, Any]:
             if event.category == "test":
                 first_test_after_edit = idx
                 break
+    mechanical_category = _mechanical_turn_category(categories)
     return {
         "tool_calls": len(tool_events),
         "categories": categories,
@@ -343,6 +362,8 @@ def _trajectory_metrics(events: list[Event]) -> dict[str, Any]:
         "has_test_after_edit": first_test_after_edit is not None,
         "context_loop": _detect_context_loop(categories),
         "repeated_tools": _detect_repeated_tool_runs(tool_names),
+        "mechanical_turn_candidate": mechanical_category is not None,
+        "mechanical_turn_category": mechanical_category,
     }
 
 
@@ -377,6 +398,8 @@ def _summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) 
     edit_without_later_test = 0
     rows_with_edit = 0
     rows_with_test = 0
+    mechanical_turn_candidates = 0
+    mechanical_category_counts: Counter[str] = Counter()
 
     for row in rows:
         total_rows += 1
@@ -398,6 +421,9 @@ def _summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) 
             context_loop_rows += 1
         for tool_name, count in metrics["repeated_tools"]:
             repeated_loops[f"{tool_name} x{count}"] += 1
+        if metrics["mechanical_turn_candidate"]:
+            mechanical_turn_candidates += 1
+            mechanical_category_counts[str(metrics["mechanical_turn_category"])] += 1
 
     avg_tool_calls = round(total_tool_calls / total_rows, 2) if total_rows else 0.0
     summary = {
@@ -409,10 +435,12 @@ def _summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) 
         "context_loop_rows_pct": round((context_loop_rows / total_rows) * 100, 2) if total_rows else 0.0,
         "edit_without_prior_context_pct": round((edit_without_prior_context / rows_with_edit) * 100, 2) if rows_with_edit else 0.0,
         "edit_without_later_test_pct": round((edit_without_later_test / rows_with_edit) * 100, 2) if rows_with_edit else 0.0,
+        "mechanical_turn_candidates_pct": round((mechanical_turn_candidates / total_rows) * 100, 2) if total_rows else 0.0,
         "avg_first_edit_index": _mean(first_edit_indexes),
         "median_first_edit_index": _median(first_edit_indexes),
         "avg_tool_calls_before_edit": _mean(tool_calls_before_edit),
         "tool_category_counts": dict(category_counts.most_common()),
+        "mechanical_turn_category_counts": dict(mechanical_category_counts.most_common()),
         "top_tools": [{"name": name, "count": count} for name, count in tool_counts.most_common(20)],
         "top_repeated_loops": [{"loop": loop, "count": count} for loop, count in repeated_loops.most_common(20)],
     }
@@ -455,6 +483,22 @@ def _heuristic_recommendations(summary: dict[str, Any]) -> list[Recommendation]:
     read_search = int(category_counts.get("read", 0)) + int(category_counts.get("search", 0))
     edits = int(category_counts.get("edit", 0))
     tests = int(category_counts.get("test", 0))
+    if summary.get("mechanical_turn_candidates_pct", 0.0) >= 5:
+        recommendations.append(
+            Recommendation(
+                id="mechanical-router",
+                priority="high",
+                title="Bypass the model for explicit mechanical tool turns",
+                change_type="controller",
+                trigger=_threshold_label(summary, "mechanical_turn_candidates_pct"),
+                rationale="A meaningful share of trajectories only select read/search/test/git tools and do not need model planning.",
+                expected_effect="Lower latency and token use for status, diff, list, search, and run-tests requests.",
+                experiments=(
+                    "Route explicit git status/diff, list_files, search, run_test, lint_typecheck, and discover_validators requests directly.",
+                    "Measure primary LLM calls avoided and compare answer correctness on mechanical-turn fixtures.",
+                ),
+            )
+        )
     if edits and read_search / max(edits, 1) >= 3:
         recommendations.append(
             Recommendation(
@@ -566,10 +610,18 @@ def _resolve_dataset_paths(root: Path, dataset_name: str) -> tuple[str, list[Pat
 def _format_report(payload: dict[str, Any]) -> str:
     lines = []
     for dataset in payload["datasets"]:
-        lines.append(f"[trajectory-profile] dataset={dataset['dataset']} rows={dataset['rows_profiled']} avg_tool_calls={dataset['avg_tool_calls']} context_loop_pct={dataset['context_loop_rows_pct']} edit_without_test_pct={dataset['edit_without_later_test_pct']}")
+        lines.append(
+            f"[trajectory-profile] dataset={dataset['dataset']} rows={dataset['rows_profiled']} "
+            f"avg_tool_calls={dataset['avg_tool_calls']} context_loop_pct={dataset['context_loop_rows_pct']} "
+            f"edit_without_test_pct={dataset['edit_without_later_test_pct']} "
+            f"mechanical_pct={dataset.get('mechanical_turn_candidates_pct', 0.0)}"
+        )
         top_tools = ", ".join(f"{item['name']}:{item['count']}" for item in dataset["top_tools"][:8])
         if top_tools:
             lines.append(f"  top_tools {top_tools}")
+        mechanical_counts = dataset.get("mechanical_turn_category_counts", {})
+        if mechanical_counts:
+            lines.append("  mechanical " + ", ".join(f"{name}:{count}" for name, count in list(mechanical_counts.items())[:6]))
         for recommendation in dataset["recommendations"]:
             lines.append(f"  recommendation[{recommendation['priority']}] {recommendation['id']} {recommendation['title']}")
     if payload.get("portfolio_recommendations"):

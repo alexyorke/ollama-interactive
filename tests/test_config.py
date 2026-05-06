@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ollama_code.cli import build_agent, build_parser
-from ollama_code.config import load_config
+from ollama_code.config import DEFAULT_MODEL, load_config
 
 
 class ConfigTests(unittest.TestCase):
@@ -31,6 +31,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:11435")
         self.assertEqual(agent.model, "config-model")
+        self.assertIn(".ollama-code/config.json", agent.model_source.replace("\\", "/"))
         self.assertEqual(agent.verifier_model_name(), "config-verifier")
         self.assertEqual(agent.reconcile_mode(), "on")
 
@@ -102,6 +103,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:34567")
         self.assertEqual(agent.model, "env-model")
+        self.assertEqual(agent.model_source, "OLLAMA_CODE_MODEL")
         self.assertEqual(agent.verifier_model_name(), "env-verifier")
         self.assertEqual(agent.reconcile_mode(), "off")
 
@@ -273,3 +275,38 @@ class ConfigCliSmokeTests(unittest.TestCase):
         self.assertEqual(_FakeOllamaHandler.tag_requests, 1)
         self.assertEqual(len(_FakeOllamaHandler.requests), 1)
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "gemma3:4b")
+
+    def test_one_shot_cli_does_not_fallback_to_unpreferred_custom_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".ollama-code"
+            config_dir.mkdir(parents=True)
+            _FakeOllamaHandler.requests = []
+            _FakeOllamaHandler.tag_requests = 0
+            _FakeOllamaHandler.available_models = [{"name": "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS"}]
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                (config_dir / "config.json").write_text(
+                    json.dumps({"host": f"http://127.0.0.1:{server.server_port}"}),
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-m", "ollama_code", "--cwd", str(root), "--quiet", "Reply with ok."],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env={key: value for key, value in os.environ.items() if key not in {"OLLAMA_HOST", "OLLAMA_CODE_MODEL", "OLLAMA_CODE_VERIFIER_MODEL"}},
+                    timeout=30,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(_FakeOllamaHandler.tag_requests, 1)
+        self.assertEqual(len(_FakeOllamaHandler.requests), 1)
+        self.assertEqual(_FakeOllamaHandler.requests[0]["model"], DEFAULT_MODEL)

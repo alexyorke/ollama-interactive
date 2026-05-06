@@ -185,7 +185,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("\x1b[1A", output)
         self.assertIn("[status] tool read_file {}", output)
 
-    def test_runtime_default_fallback_prints_granite_pull_hint(self) -> None:
+    def test_runtime_default_fallback_prints_default_pull_hint(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root)])
         agent = DummyAgent()
@@ -196,7 +196,21 @@ class CliCommandTests(unittest.TestCase):
         ensure_runtime_default_model(agent, args, renderer)
 
         self.assertEqual(agent.model, "gemma3:4b")
+        self.assertEqual(agent.model_source, "runtime fallback:gemma3:4b")
         self.assertIn(f"ollama pull {DEFAULT_MODEL}", stream.getvalue())
+
+    def test_runtime_default_fallback_ignores_unpreferred_custom_model(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root)])
+        agent = DummyAgent()
+        agent.list_models = lambda: ["hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS"]  # type: ignore[method-assign]
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
+
+        ensure_runtime_default_model(agent, args, renderer)
+
+        self.assertEqual(agent.model, DEFAULT_MODEL)
+        self.assertIn("no preferred fallback model is available", stream.getvalue())
 
     def test_runtime_default_fallback_respects_quiet(self) -> None:
         root = self._workspace_scratch()
@@ -245,6 +259,8 @@ class CliCommandTests(unittest.TestCase):
 
     def test_doctor_report_checks_first_use_setup(self) -> None:
         agent = DummyAgent()
+        agent.config_path = Path("settings.json").resolve()
+        agent.model_source = "config:settings.json"
 
         with patch("ollama_code.cli.shutil.which", return_value=None):
             report, ok = doctor_report(agent)
@@ -252,6 +268,8 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("Ollama Code doctor", report)
         self.assertIn("workspace: ok", report)
+        self.assertIn("config: ok", report)
+        self.assertIn("model_source: config:settings.json", report)
         self.assertIn("ollama: ok", report)
         self.assertIn(f"model: ok {DEFAULT_MODEL}", report)
         self.assertIn("indexer: ok enabled", report)
@@ -267,6 +285,18 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(len(output), 1)
         self.assertIn("Ollama Code doctor", output[0])
+
+    def test_status_command_prints_config_and_model_source(self) -> None:
+        agent = DummyAgent()
+        agent.config_path = Path("settings.json").resolve()
+        agent.model_source = "config:settings.json"
+        output: list[str] = []
+
+        handled = handle_meta_command("/status", agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertIn("model_source=config:settings.json", output[0])
+        self.assertIn("config=", output[0])
 
     def test_main_doctor_skips_runtime_model_resolution(self) -> None:
         agent = DummyAgent()

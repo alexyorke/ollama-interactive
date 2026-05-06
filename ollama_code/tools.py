@@ -98,6 +98,7 @@ SKIP_GENERATED_DIRS = {
     "scratch",
     "verify_scratch",
     "htmlcov",
+    ".meta",
     ".tox",
     ".nox",
     ".cache",
@@ -108,6 +109,7 @@ SKIP_WALK_DIRS = SKIP_CODE_DIRS | SKIP_GENERATED_DIRS
 SKIP_WALK_GLOBS = (
     "!scratch/**",
     "!verify_scratch/**",
+    "!.meta/**",
     "!ollama-code-*/**",
     "!probe-*/**",
     "!verify_*/**",
@@ -275,6 +277,11 @@ TOOL_DESCRIPTIONS = [
         "name": "diagnose_test_failure",
         "arguments": {"output": "run_test output", "path": "relative path, default .", "limit": "int, default 12"},
         "description": "Group failing tests by likely root cause with expected/actual and likely target files.",
+    },
+    {
+        "name": "test_spec_extract",
+        "arguments": {"test_path": "unittest file", "source_path": "optional source file", "limit": "int, default 20"},
+        "description": "Extract compact unittest examples from assertions and assertRaises for repair guidance.",
     },
     {
         "name": "run_function_probe",
@@ -459,6 +466,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "systems_lens": "systems_lens(request,path='.',evidence?,limit=8)",
         "find_implementation_target": "find_implementation_target(test_path?/path?,query?,output?,limit=12)",
         "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
+        "test_spec_extract": "test_spec_extract(test_path,source_path?,limit=20)",
         "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
         "call_graph": "call_graph(path,symbol?,limit=40)",
         "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
@@ -630,6 +638,7 @@ class ToolExecutor:
             "systems_lens": self.systems_lens,
             "find_implementation_target": self.find_implementation_target,
             "diagnose_test_failure": self.diagnose_test_failure,
+            "test_spec_extract": self.test_spec_extract,
             "run_function_probe": self.run_function_probe,
             "call_graph": self.call_graph,
             "contract_graph": self.contract_graph,
@@ -2948,6 +2957,192 @@ class ToolExecutor:
             "output": "\n".join(lines) if lines else "(no structured failures found; inspect raw output)",
         }
 
+    def _test_spec_source_symbols(self, source_path: str | None) -> set[str]:
+        if not source_path:
+            return set()
+        try:
+            target = self.resolve_path(source_path, allow_missing=False)
+            tree = ast.parse(target.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            return set()
+        return {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        }
+
+    def _test_spec_import_aliases(self, tree: ast.AST, source_path: str | None) -> dict[str, str]:
+        if not source_path:
+            return {}
+        module_name = Path(source_path).stem
+        aliases: dict[str, str] = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.module != module_name:
+                continue
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = alias.name
+        return aliases
+
+    def _node_expr(self, node: ast.AST) -> str:
+        try:
+            value = ast.literal_eval(node)
+            return repr(value)
+        except Exception:
+            try:
+                return ast.unparse(node)
+            except Exception:
+                return "?"
+
+    def _test_spec_call_name(self, call: ast.Call) -> str:
+        func = call.func
+        if isinstance(func, ast.Name):
+            return func.id
+        if isinstance(func, ast.Attribute):
+            return func.attr
+        try:
+            return ast.unparse(func)
+        except Exception:
+            return "call"
+
+    def _method_name(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute):
+                return func.attr
+            if isinstance(func, ast.Name):
+                return func.id
+        return ""
+
+    def _call_expr(self, call: ast.Call) -> str:
+        args = [self._node_expr(arg) for arg in call.args]
+        args.extend(f"{kw.arg}={self._node_expr(kw.value)}" for kw in call.keywords if kw.arg)
+        return f"{self._test_spec_call_name(call)}({', '.join(args)})"
+
+    def _first_behavior_call(self, statements: list[ast.stmt]) -> ast.Call | None:
+        for statement in statements:
+            for node in ast.walk(statement):
+                if not isinstance(node, ast.Call):
+                    continue
+                method = self._method_name(node)
+                if method.startswith("assert"):
+                    continue
+                return node
+        return None
+
+    def _test_spec_add_example(
+        self,
+        examples: list[dict[str, Any]],
+        *,
+        call: ast.Call,
+        expected: str | None = None,
+        raises: str | None = None,
+        line: int,
+        source_symbols: set[str],
+        aliases: dict[str, str],
+        limit: int,
+    ) -> None:
+        if len(examples) >= limit:
+            return
+        symbol = self._test_spec_call_name(call)
+        canonical = aliases.get(symbol, symbol)
+        if source_symbols and canonical not in source_symbols:
+            return
+        expr = self._call_expr(call)
+        if canonical != symbol and expr.startswith(symbol + "("):
+            expr = canonical + expr[len(symbol) :]
+        if expected is not None:
+            text = f"{expr} -> {expected}"
+        elif raises is not None:
+            text = f"{expr} raises {raises}"
+        else:
+            return
+        item = {"symbol": canonical, "example": text, "line": line}
+        if item not in examples:
+            examples.append(item)
+
+    def test_spec_extract(self, test_path: str, source_path: str | None = None, limit: int = 20) -> dict[str, Any]:
+        self._check_interrupted()
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        if test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "test_spec_extract", "path": self.relative_label(test_file), "summary": "test_spec_extract supports Python unittest files only."}
+        try:
+            tree = ast.parse(test_file.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "test_spec_extract", "path": self.relative_label(test_file), "summary": f"Could not parse test file: {exc}"}
+        limit = max(1, min(int(limit), 80))
+        source_symbols = self._test_spec_source_symbols(source_path)
+        aliases = self._test_spec_import_aliases(tree, source_path)
+        examples: list[dict[str, Any]] = []
+        equality_methods = {"assertEqual", "assertEquals", "assertListEqual", "assertTupleEqual", "assertDictEqual"}
+        for node in ast.walk(tree):
+            self._check_interrupted()
+            if isinstance(node, ast.Call) and self._method_name(node) in equality_methods and len(node.args) >= 2:
+                actual: ast.Call | None = None
+                expected_node: ast.AST | None = None
+                if isinstance(node.args[0], ast.Call):
+                    actual = node.args[0]
+                    expected_node = node.args[1]
+                elif isinstance(node.args[1], ast.Call):
+                    actual = node.args[1]
+                    expected_node = node.args[0]
+                if actual is not None and expected_node is not None:
+                    self._test_spec_add_example(
+                        examples,
+                        call=actual,
+                        expected=self._node_expr(expected_node),
+                        line=int(getattr(node, "lineno", 1)),
+                        source_symbols=source_symbols,
+                        aliases=aliases,
+                        limit=limit,
+                    )
+            if isinstance(node, ast.Call) and self._method_name(node) == "assertRaises" and len(node.args) >= 2:
+                func_node = node.args[1]
+                if isinstance(func_node, (ast.Name, ast.Attribute)):
+                    fake_call = ast.Call(func=func_node, args=list(node.args[2:]), keywords=list(node.keywords))
+                    self._test_spec_add_example(
+                        examples,
+                        call=fake_call,
+                        raises=self._node_expr(node.args[0]),
+                        line=int(getattr(node, "lineno", 1)),
+                        source_symbols=source_symbols,
+                        aliases=aliases,
+                        limit=limit,
+                    )
+            if isinstance(node, ast.With):
+                for item in node.items:
+                    context = item.context_expr
+                    if not isinstance(context, ast.Call) or self._method_name(context) != "assertRaises" or not context.args:
+                        continue
+                    behavior_call = self._first_behavior_call(list(node.body))
+                    if behavior_call is None:
+                        continue
+                    self._test_spec_add_example(
+                        examples,
+                        call=behavior_call,
+                        raises=self._node_expr(context.args[0]),
+                        line=int(getattr(node, "lineno", 1)),
+                        source_symbols=source_symbols,
+                        aliases=aliases,
+                        limit=limit,
+                    )
+        grouped: dict[str, list[str]] = {}
+        for item in examples:
+            grouped.setdefault(str(item["symbol"]), []).append(f"{item['example']} ({self.relative_label(test_file)}:{item['line']})")
+        lines: list[str] = []
+        for symbol, items in grouped.items():
+            lines.append(f"{symbol}:")
+            lines.extend(f"- {example}" for example in items)
+        return {
+            "ok": True,
+            "tool": "test_spec_extract",
+            "path": self.relative_label(test_file),
+            "source_path": source_path or "",
+            "count": len(examples),
+            "examples": examples,
+            "grouped": grouped,
+            "output": "\n".join(lines) if lines else "(no unittest examples extracted)",
+        }
+
     def run_function_probe(
         self,
         module: str,
@@ -4388,6 +4583,88 @@ class ToolExecutor:
         target.write_text(updated, encoding="utf-8")
         return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "syntax_ok": True if target.suffix.lower() == ".py" else None, "summary": f"Applied {op} to {relative_path}.", "diff": preview}
 
+    def _single_full_python_function_name(self, source: str) -> str | None:
+        stripped = textwrap.dedent(source or "").strip()
+        if not stripped.startswith(("def ", "async def ")):
+            return None
+        try:
+            tree = ast.parse(stripped)
+        except SyntaxError:
+            return None
+        body = [node for node in tree.body if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))]
+        if len(body) != 1 or not isinstance(body[0], (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return None
+        return body[0].name
+
+    def _normalize_python_body_replacement(self, body: str) -> str:
+        normalized = textwrap.dedent(body).strip("\n")
+        normalized = self._repair_common_python_join_typo(normalized)
+        lines = normalized.splitlines()
+        first = next((line for line in lines if line.strip()), "")
+        leading = len(first) - len(first.lstrip())
+        if leading > 0:
+            prefix = " " * leading
+            lines = [line[leading:] if line.startswith(prefix) else line for line in lines]
+            normalized = "\n".join(lines)
+        return normalized
+
+    def _python_parameter_names(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+        args = node.args
+        names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
+        if args.vararg:
+            names.add(args.vararg.arg)
+        if args.kwarg:
+            names.add(args.kwarg.arg)
+        return names
+
+    def _shadowed_builtin_call_diagnostic(self, node: ast.FunctionDef | ast.AsyncFunctionDef, body: str) -> str:
+        shadowable = {"list", "dict", "set", "tuple", "str", "int", "float", "bool", "sum", "map", "filter", "len", "min", "max"}
+        shadowed = self._python_parameter_names(node) & shadowable
+        if not shadowed:
+            return ""
+        indented = "\n".join("    " + line if line.strip() else "" for line in (body.splitlines() or ["pass"]))
+        source = f"def __candidate__():\n{indented}\n"
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return ""
+        for call in (child for child in ast.walk(tree) if isinstance(child, ast.Call)):
+            if isinstance(call.func, ast.Name) and call.func.id in shadowed:
+                return f"Replacement calls parameter {call.func.id!r} as a function; it shadows the Python builtin. Use a comprehension, rename the local parameter in a full function replacement, or call builtins.{call.func.id} explicitly."
+        return ""
+
+    def _unused_critical_parameter_diagnostic(self, node: ast.FunctionDef | ast.AsyncFunctionDef, body: str) -> str:
+        critical = self._python_parameter_names(node) & {"initial", "default", "accumulator"}
+        if not critical:
+            return ""
+        indented = "\n".join("    " + line if line.strip() else "" for line in (body.splitlines() or ["pass"]))
+        try:
+            tree = ast.parse(f"def __candidate__():\n{indented}\n")
+        except SyntaxError:
+            return ""
+        used = {child.id for child in ast.walk(tree) if isinstance(child, ast.Name)}
+        missing = sorted(critical - used)
+        if not missing:
+            return ""
+        return "Replacement does not use required accumulator/default parameter(s): " + ", ".join(missing) + ". Include them in the implementation or replace the full function with a justified signature change."
+
+    def _foldr_argument_order_diagnostic(self, node: ast.FunctionDef | ast.AsyncFunctionDef, body: str) -> str:
+        if node.name.lower() != "foldr":
+            return ""
+        indented = "\n".join("    " + line if line.strip() else "" for line in (body.splitlines() or ["pass"]))
+        try:
+            tree = ast.parse(f"def __candidate__():\n{indented}\n")
+        except SyntaxError:
+            return ""
+        for call in (child for child in ast.walk(tree) if isinstance(child, ast.Call)):
+            if not isinstance(call.func, ast.Name) or call.func.id != "function" or len(call.args) < 2:
+                continue
+            first = ast.unparse(call.args[0]) if hasattr(ast, "unparse") else ""
+            second = ast.unparse(call.args[1]) if hasattr(ast, "unparse") else ""
+            if first in {"item", "el", "element"} and second in {"result", "acc", "accumulator"}:
+                return "foldr reducer arguments look reversed. While traversing from the right, call the reducer with accumulator/result first and current element second."
+        return ""
+
     def _replace_python_function_body(self, target: Path, symbol: str, body: str) -> dict[str, Any]:
         relative_path = self.relative_label(target)
         if target.suffix.lower() != ".py":
@@ -4403,7 +4680,57 @@ class ToolExecutor:
         end = int(getattr(last_body, "end_lineno", getattr(last_body, "lineno", start)))
         header_indent = lines[int(getattr(node, "lineno", 1)) - 1][: len(lines[int(getattr(node, "lineno", 1)) - 1]) - len(lines[int(getattr(node, "lineno", 1)) - 1].lstrip())]
         body_indent = header_indent + "    "
-        normalized = textwrap.dedent(body).strip("\n")
+        normalized = self._normalize_python_body_replacement(body)
+        full_function_name = self._single_full_python_function_name(normalized)
+        if full_function_name is not None:
+            wanted = symbol.split(".")[-1]
+            if full_function_name != wanted:
+                return {
+                    "ok": False,
+                    "tool": "apply_structured_edit",
+                    "path": relative_path,
+                    "op": "replace_function_body",
+                    "error_class": "invalid_args",
+                    "summary": f"replace_function_body received full function {full_function_name!r}, but target is {wanted!r}. Target the matching function or use replace_symbol.",
+                }
+            routed = self.replace_symbol(relative_path, symbol, normalized)
+            routed = dict(routed)
+            routed["tool"] = "apply_structured_edit"
+            routed["op"] = "replace_function_body"
+            routed["routed_tool"] = "replace_symbol"
+            summary = str(routed.get("summary") or "").strip()
+            routed["summary"] = "Routed full function replacement to replace_symbol. " + summary if summary else "Routed full function replacement to replace_symbol."
+            return routed
+        shadow_diagnostic = self._shadowed_builtin_call_diagnostic(node, normalized)
+        if shadow_diagnostic:
+            return {
+                "ok": False,
+                "tool": "apply_structured_edit",
+                "path": relative_path,
+                "op": "replace_function_body",
+                "error_class": "invalid_args",
+                "summary": shadow_diagnostic,
+            }
+        unused_parameter_diagnostic = self._unused_critical_parameter_diagnostic(node, normalized)
+        if unused_parameter_diagnostic:
+            return {
+                "ok": False,
+                "tool": "apply_structured_edit",
+                "path": relative_path,
+                "op": "replace_function_body",
+                "error_class": "invalid_args",
+                "summary": unused_parameter_diagnostic,
+            }
+        foldr_diagnostic = self._foldr_argument_order_diagnostic(node, normalized)
+        if foldr_diagnostic:
+            return {
+                "ok": False,
+                "tool": "apply_structured_edit",
+                "path": relative_path,
+                "op": "replace_function_body",
+                "error_class": "invalid_args",
+                "summary": foldr_diagnostic,
+            }
         replacement_lines = ["pass"] if not normalized.strip() else normalized.splitlines()
         replacement = "".join(body_indent + line.rstrip() + "\n" if line.strip() else "\n" for line in replacement_lines)
         updated = "".join(lines[: start - 1]) + replacement + "".join(lines[end:])
@@ -4624,6 +4951,27 @@ class ToolExecutor:
         words = {word for word in normalized.split("_") if word}
         return bool(words & {"body", "implementation", "function", "method", "fix", "correct", "update"})
 
+    def _normalize_python_symbol_target(self, target: Path, intent: str, symbol: str) -> str:
+        if target.suffix.lower() != ".py" or self._looks_like_symbol_name(symbol):
+            return symbol
+        clean_intent = str(intent or "").strip().lower().replace("-", "_")
+        symbol_intents = {
+            "replace_body",
+            "replace_function_body",
+            "function_body",
+            "change_signature",
+            "replace_signature",
+            "signature",
+            "replace_symbol",
+            "replace_function",
+            "replace_class",
+            "symbol",
+        }
+        if clean_intent not in symbol_intents and not self._looks_like_function_body_edit_intent(clean_intent):
+            return symbol
+        match = re.match(r"\s*(?:async\s+def|def|class)?\s*([A-Za-z_][\w.]*)\s*(?:\(|:|$)", symbol)
+        return match.group(1) if match else symbol
+
     def edit_intent(
         self,
         path: str,
@@ -4640,6 +4988,7 @@ class ToolExecutor:
         old = str(target or "").strip()
         new = "" if replacement is None else str(replacement)
         clean_scope = str(scope or "file").strip().lower()
+        old = self._normalize_python_symbol_target(target_path, clean_intent, old)
         if not clean_intent:
             return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires an intent."}
         if not old and clean_intent not in {"add_import", "add_import_if_missing"}:
@@ -5458,7 +5807,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
     def _command_path_escapes(self, token: str, cwd: Path) -> bool:
         if not token or token.startswith("-"):
             return False
-        if token in {".", ".."} or token.startswith("../") or token.startswith("..\\"):
+        if token == ".." or token.startswith("../") or token.startswith("..\\"):
             return True
         if any(ch in token for ch in "*?[]"):
             return False

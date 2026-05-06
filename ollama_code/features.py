@@ -11,6 +11,7 @@ FEATURE_NAMES = {
     "context-pack",
     "evidence-handles",
     "num-predict-caps",
+    "question-planner",
     "structured-edits",
     "trajectory-guards",
     "contract-guards",
@@ -108,6 +109,8 @@ def options_for_purpose(purpose: str, *, primary_can_emit_large_payload: bool = 
         return {}
     if purpose == "primary":
         return {} if primary_can_emit_large_payload else {"num_predict": 256}
+    if purpose == "question_planner":
+        return {"temperature": 0, "num_predict": 384}
     if purpose in {"verification", "final_verifier", "assumption_audit", "artifact_reconciliation", "reconciliation"}:
         return {"temperature": 0, "num_predict": 192}
     if purpose in {"verification_rewrite", "final_rewrite"}:

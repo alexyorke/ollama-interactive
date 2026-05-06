@@ -26,7 +26,6 @@ from ollama_code.config import (
     ENV_OLLAMA_CODE_TEST_CMD,
     ENV_OLLAMA_CODE_VERIFIER_MODEL,
     ENV_OLLAMA_HOST,
-    GRANITE_IQ4_XS_MODEL,
     OFFICIAL_GRANITE_8B_MODEL,
     load_config,
 )
@@ -38,11 +37,12 @@ from ollama_code.tools import ToolExecutor
 
 PREFERRED_FALLBACK_MODELS = [
     DEFAULT_MODEL,
-    GRANITE_IQ4_XS_MODEL,
+    "gemma4:e4b-it-q4_K_M",
+    "gemma4:26b",
     OFFICIAL_GRANITE_8B_MODEL,
+    "gemma3:12b",
     "gemma3:4b",
     "qwen3:8b",
-    "batiai/gemma4-26b:iq4",
     "gpt-oss:20b",
 ]
 DEFAULT_MODEL_PULL_HINT = f"Install the recommended default with: ollama pull {DEFAULT_MODEL}"
@@ -211,9 +211,11 @@ def build_agent(
         restored_payload = load_transcript_payload(resume_path)
 
     model = config.model or DEFAULT_MODEL
+    model_source = f"config:{config.path.as_posix()}" if config.model and config.path is not None else "built-in default"
     env_model = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_MODEL))
     if env_model:
         model = env_model
+        model_source = ENV_OLLAMA_CODE_MODEL
     approval = config.approval or DEFAULT_APPROVAL_MODE
     if restored_payload is not None:
         saved_model = restored_payload.get("model")
@@ -221,11 +223,13 @@ def build_agent(
         explicit_model = _non_empty_string(args.model)
         if explicit_model is None and isinstance(saved_model, str) and saved_model.strip():
             model = saved_model
+            model_source = f"session:{resume_path.as_posix() if resume_path is not None else '(unknown)'}"
         if args.approval is None and saved_approval in {"ask", "auto", "read-only"}:
             approval = str(saved_approval)
     explicit_model = _non_empty_string(args.model)
     if explicit_model:
         model = explicit_model
+        model_source = "--model"
     verifier_model = config.verifier_model
     env_verifier_model = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_VERIFIER_MODEL))
     if env_verifier_model:
@@ -314,6 +318,8 @@ def build_agent(
     if restored_payload is not None:
         agent.restore_transcript(restored_payload)
         agent.session_file = resolve_transcript_path(workspace_root, session_file)
+    agent.config_path = config.path
+    agent.model_source = model_source
     return agent
 
 
@@ -356,19 +362,22 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
     if current is not None:
         if current != agent.model:
             agent.set_model(current)
+            agent.model_source = f"{getattr(agent, 'model_source', 'built-in default')} -> installed tag"
         return
     for candidate in PREFERRED_FALLBACK_MODELS:
         resolved = _resolve_model_candidate(candidate, available)
         if resolved is None:
             continue
         agent.set_model(resolved)
+        agent.model_source = f"runtime fallback:{resolved}"
         if not quiet:
             renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {resolved}. {DEFAULT_MODEL_PULL_HINT}")
         return
-    fallback = available_models[0]
-    agent.set_model(fallback)
     if not quiet:
-        renderer.status(f"default model {DEFAULT_MODEL} is not installed; using {fallback}. {DEFAULT_MODEL_PULL_HINT}")
+        renderer.status(
+            f"default model {DEFAULT_MODEL} is not installed and no preferred fallback model is available. "
+            f"{DEFAULT_MODEL_PULL_HINT} or pass --model explicitly."
+        )
 
 
 def startup_help_text(agent: OllamaCodeAgent) -> str:
@@ -463,6 +472,9 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
     ]
     session = agent.session_path()
     lines.append(f"session: ok {session.as_posix() if session is not None else '(none)'}")
+    config_path = getattr(agent, "config_path", None)
+    lines.append(f"config: {'ok ' + config_path.as_posix() if isinstance(config_path, Path) else '(none)'}")
+    lines.append(f"model_source: {getattr(agent, 'model_source', '(unknown)')}")
     if agent.configured_test_command():
         lines.append(f"test_cmd: ok {agent.configured_test_command()}")
     else:
@@ -544,8 +556,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
     if action == "/status":
         session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
         test_command = agent.configured_test_command() or "(none)"
+        config_path = getattr(agent, "config_path", None)
+        config_label = config_path.as_posix() if isinstance(config_path, Path) else "(none)"
+        model_source = getattr(agent, "model_source", "(unknown)")
         writer(
-            f"workspace={agent.workspace_root().as_posix()} model={agent.model} verifier_model={agent.verifier_model_name() or '-'} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} reconcile={agent.reconcile_mode()} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} session={session}"
+            f"workspace={agent.workspace_root().as_posix()} model={agent.model} model_source={model_source} verifier_model={agent.verifier_model_name() or '-'} approval={agent.approval_mode()} debate={'on' if agent.debate_mode() else 'off'} reconcile={agent.reconcile_mode()} max_tool_rounds={agent.max_tool_rounds} max_agent_depth={agent.max_agent_depth} test_cmd={test_command} config={config_label} session={session}"
         )
         return True
     if action == "/models":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 import shutil
 from pathlib import Path
@@ -7,7 +8,7 @@ from uuid import uuid4
 
 
 @contextmanager
-def workspace_temp_dir(prefix: str, root: Path):
+def workspace_temp_dir(prefix: str, root: Path, keep: bool | Callable[[], bool] = False):
     """Create a temporary workspace with inherited permissions.
 
     Windows sandboxed runs can reject files under stdlib tempfile dirs because
@@ -20,4 +21,6 @@ def workspace_temp_dir(prefix: str, root: Path):
     try:
         yield str(path)
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        should_keep = keep() if callable(keep) else bool(keep)
+        if not should_keep:
+            shutil.rmtree(path, ignore_errors=True)

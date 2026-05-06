@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import time
+import difflib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,18 @@ except ModuleNotFoundError:  # Imported as scripts.public_benchmark_eval in unit
 
 POLYGLOT_REPO_URL = "https://github.com/Aider-AI/polyglot-benchmark.git"
 DEFAULT_POLYGLOT_TASKS = ("list-ops", "pig-latin", "wordy")
+HARD_POLYGLOT_TASKS = (
+    "list-ops",
+    "pig-latin",
+    "wordy",
+    "phone-number",
+    "grade-school",
+    "variable-length-quantity",
+    "robot-name",
+    "simple-linked-list",
+    "transpose",
+    "scale-generator",
+)
 
 
 def _run(command: list[str], cwd: Path, *, timeout: int) -> subprocess.CompletedProcess[str]:
@@ -62,6 +75,111 @@ def load_session(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _implementation_python_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+        name = path.name.lower()
+        if name.startswith("test_") or name.endswith("_test.py") or "/tests/" in f"/{rel.lower()}":
+            continue
+        if "/scratch/" in f"/{rel.lower()}/" or "/.meta/" in f"/{rel.lower()}/":
+            continue
+        files.append(path)
+    return files
+
+
+def _detach_model_visible_meta(workspace: Path) -> Path | None:
+    meta = workspace / ".meta"
+    if not meta.exists():
+        return None
+    detached = workspace.parent / f"{workspace.name}-evaluator-meta"
+    if detached.exists():
+        shutil.rmtree(detached, ignore_errors=True)
+    shutil.move(str(meta), str(detached))
+    return detached
+
+
+def _evaluator_meta_snippets(meta_dir: Path | None, *, max_files: int = 3, max_chars: int = 1000) -> list[dict[str, str]]:
+    if meta_dir is None or not meta_dir.exists():
+        return []
+    snippets: list[dict[str, str]] = []
+    for path in sorted(meta_dir.rglob("*.py"))[:max_files]:
+        try:
+            rel = ".meta/" + path.relative_to(meta_dir).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        snippets.append({"path": rel, "content": text[:max_chars]})
+    return snippets
+
+
+def _final_source_snippets(workspace: Path, *, max_files: int = 6, max_chars: int = 1400) -> list[dict[str, str]]:
+    snippets: list[dict[str, str]] = []
+    for path in _implementation_python_files(workspace)[:max_files]:
+        try:
+            rel = path.relative_to(workspace).as_posix()
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        snippets.append({"path": rel, "content": text[:max_chars]})
+    return snippets
+
+
+def _changed_source_diffs(source: Path, workspace: Path, *, max_files: int = 8, max_chars: int = 1800) -> list[dict[str, str]]:
+    diffs: list[dict[str, str]] = []
+    for path in _implementation_python_files(workspace):
+        rel = path.relative_to(workspace).as_posix()
+        original_path = source / rel
+        try:
+            before = original_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            before = []
+        try:
+            after = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        if before == after:
+            continue
+        diff = "\n".join(
+            difflib.unified_diff(
+                before,
+                after,
+                fromfile=f"a/{rel}",
+                tofile=f"b/{rel}",
+                lineterm="",
+                n=3,
+            )
+        )
+        diffs.append({"path": rel, "diff": diff[:max_chars]})
+        if len(diffs) >= max_files:
+            break
+    return diffs
+
+
+def failure_classes(*, status: str, timed_out: bool, final_tests_returncode: int, calls: list[str], failures: list[dict[str, Any]]) -> list[str]:
+    classes: set[str] = set()
+    if timed_out:
+        classes.add("timeout")
+    for item in failures:
+        summary = str(item.get("summary") or "")
+        name = str(item.get("name") or "")
+        lowered = summary.lower()
+        if "unknown tool" in lowered:
+            classes.add("invalid_tool")
+        if "bad arguments" in lowered or "invalid" in lowered or "path escapes workspace" in lowered:
+            classes.add("invalid_args")
+        if "syntaxerror" in summary or "indentationerror" in summary or "syntax error" in lowered:
+            classes.add("syntax_edit")
+        if name == "run_test":
+            classes.add("tests_still_failing")
+    mutating = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent"}
+    if status != "pass" and not any(call in mutating for call in calls):
+        classes.add("no_edit_attempted")
+    if final_tests_returncode != 0:
+        classes.add("tests_still_failing")
+    return sorted(classes)
+
+
 def evaluate_polyglot_python_task(
     *,
     project_root: Path,
@@ -71,13 +189,16 @@ def evaluate_polyglot_python_task(
     debate: str,
     reconcile: str,
     timeout: int,
+    keep_workspaces_on_fail: bool = False,
 ) -> dict[str, Any]:
     source = polyglot_task_path(polyglot_root, task)
     bench_root = project_root / "scratch" / "public-bench"
     bench_root.mkdir(parents=True, exist_ok=True)
-    with workspace_temp_dir(f"polyglot-{task}-", bench_root) as tmp:
+    keep_workspace = False
+    with workspace_temp_dir(f"polyglot-{task}-", bench_root, keep=lambda: keep_workspace) as tmp:
         workspace = Path(tmp)
         shutil.copytree(source, workspace, dirs_exist_ok=True)
+        evaluator_meta = _detach_model_visible_meta(workspace)
         session_file = workspace / "scratch" / "session.json"
         session_file.parent.mkdir(parents=True, exist_ok=True)
         test_cmd = python_exercism_test_cmd()
@@ -117,6 +238,13 @@ def evaluate_polyglot_python_task(
         status = "pass" if cli.returncode == 0 and final_tests.returncode == 0 else "fail"
         if timed_out:
             status = "fail"
+        keep_workspace = keep_workspaces_on_fail and status != "pass"
+        calls = tool_calls(session)
+        failures = failed_tools(session)
+        final_tests_returncode = int(final_tests.returncode)
+        meta_snippets = _evaluator_meta_snippets(evaluator_meta)
+        if not keep_workspace and evaluator_meta is not None:
+            shutil.rmtree(evaluator_meta, ignore_errors=True)
         return {
             "case": task,
             "suite": "aider-polyglot-python-smoke",
@@ -130,11 +258,24 @@ def evaluate_polyglot_python_task(
             "latency_s": round(time.perf_counter() - started, 2),
             "initial_tests_returncode": initial.returncode,
             "cli_returncode": cli.returncode,
-            "final_tests_returncode": final_tests.returncode,
+            "final_tests_returncode": final_tests_returncode,
             "usage": usage_totals(session),
-            "tool_calls": tool_calls(session),
-            "failed_tools": failed_tools(session),
+            "tool_calls": calls,
+            "failed_tools": failures,
+            "failure_classes": failure_classes(
+                status=status,
+                timed_out=timed_out,
+                final_tests_returncode=final_tests_returncode,
+                calls=calls,
+                failures=failures,
+            ),
             "tests_run": tests_run(session),
+            "changed_source_diffs": _changed_source_diffs(source, workspace),
+            "final_source_snippets": _final_source_snippets(workspace),
+            "evaluator_meta_snippets": meta_snippets,
+            "evaluator_meta": str(evaluator_meta) if keep_workspace and evaluator_meta is not None else "",
+            "workspace": str(workspace) if keep_workspace else "",
+            "workspace_kept": keep_workspace,
             "stdout_tail": str(cli.stdout or "")[-1200:],
             "stderr_tail": str(cli.stderr or "")[-1200:],
             "test_tail": (final_tests.stdout + final_tests.stderr)[-1200:],
@@ -175,11 +316,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--models", nargs="+", default=["granite4.1:8b"])
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off"])
     parser.add_argument("--reconcile-modes", nargs="+", choices=["off", "on", "auto"], default=["auto"])
-    parser.add_argument("--tasks", nargs="+", default=list(DEFAULT_POLYGLOT_TASKS))
+    parser.add_argument("--tasks", nargs="+", default=None)
+    parser.add_argument("--task-set", choices=["smoke", "hard"], default="smoke", help="Use the default 3-task smoke set or 10-task hard public sample unless --tasks is provided.")
     parser.add_argument("--cache-dir", default="scratch/external")
     parser.add_argument("--output", default="scratch/public-bench/aider-polyglot-python-smoke.json")
     parser.add_argument("--compare", default=None)
     parser.add_argument("--timeout", type=int, default=480)
+    parser.add_argument("--keep-workspaces-on-fail", action="store_true", help="Keep failed copied task workspaces under scratch/public-bench for inspection.")
     parser.add_argument("--strict-accuracy", action="store_true")
     args = parser.parse_args(argv)
 
@@ -188,11 +331,12 @@ def main(argv: list[str] | None = None) -> int:
     if not output.is_absolute():
         output = project_root / output
     polyglot_root = ensure_polyglot_repo(project_root / args.cache_dir)
+    tasks = list(args.tasks) if args.tasks is not None else list(HARD_POLYGLOT_TASKS if args.task_set == "hard" else DEFAULT_POLYGLOT_TASKS)
     results: list[dict[str, Any]] = []
     for model in args.models:
         for mode in args.modes:
             for reconcile in args.reconcile_modes:
-                for task in args.tasks:
+                for task in tasks:
                     outcome = evaluate_polyglot_python_task(
                         project_root=project_root,
                         polyglot_root=polyglot_root,
@@ -201,6 +345,7 @@ def main(argv: list[str] | None = None) -> int:
                         debate=mode,
                         reconcile=reconcile,
                         timeout=args.timeout,
+                        keep_workspaces_on_fail=args.keep_workspaces_on_fail,
                     )
                     results.append(outcome)
                     write_payload(output, results=results, partial=True)
