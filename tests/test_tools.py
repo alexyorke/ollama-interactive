@@ -991,6 +991,8 @@ class ToolExecutorTests(unittest.TestCase):
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
 
             for name in {
+                "todo_read",
+                "todo_write",
                 "edit_intent",
                 "fd_search",
                 "fts_search",
@@ -1009,6 +1011,40 @@ class ToolExecutorTests(unittest.TestCase):
                 "mcp_call",
             }:
                 self.assertIn(name, tools.available_tool_names())
+
+    def test_todo_tools_store_validate_and_render_session_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="read-only")
+
+            written = tools.execute(
+                "todo_write",
+                {
+                    "items": [
+                        {"content": "Inspect failing test", "status": "completed", "id": "inspect"},
+                        {"content": "Patch implementation", "status": "in_progress", "id": "patch"},
+                        {"content": "Run focused tests", "status": "pending", "id": "test"},
+                    ]
+                },
+            )
+            read = tools.execute("todo_read", {})
+
+        self.assertTrue(written["ok"], written)
+        self.assertEqual(written["pending"], 1)
+        self.assertEqual(written["in_progress"], 1)
+        self.assertIn("patch. [in_progress] Patch implementation", read["output"])
+        self.assertEqual(read["items"][0]["id"], "inspect")
+
+    def test_todo_write_rejects_multiple_in_progress_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+
+            result = tools.execute(
+                "todo_write",
+                {"items": [{"content": "one", "status": "in_progress"}, {"content": "two", "status": "doing"}]},
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("one todo item", result["summary"].lower())
 
     def test_disabled_tool_is_hidden_and_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -13,6 +13,7 @@ It gives the model a guarded tool loop for:
 - running a configured test command
 - inspecting git status and diffs
 - creating guarded git commits
+- tracking in-session todos for complex multi-step work
 - running nested sub-agents for scoped subtasks
 - running default-on tool-step assumption audits plus claim-aware risky final verification and evidence-backed rewrite
 - running artifact reconciliation after failed tests or validator-like tools
@@ -365,6 +366,7 @@ git push origin v0.1.0
 - `/reconcile off|on|auto`
 - `/doctor`
 - `/reset`
+- `/todos [clear]`
 - `/save [path]`
 - `/sessions [limit]`
 - `/load <path>`
@@ -392,6 +394,7 @@ git push origin v0.1.0
 - Token profiling is recorded in `llm_call` events, including prompt chars by role and largest prompt messages, so evals can identify input-token waste.
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
+- `todo_read` and `todo_write` give the model a Claude Code-style in-session checklist for complex tasks. Todo state is saved in session transcripts, does not touch workspace files, and is shown to the model only when the current request benefits from it.
 - The recommended default coding model is `gemma4:e4b`; install it with `ollama pull gemma4:e4b`.
 - The recommended serial eval order is `gemma4:e4b`, `granite4.1:8b`, `gemma3:4b`, then `qwen3:8b`.
 - If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back to the first available preferred local model and prints the pull command.

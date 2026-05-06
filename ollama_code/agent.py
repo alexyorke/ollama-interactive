@@ -40,6 +40,7 @@ Rules:
 - Code nav: use file_search/fd_search and fts_search/repo_index_search to shrink scope; prefer search_symbols, code_outline, then read_symbol before broad read_file; use inspect_library_source for installed Python library internals. Search/list before broad reads; use ranges.
 - Validation/deps: use discover_validators for unknown projects; use diagnose_dependency_error before retrying import/command/path failures.
 - Systems lens: for broad/debug/design/perf/refactor tasks, use systems_lens early; force explicit boundary, observer/metric, categories, state/scale, feedback, delays, stocks/flows, coupling, model limits, and intervention tests.
+- Todos: for complex multi-step tasks, when todo tools are listed, use todo_write to track steps; keep at most one in_progress and update completed items as work finishes.
 - Reuse results; avoid repeat read-only calls unless state changed.
 - Question your assumptions before acting; prove or disprove with tools when possible.
 - Never claim edit/cmd/test/agent success without current-turn success.
@@ -101,6 +102,7 @@ CANDIDATE_CLAIM_LIMIT = 5
 CANDIDATE_CLAIM_TEXT_LIMIT = 180
 VERIFICATION_EVIDENCE_LIMIT = 3
 VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
+TODO_TOOL_NAMES = {"todo_read", "todo_write"}
 MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent", "git_commit"}
 READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "list_files",
@@ -202,6 +204,8 @@ MODEL_TOOL_RESULT_LIMITS = {
     "run_shell": 700,
     "run_test": 700,
     "run_agent": 900,
+    "todo_read": 500,
+    "todo_write": 700,
 }
 MODEL_TOOL_DIFF_LIMIT = 700
 VERIFICATION_TOOL_RESULT_LIMIT = 450
@@ -455,6 +459,8 @@ class OllamaCodeAgent:
         ]
         if requires_tools or any(term in lowered for term in workspace_terms):
             selected.update(CORE_READ_ONLY_WORKSPACE_TOOL_NAMES)
+        if self._request_benefits_from_todos(request_text, mutation_required=mutation_required, test_run_required=test_run_required):
+            selected.update(TODO_TOOL_NAMES)
         if self._request_benefits_from_systems_lens(request_text):
             selected.add("systems_lens")
         if re.search(r"\b(?:refactor|signature|type|return|caller|callee|contract|pipeline|pure|function chain)\b", lowered):
@@ -503,6 +509,7 @@ class OllamaCodeAgent:
     def reset(self) -> None:
         self.messages = self._base_messages()
         self.events = []
+        self.tools.clear_todos()
         self._reset_turn_cache()
         self._transcript_dirty = True
         self._autosave()
@@ -587,6 +594,12 @@ class OllamaCodeAgent:
         tool_names = self.tools.available_tool_names()
         return format_compact_tool_help(tool_names) if compact else format_tool_help(tool_names)
 
+    def todo_read(self) -> dict[str, Any]:
+        return self.tools.execute("todo_read", {})
+
+    def todo_clear(self) -> dict[str, Any]:
+        return self.tools.execute("todo_write", {"items": []})
+
     def list_models(self) -> list[str]:
         return self.client.list_models()
 
@@ -610,8 +623,10 @@ class OllamaCodeAgent:
                 raise ValueError("Saved session contains a malformed message.")
             restored_messages.append({"role": role, "content": content})
         events = payload.get("events")
+        todos = payload.get("todos")
         self.messages = restored_messages
         self.events = list(events) if isinstance(events, list) else []
+        self.tools.set_todos(todos if isinstance(todos, list) else [])
         self._transcript_dirty = True
         self._autosave()
 
@@ -671,6 +686,7 @@ class OllamaCodeAgent:
             "reconcile_mode": self.reconcile_mode_setting,
             "workspace_root": self.tools.workspace_root.as_posix(),
             "approval_mode": self.tools.approval_mode,
+            "todos": self.tools.todo_snapshot(),
             "messages": self.messages,
             "events": self.events,
         }
@@ -2838,6 +2854,16 @@ class OllamaCodeAgent:
             )
         )
 
+    def _request_benefits_from_todos(self, text: str, *, mutation_required: bool, test_run_required: bool) -> bool:
+        lowered = text.lower()
+        if re.search(r"\b(?:todo|to-do|checklist|task list|plan steps|track progress)\b", lowered):
+            return True
+        if self._request_is_broad_or_ambiguous(text) or test_run_required:
+            return True
+        if mutation_required and re.search(r"\b(?:implement|fix|refactor|debug|profile|migrate|integrate|keep fixing)\b", lowered):
+            return True
+        return False
+
     def _tool_output_without_line_prefixes(self, text: str) -> str:
         return "\n".join(re.sub(r"^\s*\d+\s+\|\s?", "", line) for line in text.splitlines())
 
@@ -3261,6 +3287,12 @@ class OllamaCodeAgent:
         if name == "run_shell" and result.get("ok") is True and self._requested_exact_shell_command(request_text):
             output = str(result.get("output", "")).strip()
             if output and any(phrase in request_text.lower() for phrase in ["tell me", "reply with", "output"]):
+                return output
+
+        if name in {"todo_read", "todo_write"} and result.get("ok") is True:
+            lowered = request_text.lower()
+            output = str(result.get("output", "")).strip()
+            if output and "todo" in lowered and any(phrase in lowered for phrase in ["status", "statuses", "list", "reply with", "show"]):
                 return output
 
         if name == "search" and result.get("ok") is True:

@@ -397,6 +397,7 @@ def startup_help_text(agent: OllamaCodeAgent) -> str:
             "  /test [command]                  run configured or explicit tests",
             "  /doctor                          check first-use setup",
             "  /index status|refresh|stop|start  manage the repo-local search indexer",
+            "  /todos                           show current todo list",
             "  /tools                           show compact model-facing tools",
             "  /help                            show all slash commands",
             "  /quit                            exit",
@@ -421,6 +422,7 @@ def slash_help_text() -> str:
             "  /doctor                          check Ollama/model/workspace setup",
             "  /index status|refresh|stop|start  manage the repo-local search indexer",
             "  /reset                           clear conversation memory",
+            "  /todos [clear]                   show or clear current todo list",
             "  /save [path]                     save transcript",
             "  /sessions [limit]                list saved sessions",
             "  /load <path>                     load a saved session",
@@ -604,6 +606,18 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
             writer("indexer started" if started else "indexer disabled")
             return True
         writer("Usage: /index status|refresh|stop|start")
+        return True
+    if action == "/todos":
+        command = _strip_matching_quotes(remainder).lower()
+        if command == "clear":
+            result = agent.todo_clear()
+            writer(str(result.get("output") or result.get("summary", "(no todos)")))
+            return True
+        if command:
+            writer("Usage: /todos [clear]")
+            return True
+        result = agent.todo_read()
+        writer(str(result.get("output") or result.get("summary", "(no todos)")))
         return True
     if action == "/reset":
         agent.reset()

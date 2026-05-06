@@ -26,6 +26,7 @@ class DummyAgent:
         self.loaded_path: Path | PureWindowsPath | None = None
         self._session_path = Path("session.json").resolve()
         self._test_command = "python -m unittest -v"
+        self._todos = "1. [pending] inspect\n2. [completed] setup"
 
     def workspace_root(self) -> Path:
         return self._workspace
@@ -105,6 +106,13 @@ class DummyAgent:
 
     def tool_help(self, *, compact: bool = False) -> str:
         return "list_files()\nread_file(path)" if compact else "list_files\nread_file"
+
+    def todo_read(self) -> dict[str, object]:
+        return {"ok": True, "output": self._todos}
+
+    def todo_clear(self) -> dict[str, object]:
+        self._todos = "(empty)"
+        return {"ok": True, "output": self._todos}
 
     def list_models(self) -> list[str]:
         return [DEFAULT_MODEL, "gemma4:latest"]
@@ -216,6 +224,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/approval ask|auto|read-only", text)
         self.assertIn("/doctor", text)
         self.assertIn("/index", text)
+        self.assertIn("/todos", text)
         self.assertIn("/tools", text)
         self.assertIn("Press Esc", text)
 
@@ -231,6 +240,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("/test [command]", output[0])
         self.assertIn("/doctor", output[0])
         self.assertIn("/index", output[0])
+        self.assertIn("/todos", output[0])
         self.assertIn("fix failing tests", output[0])
 
     def test_doctor_report_checks_first_use_setup(self) -> None:
@@ -281,6 +291,18 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(full)
         self.assertEqual(output[0], "list_files()\nread_file(path)")
         self.assertEqual(output[1], "list_files\nread_file")
+
+    def test_todos_command_shows_and_clears_todo_list(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        shown = handle_meta_command("/todos", agent, output.append)
+        cleared = handle_meta_command("/todos clear", agent, output.append)
+
+        self.assertTrue(shown)
+        self.assertTrue(cleared)
+        self.assertIn("[pending] inspect", output[0])
+        self.assertEqual(output[1], "(empty)")
 
     def test_index_command_reports_and_controls_indexer(self) -> None:
         agent = DummyAgent()

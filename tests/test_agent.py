@@ -558,6 +558,26 @@ class AgentTests(unittest.TestCase):
         self.assertIn("ast_search", selected)
         self.assertIn("semgrep_scan", selected)
 
+    def test_primary_tools_include_todos_for_complex_work(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        selected = agent._primary_tool_names_for_request(
+            "Implement todo list support, update tests, and run the suite.",
+            requires_tools=True,
+            session_memory_request=False,
+            mutation_allowed=True,
+            mutation_required=True,
+            test_run_required=True,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+
+        self.assertIn("todo_read", selected)
+        self.assertIn("todo_write", selected)
+
     def test_primary_context_truncates_old_messages_before_recent_limit(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient([])
@@ -595,6 +615,7 @@ class AgentTests(unittest.TestCase):
         system_prompt = client.calls[0]["messages"][0]["content"]
         self.assertNotIn("replace_symbols(path", system_prompt)
         self.assertNotIn("run_shell(command", system_prompt)
+        self.assertNotIn("todo_write(items", system_prompt)
         self.assertLess(len(system_prompt), len(agent.messages[0]["content"]))
 
     def test_primary_prompt_uses_edit_tool_palette_for_mutation_request(self) -> None:
@@ -1926,6 +1947,47 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.approval_mode(), "auto")
         self.assertEqual(agent.messages[1]["content"], "remember TOKEN_42")
         self.assertEqual(agent.events[0]["content"], "remember TOKEN_42")
+
+    def test_todos_are_saved_and_restored_with_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session = root / "scratch" / "session.json"
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", session_file=session, debate_enabled=False)
+            tools.execute(
+                "todo_write",
+                {"items": [{"content": "Inspect source", "status": "completed"}, {"content": "Run tests", "status": "pending"}]},
+            )
+            saved = agent.save_transcript()
+            payload = json.loads(saved.read_text(encoding="utf-8"))
+
+            restored_tools = ToolExecutor(root, approval_mode="auto")
+            restored = OllamaCodeAgent(client=FakeClient([]), tools=restored_tools, model="fake-model", debate_enabled=False)
+            restored.restore_transcript(payload)
+            read = restored.todo_read()
+
+        self.assertEqual(payload["todos"][0]["content"], "Inspect source")
+        self.assertIn("[pending] Run tests", str(read["output"]))
+
+    def test_agent_synthesizes_todo_statuses_after_todo_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"todo_write","arguments":{"items":[{"content":"inspect","status":"completed"},{"content":"report","status":"pending"}]}}',
+                    '{"type":"tool","name":"todo_read","arguments":{}}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="read-only")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Use todo_write to create a todo list with one completed item named inspect and one pending item named report. Then use todo_read and reply with the todo statuses only."
+            )
+
+        self.assertIn("[completed] inspect", result.message)
+        self.assertIn("[pending] report", result.message)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" and event.get("tool") == "todo_read" for event in agent.events))
 
     def test_agent_load_session_restores_runtime_settings_without_rewriting_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

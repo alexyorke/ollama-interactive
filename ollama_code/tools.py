@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+from copy import deepcopy
 import dis
 import difflib
 import hashlib
@@ -126,9 +127,30 @@ ERROR_CLASS_PATTERNS: dict[str, re.Pattern[str]] = {
     "permission": re.compile(r"Permission denied|access is denied|Operation not permitted", re.IGNORECASE),
     "patch_apply": re.compile(r"patch failed|does not apply|git apply.*failed|hunk FAILED|error: patch", re.IGNORECASE),
 }
+TODO_STATUSES = {"pending", "in_progress", "completed"}
+TODO_STATUS_ALIASES = {
+    "todo": "pending",
+    "open": "pending",
+    "doing": "in_progress",
+    "started": "in_progress",
+    "done": "completed",
+    "complete": "completed",
+}
+TODO_LIMIT = 20
+TODO_CONTENT_LIMIT = 180
 
 
 TOOL_DESCRIPTIONS = [
+    {
+        "name": "todo_read",
+        "arguments": {},
+        "description": "Read the in-session todo list for complex multi-step work.",
+    },
+    {
+        "name": "todo_write",
+        "arguments": {"items": "list of {content,status,id?}; status pending|in_progress|completed"},
+        "description": "Replace the in-session todo list. Keep at most one item in_progress.",
+    },
     {
         "name": "list_files",
         "arguments": {"path": "relative path, default .", "max_depth": "int, default 4", "limit": "int, default 200"},
@@ -410,6 +432,8 @@ def format_tool_help(tool_names: Iterable[str] | None = None) -> str:
 
 def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
     signatures = {
+        "todo_read": "todo_read()",
+        "todo_write": 'todo_write(items=[{"content":"inspect","status":"pending"}])',
         "list_files": "list_files(path='.',depth=4,limit=200)",
         "read_file": "read_file(path,start=1,end=200)",
         "search": "search(query,path='.',limit=100)",
@@ -494,6 +518,7 @@ class ToolExecutor:
         self.indexer = indexer
         self._interrupt_event: threading.Event | None = None
         self._initial_dirty_paths = self._git_dirty_paths()
+        self._todos: list[dict[str, str]] = []
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
@@ -506,6 +531,16 @@ class ToolExecutor:
 
     def set_indexer(self, indexer: Any | None) -> None:
         self.indexer = indexer
+
+    def todo_snapshot(self) -> list[dict[str, str]]:
+        return deepcopy(self._todos)
+
+    def set_todos(self, items: list[dict[str, Any]] | None) -> None:
+        normalized, _ = self._normalize_todo_items(items or [])
+        self._todos = normalized
+
+    def clear_todos(self) -> None:
+        self._todos = []
 
     def _truncate_text(self, text: str, *, limit: int) -> str:
         if len(text) <= limit:
@@ -568,6 +603,8 @@ class ToolExecutor:
             except Exception as exc:  # pragma: no cover - defensive fallback
                 return {"ok": False, "tool": name, "summary": f"{name} failed: {exc}"}
         handlers = {
+            "todo_read": self.todo_read,
+            "todo_write": self.todo_write,
             "list_files": self.list_files,
             "read_file": self.read_file,
             "search": self.search,
@@ -668,6 +705,80 @@ class ToolExecutor:
         notify = getattr(indexer, "notify_paths", None)
         if paths and callable(notify):
             notify(paths)
+
+    def _normalize_todo_status(self, raw: Any) -> str | None:
+        status = str(raw or "pending").strip().lower().replace("-", "_")
+        status = TODO_STATUS_ALIASES.get(status, status)
+        return status if status in TODO_STATUSES else None
+
+    def _normalize_todo_items(self, raw_items: Any) -> tuple[list[dict[str, str]], str | None]:
+        if not isinstance(raw_items, list):
+            return [], "todo_write requires items as a list."
+        if len(raw_items) > TODO_LIMIT:
+            return [], f"todo_write supports at most {TODO_LIMIT} items."
+        normalized: list[dict[str, str]] = []
+        seen_ids: set[str] = set()
+        in_progress_count = 0
+        for index, raw in enumerate(raw_items, start=1):
+            if isinstance(raw, str):
+                content = raw.strip()
+                status = "pending"
+                raw_id = str(index)
+            elif isinstance(raw, dict):
+                content = str(raw.get("content") or raw.get("task") or raw.get("text") or "").strip()
+                status = self._normalize_todo_status(raw.get("status"))
+                raw_id = str(raw.get("id") or index).strip()
+            else:
+                return [], f"Todo item {index} must be an object or string."
+            if not content:
+                return [], f"Todo item {index} requires non-empty content."
+            if status is None:
+                return [], f"Todo item {index} has invalid status; use pending, in_progress, or completed."
+            if status == "in_progress":
+                in_progress_count += 1
+            clean_id = re.sub(r"[^A-Za-z0-9_.:-]+", "-", raw_id).strip("-") or str(index)
+            if clean_id in seen_ids:
+                return [], f"Duplicate todo id: {clean_id}"
+            seen_ids.add(clean_id)
+            normalized.append({"id": clean_id, "status": status, "content": self._truncate_text(content, limit=TODO_CONTENT_LIMIT)})
+        if in_progress_count > 1:
+            return [], "Only one todo item can be in_progress at a time."
+        return normalized, None
+
+    def _render_todos(self) -> str:
+        if not self._todos:
+            return "(empty)"
+        return "\n".join(f"{item['id']}. [{item['status']}] {item['content']}" for item in self._todos)
+
+    def todo_read(self) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "tool": "todo_read",
+            "count": len(self._todos),
+            "items": self.todo_snapshot(),
+            "output": self._render_todos(),
+        }
+
+    def todo_write(self, items: list[Any] | None = None, todos: list[Any] | None = None) -> dict[str, Any]:
+        raw_items = items if items is not None else todos
+        normalized, error = self._normalize_todo_items(raw_items if raw_items is not None else [])
+        if error:
+            return {"ok": False, "tool": "todo_write", "summary": error}
+        self._todos = normalized
+        pending = sum(1 for item in self._todos if item["status"] == "pending")
+        in_progress = sum(1 for item in self._todos if item["status"] == "in_progress")
+        completed = sum(1 for item in self._todos if item["status"] == "completed")
+        return {
+            "ok": True,
+            "tool": "todo_write",
+            "count": len(self._todos),
+            "pending": pending,
+            "in_progress": in_progress,
+            "completed": completed,
+            "items": self.todo_snapshot(),
+            "summary": f"todo list updated: {len(self._todos)} item(s), {pending} pending, {in_progress} in_progress, {completed} completed.",
+            "output": self._render_todos(),
+        }
 
     def resolve_path(self, raw_path: str | None, *, allow_missing: bool = True) -> Path:
         candidate = self.workspace_root if not raw_path else self._coerce_input_path(raw_path)
