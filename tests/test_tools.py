@@ -1667,9 +1667,16 @@ class ToolExecutorTests(unittest.TestCase):
                 "    def test_repeated_pop(self):\n"
                 "        sut = LinkedList([1, 2])\n"
                 "        sut.push(3)\n"
+                "        self.assertEqual(len(sut), 3)\n"
                 "        self.assertEqual(sut.pop(), 3)\n"
                 "        self.assertEqual(sut.pop(), 2)\n"
-                "        self.assertEqual(sut.pop(), 1)\n",
+                "        self.assertEqual(sut.pop(), 1)\n"
+                "    def test_reversed_to_list(self):\n"
+                "        sut = LinkedList([1, 2, 3])\n"
+                "        self.assertEqual(list(sut.reversed()), [1, 2, 3])\n"
+                "    def test_nested_none(self):\n"
+                "        sut = LinkedList([1])\n"
+                "        self.assertIsNone(sut.head().next())\n",
                 encoding="utf-8",
             )
             tools = ToolExecutor(root, approval_mode="auto")
@@ -1677,9 +1684,55 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertIn("sut = LinkedList([1]); sut.head().value() -> 1", result["output"])
+        self.assertIn("sut = LinkedList([1, 2]); sut.push(3); len(sut) -> 3", result["output"])
         self.assertIn("sut = LinkedList([1, 2]); sut.push(3); sut.pop() -> 3", result["output"])
         self.assertIn("sut = LinkedList([1, 2]); sut.push(3); sut.pop(); sut.pop() -> 2", result["output"])
         self.assertIn("sut = LinkedList([1, 2]); sut.push(3); sut.pop(); sut.pop(); sut.pop() -> 1", result["output"])
+        self.assertIn("sut = LinkedList([1, 2, 3]); list(sut.reversed()) -> [1, 2, 3]", result["output"])
+        self.assertNotIn("reversed(sut.reversed())", result["output"])
+        self.assertIn("sut = LinkedList([1]); sut.head().next() -> None", result["output"])
+
+    def test_test_spec_extract_captures_regex_not_equal_and_reset_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "robot_name.py").write_text(
+                "class Robot:\n"
+                "    def __init__(self):\n"
+                "        self.name = None\n",
+                encoding="utf-8",
+            )
+            (root / "robot_name_test.py").write_text(
+                "import unittest\nfrom robot_name import Robot\n\n"
+                "class RobotNameTest(unittest.TestCase):\n"
+                "    name_re = r'^[A-Z]{2}\\d{3}$'\n"
+                "    def test_has_name(self):\n"
+                "        self.assertRegex(Robot().name, self.name_re)\n"
+                "    def test_name_sticks(self):\n"
+                "        robot = Robot()\n"
+                "        robot.name\n"
+                "        self.assertEqual(robot.name, robot.name)\n"
+                "    def test_different_robots_have_different_names(self):\n"
+                "        self.assertNotEqual(Robot().name, Robot().name)\n"
+                "    def test_reset_name(self):\n"
+                "        robot = Robot()\n"
+                "        name = robot.name\n"
+                "        robot.reset()\n"
+                "        name2 = robot.name\n"
+                "        self.assertNotEqual(name, name2)\n"
+                "        self.assertRegex(name2, self.name_re)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("robot_name_test.py", source_path="robot_name.py", limit=20)
+
+        self.assertTrue(result["ok"], result)
+        output = result["output"]
+        self.assertIn("Robot().name matches '^[A-Z]{2}\\\\d{3}$'", output)
+        self.assertIn("robot = Robot(); robot.name -> robot.name", output)
+        self.assertNotIn("Robot().name -> Robot().name", output)
+        self.assertIn("Robot().name != Robot().name", output)
+        self.assertIn("robot = Robot(); robot.reset(); robot.name matches '^[A-Z]{2}\\\\d{3}$'", output)
+        self.assertIn("robot = Robot(); robot.name != robot = Robot(); robot.reset(); robot.name", output)
 
     def test_test_spec_extract_balances_examples_across_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1959,6 +2012,123 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(synthesized["ok"], synthesized)
         self.assertTrue(validation["ok"], validation)
         self.assertIn("F", synthesized["flat_tonics"])
+
+    def test_synthesize_unique_regex_identifier_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "robot_name.py").write_text(
+                "class Robot:\n"
+                "    def __init__(self):\n"
+                "        self.name = None\n",
+                encoding="utf-8",
+            )
+            (root / "robot_name_test.py").write_text(
+                "import random\nimport unittest\nfrom robot_name import Robot\n\n"
+                "class RobotNameTest(unittest.TestCase):\n"
+                "    name_re = r'^[A-Z]{2}\\d{3}$'\n"
+                "    def test_has_name(self):\n"
+                "        self.assertRegex(Robot().name, self.name_re)\n"
+                "    def test_different_robots_have_different_names(self):\n"
+                "        self.assertNotEqual(Robot().name, Robot().name)\n"
+                "    def test_reset_name(self):\n"
+                "        random.seed('same')\n"
+                "        robot = Robot()\n"
+                "        name = robot.name\n"
+                "        random.seed('same')\n"
+                "        robot.reset()\n"
+                "        name2 = robot.name\n"
+                "        self.assertNotEqual(name, name2)\n"
+                "        self.assertRegex(name2, self.name_re)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_unique_regex_identifier_candidate("robot_name.py", "robot_name_test.py")
+            validation = tools.validate_implementation_candidate(
+                "robot_name.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="robot_name_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(synthesized["attribute"], "name")
+
+    def test_synthesize_node_collection_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "simple_linked_list.py").write_text(
+                "class EmptyListException(Exception):\n"
+                "    pass\n\n\n"
+                "class Node:\n"
+                "    def __init__(self, value):\n"
+                "        pass\n\n"
+                "    def value(self):\n"
+                "        pass\n\n"
+                "    def next(self):\n"
+                "        pass\n\n\n"
+                "class LinkedList:\n"
+                "    def __init__(self, values=None):\n"
+                "        pass\n\n"
+                "    def __iter__(self):\n"
+                "        pass\n\n"
+                "    def __len__(self):\n"
+                "        pass\n\n"
+                "    def head(self):\n"
+                "        pass\n\n"
+                "    def push(self, value):\n"
+                "        pass\n\n"
+                "    def pop(self):\n"
+                "        pass\n\n"
+                "    def reversed(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "simple_linked_list_test.py").write_text(
+                "import unittest\nfrom simple_linked_list import EmptyListException, LinkedList\n\n"
+                "class SimpleLinkedListTest(unittest.TestCase):\n"
+                "    def test_len(self):\n"
+                "        sut = LinkedList([1, 2, 3])\n"
+                "        self.assertEqual(len(sut), 3)\n"
+                "        sut.push(4)\n"
+                "        self.assertEqual(len(sut), 4)\n"
+                "    def test_empty_head(self):\n"
+                "        sut = LinkedList()\n"
+                "        with self.assertRaises(EmptyListException) as err:\n"
+                "            sut.head()\n"
+                "        self.assertEqual(err.exception.args[0], 'The list is empty.')\n"
+                "    def test_head_push_pop(self):\n"
+                "        sut = LinkedList([1, 2])\n"
+                "        self.assertEqual(sut.head().value(), 2)\n"
+                "        sut.push(3)\n"
+                "        self.assertEqual(sut.pop(), 3)\n"
+                "        self.assertEqual(sut.pop(), 2)\n"
+                "        self.assertEqual(sut.pop(), 1)\n"
+                "        with self.assertRaises(EmptyListException):\n"
+                "            sut.pop()\n"
+                "    def test_iter_and_reverse(self):\n"
+                "        sut = LinkedList([1, 2, 3])\n"
+                "        self.assertEqual(list(sut), [3, 2, 1])\n"
+                "        self.assertEqual(list(sut.reversed()), [1, 2, 3])\n"
+                "    def test_head_next(self):\n"
+                "        sut = LinkedList([1])\n"
+                "        self.assertIsNone(sut.head().next())\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_node_collection_candidate("simple_linked_list.py", "simple_linked_list_test.py")
+            validation = tools.validate_implementation_candidate(
+                "simple_linked_list.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="simple_linked_list_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("node-backed collection", synthesized["summary"])
 
     def test_validate_implementation_candidate_uses_temp_workspace_and_preserves_signatures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

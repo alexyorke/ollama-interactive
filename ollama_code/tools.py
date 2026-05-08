@@ -3039,6 +3039,8 @@ class ToolExecutor:
     def _node_expr(self, node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
         if local_exprs and isinstance(node, ast.Name) and node.id in local_exprs:
             return local_exprs[node.id]
+        if local_exprs and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self" and node.attr in local_exprs:
+            return local_exprs[node.attr]
         if local_exprs and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in local_exprs:
             return f"{local_exprs[node.value.id]}.{node.attr}"
         try:
@@ -3084,6 +3086,33 @@ class ToolExecutor:
         parts = [part.strip() for part in cleaned.split(";") if part.strip()]
         if len(parts) > 1:
             last = parts[-1]
+            receiver_attr = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<attr>[A-Za-z_][A-Za-z0-9_]*)$", last)
+            if receiver_attr:
+                receiver = receiver_attr.group("receiver")
+                for earlier in parts[:-1]:
+                    assignment = re.match(rf"^{re.escape(receiver)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
+                    if assignment and aliases.get(assignment.group("class"), assignment.group("class")) in source_symbols:
+                        return aliases.get(assignment.group("class"), assignment.group("class"))
+            len_call = re.match(r"^len\((?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\)$", last)
+            if len_call:
+                receiver = len_call.group("receiver")
+                for earlier in parts[:-1]:
+                    assignment = re.match(rf"^{re.escape(receiver)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
+                    if assignment and aliases.get(assignment.group("class"), assignment.group("class")) in source_symbols:
+                        return "__len__"
+            list_call = re.match(r"^list\((?P<inner>.+)\)$", last)
+            if list_call:
+                inner = list_call.group("inner").strip()
+                method = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", inner)
+                if method:
+                    return method.group("method")
+                receiver = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)$", inner)
+                if receiver:
+                    receiver_name = receiver.group("receiver")
+                    for earlier in parts[:-1]:
+                        assignment = re.match(rf"^{re.escape(receiver_name)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
+                        if assignment and aliases.get(assignment.group("class"), assignment.group("class")) in source_symbols:
+                            return "__iter__"
             receiver_call = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", last)
             if receiver_call:
                 receiver = receiver_call.group("receiver")
@@ -3107,11 +3136,23 @@ class ToolExecutor:
             name = aliases.get(call.group("name"), call.group("name"))
             if not source_symbols or name in source_symbols:
                 return name
+            len_constructor = re.match(r"^len\((?P<class>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\)$", cleaned)
+            if len_constructor and aliases.get(len_constructor.group("class"), len_constructor.group("class")) in source_symbols:
+                return "__len__"
+            list_method = re.match(r"^list\([A-Za-z_][A-Za-z0-9_]*\(.*\)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\)$", cleaned)
+            if list_method:
+                return list_method.group("method")
+            list_constructor = re.match(r"^list\((?P<class>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\)$", cleaned)
+            if list_constructor and aliases.get(list_constructor.group("class"), list_constructor.group("class")) in source_symbols:
+                return "__iter__"
         method_call = re.match(r"^.+\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
         if method_call:
             method = method_call.group("method")
             if not source_symbols or method in source_symbols:
                 return method
+        attr = re.match(r"^(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\.[A-Za-z_][A-Za-z0-9_]*$", cleaned)
+        if attr and aliases.get(attr.group("class"), attr.group("class")) in source_symbols:
+            return aliases.get(attr.group("class"), attr.group("class"))
         return ""
 
     def _test_spec_add_raw_example(
@@ -3178,7 +3219,7 @@ class ToolExecutor:
             if not derived_symbol:
                 return
             canonical = derived_symbol
-        if canonical != symbol and expr.startswith(symbol + "("):
+        if canonical != symbol and aliases.get(symbol) == canonical and expr.startswith(symbol + "("):
             expr = canonical + expr[len(symbol) :]
         if expected is not None:
             text = f"{expr} -> {expected}"
@@ -3226,6 +3267,13 @@ class ToolExecutor:
             return None
         return target.id, self._node_expr(value, local_exprs)
 
+    def _test_spec_assignment_value_node(self, stmt: ast.stmt) -> ast.AST | None:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
+            return stmt.value
+        if isinstance(stmt, ast.AnnAssign):
+            return stmt.value
+        return None
+
     def _test_spec_is_source_constructor(self, expr: str, source_symbols: set[str], aliases: dict[str, str]) -> bool:
         match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(", expr)
         if not match:
@@ -3250,12 +3298,99 @@ class ToolExecutor:
 
     def _test_spec_receiver_root_name(self, call: ast.Call) -> str:
         func = call.func
-        if not isinstance(func, ast.Attribute):
-            return ""
-        node: ast.AST = func.value
-        while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-            node = node.func.value
-        return node.id if isinstance(node, ast.Name) else ""
+        if isinstance(func, ast.Name) and func.id in {"len", "list", "tuple", "set"} and call.args:
+            first_arg = call.args[0]
+            if isinstance(first_arg, ast.Name):
+                return first_arg.id
+            if isinstance(first_arg, ast.Call):
+                return self._test_spec_receiver_root_name(first_arg)
+            if isinstance(first_arg, ast.Attribute):
+                return self._test_spec_receiver_root_name_from_node(first_arg)
+        if isinstance(func, ast.Attribute):
+            node: ast.AST = func.value
+            while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                node = node.func.value
+            if isinstance(node, ast.Name):
+                return node.id
+        for child in ast.walk(call):
+            if child is call or not isinstance(child, ast.Call) or not isinstance(child.func, ast.Attribute):
+                continue
+            node = child.func.value
+            while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                node = node.func.value
+            if isinstance(node, ast.Name):
+                return node.id
+        return ""
+
+    def _test_spec_assigned_names(self, node: ast.AST) -> set[str]:
+        names: set[str] = set()
+        for child in ast.walk(node):
+            targets: list[ast.AST] = []
+            if isinstance(child, ast.Assign):
+                targets = list(child.targets)
+            elif isinstance(child, ast.AnnAssign):
+                targets = [child.target]
+            elif isinstance(child, ast.AugAssign):
+                targets = [child.target]
+            elif isinstance(child, ast.For):
+                targets = [child.target]
+            for target in targets:
+                for item in ast.walk(target):
+                    if isinstance(item, ast.Name):
+                        names.add(item.id)
+        return names
+
+    def _test_spec_receiver_root_name_from_node(self, node: ast.AST) -> str:
+        if isinstance(node, ast.Call):
+            return self._test_spec_receiver_root_name(node)
+        if isinstance(node, ast.Attribute):
+            current: ast.AST = node.value
+            while isinstance(current, ast.Attribute):
+                current = current.value
+            if isinstance(current, ast.Call):
+                return self._test_spec_receiver_root_name(current)
+            if isinstance(current, ast.Name):
+                return current.id
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call):
+                receiver = self._test_spec_receiver_root_name(child)
+                if receiver:
+                    return receiver
+            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
+                return child.value.id
+        return ""
+
+    def _test_spec_expr_with_history(self, node: ast.AST, local_exprs: dict[str, str], object_history: dict[str, list[str]]) -> str:
+        receiver = self._test_spec_receiver_root_name_from_node(node)
+        if receiver and receiver in object_history:
+            return "; ".join(object_history[receiver] + [self._node_expr(node, None)])
+        return self._node_expr(node, local_exprs)
+
+    def _test_spec_expected_expr(self, node: ast.AST, local_exprs: dict[str, str], object_history: dict[str, list[str]]) -> str:
+        receiver = self._test_spec_receiver_root_name_from_node(node)
+        if receiver and receiver in object_history:
+            return self._node_expr(node, None)
+        return self._node_expr(node, local_exprs)
+
+    def _test_spec_add_text_example(
+        self,
+        examples: list[dict[str, Any]],
+        *,
+        expr: str,
+        text: str,
+        line: int,
+        test_name: str | None,
+        source_symbols: set[str],
+        aliases: dict[str, str],
+    ) -> None:
+        symbol = self._test_spec_symbol_from_expr(expr, source_symbols, aliases)
+        if source_symbols and not symbol:
+            return
+        item = {"symbol": symbol or "expression", "example": text, "line": line}
+        if test_name:
+            item["test_name"] = test_name
+        if item not in examples:
+            examples.append(item)
 
     def _test_spec_call_may_mutate_state(self, call: ast.Call) -> bool:
         name = self._test_spec_call_name(call)
@@ -3351,20 +3486,41 @@ class ToolExecutor:
         aliases = self._test_spec_import_aliases(tree, source_path)
         examples: list[dict[str, Any]] = []
         equality_methods = {"assertEqual", "assertEquals", "assertListEqual", "assertTupleEqual", "assertDictEqual"}
+        function_constants: dict[int, dict[str, str]] = {}
+        for node in getattr(tree, "body", []):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            constants: dict[str, str] = {}
+            for child in node.body:
+                assigned = self._test_spec_assignment_expr(child, constants)
+                if assigned is not None:
+                    constants[assigned[0]] = assigned[1]
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
+                    function_constants[id(child)] = dict(constants)
         for function in self._test_spec_iter_test_functions(tree):
             self._check_interrupted()
-            local_exprs: dict[str, str] = {}
+            local_exprs: dict[str, str] = dict(function_constants.get(id(function), {}))
             object_history: dict[str, list[str]] = {}
             for stmt_index, stmt in enumerate(function.body):
                 assigned = self._test_spec_assignment_expr(stmt, local_exprs)
                 if assigned is not None:
                     name, expr = assigned
+                    value_node = self._test_spec_assignment_value_node(stmt)
+                    if value_node is not None:
+                        expr = self._test_spec_expr_with_history(value_node, local_exprs, object_history)
                     local_exprs[name] = expr
                     if self._test_spec_is_source_constructor(expr, source_symbols, aliases):
                         object_history[name] = [f"{name} = {expr}"]
                     continue
+                if isinstance(stmt, (ast.For, ast.While)):
+                    for name in self._test_spec_assigned_names(stmt):
+                        local_exprs.pop(name, None)
+                        object_history.pop(name, None)
+                    continue
                 if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
                     node = stmt.value
+                    method_name = self._method_name(node)
                     if self._method_name(node) in equality_methods and len(node.args) >= 2:
                         actual: ast.Call | None = None
                         expected_node: ast.AST | None = None
@@ -3378,7 +3534,7 @@ class ToolExecutor:
                             self._test_spec_add_example(
                                 examples,
                                 call=actual,
-                                expected=self._node_expr(expected_node, local_exprs),
+                                expected=self._test_spec_expected_expr(expected_node, local_exprs, object_history),
                                 expr_override=self._test_spec_behavior_expr(actual, local_exprs, object_history),
                                 line=int(getattr(node, "lineno", 1)),
                                 test_name=function.name,
@@ -3390,19 +3546,62 @@ class ToolExecutor:
                                 self._test_spec_record_side_effect_call(actual, local_exprs, object_history)
                         else:
                             for actual_node, expected_candidate in ((node.args[0], node.args[1]), (node.args[1], node.args[0])):
-                                expr = self._node_expr(actual_node, local_exprs)
+                                actual_receiver = self._test_spec_receiver_root_name_from_node(actual_node)
+                                expected_receiver = self._test_spec_receiver_root_name_from_node(expected_candidate)
+                                if actual_receiver and actual_receiver == expected_receiver and actual_receiver in object_history:
+                                    expr = self._test_spec_expr_with_history(actual_node, local_exprs, object_history)
+                                else:
+                                    expr = self._node_expr(actual_node, local_exprs)
                                 if not self._test_spec_symbol_from_expr(expr, source_symbols, aliases):
                                     continue
                                 self._test_spec_add_raw_example(
                                     examples,
                                     expr=expr,
-                                    expected=self._node_expr(expected_candidate, local_exprs),
+                                    expected=self._test_spec_expected_expr(expected_candidate, local_exprs, object_history),
                                     line=int(getattr(node, "lineno", 1)),
                                     test_name=function.name,
                                     source_symbols=source_symbols,
                                     aliases=aliases,
                                 )
                                 break
+                        continue
+                    if method_name == "assertIsNone" and node.args:
+                        expr = self._test_spec_behavior_expr(node.args[0], local_exprs, object_history) if isinstance(node.args[0], ast.Call) else self._node_expr(node.args[0], local_exprs)
+                        self._test_spec_add_raw_example(
+                            examples,
+                            expr=expr,
+                            expected="None",
+                            line=int(getattr(node, "lineno", 1)),
+                            test_name=function.name,
+                            source_symbols=source_symbols,
+                            aliases=aliases,
+                        )
+                        continue
+                    if method_name in {"assertRegex", "assertRegexpMatches"} and len(node.args) >= 2:
+                        expr = self._node_expr(node.args[0], local_exprs)
+                        pattern = self._node_expr(node.args[1], local_exprs)
+                        self._test_spec_add_text_example(
+                            examples,
+                            expr=expr,
+                            text=f"{expr} matches {pattern}",
+                            line=int(getattr(node, "lineno", 1)),
+                            test_name=function.name,
+                            source_symbols=source_symbols,
+                            aliases=aliases,
+                        )
+                        continue
+                    if method_name == "assertNotEqual" and len(node.args) >= 2:
+                        left = self._node_expr(node.args[0], local_exprs)
+                        right = self._node_expr(node.args[1], local_exprs)
+                        self._test_spec_add_text_example(
+                            examples,
+                            expr=left,
+                            text=f"{left} != {right}",
+                            line=int(getattr(node, "lineno", 1)),
+                            test_name=function.name,
+                            source_symbols=source_symbols,
+                            aliases=aliases,
+                        )
                         continue
                     if self._method_name(node) == "assertRaises" and len(node.args) >= 2:
                         func_node = node.args[1]
@@ -3996,6 +4195,205 @@ class ToolExecutor:
             "candidate_source": body,
             "summary": f"synthesized cyclic interval scale candidate from {len(scale_rows)} examples",
             "flat_tonics": flat_tonics,
+        }
+
+    def synthesize_unique_regex_identifier_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(classes) != 1:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": "Unique-regex synthesis requires exactly one class."}
+        class_node = classes[0]
+        methods = {child.name: child for child in class_node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        init_node = methods.get("__init__")
+        if init_node is None:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": "Unique-regex synthesis requires __init__."}
+        init_params = self._python_parameter_sequence(init_node)
+        if len(init_params) != 1:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": "Unique-regex synthesis supports no-argument constructors."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        examples = [str(item.get("example") or "") for item in list(extracted.get("examples") or []) if isinstance(item, dict)]
+        text = "\n".join(examples)
+        regex_match = re.search(r"(?P<expr>[A-Za-z_][A-Za-z0-9_]*(?:\(.*?\))?(?:; [^\\n]+?)?\.[A-Za-z_][A-Za-z0-9_]*) matches (?P<pattern>'[^']+'|\"[^\"]+\")", text)
+        if not regex_match or "!=" not in text:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": "No regex plus uniqueness examples found."}
+        try:
+            pattern = ast.literal_eval(regex_match.group("pattern"))
+        except Exception:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": "Could not parse regex literal."}
+        shape = re.fullmatch(r"^\^\[A-Z\]\{(?P<letters>\d+)\}\\\\?d\{(?P<digits>\d+)\}\$$", str(pattern))
+        if not shape:
+            return {"ok": False, "tool": "synthesize_unique_regex_identifier_candidate", "path": rel_source, "summary": f"Unsupported identifier regex: {pattern}"}
+        attr_match = re.search(r"\.(?P<attr>[A-Za-z_][A-Za-z0-9_]*)$", regex_match.group("expr").split(";")[-1].strip())
+        attr_name = attr_match.group("attr") if attr_match else "name"
+        letter_count = int(shape.group("letters"))
+        digit_count = int(shape.group("digits"))
+        class_header = self._python_signature(source_text.splitlines(), int(getattr(class_node, "lineno", 1)))
+        init_header = self._python_signature(source_text.splitlines(), int(getattr(init_node, "lineno", 1)))
+        body = f'''import random
+import string
+
+
+{class_header}
+    _used_identifiers = set()
+
+    {init_header.strip()}
+        self.{attr_name} = self._generate_identifier()
+
+    @classmethod
+    def _generate_identifier(cls):
+        while True:
+            letters = "".join(random.choice(string.ascii_uppercase) for _ in range({letter_count}))
+            digits = "".join(random.choice(string.digits) for _ in range({digit_count}))
+            identifier = letters + digits
+            if identifier not in cls._used_identifiers:
+                cls._used_identifiers.add(identifier)
+                return identifier
+
+    def reset(self):
+        self.{attr_name} = self._generate_identifier()
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_unique_regex_identifier_candidate",
+            "path": rel_source,
+            "candidate_source": body,
+            "summary": f"synthesized unique regex identifier candidate for {attr_name} matching {pattern}",
+            "attribute": attr_name,
+            "pattern": pattern,
+        }
+
+    def synthesize_node_collection_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_node_collection_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_node_collection_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        node_class: ast.ClassDef | None = None
+        collection_class: ast.ClassDef | None = None
+        exception_class: ast.ClassDef | None = None
+        class_methods: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        for class_node in classes:
+            methods = {child.name: child for child in class_node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            class_methods[class_node.name] = methods
+            method_names = set(methods)
+            if {"value", "next", "__init__"} <= method_names and node_class is None:
+                node_class = class_node
+            if {"__iter__", "__len__", "head", "push", "pop", "reversed", "__init__"} <= method_names and collection_class is None:
+                collection_class = class_node
+            if exception_class is None and (class_node.name.endswith("Exception") or any(self._node_expr(base, {}) == "Exception" for base in class_node.bases)):
+                exception_class = class_node
+        if node_class is None or collection_class is None:
+            return {
+                "ok": False,
+                "tool": "synthesize_node_collection_candidate",
+                "path": rel_source,
+                "summary": "Node collection synthesis requires Node-like value/next and collection push/pop/iter/head methods.",
+            }
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_node_collection_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        example_text = "\n".join(str(item.get("example") or "") for item in list(extracted.get("examples") or []) if isinstance(item, dict))
+        required_fragments = ("list(", "len(", ".push(", ".pop()", ".head()", ".reversed()")
+        if not all(fragment in example_text for fragment in required_fragments):
+            return {
+                "ok": False,
+                "tool": "synthesize_node_collection_candidate",
+                "path": rel_source,
+                "summary": "Node collection synthesis requires list/len/push/pop/head/reversed examples.",
+            }
+        message = "The list is empty."
+        message_match = re.search(r"raises\s+[A-Za-z_][\w.]*\((?P<message>'[^']*'|\"[^\"]*\")\)", example_text)
+        if message_match:
+            try:
+                message = str(ast.literal_eval(message_match.group("message")))
+            except Exception:
+                message = "The list is empty."
+        lines = source_text.splitlines()
+        exception_name = exception_class.name if exception_class is not None else "EmptyListException"
+        node_name = node_class.name
+        collection_name = collection_class.name
+        node_methods = class_methods[node_name]
+        collection_methods = class_methods[collection_name]
+
+        def signature_for(class_or_method: ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+            return self._python_signature(lines, int(getattr(class_or_method, "lineno", 1))).strip()
+
+        exception_block = ""
+        if exception_class is not None:
+            exception_block = f"{signature_for(exception_class)}\n    pass\n\n\n"
+        else:
+            exception_block = f"class {exception_name}(Exception):\n    pass\n\n\n"
+        body = (
+            exception_block
+            + f"{signature_for(node_class)}\n"
+            + f"    {signature_for(node_methods['__init__'])}\n"
+            + "        self._value = value\n"
+            + "        self._next = None\n\n"
+            + f"    {signature_for(node_methods['value'])}\n"
+            + "        return self._value\n\n"
+            + f"    {signature_for(node_methods['next'])}\n"
+            + "        return self._next\n\n\n"
+            + f"{signature_for(collection_class)}\n"
+            + f"    {signature_for(collection_methods['__init__'])}\n"
+            + "        self._head = None\n"
+            + "        self._length = 0\n"
+            + "        for value in values or []:\n"
+            + "            self.push(value)\n\n"
+            + f"    {signature_for(collection_methods['__iter__'])}\n"
+            + "        current = self._head\n"
+            + "        while current is not None:\n"
+            + "            yield current.value()\n"
+            + "            current = current.next()\n\n"
+            + f"    {signature_for(collection_methods['__len__'])}\n"
+            + "        return self._length\n\n"
+            + f"    {signature_for(collection_methods['head'])}\n"
+            + "        if self._head is None:\n"
+            + f"            raise {exception_name}({message!r})\n"
+            + "        return self._head\n\n"
+            + f"    {signature_for(collection_methods['push'])}\n"
+            + f"        node = {node_name}(value)\n"
+            + "        node._next = self._head\n"
+            + "        self._head = node\n"
+            + "        self._length += 1\n\n"
+            + f"    {signature_for(collection_methods['pop'])}\n"
+            + "        if self._head is None:\n"
+            + f"            raise {exception_name}({message!r})\n"
+            + "        value = self._head.value()\n"
+            + "        self._head = self._head.next()\n"
+            + "        self._length -= 1\n"
+            + "        return value\n\n"
+            + f"    {signature_for(collection_methods['reversed'])}\n"
+            + f"        result = {collection_name}()\n"
+            + "        for value in self:\n"
+            + "            result.push(value)\n"
+            + "        return result\n"
+        )
+        return {
+            "ok": True,
+            "tool": "synthesize_node_collection_candidate",
+            "path": rel_source,
+            "candidate_source": body,
+            "summary": f"synthesized node-backed collection candidate for {collection_name}",
+            "node_class": node_name,
+            "collection_class": collection_name,
+            "exception_class": exception_name,
         }
 
     def implementation_spec(self, source_path: str, test_path: str | None = None, limit: int = 40) -> dict[str, Any]:

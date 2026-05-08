@@ -4989,7 +4989,10 @@ class OllamaCodeAgent:
             return None
         if quick_spec.get("ok") is not True:
             return None
-        if len(list(quick_spec.get("stubs") or [])) < 3 and len(list(quick_spec.get("examples") or [])) < 6:
+        quick_examples = list(quick_spec.get("examples") or [])
+        quick_example_text = "\n".join(str(item.get("example") or "") for item in quick_examples if isinstance(item, dict))
+        has_structured_behavior_constraints = " matches " in quick_example_text or " != " in quick_example_text
+        if len(list(quick_spec.get("stubs") or [])) < 3 and len(quick_examples) < 6 and not has_structured_behavior_constraints:
             return None
         failed_tool = str(failed_run_test_result.get("tool") or "").strip()
         if failed_tool == "preemptive_spec_repair":
@@ -5024,6 +5027,8 @@ class OllamaCodeAgent:
             "synthesize_prefix_rotation_candidate",
             "synthesize_text_matrix_transpose_candidate",
             "synthesize_cyclic_interval_scale_candidate",
+            "synthesize_unique_regex_identifier_candidate",
+            "synthesize_node_collection_candidate",
         ):
             try:
                 synthesize = getattr(self.tools, synthesis_name)
