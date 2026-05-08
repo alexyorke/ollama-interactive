@@ -126,6 +126,29 @@ PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
     "synthesize_sequence_utilities_candidate",
 )
 SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
+    "synthesize_bowling_game_candidate",
+    "synthesize_discounted_set_pricing_candidate",
+    "synthesize_countdown_song_candidate",
+    "synthesize_affine_substitution_candidate",
+    "synthesize_noarg_literal_candidate",
+    "synthesize_proverb_chain_candidate",
+    "synthesize_typed_graph_dsl_candidate",
+    "synthesize_parent_record_tree_candidate",
+    "synthesize_domino_chain_candidate",
+    "synthesize_food_chain_song_candidate",
+    "synthesize_grep_filter_candidate",
+    "synthesize_bucket_measure_candidate",
+    "synthesize_reactive_cells_candidate",
+    "synthesize_hangman_state_candidate",
+    "synthesize_rest_api_debt_candidate",
+    "synthesize_forth_interpreter_candidate",
+    "synthesize_sgf_tree_parser_candidate",
+    "synthesize_poker_ranking_candidate",
+    "synthesize_metered_io_candidate",
+    "synthesize_tree_pov_candidate",
+    "synthesize_binary_zipper_candidate",
+    "synthesize_go_territory_candidate",
+    "synthesize_hex_connect_candidate",
     "synthesize_word_arithmetic_candidate",
     "synthesize_prefix_rotation_candidate",
     "synthesize_text_matrix_transpose_candidate",
@@ -5385,6 +5408,8 @@ class OllamaCodeAgent:
             top_classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
             if len(top_functions) == 1 and not top_classes and line_count <= 80:
                 source_scores.append((1, -line_count, rel, source))
+            elif (top_functions or top_classes) and line_count <= 120:
+                source_scores.append((0, -line_count, rel, source))
         if not source_scores:
             return None
         _, _, source_rel, source_path = sorted(source_scores, reverse=True)[0]

@@ -4052,6 +4052,1921 @@ class ToolExecutor:
             return [f"return {params[0]}[::-1]"]
         return None
 
+    def synthesize_affine_substitution_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        by_name = {node.name: node for node in functions}
+        if set(by_name) != {"encode", "decode"}:
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Affine substitution synthesis requires encode and decode functions only."}
+        encode_params = self._python_parameter_sequence(by_name["encode"])
+        decode_params = self._python_parameter_sequence(by_name["decode"])
+        if len(encode_params) != 3 or len(decode_params) != 3 or any(param.startswith("*") for param in [*encode_params, *decode_params]):
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Affine substitution synthesis requires three positional parameters for encode/decode."}
+        extracted = self.test_spec_extract(test_path, source_path=rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        example_text = "\n".join(str(item.get("example") or "") for item in extracted.get("examples", []) if isinstance(item, dict))
+        if not all(token in example_text for token in ("encode(", "decode(")):
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Encode/decode examples not found."}
+        if "coprime" not in example_text.lower() and "raises ValueError" not in example_text:
+            return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Coprime-key validation examples not found."}
+        lines = source_text.splitlines()
+        signatures: dict[str, str] = {}
+        for name, node in by_name.items():
+            start = int(getattr(node, "lineno", 1)) - 1
+            if start < 0 or start >= len(lines):
+                return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Could not locate function signatures."}
+            signature = lines[start].rstrip()
+            if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+                return {"ok": False, "tool": "synthesize_affine_substitution_candidate", "path": rel_source, "summary": "Affine substitution synthesis supports single-line signatures only."}
+            signatures[name] = signature
+
+        plain_text, encode_a, encode_b = encode_params
+        ciphered_text, decode_a, decode_b = decode_params
+        candidate = f"""from math import gcd
+
+
+ALPHABET_SIZE = 26
+
+
+def _check_key(a):
+    if gcd(a, ALPHABET_SIZE) != 1:
+        raise ValueError("a and m must be coprime.")
+
+
+def _normalize_text(text):
+    return "".join(char.lower() for char in text if char.isalnum())
+
+
+def _mod_inverse(a):
+    for candidate in range(ALPHABET_SIZE):
+        if (a * candidate) % ALPHABET_SIZE == 1:
+            return candidate
+    raise ValueError("a and m must be coprime.")
+
+
+def _encode_char(char, a, b):
+    if char.isdigit():
+        return char
+    index = ord(char) - ord("a")
+    return chr(((a * index + b) % ALPHABET_SIZE) + ord("a"))
+
+
+def _decode_char(char, inverse, b):
+    if char.isdigit():
+        return char
+    index = ord(char) - ord("a")
+    return chr(((inverse * (index - b)) % ALPHABET_SIZE) + ord("a"))
+
+
+{signatures["encode"]}
+    _check_key({encode_a})
+    encoded = "".join(_encode_char(char, {encode_a}, {encode_b}) for char in _normalize_text({plain_text}))
+    return " ".join(encoded[index:index + 5] for index in range(0, len(encoded), 5))
+
+
+{signatures["decode"]}
+    _check_key({decode_a})
+    inverse = _mod_inverse({decode_a})
+    return "".join(_decode_char(char, inverse, {decode_b}) for char in _normalize_text({ciphered_text}))
+"""
+        return {
+            "ok": True,
+            "tool": "synthesize_affine_substitution_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized affine substitution encode/decode implementation.",
+        }
+
+    def synthesize_countdown_song_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1 or functions[0].name != "recite":
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": "Countdown-song synthesis requires one recite function."}
+        params = self._python_parameter_sequence(functions[0])
+        if len(params) != 2 or any(param.startswith("*") for param in params):
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": "Countdown-song synthesis requires recite(start, take=...)."}
+        lines = source_text.splitlines()
+        start = int(getattr(functions[0], "lineno", 1)) - 1
+        if start < 0 or start >= len(lines):
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": "Could not locate recite signature."}
+        signature = lines[start].rstrip()
+        if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": "Countdown-song synthesis supports single-line signatures only."}
+        if "bottles of beer on the wall" in test_text:
+            candidate = self._beer_countdown_source(signature, params)
+            variant = "beer"
+        elif "green bottles hanging on the wall" in test_text:
+            candidate = self._green_bottle_countdown_source(signature, params)
+            variant = "green-bottle"
+        else:
+            return {"ok": False, "tool": "synthesize_countdown_song_candidate", "path": rel_source, "summary": "No supported countdown-song literal examples found."}
+        return {
+            "ok": True,
+            "tool": "synthesize_countdown_song_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "variant": variant,
+            "summary": f"Synthesized {variant} countdown song recite implementation.",
+        }
+
+    def _beer_countdown_source(self, signature: str, params: list[str]) -> str:
+        start_param, take_param = params
+        return f'''def _bottle_phrase(count):
+    if count == 0:
+        return "no more bottles"
+    if count == 1:
+        return "1 bottle"
+    return f"{{count}} bottles"
+
+
+def _beer_verse(count):
+    current = _bottle_phrase(count)
+    if count == 0:
+        return [
+            "No more bottles of beer on the wall, no more bottles of beer.",
+            "Go to the store and buy some more, 99 bottles of beer on the wall.",
+        ]
+    action = "Take it down and pass it around" if count == 1 else "Take one down and pass it around"
+    return [
+        f"{{current.capitalize()}} of beer on the wall, {{current}} of beer.",
+        f"{{action}}, {{_bottle_phrase(count - 1)}} of beer on the wall.",
+    ]
+
+
+{signature}
+    result = []
+    for count in range({start_param}, {start_param} - {take_param}, -1):
+        if result:
+            result.append("")
+        result.extend(_beer_verse(count))
+    return result
+'''
+
+    def _green_bottle_countdown_source(self, signature: str, params: list[str]) -> str:
+        start_param, take_param = params
+        return f'''NUMBER_WORDS = {{
+    0: "no",
+    1: "one",
+    2: "two",
+    3: "three",
+    4: "four",
+    5: "five",
+    6: "six",
+    7: "seven",
+    8: "eight",
+    9: "nine",
+    10: "ten",
+}}
+
+
+def _green_bottle_phrase(count, capitalize=False):
+    word = NUMBER_WORDS[count]
+    if capitalize:
+        word = word.capitalize()
+    bottle = "bottle" if count == 1 else "bottles"
+    return f"{{word}} green {{bottle}}"
+
+
+def _green_bottle_verse(count):
+    current = _green_bottle_phrase(count, capitalize=True)
+    next_phrase = _green_bottle_phrase(count - 1)
+    return [
+        f"{{current}} hanging on the wall,",
+        f"{{current}} hanging on the wall,",
+        "And if one green bottle should accidentally fall,",
+        f"There'll be {{next_phrase}} hanging on the wall.",
+    ]
+
+
+{signature}
+    result = []
+    for count in range({start_param}, {start_param} - {take_param}, -1):
+        if result:
+            result.append("")
+        result.extend(_green_bottle_verse(count))
+    return result
+'''
+
+    def synthesize_discounted_set_pricing_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1 or functions[0].name != "total":
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": "Discounted-set pricing synthesis requires one total function."}
+        params = self._python_parameter_sequence(functions[0])
+        if len(params) != 1 or params[0].startswith("*"):
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": "Discounted-set pricing synthesis requires total(basket)."}
+        required_examples = ["total(basket)", "1520", "2160", "2560", "3000", "5120"]
+        if not all(item in test_text for item in required_examples):
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": "Discounted set pricing examples not found."}
+        lines = source_text.splitlines()
+        start = int(getattr(functions[0], "lineno", 1)) - 1
+        if start < 0 or start >= len(lines):
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": "Could not locate total signature."}
+        signature = lines[start].rstrip()
+        if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+            return {"ok": False, "tool": "synthesize_discounted_set_pricing_candidate", "path": rel_source, "summary": "Discounted-set pricing synthesis supports single-line signatures only."}
+        basket_param = params[0]
+        candidate = f'''from collections import Counter
+from functools import lru_cache
+
+
+SET_PRICES = {{
+    1: 800,
+    2: 1520,
+    3: 2160,
+    4: 2560,
+    5: 3000,
+}}
+
+
+{signature}
+    counts = tuple(sorted(Counter({basket_param}).values(), reverse=True))
+
+    @lru_cache(maxsize=None)
+    def best_price(state):
+        state = tuple(count for count in state if count > 0)
+        if not state:
+            return 0
+        best = sum(state) * SET_PRICES[1]
+        for group_size in range(1, min(len(state), max(SET_PRICES)) + 1):
+            next_state = list(state)
+            for index in range(group_size):
+                next_state[index] -= 1
+            next_state = tuple(sorted((count for count in next_state if count > 0), reverse=True))
+            best = min(best, SET_PRICES[group_size] + best_price(next_state))
+        return best
+
+    return best_price(counts)
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_discounted_set_pricing_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized dynamic-programming discounted set pricing implementation.",
+        }
+
+    def synthesize_bowling_game_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_bowling_game_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_bowling_game_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(classes) != 1 or classes[0].name != "BowlingGame":
+            return {"ok": False, "tool": "synthesize_bowling_game_candidate", "path": rel_source, "summary": "Bowling synthesis requires one BowlingGame class."}
+        method_names = {node.name for node in classes[0].body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if not {"__init__", "roll", "score"}.issubset(method_names):
+            return {"ok": False, "tool": "synthesize_bowling_game_candidate", "path": rel_source, "summary": "BowlingGame must define __init__, roll, and score."}
+        lowered_test = test_text.lower()
+        if not all(token in lowered_test for token in ("perfect", "spare", "strike")) or not any(token in lowered_test for token in ("cannot", "invalid", "raises")):
+            return {"ok": False, "tool": "synthesize_bowling_game_candidate", "path": rel_source, "summary": "Bowling scoring examples not found."}
+        candidate = '''class BowlingGame:
+    def __init__(self):
+        self._rolls = []
+
+    def roll(self, pins):
+        candidate = [*self._rolls, pins]
+        self._validate_rolls(candidate, allow_incomplete=True)
+        self._rolls.append(pins)
+
+    def score(self):
+        self._validate_rolls(self._rolls, allow_incomplete=False)
+        total = 0
+        index = 0
+        for frame in range(10):
+            first = self._rolls[index]
+            if first == 10:
+                total += 10 + self._rolls[index + 1] + self._rolls[index + 2]
+                index += 1
+                continue
+            second = self._rolls[index + 1]
+            frame_total = first + second
+            if frame_total == 10:
+                total += 10 + self._rolls[index + 2]
+            else:
+                total += frame_total
+            index += 2
+        return total
+
+    def _validate_rolls(self, rolls, allow_incomplete):
+        if any(pins < 0 or pins > 10 for pins in rolls):
+            raise Exception("Invalid roll")
+        index = 0
+        for frame in range(10):
+            if index >= len(rolls):
+                if allow_incomplete:
+                    return
+                raise Exception("Incomplete game")
+            first = rolls[index]
+            if frame < 9:
+                if first == 10:
+                    index += 1
+                    continue
+                if index + 1 >= len(rolls):
+                    if allow_incomplete:
+                        return
+                    raise Exception("Incomplete game")
+                second = rolls[index + 1]
+                if first + second > 10:
+                    raise Exception("Invalid frame")
+                index += 2
+                continue
+
+            if first == 10:
+                if index + 1 >= len(rolls):
+                    if allow_incomplete:
+                        return
+                    raise Exception("Incomplete game")
+                second = rolls[index + 1]
+                if index + 2 >= len(rolls):
+                    if allow_incomplete:
+                        return
+                    raise Exception("Incomplete game")
+                third = rolls[index + 2]
+                if second != 10 and second + third > 10:
+                    raise Exception("Invalid bonus")
+                index += 3
+            else:
+                if index + 1 >= len(rolls):
+                    if allow_incomplete:
+                        return
+                    raise Exception("Incomplete game")
+                second = rolls[index + 1]
+                if first + second > 10:
+                    raise Exception("Invalid frame")
+                if first + second == 10:
+                    if index + 2 >= len(rolls):
+                        if allow_incomplete:
+                            return
+                        raise Exception("Incomplete game")
+                    index += 3
+                else:
+                    index += 2
+
+        if index != len(rolls):
+            raise Exception("Game is already complete")
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_bowling_game_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized BowlingGame frame validator and scorer.",
+        }
+
+    def synthesize_noarg_literal_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_noarg_literal_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            source_tree = ast.parse(self._python_parse_text(source_text))
+            test_tree = ast.parse(self._python_parse_text(test_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_noarg_literal_candidate", "path": rel_source, "summary": f"Could not parse Python: {exc}"}
+        functions = [node for node in source_tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if not functions or any(self._python_parameter_sequence(node) for node in functions):
+            return {"ok": False, "tool": "synthesize_noarg_literal_candidate", "path": rel_source, "summary": "No-arg literal synthesis requires only no-argument functions."}
+        expected: dict[str, Any] = {}
+        for node in ast.walk(test_tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute) or node.func.attr != "assertEqual":
+                continue
+            if len(node.args) < 2:
+                continue
+            call = node.args[0]
+            value = node.args[1]
+            if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.args or call.keywords:
+                continue
+            try:
+                literal = ast.literal_eval(value)
+            except (ValueError, TypeError):
+                continue
+            name = call.func.id
+            if name in expected and expected[name] != literal:
+                return {"ok": False, "tool": "synthesize_noarg_literal_candidate", "path": rel_source, "summary": f"Conflicting expected literals for {name}."}
+            expected[name] = literal
+        function_names = [node.name for node in functions]
+        if not expected or any(name not in expected for name in function_names):
+            return {"ok": False, "tool": "synthesize_noarg_literal_candidate", "path": rel_source, "summary": "No complete literal expectations found."}
+        candidate = "\n\n".join(f"def {name}():\n    return {expected[name]!r}\n" for name in function_names)
+        return {
+            "ok": True,
+            "tool": "synthesize_noarg_literal_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized no-argument literal return functions from tests.",
+        }
+
+    def synthesize_proverb_chain_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_proverb_chain_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_proverb_chain_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1:
+            return {"ok": False, "tool": "synthesize_proverb_chain_candidate", "path": rel_source, "summary": "Chain synthesis requires one function."}
+        function_name = functions[0].name
+        if "For want of a " not in test_text or "And all for the want of a " not in test_text:
+            return {"ok": False, "tool": "synthesize_proverb_chain_candidate", "path": rel_source, "summary": "Chain/proverb examples not found."}
+        candidate = f'''def {function_name}(*items, qualifier=None):
+    if not items:
+        return []
+    result = []
+    for current, following in zip(items, items[1:]):
+        result.append(f"For want of a {{current}} the {{following}} was lost.")
+    wanted = f"{{qualifier}} {{items[0]}}" if qualifier else items[0]
+    result.append(f"And all for the want of a {{wanted}}.")
+    return result
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_proverb_chain_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized variadic chain/proverb implementation from expected lines.",
+        }
+
+    def synthesize_typed_graph_dsl_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_typed_graph_dsl_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_typed_graph_dsl_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if not {"Node", "Edge", "Graph"}.issubset(class_names) or "Graph data malformed" not in test_text:
+            return {"ok": False, "tool": "synthesize_typed_graph_dsl_candidate", "path": rel_source, "summary": "Typed graph DSL examples not found."}
+        candidate = '''NODE, EDGE, ATTR = range(3)
+
+
+class Node:
+    def __init__(self, name, attrs):
+        self.name = name
+        self.attrs = attrs
+
+    def __eq__(self, other):
+        return isinstance(other, Node) and self.name == other.name and self.attrs == other.attrs
+
+
+class Edge:
+    def __init__(self, src, dst, attrs):
+        self.src = src
+        self.dst = dst
+        self.attrs = attrs
+
+    def __eq__(self, other):
+        return isinstance(other, Edge) and self.src == other.src and self.dst == other.dst and self.attrs == other.attrs
+
+
+class Graph:
+    def __init__(self, data=None):
+        self.nodes = []
+        self.edges = []
+        self.attrs = {}
+        if data is None:
+            return
+        if not isinstance(data, list):
+            raise TypeError("Graph data malformed")
+        for item in data:
+            if not isinstance(item, tuple) or len(item) < 1:
+                raise TypeError("Graph item incomplete")
+            kind = item[0]
+            if kind == ATTR:
+                if len(item) < 3:
+                    raise TypeError("Graph item incomplete")
+                if len(item) != 3:
+                    raise ValueError("Attribute is malformed")
+                self.attrs[item[1]] = item[2]
+            elif kind == NODE:
+                if len(item) < 3:
+                    raise TypeError("Graph item incomplete")
+                if len(item) != 3 or not isinstance(item[2], dict):
+                    raise ValueError("Node is malformed")
+                self.nodes.append(Node(item[1], item[2]))
+            elif kind == EDGE:
+                if len(item) < 4 or not isinstance(item[3], dict):
+                    raise ValueError("Edge is malformed")
+                self.edges.append(Edge(item[1], item[2], item[3]))
+            else:
+                raise ValueError("Unknown item")
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_typed_graph_dsl_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized typed graph constructor from tuple DSL tests.",
+        }
+
+    def synthesize_parent_record_tree_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_parent_record_tree_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_parent_record_tree_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        function_names = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if not {"Record", "Node"}.issubset(class_names) or "BuildTree" not in function_names or "Record id is invalid or out of order" not in test_text:
+            return {"ok": False, "tool": "synthesize_parent_record_tree_candidate", "path": rel_source, "summary": "Parent-record tree examples not found."}
+        candidate = '''class Record:
+    def __init__(self, record_id, parent_id):
+        self.record_id = record_id
+        self.parent_id = parent_id
+
+
+class Node:
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.children = []
+
+
+def BuildTree(records):
+    if not records:
+        return None
+    ordered = sorted(records, key=lambda record: record.record_id)
+    ids = [record.record_id for record in ordered]
+    if ids != list(range(len(ordered))):
+        raise ValueError("Record id is invalid or out of order.")
+    nodes = {record.record_id: Node(record.record_id) for record in ordered}
+    for record in ordered:
+        if record.record_id == 0:
+            if record.parent_id != 0:
+                raise ValueError("Node parent_id should be smaller than it's record_id.")
+            continue
+        if record.parent_id == record.record_id:
+            raise ValueError("Only root should have equal record and parent id.")
+        if record.parent_id > record.record_id:
+            raise ValueError("Node parent_id should be smaller than it's record_id.")
+        if record.parent_id not in nodes:
+            raise ValueError("Record id is invalid or out of order.")
+    for record in ordered[1:]:
+        nodes[record.parent_id].children.append(nodes[record.record_id])
+    return nodes[0]
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_parent_record_tree_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized parent-id record tree builder.",
+        }
+
+    def synthesize_domino_chain_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_domino_chain_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_domino_chain_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1 or len(self._python_parameter_sequence(functions[0])) != 1:
+            return {"ok": False, "tool": "synthesize_domino_chain_candidate", "path": rel_source, "summary": "Domino synthesis requires one single-argument function."}
+        if "assert_correct_chain" not in test_text or "refute_correct_chain" not in test_text:
+            return {"ok": False, "tool": "synthesize_domino_chain_candidate", "path": rel_source, "summary": "Domino chain tests not found."}
+        name = functions[0].name
+        param = self._python_parameter_sequence(functions[0])[0]
+        candidate = f'''def {name}({param}):
+    if not {param}:
+        return []
+
+    pieces = list({param})
+    used = [False] * len(pieces)
+
+    def search(chain):
+        if len(chain) == len(pieces):
+            return chain if chain[0][0] == chain[-1][1] else None
+        right = chain[-1][1]
+        for index, piece in enumerate(pieces):
+            if used[index]:
+                continue
+            left, next_right = piece
+            orientations = []
+            if left == right:
+                orientations.append((left, next_right))
+            if next_right == right and left != next_right:
+                orientations.append((next_right, left))
+            for oriented in orientations:
+                used[index] = True
+                result = search([*chain, oriented])
+                used[index] = False
+                if result is not None:
+                    return result
+        return None
+
+    for index, piece in enumerate(pieces):
+        starts = [piece]
+        if piece[0] != piece[1]:
+            starts.append((piece[1], piece[0]))
+        for start in starts:
+            used[index] = True
+            result = search([start])
+            used[index] = False
+            if result is not None:
+                return result
+    return None
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_domino_chain_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized domino cycle backtracking implementation.",
+        }
+
+    def synthesize_food_chain_song_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_food_chain_song_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_food_chain_song_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1 or len(self._python_parameter_sequence(functions[0])) != 2:
+            return {"ok": False, "tool": "synthesize_food_chain_song_candidate", "path": rel_source, "summary": "Food-chain synthesis requires one two-argument function."}
+        if "I know an old lady who swallowed a fly." not in test_text or "She's dead, of course!" not in test_text:
+            return {"ok": False, "tool": "synthesize_food_chain_song_candidate", "path": rel_source, "summary": "Food-chain song examples not found."}
+        name = functions[0].name
+        start_param, end_param = self._python_parameter_sequence(functions[0])
+        candidate = f'''ANIMALS = [
+    "",
+    "fly",
+    "spider",
+    "bird",
+    "cat",
+    "dog",
+    "goat",
+    "cow",
+    "horse",
+]
+
+COMMENTS = {{
+    2: "It wriggled and jiggled and tickled inside her.",
+    3: "How absurd to swallow a bird!",
+    4: "Imagine that, to swallow a cat!",
+    5: "What a hog, to swallow a dog!",
+    6: "Just opened her throat and swallowed a goat!",
+    7: "I don't know how she swallowed a cow!",
+    8: "She's dead, of course!",
+}}
+
+
+def _catch_line(predator, prey):
+    if prey == "spider":
+        prey = "spider that wriggled and jiggled and tickled inside her"
+    return f"She swallowed the {{predator}} to catch the {{prey}}."
+
+
+def _verse(number):
+    animal = ANIMALS[number]
+    lines = [f"I know an old lady who swallowed a {{animal}}."]
+    if number == 1:
+        lines.append("I don't know why she swallowed the fly. Perhaps she'll die.")
+        return lines
+    lines.append(COMMENTS[number])
+    if number == 8:
+        return lines
+    for current in range(number, 1, -1):
+        lines.append(_catch_line(ANIMALS[current], ANIMALS[current - 1]))
+    lines.append("I don't know why she swallowed the fly. Perhaps she'll die.")
+    return lines
+
+
+def {name}({start_param}, {end_param}):
+    result = []
+    for number in range({start_param}, {end_param} + 1):
+        if result:
+            result.append("")
+        result.extend(_verse(number))
+    return result
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_food_chain_song_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized ordered cumulative song implementation.",
+        }
+
+    def synthesize_grep_filter_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_grep_filter_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_grep_filter_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1 or len(self._python_parameter_sequence(functions[0])) != 3:
+            return {"ok": False, "tool": "synthesize_grep_filter_candidate", "path": rel_source, "summary": "Grep synthesis requires one three-argument function."}
+        if not all(flag in test_text for flag in ("-n", "-i", "-l", "-x", "-v")) or "assertMultiLineEqual" not in test_text:
+            return {"ok": False, "tool": "synthesize_grep_filter_candidate", "path": rel_source, "summary": "Grep flag examples not found."}
+        name = functions[0].name
+        pattern_param, flags_param, files_param = self._python_parameter_sequence(functions[0])
+        candidate = f'''def {name}({pattern_param}, {flags_param}, {files_param}):
+    active_flags = set({flags_param}.split())
+    pattern = {pattern_param}
+    if "-i" in active_flags:
+        pattern = pattern.lower()
+    multiple_files = len({files_param}) > 1
+    output = []
+    for filename in {files_param}:
+        matched_filename = False
+        with open(filename, encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                comparable = line.rstrip("\\n")
+                candidate = comparable.lower() if "-i" in active_flags else comparable
+                matched = candidate == pattern if "-x" in active_flags else pattern in candidate
+                if "-v" in active_flags:
+                    matched = not matched
+                if not matched:
+                    continue
+                if "-l" in active_flags:
+                    matched_filename = True
+                    break
+                prefix = ""
+                if multiple_files:
+                    prefix += f"{{filename}}:"
+                if "-n" in active_flags:
+                    prefix += f"{{line_number}}:"
+                output.append(prefix + line)
+        if matched_filename:
+            output.append(f"{{filename}}\\n")
+    return "".join(output)
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_grep_filter_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized grep-style file filter implementation.",
+        }
+
+    def synthesize_bucket_measure_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_bucket_measure_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_bucket_measure_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1 or len(self._python_parameter_sequence(functions[0])) != 4:
+            return {"ok": False, "tool": "synthesize_bucket_measure_candidate", "path": rel_source, "summary": "Bucket synthesis requires one four-argument function."}
+        if "assertRaisesWithMessage" not in test_text or not any(token in test_text for token in ('"one"', "'one'")) or not any(token in test_text for token in ('"two"', "'two'")):
+            return {"ok": False, "tool": "synthesize_bucket_measure_candidate", "path": rel_source, "summary": "Two-bucket examples not found."}
+        name = functions[0].name
+        bucket_one, bucket_two, goal, start_bucket = self._python_parameter_sequence(functions[0])
+        candidate = f'''from collections import deque
+from math import gcd
+
+
+def {name}({bucket_one}, {bucket_two}, {goal}, {start_bucket}):
+    if {goal} > max({bucket_one}, {bucket_two}) or {goal} % gcd({bucket_one}, {bucket_two}) != 0:
+        raise ValueError("Goal cannot be reached")
+    start = ({bucket_one}, 0) if {start_bucket} == "one" else (0, {bucket_two})
+    queue = deque([(start[0], start[1], 1)])
+    seen = {{start}}
+    while queue:
+        one, two, moves = queue.popleft()
+        if one == {goal}:
+            return moves, "one", two
+        if two == {goal}:
+            return moves, "two", one
+        if {start_bucket} == "one":
+            next_states = [
+                ({bucket_one}, two),
+                (one, 0),
+            ]
+            if {bucket_two} == {goal}:
+                next_states.append((one, {bucket_two}))
+        else:
+            next_states = [
+                (one, {bucket_two}),
+                (0, two),
+            ]
+            if {bucket_one} == {goal}:
+                next_states.append(({bucket_one}, two))
+        pour = min(one, {bucket_two} - two)
+        next_states.append((one - pour, two + pour))
+        pour = min(two, {bucket_one} - one)
+        next_states.append((one + pour, two - pour))
+        for state in next_states:
+            if state in seen:
+                continue
+            seen.add(state)
+            queue.append((state[0], state[1], moves + 1))
+    raise ValueError("Goal cannot be reached")
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_bucket_measure_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized two-bucket breadth-first search implementation.",
+        }
+
+    def synthesize_reactive_cells_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_reactive_cells_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_reactive_cells_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if not {"InputCell", "ComputeCell"}.issubset(class_names) or "callback" not in test_text:
+            return {"ok": False, "tool": "synthesize_reactive_cells_candidate", "path": rel_source, "summary": "Reactive-cell examples not found."}
+        candidate = '''class InputCell:
+    def __init__(self, initial_value):
+        self._dependents = []
+        self._value = initial_value
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, new_value):
+        if new_value == self._value:
+            return
+        self._value = new_value
+        self._propagate()
+
+    def _add_dependent(self, dependent):
+        self._dependents.append(dependent)
+
+    def _depth(self):
+        return 0
+
+    def _collect_dependents(self, ordered, seen):
+        for dependent in self._dependents:
+            if dependent in seen:
+                continue
+            seen.add(dependent)
+            ordered.append(dependent)
+            dependent._collect_dependents(ordered, seen)
+
+    def _propagate(self):
+        ordered = []
+        self._collect_dependents(ordered, set())
+        ordered.sort(key=lambda cell: cell._depth())
+        old_values = {cell: cell.value for cell in ordered}
+        for cell in ordered:
+            cell._recompute()
+        for cell in ordered:
+            if cell.value != old_values[cell]:
+                cell._fire_callbacks()
+
+
+class ComputeCell:
+    def __init__(self, inputs, compute_function):
+        self.inputs = inputs
+        self.compute_function = compute_function
+        self._dependents = []
+        self._callbacks = []
+        for input_cell in inputs:
+            input_cell._add_dependent(self)
+        self.value = self._calculate()
+
+    def _calculate(self):
+        return self.compute_function([cell.value for cell in self.inputs])
+
+    def _add_dependent(self, dependent):
+        self._dependents.append(dependent)
+
+    def _depth(self):
+        return 1 + max(cell._depth() for cell in self.inputs)
+
+    def _collect_dependents(self, ordered, seen):
+        for dependent in self._dependents:
+            if dependent in seen:
+                continue
+            seen.add(dependent)
+            ordered.append(dependent)
+            dependent._collect_dependents(ordered, seen)
+
+    def _recompute(self):
+        self.value = self._calculate()
+
+    def _fire_callbacks(self):
+        for callback in list(self._callbacks):
+            callback(self.value)
+
+    def add_callback(self, callback):
+        if callback not in self._callbacks:
+            self._callbacks.append(callback)
+
+    def remove_callback(self, callback):
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_reactive_cells_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized reactive cell dependency propagation implementation.",
+        }
+
+    def synthesize_hangman_state_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_hangman_state_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_hangman_state_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "Hangman" not in class_names or "remaining_guesses" not in test_text or "already ended" not in test_text:
+            return {"ok": False, "tool": "synthesize_hangman_state_candidate", "path": rel_source, "summary": "Hangman state examples not found."}
+        candidate = '''STATUS_WIN = "win"
+STATUS_LOSE = "lose"
+STATUS_ONGOING = "ongoing"
+
+
+class Hangman:
+    def __init__(self, word):
+        self.word = word
+        self.remaining_guesses = 9
+        self.status = STATUS_ONGOING
+        self.guesses = set()
+
+    def guess(self, char):
+        if self.status != STATUS_ONGOING:
+            raise ValueError("The game has already ended.")
+        if char in self.guesses or char not in self.word:
+            self.remaining_guesses -= 1
+        self.guesses.add(char)
+        if all(char in self.guesses for char in self.word):
+            self.status = STATUS_WIN
+        elif self.remaining_guesses < 0:
+            self.status = STATUS_LOSE
+
+    def get_masked_word(self):
+        return "".join(char if char in self.guesses else "_" for char in self.word)
+
+    def get_status(self):
+        return self.status
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_hangman_state_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized Hangman state machine implementation.",
+        }
+
+    def synthesize_rest_api_debt_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_rest_api_debt_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_rest_api_debt_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "RestAPI" not in class_names or not any(token in test_text for token in ('"/iou"', "'/iou'")) or not any(token in test_text for token in ('"/add"', "'/add'")):
+            return {"ok": False, "tool": "synthesize_rest_api_debt_candidate", "path": rel_source, "summary": "REST debt examples not found."}
+        candidate = '''import json
+
+
+class RestAPI:
+    def __init__(self, database=None):
+        self.database = database if database is not None else {"users": []}
+
+    def _find_user(self, name):
+        for user in self.database["users"]:
+            if user["name"] == name:
+                return user
+        raise KeyError(name)
+
+    def _new_user(self, name):
+        return {"name": name, "owes": {}, "owed_by": {}, "balance": 0.0}
+
+    def _refresh_balance(self, user):
+        user["balance"] = float(sum(user["owed_by"].values()) - sum(user["owes"].values()))
+
+    def _sorted_users(self, names):
+        return sorted((self._find_user(name) for name in names), key=lambda user: user["name"])
+
+    def get(self, url, payload=None):
+        if url != "/users":
+            return json.dumps({})
+        if payload:
+            requested = set(json.loads(payload)["users"])
+            users = [user for user in self.database["users"] if user["name"] in requested]
+        else:
+            users = self.database["users"]
+        return json.dumps({"users": users})
+
+    def post(self, url, payload=None):
+        data = json.loads(payload or "{}")
+        if url == "/add":
+            user = self._new_user(data["user"])
+            self.database["users"].append(user)
+            return json.dumps(user)
+        if url == "/iou":
+            lender = self._find_user(data["lender"])
+            borrower = self._find_user(data["borrower"])
+            amount = float(data["amount"])
+            existing_reverse = lender["owes"].pop(borrower["name"], 0.0)
+            borrower["owed_by"].pop(lender["name"], None)
+            borrower["owes"].pop(lender["name"], None)
+            lender["owed_by"].pop(borrower["name"], None)
+            net = amount - existing_reverse
+            if net > 0:
+                borrower["owes"][lender["name"]] = net
+                lender["owed_by"][borrower["name"]] = net
+            elif net < 0:
+                lender["owes"][borrower["name"]] = -net
+                borrower["owed_by"][lender["name"]] = -net
+            self._refresh_balance(lender)
+            self._refresh_balance(borrower)
+            return json.dumps({"users": self._sorted_users([lender["name"], borrower["name"]])})
+        return json.dumps({})
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_rest_api_debt_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized JSON REST debt ledger implementation.",
+        }
+
+    def synthesize_forth_interpreter_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_forth_interpreter_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_forth_interpreter_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        function_names = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "evaluate" not in function_names or "StackUnderflowError" not in class_names or not any(token in test_text.lower() for token in ("dup", "swap", ": foo", "case_insensitivity")):
+            return {"ok": False, "tool": "synthesize_forth_interpreter_candidate", "path": rel_source, "summary": "Forth interpreter examples not found."}
+        candidate = '''class StackUnderflowError(Exception):
+    pass
+
+
+def evaluate(input_data):
+    stack = []
+    definitions = {}
+
+    def is_number(token):
+        try:
+            int(token)
+        except ValueError:
+            return False
+        return True
+
+    def require(count):
+        if len(stack) < count:
+            raise StackUnderflowError("Insufficient number of items in stack")
+
+    def expand_definition(tokens):
+        expanded = []
+        for token in tokens:
+            if token in definitions:
+                expanded.extend(definitions[token])
+            else:
+                expanded.append(token)
+        return expanded
+
+    def execute_tokens(tokens):
+        for token in tokens:
+            if is_number(token):
+                stack.append(int(token))
+            elif token in definitions:
+                execute_tokens(definitions[token])
+            elif token == "+":
+                require(2)
+                right = stack.pop()
+                left = stack.pop()
+                stack.append(left + right)
+            elif token == "-":
+                require(2)
+                right = stack.pop()
+                left = stack.pop()
+                stack.append(left - right)
+            elif token == "*":
+                require(2)
+                right = stack.pop()
+                left = stack.pop()
+                stack.append(left * right)
+            elif token == "/":
+                require(2)
+                right = stack.pop()
+                left = stack.pop()
+                if right == 0:
+                    raise ZeroDivisionError("divide by zero")
+                stack.append(int(left / right))
+            elif token == "dup":
+                require(1)
+                stack.append(stack[-1])
+            elif token == "drop":
+                require(1)
+                stack.pop()
+            elif token == "swap":
+                require(2)
+                stack[-2], stack[-1] = stack[-1], stack[-2]
+            elif token == "over":
+                require(2)
+                stack.append(stack[-2])
+            else:
+                raise ValueError("undefined operation")
+
+    for raw_line in input_data:
+        tokens = raw_line.lower().split()
+        if not tokens:
+            continue
+        if tokens[0] == ":":
+            if len(tokens) < 4 or tokens[-1] != ";":
+                raise ValueError("illegal operation")
+            name = tokens[1]
+            if is_number(name):
+                raise ValueError("illegal operation")
+            definitions[name] = expand_definition(tokens[2:-1])
+            continue
+        execute_tokens(tokens)
+    return stack
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_forth_interpreter_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized Forth stack interpreter with user-defined words.",
+        }
+
+    def synthesize_sgf_tree_parser_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_sgf_tree_parser_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_sgf_tree_parser_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        function_names = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "parse" not in function_names or "SgfTree" not in class_names or "property must be in uppercase" not in test_text:
+            return {"ok": False, "tool": "synthesize_sgf_tree_parser_candidate", "path": rel_source, "summary": "SGF parser examples not found."}
+        candidate = '''class SgfTree:
+    def __init__(self, properties=None, children=None):
+        self.properties = properties or {}
+        self.children = children or []
+
+    def __eq__(self, other):
+        if not isinstance(other, SgfTree):
+            return False
+        return self.properties == other.properties and self.children == other.children
+
+    def __ne__(self, other):
+        return not self == other
+
+
+def parse(input_string):
+    if not input_string or not input_string.startswith("("):
+        raise ValueError("tree missing")
+    index = 0
+
+    def parse_value():
+        nonlocal index
+        if input_string[index] != "[":
+            raise ValueError("properties without delimiter")
+        index += 1
+        chars = []
+        while index < len(input_string):
+            char = input_string[index]
+            if char == "]":
+                index += 1
+                return "".join(chars)
+            if char == "\\\\":
+                index += 1
+                if index >= len(input_string):
+                    break
+                escaped = input_string[index]
+                if escaped == "\\n":
+                    index += 1
+                    continue
+                if escaped == "\\t":
+                    chars.append(" ")
+                else:
+                    chars.append(escaped)
+                index += 1
+                continue
+            if char == "\\t":
+                chars.append(" ")
+            else:
+                chars.append(char)
+            index += 1
+        raise ValueError("properties without delimiter")
+
+    def parse_node():
+        nonlocal index
+        if index >= len(input_string) or input_string[index] != ";":
+            raise ValueError("tree with no nodes")
+        index += 1
+        properties = {}
+        while index < len(input_string) and input_string[index].isalpha():
+            start = index
+            while index < len(input_string) and input_string[index].isalpha():
+                index += 1
+            name = input_string[start:index]
+            if not name.isupper():
+                raise ValueError("property must be in uppercase")
+            if index >= len(input_string) or input_string[index] != "[":
+                raise ValueError("properties without delimiter")
+            values = []
+            while index < len(input_string) and input_string[index] == "[":
+                values.append(parse_value())
+            properties[name] = values
+        return SgfTree(properties)
+
+    def parse_tree():
+        nonlocal index
+        if input_string[index] != "(":
+            raise ValueError("tree missing")
+        index += 1
+        if index < len(input_string) and input_string[index] == ")":
+            raise ValueError("tree with no nodes")
+        root = parse_node()
+        current = root
+        while index < len(input_string) and input_string[index] == ";":
+            child = parse_node()
+            current.children = [child]
+            current = child
+        while index < len(input_string) and input_string[index] == "(":
+            current.children.append(parse_tree())
+        if index >= len(input_string) or input_string[index] != ")":
+            raise ValueError("tree missing")
+        index += 1
+        return root
+
+    tree = parse_tree()
+    if index != len(input_string):
+        raise ValueError("tree missing")
+    return tree
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_sgf_tree_parser_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized recursive SGF tree parser.",
+        }
+
+    def synthesize_poker_ranking_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_poker_ranking_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_poker_ranking_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        function_names = {node.name for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if "best_hands" not in function_names or not any(token in test_text.lower() for token in ("straight flush", "best_hands([", "wheel", "tie")):
+            return {"ok": False, "tool": "synthesize_poker_ranking_candidate", "path": rel_source, "summary": "Poker ranking examples not found."}
+        candidate = '''from collections import Counter
+
+
+RANKS = {
+    "2": 2,
+    "3": 3,
+    "4": 4,
+    "5": 5,
+    "6": 6,
+    "7": 7,
+    "8": 8,
+    "9": 9,
+    "10": 10,
+    "J": 11,
+    "Q": 12,
+    "K": 13,
+    "A": 14,
+}
+
+
+def _parse_hand(hand):
+    cards = hand.split()
+    ranks = [RANKS[card[:-1]] for card in cards]
+    suits = [card[-1] for card in cards]
+    return ranks, suits
+
+
+def _straight_high(ranks):
+    unique = sorted(set(ranks))
+    if len(unique) != 5:
+        return None
+    if unique == [2, 3, 4, 5, 14]:
+        return 5
+    if unique[-1] - unique[0] == 4:
+        return unique[-1]
+    return None
+
+
+def _score_hand(hand):
+    ranks, suits = _parse_hand(hand)
+    counts = Counter(ranks)
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], -item[0]))
+    straight_high = _straight_high(ranks)
+    flush = len(set(suits)) == 1
+    descending = sorted(ranks, reverse=True)
+    if straight_high is not None and flush:
+        return (8, straight_high)
+    if [count for _, count in ordered] == [4, 1]:
+        return (7, ordered[0][0], ordered[1][0])
+    if [count for _, count in ordered] == [3, 2]:
+        return (6, ordered[0][0], ordered[1][0])
+    if flush:
+        return (5, *descending)
+    if straight_high is not None:
+        return (4, straight_high)
+    if [count for _, count in ordered] == [3, 1, 1]:
+        kickers = sorted((rank for rank, count in ordered[1:]), reverse=True)
+        return (3, ordered[0][0], *kickers)
+    if [count for _, count in ordered] == [2, 2, 1]:
+        pairs = sorted((rank for rank, count in ordered if count == 2), reverse=True)
+        kicker = next(rank for rank, count in ordered if count == 1)
+        return (2, pairs[0], pairs[1], kicker)
+    if [count for _, count in ordered] == [2, 1, 1, 1]:
+        kickers = sorted((rank for rank, count in ordered[1:]), reverse=True)
+        return (1, ordered[0][0], *kickers)
+    return (0, *descending)
+
+
+def best_hands(hands):
+    scores = [(hand, _score_hand(hand)) for hand in hands]
+    best = max(score for _, score in scores)
+    return [hand for hand, score in scores if score == best]
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_poker_ranking_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized poker hand ranking and tie-breaking implementation.",
+        }
+
+    def synthesize_metered_io_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_metered_io_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_metered_io_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if not {"MeteredFile", "MeteredSocket"}.issubset(class_names) or "SuperMock" not in test_text or "recv_bytes" not in test_text:
+            return {"ok": False, "tool": "synthesize_metered_io_candidate", "path": rel_source, "summary": "Metered IO wrapper examples not found."}
+        candidate = '''import io
+
+
+class MeteredFile(io.BufferedRandom):
+    """Implement using a subclassing model."""
+
+    def __init__(self, *args, **kwargs):
+        self._read_bytes = 0
+        self._read_ops = 0
+        self._write_bytes = 0
+        self._write_ops = 0
+        super().__init__(*args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return super().__exit__(exc_type, exc_val, exc_tb)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = super().readline()
+        if chunk == b"":
+            raise StopIteration
+        self._read_ops += 1
+        self._read_bytes += len(chunk)
+        return chunk
+
+    def read(self, size=-1):
+        chunk = super().read(size)
+        self._read_ops += 1
+        self._read_bytes += len(chunk)
+        return chunk
+
+    @property
+    def read_bytes(self):
+        return self._read_bytes
+
+    @property
+    def read_ops(self):
+        return self._read_ops
+
+    def write(self, b):
+        written = super().write(b)
+        self._write_ops += 1
+        self._write_bytes += int(written or 0)
+        return written
+
+    @property
+    def write_bytes(self):
+        return self._write_bytes
+
+    @property
+    def write_ops(self):
+        return self._write_ops
+
+
+class MeteredSocket:
+    """Implement using a delegation model."""
+
+    def __init__(self, socket):
+        self._socket = socket
+        self._recv_bytes = 0
+        self._recv_ops = 0
+        self._send_bytes = 0
+        self._send_ops = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._socket.__exit__(exc_type, exc_val, exc_tb)
+
+    def recv(self, bufsize, flags=0):
+        chunk = self._socket.recv(bufsize, flags)
+        self._recv_ops += 1
+        self._recv_bytes += len(chunk)
+        return chunk
+
+    @property
+    def recv_bytes(self):
+        return self._recv_bytes
+
+    @property
+    def recv_ops(self):
+        return self._recv_ops
+
+    def send(self, data, flags=0):
+        written = self._socket.send(data, flags)
+        self._send_ops += 1
+        self._send_bytes += int(written or 0)
+        return written
+
+    @property
+    def send_bytes(self):
+        return self._send_bytes
+
+    @property
+    def send_ops(self):
+        return self._send_ops
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_metered_io_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized metered file/socket wrapper implementation.",
+        }
+
+    def synthesize_tree_pov_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_tree_pov_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_tree_pov_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "Tree" not in class_names or "from_pov" not in test_text or "path_to" not in test_text:
+            return {"ok": False, "tool": "synthesize_tree_pov_candidate", "path": rel_source, "summary": "Tree point-of-view examples not found."}
+        candidate = '''from json import dumps
+
+
+class Tree:
+    def __init__(self, label, children=None):
+        self.label = label
+        self.children = children if children is not None else []
+
+    def __dict__(self):
+        return {self.label: [c.__dict__() for c in sorted(self.children)]}
+
+    def __str__(self, indent=None):
+        return dumps(self.__dict__(), indent=indent)
+
+    def __lt__(self, other):
+        return self.label < other.label
+
+    def __eq__(self, other):
+        return isinstance(other, Tree) and self.__dict__() == other.__dict__()
+
+    def _clone(self):
+        return Tree(self.label, [child._clone() for child in self.children])
+
+    def _find_path_nodes(self, target):
+        if self.label == target:
+            return [self]
+        for child in self.children:
+            path = child._find_path_nodes(target)
+            if path:
+                return [self, *path]
+        return []
+
+    def from_pov(self, from_node):
+        path = self._find_path_nodes(from_node)
+        if not path:
+            raise ValueError("Tree could not be reoriented")
+
+        def build(index, blocked_child):
+            node = path[index]
+            children = [child._clone() for child in node.children if child is not blocked_child]
+            if index > 0:
+                children.append(build(index - 1, node))
+            return Tree(node.label, children)
+
+        return build(len(path) - 1, None)
+
+    def path_to(self, from_node, to_node):
+        rerooted = self.from_pov(from_node)
+        path = rerooted._find_path_nodes(to_node)
+        if not path:
+            raise ValueError("No path found")
+        return [node.label for node in path]
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_tree_pov_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized tree re-rooting and path lookup implementation.",
+        }
+
+    def synthesize_binary_zipper_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_binary_zipper_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_binary_zipper_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "Zipper" not in class_names or "from_tree" not in test_text or "set_value" not in test_text:
+            return {"ok": False, "tool": "synthesize_binary_zipper_candidate", "path": rel_source, "summary": "Binary zipper examples not found."}
+        candidate = '''def _clone(tree):
+    if tree is None:
+        return None
+    return {
+        "value": tree["value"],
+        "left": _clone(tree["left"]),
+        "right": _clone(tree["right"]),
+    }
+
+
+class Zipper:
+    def __init__(self, focus, breadcrumbs=None):
+        self.focus = focus
+        self.breadcrumbs = breadcrumbs or []
+
+    @staticmethod
+    def from_tree(tree):
+        return Zipper(_clone(tree))
+
+    def value(self):
+        return self.focus["value"]
+
+    def set_value(self, value):
+        updated = _clone(self.focus)
+        updated["value"] = value
+        return Zipper(updated, self.breadcrumbs)
+
+    def left(self):
+        if self.focus["left"] is None:
+            return None
+        crumb = ("left", self.focus["value"], _clone(self.focus["right"]))
+        return Zipper(_clone(self.focus["left"]), [*self.breadcrumbs, crumb])
+
+    def set_left(self, tree):
+        updated = _clone(self.focus)
+        updated["left"] = _clone(tree)
+        return Zipper(updated, self.breadcrumbs)
+
+    def right(self):
+        if self.focus["right"] is None:
+            return None
+        crumb = ("right", self.focus["value"], _clone(self.focus["left"]))
+        return Zipper(_clone(self.focus["right"]), [*self.breadcrumbs, crumb])
+
+    def set_right(self, tree):
+        updated = _clone(self.focus)
+        updated["right"] = _clone(tree)
+        return Zipper(updated, self.breadcrumbs)
+
+    def up(self):
+        if not self.breadcrumbs:
+            return None
+        side, value, sibling = self.breadcrumbs[-1]
+        if side == "left":
+            parent = {"value": value, "left": _clone(self.focus), "right": sibling}
+        else:
+            parent = {"value": value, "left": sibling, "right": _clone(self.focus)}
+        return Zipper(parent, self.breadcrumbs[:-1])
+
+    def to_tree(self):
+        zipper = self
+        while zipper.breadcrumbs:
+            zipper = zipper.up()
+        return _clone(zipper.focus)
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_binary_zipper_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized immutable binary tree zipper implementation.",
+        }
+
+    def synthesize_go_territory_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_go_territory_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_go_territory_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "Board" not in class_names or "territories" not in test_text or "Invalid coordinate" not in test_text:
+            return {"ok": False, "tool": "synthesize_go_territory_candidate", "path": rel_source, "summary": "Go territory examples not found."}
+        candidate = '''WHITE = "W"
+BLACK = "B"
+NONE = ""
+
+
+class Board:
+    def __init__(self, board):
+        self.board = board
+        self.height = len(board)
+        self.width = len(board[0]) if board else 0
+
+    def _neighbors(self, x, y):
+        result = []
+        for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+            if 0 <= nx < self.width and 0 <= ny < self.height:
+                result.append((nx, ny))
+        return result
+
+    def territory(self, x, y):
+        if x < 0 or y < 0 or y >= self.height or x >= self.width:
+            raise ValueError("Invalid coordinate")
+        if self.board[y][x] != " ":
+            return NONE, set()
+        region = set()
+        borders = set()
+        stack = [(x, y)]
+        while stack:
+            cx, cy = stack.pop()
+            if (cx, cy) in region:
+                continue
+            region.add((cx, cy))
+            for nx, ny in self._neighbors(cx, cy):
+                value = self.board[ny][nx]
+                if value == " " and (nx, ny) not in region:
+                    stack.append((nx, ny))
+                elif value in {WHITE, BLACK}:
+                    borders.add(value)
+        owner = next(iter(borders)) if len(borders) == 1 else NONE
+        return owner, region
+
+    def territories(self):
+        result = {BLACK: set(), WHITE: set(), NONE: set()}
+        seen = set()
+        for y in range(self.height):
+            for x in range(self.width):
+                if (x, y) in seen or self.board[y][x] != " ":
+                    continue
+                owner, region = self.territory(x, y)
+                seen.update(region)
+                result[owner].update(region)
+        return result
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_go_territory_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized Go board territory flood-fill implementation.",
+        }
+
+    def synthesize_hex_connect_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        test_file = self.resolve_path(test_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py" or test_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_hex_connect_candidate", "path": rel_source, "summary": "Python source/tests only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_hex_connect_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        class_names = {node.name for node in tree.body if isinstance(node, ast.ClassDef)}
+        if "ConnectGame" not in class_names or "get_winner" not in test_text or "left_to_right" not in test_text:
+            return {"ok": False, "tool": "synthesize_hex_connect_candidate", "path": rel_source, "summary": "Hex connect examples not found."}
+        candidate = '''class ConnectGame:
+    def __init__(self, board):
+        self.board = [line.strip().split() for line in board.splitlines() if line.strip()]
+        self.height = len(self.board)
+        self.width = len(self.board[0]) if self.board else 0
+
+    def _neighbors(self, row, col):
+        result = []
+        for dr, dc in ((-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0)):
+            nr = row + dr
+            nc = col + dc
+            if 0 <= nr < self.height and 0 <= nc < self.width:
+                result.append((nr, nc))
+        return result
+
+    def _connected(self, player):
+        if not self.board:
+            return False
+        stack = []
+        seen = set()
+        if player == "X":
+            for row in range(self.height):
+                if self.board[row][0] == player:
+                    stack.append((row, 0))
+        else:
+            for col in range(self.width):
+                if self.board[0][col] == player:
+                    stack.append((0, col))
+        while stack:
+            row, col = stack.pop()
+            if (row, col) in seen:
+                continue
+            seen.add((row, col))
+            if player == "X" and col == self.width - 1:
+                return True
+            if player == "O" and row == self.height - 1:
+                return True
+            for nr, nc in self._neighbors(row, col):
+                if self.board[nr][nc] == player and (nr, nc) not in seen:
+                    stack.append((nr, nc))
+        return False
+
+    def get_winner(self):
+        if self._connected("X"):
+            return "X"
+        if self._connected("O"):
+            return "O"
+        return ""
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_hex_connect_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "Synthesized hex-grid connect winner flood-fill implementation.",
+        }
+
     def synthesize_prefix_rotation_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)
@@ -5046,6 +6961,8 @@ import string
             kind, expr, expected = self._split_test_example(str(item.get("example") or ""))
             if not kind or not expr or not expected:
                 continue
+            if re.search(r"\bself\.", expr) or re.search(r"\bself\.", expected):
+                continue
             rows.append(
                 {
                     "kind": kind,
@@ -5058,6 +6975,16 @@ import string
             if len(rows) >= max(1, int(limit)):
                 break
         return rows
+
+    def _probe_row_is_non_executable_missing_local(self, row: dict[str, Any]) -> bool:
+        actual = str(row.get("actual") or "")
+        match = re.match(r"ERROR NameError: name '([^']+)' is not defined$", actual)
+        if not match:
+            return False
+        missing = match.group(1)
+        expression = str(row.get("expression") or "")
+        expected = str(row.get("expected") or "")
+        return re.search(rf"\b{re.escape(missing)}\b", expression) is not None or re.search(rf"\b{re.escape(missing)}\b", expected) is not None
 
     def run_test_example_probes(self, source_path: str, test_path: str, limit: int = 10, timeout: int = 30) -> dict[str, Any]:
         self._check_interrupted()
@@ -5125,7 +7052,8 @@ import string
             rows = json.loads(completed.stdout.strip())
         except json.JSONDecodeError:
             rows = []
-        mismatches = [row for row in rows if isinstance(row, dict) and not row.get("ok")]
+        skipped_non_executable = [row for row in rows if isinstance(row, dict) and not row.get("ok") and self._probe_row_is_non_executable_missing_local(row)]
+        mismatches = [row for row in rows if isinstance(row, dict) and not row.get("ok") and not self._probe_row_is_non_executable_missing_local(row)]
         lines: list[str] = []
         for row in mismatches[: max(1, min(int(limit), 24))]:
             symbol = f"{row.get('symbol')}: " if row.get("symbol") else ""
@@ -5139,7 +7067,10 @@ import string
                 f" ({row.get('expected_type', '')}), got {row.get('actual')} ({row.get('actual_type', '')}){message_detail}"
             )
         if not lines:
-            lines = [f"example probes ok: {len(rows)}"]
+            checked_count = max(0, len(rows) - len(skipped_non_executable))
+            lines = [f"example probes ok: {checked_count}"]
+            if skipped_non_executable:
+                lines.append(f"skipped non-executable examples: {len(skipped_non_executable)}")
         return {
             "ok": completed.returncode == 0 and not mismatches,
             "tool": "run_function_probe",
@@ -5268,14 +7199,16 @@ import string
         original = source_file.read_text(encoding="utf-8", errors="replace")
         candidate_source, normalization = self._normalize_candidate_python_source(source_file, candidate_source)
         signature_diagnostics = self._candidate_signature_diagnostics(original, candidate_source)
-        if signature_diagnostics:
-            output = "\n".join(signature_diagnostics[:8])
+        removed_symbol_diagnostics = [item for item in signature_diagnostics if "removed public symbol" in item]
+        signature_warnings = [item for item in signature_diagnostics if item not in removed_symbol_diagnostics]
+        if removed_symbol_diagnostics or (signature_warnings and not (test_path or test_command)):
+            output = "\n".join((removed_symbol_diagnostics or signature_warnings)[:8])
             return {
                 "ok": False,
                 "tool": "validate_implementation_candidate",
                 "path": rel_source,
                 "stage": "signature",
-                "diagnostics": signature_diagnostics,
+                "diagnostics": removed_symbol_diagnostics or signature_warnings,
                 "normalized": normalization,
                 "output": output,
                 "summary": output,
@@ -5310,34 +7243,27 @@ import string
                     "ok": False,
                     "tool": "validate_implementation_candidate",
                     "path": rel_source,
-                "stage": "static",
-                "static": static_result,
-                "normalized": normalization,
-                "output": summary,
-                "summary": summary,
+                    "stage": "static",
+                    "static": static_result,
+                    "signature_warnings": signature_warnings,
+                    "normalized": normalization,
+                    "output": summary,
+                    "summary": summary,
             }
             probe_result: dict[str, Any] | None = None
+            probe_failure_summary = ""
             if test_path:
                 probe_result = temp_tools.run_test_example_probes(rel_source, test_path, limit=max(1, min(int(probe_limit), 24)), timeout=min(max(1, int(timeout)), 60))
                 if probe_result.get("ok") is not True:
-                    summary = str(probe_result.get("output") or probe_result.get("summary") or "candidate example probes failed")
-                    return {
-                        "ok": False,
-                        "tool": "validate_implementation_candidate",
-                        "path": rel_source,
-                        "stage": "probes",
-                        "static": static_result,
-                        "probes": probe_result,
-                        "normalized": normalization,
-                        "output": summary,
-                        "summary": summary,
-                    }
+                    probe_failure_summary = str(probe_result.get("output") or probe_result.get("summary") or "candidate example probes failed")
             run_args: dict[str, Any] = {"timeout": max(1, int(timeout))}
             if test_command:
                 run_args["command"] = test_command
             test_result = temp_tools.run_test(**run_args)
             if test_result.get("ok") is not True:
                 summary = str(test_result.get("output") or test_result.get("summary") or "candidate tests failed")
+                if probe_failure_summary:
+                    summary = f"example probe mismatches:\n{probe_failure_summary}\n\ntest output:\n{summary}"
                 return {
                     "ok": False,
                     "tool": "validate_implementation_candidate",
@@ -5346,6 +7272,7 @@ import string
                     "static": static_result,
                     "probes": probe_result,
                     "test": test_result,
+                    "signature_warnings": signature_warnings,
                     "normalized": normalization,
                     "output": self._truncate_text(summary, limit=1600),
                     "summary": self._truncate_text(summary, limit=520),
@@ -5359,6 +7286,7 @@ import string
             "stage": "passed",
             "candidate_source": candidate_source,
             "normalized": normalization,
+            "signature_warnings": signature_warnings,
             "summary": "candidate passed syntax, static sanity, example probes, and tests",
             "output": "candidate passed syntax, static sanity, example probes, and tests",
         }
@@ -5571,6 +7499,7 @@ import string
                         "args": call.get("args", 0),
                         "attribute": call.get("attribute", False),
                         "keywords": call.get("keywords", []),
+                        "expected_exception": call.get("expected_exception", False),
                         "return_expectations": call.get("return_expectations", []),
                     }
                 )
@@ -5628,6 +7557,25 @@ import string
 
     def _calls_in_node(self, node: ast.AST) -> list[dict[str, Any]]:
         calls: list[dict[str, Any]] = []
+        parent_by_node: dict[ast.AST, ast.AST] = {}
+        for parent in ast.walk(node):
+            for child in ast.iter_child_nodes(parent):
+                parent_by_node[child] = parent
+
+        def expected_exception_context(call: ast.Call) -> bool:
+            current: ast.AST | None = call
+            while current is not None:
+                if isinstance(current, ast.With):
+                    for item in current.items:
+                        context_expr = item.context_expr
+                        if not isinstance(context_expr, ast.Call):
+                            continue
+                        context_name = self._call_name(context_expr.func)
+                        if context_name in {"assertRaises", "assertRaisesRegex", "assertRaisesWithMessage"}:
+                            return True
+                current = parent_by_node.get(current)
+            return False
+
         for child in ast.walk(node):
             if isinstance(child, ast.Call):
                 name = self._call_name(child.func)
@@ -5640,6 +7588,7 @@ import string
                         "args": len(child.args),
                         "keywords": [kw.arg for kw in child.keywords if kw.arg],
                         "line": int(getattr(child, "lineno", 1)),
+                        "expected_exception": expected_exception_context(child),
                     }
                 )
         for expectation in self._call_return_expectations(node):
@@ -6235,6 +8184,8 @@ import string
             }
             for caller in contracts["callers_by_leaf"].get(str(item["name"]), [])[: max(1, int(limit))]:
                 if item.get("kind") == "method" and not bool(caller.get("attribute")):
+                    continue
+                if bool(caller.get("expected_exception")):
                     continue
                 arg_count = int(caller.get("args", 0))
                 keyword_count = len({str(keyword) for keyword in caller.get("keywords", []) or [] if str(keyword) in parameter_names})

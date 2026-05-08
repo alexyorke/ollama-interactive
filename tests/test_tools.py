@@ -2010,6 +2010,934 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("def foldr(function, values, initial):", synthesized["candidate_source"])
         self.assertTrue(validation["ok"], validation)
 
+    def test_synthesize_affine_substitution_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "affine_cipher.py").write_text("def encode(plain_text, a, b):\n    pass\n\n\ndef decode(ciphered_text, a, b):\n    pass\n", encoding="utf-8")
+            (root / "affine_cipher_test.py").write_text(
+                "import unittest\nfrom affine_cipher import decode, encode\n\n"
+                "class AffineCipherTest(unittest.TestCase):\n"
+                "    def test_encode_yes(self):\n"
+                "        self.assertEqual(encode('yes', 5, 7), 'xbt')\n"
+                "    def test_encode_omg(self):\n"
+                "        self.assertEqual(encode('OMG', 21, 3), 'lvz')\n"
+                "    def test_encode_numbers_and_groups(self):\n"
+                "        self.assertEqual(encode('Testing,1 2 3, testing.', 3, 4), 'jqgjc rw123 jqgjc rw')\n"
+                "    def test_encode_with_a_not_coprime_to_m(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            encode('This is a test.', 6, 17)\n"
+                "        self.assertEqual(err.exception.args[0], 'a and m must be coprime.')\n"
+                "    def test_decode_exercism(self):\n"
+                "        self.assertEqual(decode('tytgn fjr', 3, 7), 'exercism')\n"
+                "    def test_decode_numbers(self):\n"
+                "        self.assertEqual(decode('odpoz ub123 odpoz ub', 25, 7), 'testing123testing')\n"
+                "    def test_decode_with_a_not_coprime_to_m(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            decode('Test', 13, 5)\n"
+                "        self.assertEqual(err.exception.args[0], 'a and m must be coprime.')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_affine_substitution_candidate("affine_cipher.py", "affine_cipher_test.py")
+            validation = tools.validate_implementation_candidate(
+                "affine_cipher.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="affine_cipher_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("ALPHABET_SIZE = 26", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_countdown_song_candidate_for_beer_song(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "beer_song.py").write_text("def recite(start, take=1):\n    pass\n", encoding="utf-8")
+            (root / "beer_song_test.py").write_text(
+                "import unittest\nfrom beer_song import recite\n\n"
+                "class BeerSongTest(unittest.TestCase):\n"
+                "    def test_first_generic_verse(self):\n"
+                "        expected = ['99 bottles of beer on the wall, 99 bottles of beer.', 'Take one down and pass it around, 98 bottles of beer on the wall.']\n"
+                "        self.assertEqual(recite(start=99), expected)\n"
+                "    def test_verse_with_1_bottle(self):\n"
+                "        expected = ['1 bottle of beer on the wall, 1 bottle of beer.', 'Take it down and pass it around, no more bottles of beer on the wall.']\n"
+                "        self.assertEqual(recite(start=1), expected)\n"
+                "    def test_verse_with_0_bottles(self):\n"
+                "        expected = ['No more bottles of beer on the wall, no more bottles of beer.', 'Go to the store and buy some more, 99 bottles of beer on the wall.']\n"
+                "        self.assertEqual(recite(start=0), expected)\n"
+                "    def test_last_three_verses(self):\n"
+                "        expected = ['2 bottles of beer on the wall, 2 bottles of beer.', 'Take one down and pass it around, 1 bottle of beer on the wall.', '', '1 bottle of beer on the wall, 1 bottle of beer.', 'Take it down and pass it around, no more bottles of beer on the wall.', '', 'No more bottles of beer on the wall, no more bottles of beer.', 'Go to the store and buy some more, 99 bottles of beer on the wall.']\n"
+                "        self.assertEqual(recite(start=2, take=3), expected)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_countdown_song_candidate("beer_song.py", "beer_song_test.py")
+            validation = tools.validate_implementation_candidate(
+                "beer_song.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="beer_song_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertEqual(synthesized["variant"], "beer")
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_countdown_song_candidate_for_green_bottles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bottle_song.py").write_text("def recite(start, take=1):\n    pass\n", encoding="utf-8")
+            (root / "bottle_song_test.py").write_text(
+                "import unittest\nfrom bottle_song import recite\n\n"
+                "class BottleSongTest(unittest.TestCase):\n"
+                "    def test_first_generic_verse(self):\n"
+                "        expected = ['Ten green bottles hanging on the wall,', 'Ten green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be nine green bottles hanging on the wall.\"]\n"
+                "        self.assertEqual(recite(start=10), expected)\n"
+                "    def test_last_three_verses(self):\n"
+                "        expected = ['Three green bottles hanging on the wall,', 'Three green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be two green bottles hanging on the wall.\", '', 'Two green bottles hanging on the wall,', 'Two green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be one green bottle hanging on the wall.\", '', 'One green bottle hanging on the wall,', 'One green bottle hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be no green bottles hanging on the wall.\"]\n"
+                "        self.assertEqual(recite(start=3, take=3), expected)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_countdown_song_candidate("bottle_song.py", "bottle_song_test.py")
+            validation = tools.validate_implementation_candidate(
+                "bottle_song.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="bottle_song_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertEqual(synthesized["variant"], "green-bottle")
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_discounted_set_pricing_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "book_store.py").write_text("def total(basket):\n    pass\n", encoding="utf-8")
+            (root / "book_store_test.py").write_text(
+                "import unittest\nfrom book_store import total\n\n"
+                "class BookStoreTest(unittest.TestCase):\n"
+                "    def test_only_a_single_book(self):\n"
+                "        basket = [1]\n"
+                "        self.assertEqual(total(basket), 800)\n"
+                "    def test_two_different_books(self):\n"
+                "        basket = [1, 2]\n"
+                "        self.assertEqual(total(basket), 1520)\n"
+                "    def test_three_different_books(self):\n"
+                "        basket = [1, 2, 3]\n"
+                "        self.assertEqual(total(basket), 2160)\n"
+                "    def test_four_different_books(self):\n"
+                "        basket = [1, 2, 3, 4]\n"
+                "        self.assertEqual(total(basket), 2560)\n"
+                "    def test_five_different_books(self):\n"
+                "        basket = [1, 2, 3, 4, 5]\n"
+                "        self.assertEqual(total(basket), 3000)\n"
+                "    def test_two_groups_of_four_is_cheaper_than_group_of_five_plus_group_of_three(self):\n"
+                "        basket = [1, 1, 2, 2, 3, 3, 4, 5]\n"
+                "        self.assertEqual(total(basket), 5120)\n"
+                "    def test_complex_grouping(self):\n"
+                "        basket = [1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5]\n"
+                "        self.assertEqual(total(basket), 10000)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_discounted_set_pricing_candidate("book_store.py", "book_store_test.py")
+            validation = tools.validate_implementation_candidate(
+                "book_store.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="book_store_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("best_price", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_bowling_game_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bowling.py").write_text(
+                "class BowlingGame:\n"
+                "    def __init__(self):\n"
+                "        pass\n\n"
+                "    def roll(self, pins):\n"
+                "        pass\n\n"
+                "    def score(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "bowling_test.py").write_text(
+                "import unittest\nfrom bowling import BowlingGame\n\n"
+                "class BowlingTest(unittest.TestCase):\n"
+                "    def roll_new_game(self, rolls):\n"
+                "        game = BowlingGame()\n"
+                "        for roll in rolls:\n"
+                "            game.roll(roll)\n"
+                "        return game\n"
+                "    def assertRaisesWithMessage(self, exception):\n"
+                "        return self.assertRaisesRegex(exception, r'.+')\n"
+                "    def test_all_zeros(self):\n"
+                "        self.assertEqual(self.roll_new_game([0] * 20).score(), 0)\n"
+                "    def test_spare_bonus(self):\n"
+                "        self.assertEqual(self.roll_new_game([6, 4, 3, 0] + [0] * 16).score(), 16)\n"
+                "    def test_strike_bonus(self):\n"
+                "        self.assertEqual(self.roll_new_game([10, 5, 3] + [0] * 16).score(), 26)\n"
+                "    def test_perfect_game(self):\n"
+                "        self.assertEqual(self.roll_new_game([10] * 12).score(), 300)\n"
+                "    def test_incomplete_game(self):\n"
+                "        with self.assertRaisesWithMessage(Exception):\n"
+                "            self.roll_new_game([0, 0]).score()\n"
+                "    def test_invalid_frame(self):\n"
+                "        game = self.roll_new_game([5])\n"
+                "        with self.assertRaisesWithMessage(Exception):\n"
+                "            game.roll(6)\n"
+                "    def test_invalid_last_strike_bonus(self):\n"
+                "        game = self.roll_new_game([0] * 18 + [10, 5])\n"
+                "        with self.assertRaisesWithMessage(Exception):\n"
+                "            game.roll(6)\n"
+                "    def test_cannot_roll_after_complete_game(self):\n"
+                "        game = self.roll_new_game([0] * 20)\n"
+                "        with self.assertRaisesWithMessage(Exception):\n"
+                "            game.roll(0)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_bowling_game_candidate("bowling.py", "bowling_test.py")
+            validation = tools.validate_implementation_candidate(
+                "bowling.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="bowling_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("_validate_rolls", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_noarg_literal_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "answers.py").write_text("def drinks_water():\n    pass\n\ndef owns_zebra():\n    pass\n", encoding="utf-8")
+            (root / "answers_test.py").write_text(
+                "import unittest\nfrom answers import drinks_water, owns_zebra\n\n"
+                "class AnswerTest(unittest.TestCase):\n"
+                "    def test_water(self):\n"
+                "        self.assertEqual(drinks_water(), 'Norwegian')\n"
+                "    def test_zebra(self):\n"
+                "        self.assertEqual(owns_zebra(), 'Japanese')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_noarg_literal_candidate("answers.py", "answers_test.py")
+            validation = tools.validate_implementation_candidate("answers.py", str(synthesized.get("candidate_source") or ""), test_path="answers_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("return 'Norwegian'", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_proverb_chain_candidate_allows_test_backed_signature_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "proverb.py").write_text("def proverb():\n    pass\n", encoding="utf-8")
+            (root / "proverb_test.py").write_text(
+                "import unittest\nfrom proverb import proverb\n\n"
+                "class ProverbTest(unittest.TestCase):\n"
+                "    def test_three(self):\n"
+                "        self.assertEqual(proverb('nail', 'shoe', 'horse', qualifier=None), [\n"
+                "            'For want of a nail the shoe was lost.',\n"
+                "            'For want of a shoe the horse was lost.',\n"
+                "            'And all for the want of a nail.',\n"
+                "        ])\n"
+                "    def test_qualifier(self):\n"
+                "        self.assertEqual(proverb('nail', qualifier='horseshoe'), ['And all for the want of a horseshoe nail.'])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_proverb_chain_candidate("proverb.py", "proverb_test.py")
+            validation = tools.validate_implementation_candidate("proverb.py", str(synthesized.get("candidate_source") or ""), test_path="proverb_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("candidate changed signature", "\n".join(validation.get("signature_warnings") or []))
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_typed_graph_dsl_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "dot_dsl.py").write_text(
+                "NODE, EDGE, ATTR = range(3)\n\n"
+                "class Node:\n"
+                "    def __init__(self, name, attrs):\n"
+                "        self.name = name\n"
+                "        self.attrs = attrs\n"
+                "    def __eq__(self, other):\n"
+                "        return self.name == other.name and self.attrs == other.attrs\n\n"
+                "class Edge:\n"
+                "    def __init__(self, src, dst, attrs):\n"
+                "        self.src = src\n"
+                "        self.dst = dst\n"
+                "        self.attrs = attrs\n"
+                "    def __eq__(self, other):\n"
+                "        return self.src == other.src and self.dst == other.dst and self.attrs == other.attrs\n\n"
+                "class Graph:\n"
+                "    def __init__(self, data=None):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "dot_dsl_test.py").write_text(
+                "import unittest\nfrom dot_dsl import Graph, Node, Edge, NODE, EDGE, ATTR\n\n"
+                "class GraphTest(unittest.TestCase):\n"
+                "    def test_items(self):\n"
+                "        g = Graph([(ATTR, 'title', 'T'), (NODE, 'a', {}), (EDGE, 'a', 'b', {'x': '1'})])\n"
+                "        self.assertEqual(g.attrs, {'title': 'T'})\n"
+                "        self.assertEqual(g.nodes, [Node('a', {})])\n"
+                "        self.assertEqual(g.edges, [Edge('a', 'b', {'x': '1'})])\n"
+                "    def test_malformed(self):\n"
+                "        with self.assertRaisesRegex(TypeError, 'Graph data malformed'):\n"
+                "            Graph(1)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_typed_graph_dsl_candidate("dot_dsl.py", "dot_dsl_test.py")
+            validation = tools.validate_implementation_candidate("dot_dsl.py", str(synthesized.get("candidate_source") or ""), test_path="dot_dsl_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("Graph data malformed", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_parent_record_tree_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tree_building.py").write_text(
+                "class Record:\n"
+                "    def __init__(self, record_id, parent_id):\n"
+                "        self.record_id = record_id\n"
+                "        self.parent_id = parent_id\n\n"
+                "class Node:\n"
+                "    def __init__(self, node_id):\n"
+                "        self.node_id = node_id\n"
+                "        self.children = []\n\n"
+                "def BuildTree(records):\n"
+                "    return None\n",
+                encoding="utf-8",
+            )
+            (root / "tree_building_test.py").write_text(
+                "import unittest\nfrom tree_building import Record, BuildTree\n\n"
+                "class TreeTest(unittest.TestCase):\n"
+                "    def test_tree(self):\n"
+                "        root = BuildTree([Record(2, 0), Record(1, 0), Record(0, 0)])\n"
+                "        self.assertEqual(root.node_id, 0)\n"
+                "        self.assertEqual([child.node_id for child in root.children], [1, 2])\n"
+                "    def test_invalid(self):\n"
+                "        with self.assertRaisesRegex(ValueError, 'Record id is invalid or out of order'):\n"
+                "            BuildTree([Record(1, 0)])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_parent_record_tree_candidate("tree_building.py", "tree_building_test.py")
+            validation = tools.validate_implementation_candidate("tree_building.py", str(synthesized.get("candidate_source") or ""), test_path="tree_building_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("Record id is invalid or out of order", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_domino_chain_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "dominoes.py").write_text("def can_chain(dominoes):\n    pass\n", encoding="utf-8")
+            (root / "dominoes_test.py").write_text(
+                "import unittest\nfrom dominoes import can_chain\n\n"
+                "class DominoTest(unittest.TestCase):\n"
+                "    def assert_correct_chain(self, input_dominoes, output_chain):\n"
+                "        self.assertIsNotNone(output_chain)\n"
+                "        self.assertEqual(sorted(tuple(sorted(d)) for d in input_dominoes), sorted(tuple(sorted(d)) for d in output_chain))\n"
+                "        if output_chain:\n"
+                "            self.assertEqual(output_chain[0][0], output_chain[-1][1])\n"
+                "            for left, right in zip(output_chain, output_chain[1:]):\n"
+                "                self.assertEqual(left[1], right[0])\n"
+                "    def refute_correct_chain(self, input_dominoes, output_chain):\n"
+                "        self.assertIsNone(output_chain)\n"
+                "    def test_chain(self):\n"
+                "        self.assert_correct_chain([(1, 2), (3, 1), (2, 3)], can_chain([(1, 2), (3, 1), (2, 3)]))\n"
+                "    def test_no_chain(self):\n"
+                "        self.refute_correct_chain([(1, 2)], can_chain([(1, 2)]))\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_domino_chain_candidate("dominoes.py", "dominoes_test.py")
+            validation = tools.validate_implementation_candidate("dominoes.py", str(synthesized.get("candidate_source") or ""), test_path="dominoes_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_food_chain_song_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "food_chain.py").write_text("def recite(start, end):\n    pass\n", encoding="utf-8")
+            (root / "food_chain_test.py").write_text(
+                "import unittest\nfrom food_chain import recite\n\n"
+                "class FoodChainTest(unittest.TestCase):\n"
+                "    def test_fly(self):\n"
+                "        self.assertEqual(recite(1, 1), ['I know an old lady who swallowed a fly.', \"I don't know why she swallowed the fly. Perhaps she'll die.\"])\n"
+                "    def test_horse(self):\n"
+                "        self.assertEqual(recite(8, 8), ['I know an old lady who swallowed a horse.', \"She's dead, of course!\"])\n"
+                "    def test_range(self):\n"
+                "        self.assertIn('', recite(1, 3))\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_food_chain_song_candidate("food_chain.py", "food_chain_test.py")
+            validation = tools.validate_implementation_candidate("food_chain.py", str(synthesized.get("candidate_source") or ""), test_path="food_chain_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_grep_filter_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "grep.py").write_text("def grep(pattern, flags, files):\n    pass\n", encoding="utf-8")
+            (root / "grep_test.py").write_text(
+                "import io\nimport unittest\nfrom unittest import mock\nfrom grep import grep\n\n"
+                "DATA = {'a.txt': 'Alpha\\nbeta\\n', 'b.txt': 'alpha\\n'}\n"
+                "def open_mock(name, *args, **kwargs):\n"
+                "    return io.StringIO(DATA[name])\n"
+                "@mock.patch('grep.open', side_effect=open_mock, create=True)\n"
+                "class GrepTest(unittest.TestCase):\n"
+                "    def test_flags(self, _open):\n"
+                "        self.assertMultiLineEqual(grep('ALPHA', '-i -n', ['a.txt']), '1:Alpha\\n')\n"
+                "        self.assertMultiLineEqual(grep('alpha', '-l', ['a.txt', 'b.txt']), 'b.txt\\n')\n"
+                "        self.assertMultiLineEqual(grep('beta', '-v -x', ['a.txt']), 'Alpha\\n')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_grep_filter_candidate("grep.py", "grep_test.py")
+            validation = tools.validate_implementation_candidate("grep.py", str(synthesized.get("candidate_source") or ""), test_path="grep_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_bucket_measure_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "two_bucket.py").write_text("def measure(bucket_one, bucket_two, goal, start_bucket):\n    pass\n", encoding="utf-8")
+            (root / "two_bucket_test.py").write_text(
+                "import unittest\nfrom two_bucket import measure\n\n"
+                "class BucketTest(unittest.TestCase):\n"
+                "    def assertRaisesWithMessage(self, exception):\n"
+                "        return self.assertRaisesRegex(exception, r'.+')\n"
+                "    def test_one(self):\n"
+                "        self.assertEqual(measure(3, 5, 1, 'one'), (4, 'one', 5))\n"
+                "    def test_start_two(self):\n"
+                "        self.assertEqual(measure(3, 5, 1, 'two'), (8, 'two', 3))\n"
+                "    def test_two(self):\n"
+                "        self.assertEqual(measure(1, 3, 3, 'two'), (1, 'two', 0))\n"
+                "    def test_goal_is_other_capacity(self):\n"
+                "        self.assertEqual(measure(2, 3, 3, 'one'), (2, 'two', 2))\n"
+                "    def test_impossible(self):\n"
+                "        with self.assertRaisesWithMessage(ValueError):\n"
+                "            measure(6, 15, 5, 'one')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_bucket_measure_candidate("two_bucket.py", "two_bucket_test.py")
+            validation = tools.validate_implementation_candidate("two_bucket.py", str(synthesized.get("candidate_source") or ""), test_path="two_bucket_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_reactive_cells_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "react.py").write_text(
+                "class InputCell:\n"
+                "    def __init__(self, initial_value):\n"
+                "        self.value = None\n\n"
+                "class ComputeCell:\n"
+                "    def __init__(self, inputs, compute_function):\n"
+                "        self.value = None\n"
+                "    def add_callback(self, callback):\n"
+                "        pass\n"
+                "    def remove_callback(self, callback):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "react_test.py").write_text(
+                "import unittest\nfrom react import InputCell, ComputeCell\n\n"
+                "class ReactTest(unittest.TestCase):\n"
+                "    def test_diamond(self):\n"
+                "        input = InputCell(1)\n"
+                "        plus_one = ComputeCell([input], lambda inputs: inputs[0] + 1)\n"
+                "        minus_one1 = ComputeCell([input], lambda inputs: inputs[0] - 1)\n"
+                "        minus_one2 = ComputeCell([minus_one1], lambda inputs: inputs[0] - 1)\n"
+                "        output = ComputeCell([plus_one, minus_one2], lambda inputs: inputs[0] * inputs[1])\n"
+                "        seen = []\n"
+                "        output.add_callback(lambda value: seen.append(value))\n"
+                "        input.value = 4\n"
+                "        self.assertEqual(seen, [10])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_reactive_cells_candidate("react.py", "react_test.py")
+            validation = tools.validate_implementation_candidate("react.py", str(synthesized.get("candidate_source") or ""), test_path="react_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_hangman_state_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "hangman.py").write_text(
+                "STATUS_WIN = 'win'\nSTATUS_LOSE = 'lose'\nSTATUS_ONGOING = 'ongoing'\n\n"
+                "class Hangman:\n"
+                "    def __init__(self, word):\n"
+                "        self.remaining_guesses = 9\n"
+                "        self.status = STATUS_ONGOING\n"
+                "    def guess(self, char):\n"
+                "        pass\n"
+                "    def get_masked_word(self):\n"
+                "        pass\n"
+                "    def get_status(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "hangman_test.py").write_text(
+                "import unittest\nimport hangman\nfrom hangman import Hangman\n\n"
+                "class HangmanTest(unittest.TestCase):\n"
+                "    def test_win_and_end(self):\n"
+                "        game = Hangman('aaa')\n"
+                "        for ch in 'bcdefghij':\n"
+                "            game.guess(ch)\n"
+                "        game.guess('a')\n"
+                "        self.assertEqual(game.remaining_guesses, 0)\n"
+                "        self.assertEqual(game.get_status(), hangman.STATUS_WIN)\n"
+                "        with self.assertRaisesRegex(ValueError, 'already ended'):\n"
+                "            game.guess('x')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_hangman_state_candidate("hangman.py", "hangman_test.py")
+            validation = tools.validate_implementation_candidate("hangman.py", str(synthesized.get("candidate_source") or ""), test_path="hangman_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_rest_api_debt_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rest_api.py").write_text(
+                "class RestAPI:\n"
+                "    def __init__(self, database=None):\n"
+                "        pass\n"
+                "    def get(self, url, payload=None):\n"
+                "        pass\n"
+                "    def post(self, url, payload=None):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "rest_api_test.py").write_text(
+                "import json\nimport unittest\nfrom rest_api import RestAPI\n\n"
+                "class RestApiTest(unittest.TestCase):\n"
+                "    def test_iou(self):\n"
+                "        database = {'users': [{'name': 'Adam', 'owes': {'Bob': 3.0}, 'owed_by': {}, 'balance': -3.0}, {'name': 'Bob', 'owes': {}, 'owed_by': {'Adam': 3.0}, 'balance': 3.0}]}\n"
+                "        api = RestAPI(database)\n"
+                "        response = api.post('/iou', json.dumps({'lender': 'Adam', 'borrower': 'Bob', 'amount': 4.0}))\n"
+                "        self.assertEqual(json.loads(response)['users'][0]['balance'], 1.0)\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(json.loads(RestAPI({'users': []}).post('/add', json.dumps({'user': 'Adam'})))['name'], 'Adam')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_rest_api_debt_candidate("rest_api.py", "rest_api_test.py")
+            validation = tools.validate_implementation_candidate("rest_api.py", str(synthesized.get("candidate_source") or ""), test_path="rest_api_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_forth_interpreter_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "forth.py").write_text(
+                "class StackUnderflowError(Exception):\n"
+                "    pass\n\n"
+                "def evaluate(input_data):\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            (root / "forth_test.py").write_text(
+                "import unittest\nfrom forth import evaluate, StackUnderflowError\n\n"
+                "class ForthTest(unittest.TestCase):\n"
+                "    def test_arithmetic(self):\n"
+                "        self.assertEqual(evaluate(['1 2 + 4 -']), [-1])\n"
+                "    def test_definition_binding(self):\n"
+                "        self.assertEqual(evaluate([': foo 5 ;', ': bar foo ;', ': foo 6 ;', 'bar foo']), [5, 6])\n"
+                "    def test_case(self):\n"
+                "        self.assertEqual(evaluate(['1 DUP Dup dup']), [1, 1, 1, 1])\n"
+                "    def test_underflow(self):\n"
+                "        with self.assertRaisesRegex(StackUnderflowError, 'Insufficient'):\n"
+                "            evaluate(['swap'])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_forth_interpreter_candidate("forth.py", "forth_test.py")
+            validation = tools.validate_implementation_candidate("forth.py", str(synthesized.get("candidate_source") or ""), test_path="forth_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("definitions", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_sgf_tree_parser_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sgf_parsing.py").write_text(
+                "class SgfTree:\n"
+                "    def __init__(self, properties=None, children=None):\n"
+                "        self.properties = properties or {}\n"
+                "        self.children = children or []\n"
+                "    def __eq__(self, other):\n"
+                "        return isinstance(other, SgfTree) and self.properties == other.properties and self.children == other.children\n"
+                "    def __ne__(self, other):\n"
+                "        return not self == other\n\n"
+                "def parse(input_string):\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            (root / "sgf_parsing_test.py").write_text(
+                "import unittest\nfrom sgf_parsing import parse, SgfTree\n\n"
+                "class SgfTest(unittest.TestCase):\n"
+                "    def test_simple(self):\n"
+                "        self.assertEqual(parse('(;A[B])'), SgfTree(properties={'A': ['B']}))\n"
+                "    def test_escape(self):\n"
+                "        self.assertEqual(parse('(;A[\\\\]])'), SgfTree(properties={'A': [']']}))\n"
+                "    def test_lower(self):\n"
+                "        with self.assertRaisesRegex(ValueError, 'property must be in uppercase'):\n"
+                "            parse('(;a[b])')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_sgf_tree_parser_candidate("sgf_parsing.py", "sgf_parsing_test.py")
+            validation = tools.validate_implementation_candidate("sgf_parsing.py", str(synthesized.get("candidate_source") or ""), test_path="sgf_parsing_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("parse_tree", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_poker_ranking_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "poker.py").write_text("def best_hands(hands):\n    pass\n", encoding="utf-8")
+            (root / "poker_test.py").write_text(
+                "import unittest\nfrom poker import best_hands\n\n"
+                "class PokerTest(unittest.TestCase):\n"
+                "    def test_winner(self):\n"
+                "        self.assertEqual(best_hands(['4S 5H 4D 5D 4H', '7S 8S 9S 6S 10S']), ['7S 8S 9S 6S 10S'])\n"
+                "    def test_tie(self):\n"
+                "        self.assertEqual(best_hands(['3S 4S 5D 6H JH', '3H 4H 5C 6C JD']), ['3S 4S 5D 6H JH', '3H 4H 5C 6C JD'])\n"
+                "    def test_wheel(self):\n"
+                "        self.assertEqual(best_hands(['2H 3H 4H 5H 6H', '4D AD 3D 2D 5D']), ['2H 3H 4H 5H 6H'])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_poker_ranking_candidate("poker.py", "poker_test.py")
+            validation = tools.validate_implementation_candidate("poker.py", str(synthesized.get("candidate_source") or ""), test_path="poker_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("_score_hand", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_metered_io_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "paasio.py").write_text(
+                "import io\n\n"
+                "class MeteredFile(io.BufferedRandom):\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        pass\n"
+                "    def __enter__(self):\n"
+                "        pass\n"
+                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                "        pass\n"
+                "    def __iter__(self):\n"
+                "        pass\n"
+                "    def __next__(self):\n"
+                "        pass\n"
+                "    def read(self, size=-1):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def read_bytes(self):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def read_ops(self):\n"
+                "        pass\n"
+                "    def write(self, b):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def write_bytes(self):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def write_ops(self):\n"
+                "        pass\n\n"
+                "class MeteredSocket:\n"
+                "    def __init__(self, socket):\n"
+                "        pass\n"
+                "    def __enter__(self):\n"
+                "        pass\n"
+                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                "        pass\n"
+                "    def recv(self, bufsize, flags=0):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def recv_bytes(self):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def recv_ops(self):\n"
+                "        pass\n"
+                "    def send(self, data, flags=0):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def send_bytes(self):\n"
+                "        pass\n"
+                "    @property\n"
+                "    def send_ops(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "test_utils.py").write_text(
+                "import inspect\nimport io\n\n"
+                "class MockFile(io.BytesIO):\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        super().__init__(*args, **kwargs)\n"
+                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                "        return super().__exit__(exc_type, exc_val, exc_tb)\n\n"
+                "class MockSock:\n"
+                "    def __init__(self):\n"
+                "        self.payload = io.BytesIO(b'abcdef')\n"
+                "        self.sent = io.BytesIO()\n"
+                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                "        return False\n"
+                "    def recv(self, bufsize, flags=0):\n"
+                "        return self.payload.read(bufsize)\n"
+                "    def send(self, data, flags=0):\n"
+                "        return self.sent.write(data)\n\n"
+                "class SuperMock:\n"
+                "    mock_object = None\n"
+                "    init_called = 0\n"
+                "    initialized = False\n"
+                "    def __init__(self, *args, **kwargs):\n"
+                "        if self.initialized:\n"
+                "            self.init_called += 1\n"
+                "        else:\n"
+                "            self.initialized = True\n"
+                "    def __call__(self, *args, **kwargs):\n"
+                "        frame = inspect.currentframe()\n"
+                "        stack = inspect.getouterframes(frame)\n"
+                "        if any(item[3] == '__init__' and 'paasio' in item[1] for item in stack):\n"
+                "            return self\n"
+                "        return self.mock_object\n",
+                encoding="utf-8",
+            )
+            (root / "paasio_test.py").write_text(
+                "import unittest\nfrom unittest.mock import NonCallableMagicMock, patch\n"
+                "from test_utils import MockFile, MockSock, SuperMock\nfrom paasio import MeteredFile, MeteredSocket\n\n"
+                "class PaasioTest(unittest.TestCase):\n"
+                "    def test_socket(self):\n"
+                "        mock = NonCallableMagicMock(wraps=MockSock(), autospec=True)\n"
+                "        with MeteredSocket(mock) as socket:\n"
+                "            self.assertEqual(socket.recv(3), b'abc')\n"
+                "            self.assertEqual(socket.send(b'xy'), 2)\n"
+                "        self.assertEqual(socket.recv_ops, 1)\n"
+                "        self.assertEqual(socket.recv_bytes, 3)\n"
+                "        self.assertEqual(socket.send_ops, 1)\n"
+                "        self.assertEqual(socket.send_bytes, 2)\n"
+                "    @patch('paasio.super', create=True, new_callable=SuperMock)\n"
+                "    def test_file(self, super_mock):\n"
+                "        mock = NonCallableMagicMock(wraps=MockFile(b'abcdef'), autospec=True)\n"
+                "        super_mock.mock_object = mock\n"
+                "        with MeteredFile() as file:\n"
+                "            self.assertEqual(file.read(2), b'ab')\n"
+                "            self.assertEqual(file.write(b'xy'), 2)\n"
+                "        self.assertEqual(file.read_ops, 1)\n"
+                "        self.assertEqual(file.read_bytes, 2)\n"
+                "        self.assertEqual(file.write_ops, 1)\n"
+                "        self.assertEqual(file.write_bytes, 2)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_metered_io_candidate("paasio.py", "paasio_test.py")
+            validation = tools.validate_implementation_candidate("paasio.py", str(synthesized.get("candidate_source") or ""), test_path="paasio_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("MeteredSocket", synthesized["candidate_source"])
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_tree_pov_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pov.py").write_text(
+                "class Tree:\n"
+                "    def __init__(self, label, children=None):\n"
+                "        self.label = label\n"
+                "        self.children = children if children is not None else []\n"
+                "    def __lt__(self, other):\n"
+                "        return self.label < other.label\n"
+                "    def __eq__(self, other):\n"
+                "        return self.label == other.label and self.children == other.children\n"
+                "    def from_pov(self, from_node):\n"
+                "        pass\n"
+                "    def path_to(self, from_node, to_node):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "pov_test.py").write_text(
+                "import unittest\nfrom pov import Tree\n\n"
+                "class PovTest(unittest.TestCase):\n"
+                "    def test_path(self):\n"
+                "        tree = Tree('parent', [Tree('a'), Tree('x'), Tree('b')])\n"
+                "        self.assertEqual(tree.path_to('a', 'b'), ['a', 'parent', 'b'])\n"
+                "    def test_from_pov(self):\n"
+                "        tree = Tree('parent', [Tree('x'), Tree('sibling')])\n"
+                "        self.assertEqual(tree.from_pov('x'), Tree('x', [Tree('parent', [Tree('sibling')])]))\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_tree_pov_candidate("pov.py", "pov_test.py")
+            validation = tools.validate_implementation_candidate("pov.py", str(synthesized.get("candidate_source") or ""), test_path="pov_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_binary_zipper_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "zipper.py").write_text(
+                "class Zipper:\n"
+                "    @staticmethod\n"
+                "    def from_tree(tree):\n"
+                "        pass\n"
+                "    def value(self):\n"
+                "        pass\n"
+                "    def set_value(self):\n"
+                "        pass\n"
+                "    def left(self):\n"
+                "        pass\n"
+                "    def set_left(self):\n"
+                "        pass\n"
+                "    def right(self):\n"
+                "        pass\n"
+                "    def set_right(self):\n"
+                "        pass\n"
+                "    def up(self):\n"
+                "        pass\n"
+                "    def to_tree(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "zipper_test.py").write_text(
+                "import unittest\nfrom zipper import Zipper\n\n"
+                "TREE = {'value': 1, 'left': {'value': 2, 'left': None, 'right': {'value': 3, 'left': None, 'right': None}}, 'right': {'value': 4, 'left': None, 'right': None}}\n"
+                "class ZipperTest(unittest.TestCase):\n"
+                "    def test_navigation(self):\n"
+                "        self.assertEqual(Zipper.from_tree(TREE).left().right().up().up().value(), 1)\n"
+                "    def test_set(self):\n"
+                "        result = Zipper.from_tree(TREE).left().set_value(5).to_tree()\n"
+                "        self.assertEqual(result['left']['value'], 5)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_binary_zipper_candidate("zipper.py", "zipper_test.py")
+            validation = tools.validate_implementation_candidate("zipper.py", str(synthesized.get("candidate_source") or ""), test_path="zipper_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_go_territory_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "go_counting.py").write_text(
+                "class Board:\n"
+                "    def __init__(self, board):\n"
+                "        pass\n"
+                "    def territory(self, x, y):\n"
+                "        pass\n"
+                "    def territories(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "go_counting_test.py").write_text(
+                "import unittest\nfrom go_counting import Board, WHITE, BLACK, NONE\n\n"
+                "class GoCountingTest(unittest.TestCase):\n"
+                "    def test_region(self):\n"
+                "        board = Board([' B ', 'B W', ' W '])\n"
+                "        stone, territory = board.territory(0, 0)\n"
+                "        self.assertEqual(stone, BLACK)\n"
+                "        self.assertEqual(territory, {(0, 0)})\n"
+                "    def test_invalid(self):\n"
+                "        with self.assertRaisesRegex(ValueError, 'Invalid coordinate'):\n"
+                "            Board([' ']).territory(-1, 0)\n"
+                "    def test_territories(self):\n"
+                "        self.assertIn(NONE, Board([' ']).territories())\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_go_territory_candidate("go_counting.py", "go_counting_test.py")
+            validation = tools.validate_implementation_candidate("go_counting.py", str(synthesized.get("candidate_source") or ""), test_path="go_counting_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_hex_connect_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "connect.py").write_text(
+                "class ConnectGame:\n"
+                "    def __init__(self, board):\n"
+                "        pass\n"
+                "    def get_winner(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "connect_test.py").write_text(
+                "import unittest\nfrom connect import ConnectGame\n\n"
+                "class ConnectTest(unittest.TestCase):\n"
+                "    def test_x_wins_crossing_from_left_to_right(self):\n"
+                "        self.assertEqual(ConnectGame('X X\\n . X').get_winner(), 'X')\n"
+                "    def test_o_wins_crossing_from_top_to_bottom(self):\n"
+                "        self.assertEqual(ConnectGame('O .\\n O X').get_winner(), 'O')\n"
+                "    def test_none(self):\n"
+                "        self.assertEqual(ConnectGame('. .\\n . .').get_winner(), '')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_hex_connect_candidate("connect.py", "connect_test.py")
+            validation = tools.validate_implementation_candidate("connect.py", str(synthesized.get("candidate_source") or ""), test_path="connect_test.py", test_command=command)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+
     def test_synthesize_text_matrix_transpose_candidate_from_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2275,8 +3203,10 @@ class ToolExecutorTests(unittest.TestCase):
             )
             final_text = source.read_text(encoding="utf-8")
 
-        self.assertFalse(changed_signature["ok"])
-        self.assertEqual(changed_signature["stage"], "signature")
+        self.assertTrue(changed_signature["ok"], changed_signature)
+        self.assertEqual(changed_signature["stage"], "passed")
+        self.assertIn("signature_warnings", changed_signature)
+        self.assertIn("candidate changed signature for add", "\n".join(changed_signature["signature_warnings"]))
         self.assertTrue(passing["ok"], passing)
         self.assertTrue(annotated["ok"], annotated)
         self.assertIn("pass", final_text)
@@ -2663,6 +3593,31 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls EmptyListException with 1 supplied args", result["output"])
         self.assertNotIn("calls reversed with 1 supplied args", result["output"])
+
+    def test_contract_check_ignores_expected_exception_call_arity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "paasio.py").write_text(
+                "class MeteredSocket:\n"
+                "    def recv(self, bufsize, flags=0):\n"
+                "        return b''\n",
+                encoding="utf-8",
+            )
+            (root / "paasio_test.py").write_text(
+                "import unittest\n"
+                "from paasio import MeteredSocket\n\n"
+                "class PaasioTest(unittest.TestCase):\n"
+                "    def test_meteredsocket_bufsize_required(self):\n"
+                "        socket = MeteredSocket()\n"
+                "        with self.assertRaises(TypeError):\n"
+                "            socket.recv()\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["paasio.py", "paasio_test.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("calls recv with 0 supplied args", result["output"])
 
     def test_contract_check_allows_nested_helper_closure_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
