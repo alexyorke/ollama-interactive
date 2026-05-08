@@ -65,6 +65,7 @@ class BenchmarkCase:
     budget_off: BenchmarkBudget = BenchmarkBudget(max_llm_calls=12, max_total_tokens=80_000)
     budget_on: BenchmarkBudget = BenchmarkBudget(max_llm_calls=16, max_total_tokens=120_000)
     timeout: int | None = None
+    requires_git: bool = False
 
 
 def prompt_integrity_findings(case: BenchmarkCase) -> list[str]:
@@ -285,7 +286,8 @@ def _status_or_fail_closed(ctx: BenchmarkContext, condition: bool) -> str:
 
 
 def _git_status_short(workspace: Path) -> list[str]:
-    result = _run(["git", "status", "--short"], workspace, timeout=60)
+    env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(workspace.parent)}
+    result = subprocess.run(["git", "status", "--short"], cwd=workspace, capture_output=True, text=True, timeout=60, check=False, env=env)
     if result.returncode != 0:
         return []
     return [line for line in result.stdout.splitlines() if line.strip()]
@@ -639,6 +641,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         acceptable=("pass", "fail_closed"),
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
+        requires_git=True,
     ),
     BenchmarkCase(
         name="multi_turn_session_task",
@@ -679,7 +682,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
     BenchmarkCase(
         name="replace_all_refactor",
         suite="local-full",
-        turns=("Change src/flags.py so flag_name() returns 'new' while keeping the existing function name. Run tests.",),
+        turns=("Update the OLD_FLAG constant in src/flags.py to 'new' while keeping flag_name() as the public function. Run tests.",),
         prepare=prepare_replace_all_refactor,
         validate=validate_replace_all_refactor,
         test_cmd=_python_test_cmd(),
@@ -715,6 +718,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         acceptable=("pass", "fail_closed"),
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
+        requires_git=True,
     ),
     BenchmarkCase(
         name="large_file_targeted_read",
@@ -793,6 +797,20 @@ def _load_session_if_exists(session_file: Path) -> dict[str, Any]:
     return load_session(session_file)
 
 
+def _benchmark_workspace_parent(repo_root: Path, *, requires_git: bool) -> Path:
+    configured = os.environ.get("OLLAMA_CODE_BENCH_WORKSPACE_ROOT", "").strip()
+    if configured:
+        return Path(configured)
+    if requires_git:
+        fallback = Path.home() / ".codex" / "memories" / "ollama-code-bench-temp"
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback
+        except OSError:
+            return repo_root
+    return repo_root
+
+
 def evaluate_case(
     repo_root: Path,
     model: str,
@@ -803,9 +821,41 @@ def evaluate_case(
     reconcile: str = "auto",
     feature_profile: str = "baseline",
 ) -> dict[str, Any]:
-    with workspace_temp_dir("ollama-code-bench-", repo_root) as tmp:
+    workspace_parent = _benchmark_workspace_parent(repo_root, requires_git=case.requires_git)
+    with workspace_temp_dir("ollama-code-bench-", workspace_parent) as tmp:
         workspace = Path(tmp)
-        build_workspace(workspace)
+        git_available = build_workspace(workspace, init_git=case.requires_git)
+        if case.requires_git and not git_available:
+            return {
+                "case": case.name,
+                "suite": case.suite,
+                "benchmark_kind": case.benchmark_kind,
+                "model": model,
+                "verifier_model": verifier_model,
+                "debate": mode,
+                "reconcile": reconcile,
+                "feature_profile": feature_profile,
+                "status": "skip",
+                "acceptable": sorted(set(case.acceptable) | {"skip"}),
+                "skip_reason": "nested git workspace unavailable",
+                "latency_s": 0.0,
+                "usage": {"llm_calls": 0, "prompt_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                "tool_calls": [],
+                "tool_profile": {},
+                "failed_tools": [],
+                "assumption_audits": 0,
+                "assumption_audit_retries": 0,
+                "reconciliations": 0,
+                "reconciliation_retries": 0,
+                "verification_retries": 0,
+                "verification_rewrites": 0,
+                "changed_files": [],
+                "tests_run": [],
+                "validator_output": "skipped: nested git workspace unavailable",
+                "final": "",
+                "stdout_tail": "",
+                "stderr_tail": "",
+            }
         if case.prepare is not None:
             case.prepare(workspace)
         session_file = workspace / "scratch" / f"{case.name}-{mode}-{reconcile}.json"
@@ -830,7 +880,10 @@ def evaluate_case(
                     session_file=session_file,
                     timeout=case.timeout or timeout,
                     extra_args=extra_args,
-                    extra_env={"OLLAMA_CODE_FEATURE_PROFILE": feature_profile},
+                    extra_env={
+                        "GIT_CEILING_DIRECTORIES": str(workspace.parent),
+                        "OLLAMA_CODE_FEATURE_PROFILE": feature_profile,
+                    },
                 )
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.perf_counter() - started
@@ -973,16 +1026,17 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     by_kind: dict[str, dict[str, int]] = {}
     for item in results:
         kind = str(item.get("benchmark_kind") or "unknown")
-        bucket = by_kind.setdefault(kind, {"runs": 0, "pass": 0, "fail_closed": 0, "fail": 0})
+        bucket = by_kind.setdefault(kind, {"runs": 0, "pass": 0, "fail_closed": 0, "fail": 0, "skip": 0})
         bucket["runs"] += 1
         status = str(item.get("status"))
-        if status in {"pass", "fail_closed", "fail"}:
+        if status in {"pass", "fail_closed", "fail", "skip"}:
             bucket[status] += 1
     return {
         "runs": len(results),
         "pass": sum(1 for item in results if item.get("status") == "pass"),
         "fail_closed": sum(1 for item in results if item.get("status") == "fail_closed"),
         "fail": sum(1 for item in results if item.get("status") == "fail"),
+        "skip": sum(1 for item in results if item.get("status") == "skip"),
         "total_llm_calls": sum(int(item["usage"]["llm_calls"]) for item in results if isinstance(item.get("usage"), dict)),
         "total_tokens": sum(total_tokens),
         "median_total_tokens": median(total_tokens),

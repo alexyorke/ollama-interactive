@@ -55,6 +55,8 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(cases["exact_literal_write_readback"].benchmark_kind, "tool_contract")
         self.assertEqual(cases["forbidden_tool_efficiency"].benchmark_kind, "tool_contract")
         self.assertEqual(cases["large_repo_symbol_nav"].benchmark_kind, "tool_contract")
+        self.assertTrue(cases["forbidden_tool_efficiency"].requires_git)
+        self.assertTrue(cases["staged_vs_worktree_diff"].requires_git)
 
     def test_prompt_integrity_flags_leaked_answers_for_coding_accuracy_cases(self) -> None:
         case = bench.BenchmarkCase(
@@ -301,8 +303,9 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             validate=lambda ctx: "pass" if len(ctx.results) == 2 else "fail",
         )
 
-        def fake_build_workspace(workspace: Path) -> None:
+        def fake_build_workspace(workspace: Path, *, init_git: bool = True) -> bool:
             workspace.mkdir(parents=True, exist_ok=True)
+            return init_git
 
         with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli", side_effect=fake_run_cli):
             outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "on", case, timeout=30, feature_profile="all")
@@ -310,9 +313,53 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "pass")
         self.assertEqual(outcome["feature_profile"], "all")
         self.assertEqual(outcome["usage"]["llm_calls"], 1)
-        self.assertEqual(calls[0]["extra_env"], {"OLLAMA_CODE_FEATURE_PROFILE": "all"})
+        self.assertEqual(calls[0]["extra_env"]["OLLAMA_CODE_FEATURE_PROFILE"], "all")
+        self.assertIn("GIT_CEILING_DIRECTORIES", calls[0]["extra_env"])
         self.assertNotIn("--resume", calls[0]["extra_args"])
         self.assertIn("--resume", calls[1]["extra_args"])
+
+    def test_evaluate_case_skips_git_required_case_when_nested_git_unavailable(self) -> None:
+        case = bench.BenchmarkCase(
+            name="git_case",
+            suite="local-small",
+            turns=("prompt",),
+            validate=lambda ctx: "pass",
+            requires_git=True,
+        )
+
+        def fake_build_workspace(workspace: Path, *, init_git: bool = True) -> bool:
+            workspace.mkdir(parents=True, exist_ok=True)
+            self.assertTrue(init_git)
+            return False
+
+        with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli") as run_cli:
+            outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "off", case, timeout=30, feature_profile="all")
+
+        self.assertEqual(outcome["status"], "skip")
+        self.assertIn("skip", outcome["acceptable"])
+        self.assertEqual(outcome["skip_reason"], "nested git workspace unavailable")
+        run_cli.assert_not_called()
+
+    def test_git_required_benchmark_uses_external_temp_root_by_default(self) -> None:
+        case = bench.BenchmarkCase(
+            name="git_case",
+            suite="local-small",
+            turns=("prompt",),
+            validate=lambda ctx: "pass",
+            requires_git=True,
+        )
+        seen: list[Path] = []
+
+        def fake_build_workspace(workspace: Path, *, init_git: bool = True) -> bool:
+            seen.append(workspace)
+            workspace.mkdir(parents=True, exist_ok=True)
+            return False
+
+        with patch.dict("os.environ", {}, clear=False), patch.object(bench, "build_workspace", side_effect=fake_build_workspace):
+            bench.evaluate_case(Path.cwd(), "fake-model", None, "off", case, timeout=30, feature_profile="all")
+
+        self.assertTrue(seen)
+        self.assertIn(".codex", seen[0].as_posix())
 
 
 if __name__ == "__main__":

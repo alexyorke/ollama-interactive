@@ -103,10 +103,11 @@ def _implementation_python_files(root: Path) -> list[Path]:
     files: list[Path] = []
     for path in sorted(root.rglob("*.py")):
         rel = path.relative_to(root).as_posix()
+        rel_parts = {part.lower() for part in Path(rel).parts}
         name = path.name.lower()
         if name.startswith("test_") or name.endswith("_test.py") or "/tests/" in f"/{rel.lower()}":
             continue
-        if "/scratch/" in f"/{rel.lower()}/" or "/.meta/" in f"/{rel.lower()}/":
+        if {"scratch", ".meta", ".ollama-code"} & rel_parts:
             continue
         files.append(path)
     return files
@@ -116,14 +117,16 @@ def _detach_model_visible_meta(workspace: Path) -> Path | None:
     meta = workspace / ".meta"
     if not meta.exists():
         return None
-    detached = workspace.parent / f"{workspace.name}-evaluator-meta"
-    if detached.exists():
-        _rmtree_force(detached)
+    detached_base = workspace.parent / f"{workspace.name}-evaluator-meta"
+    detached = detached_base
+    suffix = 1
+    while detached.exists():
+        suffix += 1
+        detached = workspace.parent / f"{detached_base.name}-{suffix}"
     try:
         meta.rename(detached)
     except OSError:
         shutil.copytree(meta, detached)
-        _rmtree_force(meta)
     return detached
 
 

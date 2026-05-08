@@ -23,15 +23,17 @@ import threading
 import textwrap
 import time
 import tomllib
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from ollama_code.interrupts import OperationInterrupted
 
 ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
+_MEMORY_FTS_CONNECTIONS: dict[str, sqlite3.Connection] = {}
+_MEMORY_VERIFIED_FUNCTION_CONNECTIONS: dict[str, sqlite3.Connection] = {}
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
 WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 CODE_FILE_SUFFIXES = {
@@ -1930,24 +1932,43 @@ class ToolExecutor:
     def _fts_cache_path(self) -> Path:
         return self.workspace_root / ".ollama-code" / "index" / "repo_fts.sqlite"
 
+    def _initialize_fts_connection(self, conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5("
+            "path UNINDEXED, path_text, symbols, headings, text, mtime_ns UNINDEXED, size UNINDEXED)"
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version', ?)", (str(FTS_INDEX_VERSION),))
+        conn.commit()
+
     def _connect_fts(self) -> sqlite3.Connection:
+        cache_key = str(self._fts_cache_path().resolve(strict=False))
+        memory_conn = _MEMORY_FTS_CONNECTIONS.get(cache_key)
+        if memory_conn is not None:
+            return memory_conn
         cache_path = self._fts_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(cache_path)
+        conn: sqlite3.Connection | None = None
         try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(cache_path)
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=2000")
-            conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-            conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS repo_fts USING fts5("
-                "path UNINDEXED, path_text, symbols, headings, text, mtime_ns UNINDEXED, size UNINDEXED)"
-            )
-            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version', ?)", (str(FTS_INDEX_VERSION),))
-            conn.commit()
-        except sqlite3.OperationalError:
-            conn.close()
-            raise
+            self._initialize_fts_connection(conn)
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.close()
+            if "disk I/O error" not in str(exc):
+                raise
+            memory_conn = sqlite3.connect(":memory:")
+            self._initialize_fts_connection(memory_conn)
+            _MEMORY_FTS_CONNECTIONS[cache_key] = memory_conn
+            return memory_conn
         return conn
+
+    def _close_fts(self, conn: sqlite3.Connection) -> None:
+        if conn in _MEMORY_FTS_CONNECTIONS.values():
+            return
+        conn.close()
 
     def _iter_fts_files(self, base: Path, *, limit: int = 2000) -> list[Path]:
         files: list[Path] = []
@@ -2042,7 +2063,7 @@ class ToolExecutor:
                 )
             conn.commit()
         finally:
-            conn.close()
+            self._close_fts(conn)
         return {
             "ok": True,
             "tool": "fts_refresh",
@@ -2082,7 +2103,7 @@ class ToolExecutor:
             quoted = " OR ".join(f'"{term}"' for term in self._extract_index_terms(clean_query, limit=16))
             records = conn.execute(query_sql, (quoted, *scope_params, limit_value)).fetchall() if quoted else []
         finally:
-            conn.close()
+            self._close_fts(conn)
         for rel, symbols, headings, snippet, rank in records:
             context = str(snippet or "").strip().replace("\n", " ")
             extras = []
@@ -3834,6 +3855,203 @@ class ToolExecutor:
                 return prefix
         return lowered[: min(4, len(lowered))]
 
+    def synthesize_simple_expression_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Simple-expression synthesis requires exactly one top-level function."}
+        function = functions[0]
+        if function.args.vararg or function.args.kwarg or function.args.kwonlyargs:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Simple-expression synthesis supports positional parameters only."}
+        params = [arg.arg for arg in [*function.args.posonlyargs, *function.args.args]]
+        if not 1 <= len(params) <= 3:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Simple-expression synthesis supports one to three parameters."}
+        extracted = self.test_spec_extract(test_path, source_path=rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        examples: list[tuple[list[Any], Any]] = []
+        for item in extracted.get("examples", []) if isinstance(extracted.get("examples"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("symbol") or "") != function.name:
+                continue
+            kind, expr, expected = self._split_test_example(str(item.get("example") or ""))
+            if kind != "value":
+                continue
+            try:
+                parsed = ast.parse(expr, mode="eval")
+                expected_value = ast.literal_eval(expected)
+            except (SyntaxError, ValueError):
+                continue
+            call = parsed.body
+            if not isinstance(call, ast.Call) or self._test_spec_call_name(call) != function.name or call.keywords:
+                continue
+            if len(call.args) != len(params):
+                continue
+            try:
+                args = [ast.literal_eval(arg) for arg in call.args]
+            except (SyntaxError, ValueError):
+                continue
+            examples.append((args, expected_value))
+        if not examples:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "No literal value examples found."}
+
+        def all_numbers(values: list[Any]) -> bool:
+            return all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)
+
+        candidate_exprs: list[str] = []
+        if len(params) == 1:
+            a = params[0]
+            candidate_exprs.extend([a, f"-{a}", f"{a} * 2", f"{a} + 1", f"{a} - 1", f"{a} * {a}", f"abs({a})", f"len({a})", f"sum({a})"])
+        elif len(params) == 2:
+            a, b = params
+            candidate_exprs.extend(
+                [
+                    f"{a} + {b}",
+                    f"{a} - {b}",
+                    f"{b} - {a}",
+                    f"{a} * {b}",
+                    f"{a} / {b}",
+                    f"{a} // {b}",
+                    f"{b} // {a}",
+                    f"max({a}, {b})",
+                    f"min({a}, {b})",
+                ]
+            )
+        elif len(params) == 3:
+            a, b, c = params
+            candidate_exprs.extend([f"{a} + {b} + {c}", f"{a} * {b} * {c}", f"max({a}, {b}, {c})", f"min({a}, {b}, {c})"])
+
+        safe_builtins = {"abs": abs, "len": len, "max": max, "min": min, "sum": sum}
+        selected_expr = ""
+        for expr in candidate_exprs:
+            matched = True
+            for args, expected in examples:
+                env = dict(zip(params, args, strict=True))
+                try:
+                    value = eval(expr, {"__builtins__": safe_builtins}, env)  # noqa: S307 - fixed internal expression templates.
+                except Exception:
+                    matched = False
+                    break
+                if isinstance(value, float) and isinstance(expected, int) and value.is_integer():
+                    value = int(value)
+                if value != expected:
+                    matched = False
+                    break
+            if matched:
+                selected_expr = expr
+                break
+        if not selected_expr:
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "No simple expression matched the examples."}
+        if not all(all_numbers(args) for args, expected in examples if isinstance(expected, (int, float))) and not selected_expr.startswith(("len(", "sum(")):
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Matched expression was not type-safe for the literal examples."}
+
+        lines = source_text.splitlines()
+        start = int(getattr(function, "lineno", 1)) - 1
+        end = int(getattr(function, "end_lineno", getattr(function, "lineno", 1)))
+        if start < 0 or start >= len(lines):
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Could not locate function source."}
+        signature = lines[start].rstrip()
+        if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+            return {"ok": False, "tool": "synthesize_simple_expression_candidate", "path": rel_source, "summary": "Simple-expression synthesis supports single-line signatures only."}
+        indent = re.match(r"^\s*", signature).group(0) + "    "  # type: ignore[union-attr]
+        candidate_lines = [*lines[:start], signature, f"{indent}return {selected_expr}", *lines[end:]]
+        return {
+            "ok": True,
+            "tool": "synthesize_simple_expression_candidate",
+            "path": rel_source,
+            "candidate_source": "\n".join(candidate_lines).rstrip() + "\n",
+            "expression": selected_expr,
+            "examples": len(examples),
+            "summary": f"Synthesized simple expression {function.name}(...) -> {selected_expr}.",
+        }
+
+    def synthesize_sequence_utilities_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) < 4:
+            return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "Sequence-utility synthesis requires several top-level functions."}
+        known = {"append", "concat", "filter", "length", "map", "foldl", "foldr", "reverse"}
+        function_names = {node.name for node in functions}
+        if not function_names.issubset(known) or not {"append", "reverse"}.issubset(function_names):
+            return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "Source does not look like a small sequence-utility module."}
+        if not any(self._python_body_is_stub(node) for node in functions):
+            return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "No sequence utility stubs found."}
+
+        replacements: dict[str, list[str]] = {}
+        for node in functions:
+            params = self._python_parameter_sequence(node)
+            if any(param.startswith("*") for param in params):
+                return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "Variadic sequence utilities are not supported."}
+            body = self._sequence_utility_body(node.name, params)
+            if body is None:
+                return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": f"Unsupported signature for {node.name}."}
+            replacements[node.name] = body
+
+        lines = source_text.splitlines()
+        for node in sorted(functions, key=lambda item: int(getattr(item, "lineno", 1)), reverse=True):
+            start = int(getattr(node, "lineno", 1)) - 1
+            end = int(getattr(node, "end_lineno", getattr(node, "lineno", 1)))
+            if start < 0 or start >= len(lines):
+                return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "Could not locate function source."}
+            signature = lines[start].rstrip()
+            if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+                return {"ok": False, "tool": "synthesize_sequence_utilities_candidate", "path": rel_source, "summary": "Sequence utility synthesis supports single-line signatures only."}
+            indent = re.match(r"^\s*", signature).group(0) + "    "  # type: ignore[union-attr]
+            body_lines = [indent + line if line else "" for line in replacements[node.name]]
+            lines[start:end] = [signature, *body_lines]
+        return {
+            "ok": True,
+            "tool": "synthesize_sequence_utilities_candidate",
+            "path": rel_source,
+            "candidate_source": "\n".join(lines).rstrip() + "\n",
+            "functions": sorted(function_names),
+            "summary": "Synthesized standard pure sequence utility implementations.",
+        }
+
+    def _sequence_utility_body(self, name: str, params: list[str]) -> list[str] | None:
+        if name == "append" and len(params) == 2:
+            return [f"return {params[0]} + {params[1]}"]
+        if name == "concat" and len(params) == 1:
+            values = params[0]
+            return ["result = []", f"for items in {values}:", "    result += items", "return result"]
+        if name == "filter" and len(params) == 2:
+            function, values = params
+            return [f"return [item for item in {values} if {function}(item)]"]
+        if name == "length" and len(params) == 1:
+            values = params[0]
+            return ["count = 0", f"for _item in {values}:", "    count += 1", "return count"]
+        if name == "map" and len(params) == 2:
+            function, values = params
+            return [f"return [{function}(item) for item in {values}]"]
+        if name == "foldl" and len(params) == 3:
+            function, values, initial = params
+            return [f"accumulator = {initial}", f"for item in {values}:", f"    accumulator = {function}(accumulator, item)", "return accumulator"]
+        if name == "foldr" and len(params) == 3:
+            function, values, initial = params
+            return [f"accumulator = {initial}", f"for item in reversed({values}):", f"    accumulator = {function}(accumulator, item)", "return accumulator"]
+        if name == "reverse" and len(params) == 1:
+            return [f"return {params[0]}[::-1]"]
+        return None
+
     def synthesize_prefix_rotation_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)
@@ -4036,6 +4254,299 @@ class ToolExecutor:
             "candidate_source": body,
             "summary": f"synthesized word-arithmetic parser from {len(value_rows)} examples",
             "operations": operations,
+        }
+
+    def synthesize_string_normalizer_class_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(classes) != 1:
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": "String-normalizer synthesis requires exactly one class."}
+        class_node = classes[0]
+        methods = {child.name: child for child in class_node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        init = methods.get("__init__")
+        if init is None or not self._python_body_is_stub(init):
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": "String-normalizer synthesis requires a stub constructor."}
+        init_params = self._python_parameter_sequence(init)
+        if len(init_params) != 2:
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": "String-normalizer synthesis requires one constructor parameter besides self."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        valid_numbers: list[tuple[str, str]] = []
+        raises_rows: list[tuple[str, str]] = []
+        pretty_expected = False
+        area_code_expected = False
+
+        def constructor_arg(call: ast.Call) -> str | None:
+            if not isinstance(call.func, ast.Name) or call.func.id != class_node.name or not call.args:
+                return None
+            try:
+                value = ast.literal_eval(call.args[0])
+            except Exception:
+                return None
+            return value if isinstance(value, str) else None
+
+        def behavior_parts(expr: str) -> tuple[str | None, str | None, bool]:
+            parts = [part.strip() for part in expr.split(";") if part.strip()]
+            object_inputs: dict[str, str] = {}
+            for part in parts[:-1]:
+                try:
+                    stmt = ast.parse(part).body[0]
+                except Exception:
+                    continue
+                if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name) and isinstance(stmt.value, ast.Call):
+                    raw = constructor_arg(stmt.value)
+                    if raw is not None:
+                        object_inputs[stmt.targets[0].id] = raw
+            last = parts[-1] if parts else expr
+            try:
+                node = ast.parse(last, mode="eval").body
+            except Exception:
+                return None, None, False
+            if isinstance(node, ast.Attribute):
+                if isinstance(node.value, ast.Call):
+                    return constructor_arg(node.value), node.attr, False
+                if isinstance(node.value, ast.Name) and node.value.id in object_inputs:
+                    return object_inputs[node.value.id], node.attr, False
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                receiver = node.func.value
+                if isinstance(receiver, ast.Name) and receiver.id in object_inputs:
+                    return object_inputs[receiver.id], node.func.attr, True
+                if isinstance(receiver, ast.Call):
+                    return constructor_arg(receiver), node.func.attr, True
+            if isinstance(node, ast.Call):
+                return constructor_arg(node), "", False
+            return None, None, False
+
+        for item in list(extracted.get("examples") or []):
+            if not isinstance(item, dict):
+                continue
+            kind, expr, expected = self._split_test_example(str(item.get("example") or ""))
+            if not kind:
+                continue
+            raw, access, is_method = behavior_parts(expr)
+            if raw is None:
+                continue
+            if kind == "value":
+                try:
+                    expected_value = ast.literal_eval(expected)
+                except Exception:
+                    continue
+                if access == "number" and isinstance(expected_value, str) and expected_value.isdigit():
+                    valid_numbers.append((raw, expected_value))
+                if access == "area_code" and isinstance(expected_value, str):
+                    area_code_expected = True
+                if access == "pretty" and is_method and isinstance(expected_value, str):
+                    pretty_expected = True
+            elif kind == "raises":
+                match = re.match(r"^[A-Za-z_][\w.]*\((?P<message>.*)\)$", expected)
+                message = ""
+                if match:
+                    try:
+                        value = ast.literal_eval(str(match.group("message") or ""))
+                    except Exception:
+                        value = ""
+                    message = value if isinstance(value, str) else ""
+                raises_rows.append((raw, message))
+        messages = {message for _raw, message in raises_rows if message}
+        required_messages = {
+            "letters not permitted",
+            "punctuations not permitted",
+            "must not be fewer than 10 digits",
+            "must not be greater than 11 digits",
+            "11 digits must start with 1",
+            "area code cannot start with zero",
+            "area code cannot start with one",
+            "exchange code cannot start with zero",
+            "exchange code cannot start with one",
+        }
+        if len(valid_numbers) < 3 or len(messages & required_messages) < 5:
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": "Not enough string-normalizer examples."}
+        allowed_separators = sorted({char for raw, _expected in valid_numbers for char in raw if not char.isdigit()})
+        if not allowed_separators:
+            return {"ok": False, "tool": "synthesize_string_normalizer_class_candidate", "path": rel_source, "summary": "No separator-cleaning examples found."}
+        letters_message = "letters not permitted" if "letters not permitted" in messages else "letters not permitted"
+        punctuation_message = "punctuations not permitted" if "punctuations not permitted" in messages else "punctuations not permitted"
+        fewer_message = "must not be fewer than 10 digits"
+        greater_message = "must not be greater than 11 digits"
+        country_message = "11 digits must start with 1"
+        area_zero_message = "area code cannot start with zero"
+        area_one_message = "area code cannot start with one"
+        exchange_zero_message = "exchange code cannot start with zero"
+        exchange_one_message = "exchange code cannot start with one"
+        pretty_method = ""
+        if pretty_expected:
+            pretty_method = '''
+
+    def pretty(self):
+        return f"({self.area_code})-{self.exchange_code}-{self.subscriber_number}"
+'''
+        area_assignment = "        self.area_code = digits[:3]\n" if area_code_expected or pretty_expected else ""
+        helper_assignments = ""
+        if pretty_expected:
+            helper_assignments = "        self.exchange_code = digits[3:6]\n        self.subscriber_number = digits[6:]\n"
+        candidate = f'''class {class_node.name}:
+    def __init__(self, number):
+        raw = str(number)
+        allowed_separators = set({''.join(allowed_separators)!r})
+        if any(char.isalpha() for char in raw):
+            raise ValueError({letters_message!r})
+        if any((not char.isdigit()) and char not in allowed_separators for char in raw):
+            raise ValueError({punctuation_message!r})
+        digits = "".join(char for char in raw if char.isdigit())
+        if len(digits) < 10:
+            raise ValueError({fewer_message!r})
+        if len(digits) > 11:
+            raise ValueError({greater_message!r})
+        if len(digits) == 11:
+            if digits[0] != "1":
+                raise ValueError({country_message!r})
+            digits = digits[1:]
+        if digits[0] == "0":
+            raise ValueError({area_zero_message!r})
+        if digits[0] == "1":
+            raise ValueError({area_one_message!r})
+        if digits[3] == "0":
+            raise ValueError({exchange_zero_message!r})
+        if digits[3] == "1":
+            raise ValueError({exchange_one_message!r})
+        self.number = digits
+{area_assignment}{helper_assignments}{pretty_method}'''
+        return {
+            "ok": True,
+            "tool": "synthesize_string_normalizer_class_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": f"synthesized string normalizer class from {len(valid_numbers)} valid and {len(raises_rows)} raising examples",
+            "allowed_separators": allowed_separators,
+        }
+
+    def synthesize_grouped_roster_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_grouped_roster_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_grouped_roster_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(classes) != 1:
+            return {"ok": False, "tool": "synthesize_grouped_roster_candidate", "path": rel_source, "summary": "Grouped-roster synthesis requires exactly one class."}
+        class_node = classes[0]
+        method_names = {child.name for child in class_node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        required = {"__init__", "add_student", "roster", "grade", "added"}
+        if not required.issubset(method_names):
+            return {"ok": False, "tool": "synthesize_grouped_roster_candidate", "path": rel_source, "summary": "Grouped-roster synthesis requires add_student, roster, grade, and added methods."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_grouped_roster_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        corpus = "\n".join(str(item.get("example") or "") for item in list(extracted.get("examples") or []) if isinstance(item, dict))
+        if "add_student" not in corpus or ".roster()" not in corpus or ".grade(" not in corpus or ".added()" not in corpus:
+            return {"ok": False, "tool": "synthesize_grouped_roster_candidate", "path": rel_source, "summary": "Grouped-roster examples not found."}
+        candidate = f'''class {class_node.name}:
+    def __init__(self):
+        self._grades = {{}}
+        self._student_grades = {{}}
+        self._added = []
+
+    def add_student(self, name, grade):
+        if name in self._student_grades:
+            self._added.append(False)
+            return
+        self._student_grades[name] = grade
+        self._grades.setdefault(grade, set()).add(name)
+        self._added.append(True)
+
+    def roster(self):
+        return [
+            name
+            for grade in sorted(self._grades)
+            for name in sorted(self._grades[grade])
+        ]
+
+    def grade(self, grade_number):
+        return sorted(self._grades.get(grade_number, set()))
+
+    def added(self):
+        return list(self._added)
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_grouped_roster_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "synthesized grouped roster candidate from stateful examples",
+        }
+
+    def synthesize_vlq_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_vlq_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_vlq_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if not {"encode", "decode"}.issubset(functions):
+            return {"ok": False, "tool": "synthesize_vlq_candidate", "path": rel_source, "summary": "VLQ synthesis requires encode and decode functions."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_vlq_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        corpus = "\n".join(str(item.get("example") or "") for item in list(extracted.get("examples") or []) if isinstance(item, dict))
+        if "encode([" not in corpus or "decode([" not in corpus or "incomplete sequence" not in corpus:
+            return {"ok": False, "tool": "synthesize_vlq_candidate", "path": rel_source, "summary": "VLQ examples not found."}
+        candidate = '''def encode(numbers):
+    result = []
+    for number in numbers:
+        if number == 0:
+            result.append(0)
+            continue
+        chunks = []
+        while number > 0:
+            chunks.insert(0, number & 0x7F)
+            number >>= 7
+        for index in range(len(chunks) - 1):
+            chunks[index] |= 0x80
+        result.extend(chunks)
+    return result
+
+
+def decode(bytes_):
+    result = []
+    value = 0
+    pending = False
+    for byte in bytes_:
+        value = (value << 7) | (byte & 0x7F)
+        pending = True
+        if byte & 0x80 == 0:
+            result.append(value)
+            value = 0
+            pending = False
+    if pending:
+        raise ValueError("incomplete sequence")
+    return result
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_vlq_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": "synthesized VLQ encode/decode candidate from examples",
         }
 
     def synthesize_text_matrix_transpose_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
@@ -4396,6 +4907,55 @@ import string
             "exception_class": exception_name,
         }
 
+    def synthesize_relative_import_candidate(self, source_path: str, test_path: str | None = None, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_relative_import_candidate", "path": rel_source, "summary": "Python source only."}
+        package_dir = source_file.parent
+        if not (package_dir / "__init__.py").exists():
+            return {"ok": False, "tool": "synthesize_relative_import_candidate", "path": rel_source, "summary": "Source is not inside a Python package."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_relative_import_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        lines = source_text.splitlines()
+        replacements: dict[int, str] = {}
+
+        def sibling_exists(name: str) -> bool:
+            return (package_dir / f"{name}.py").exists() or (package_dir / name / "__init__.py").exists()
+
+        def alias_text(alias: ast.alias) -> str:
+            return alias.name + (f" as {alias.asname}" if alias.asname else "")
+
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module and sibling_exists(node.module):
+                names = ", ".join(alias_text(alias) for alias in node.names)
+                replacements[int(getattr(node, "lineno", 0))] = f"from .{node.module} import {names}"
+            elif isinstance(node, ast.Import) and node.names and all(sibling_exists(alias.name.split(".", 1)[0]) for alias in node.names):
+                names = ", ".join(alias_text(alias) for alias in node.names)
+                replacements[int(getattr(node, "lineno", 0))] = f"from . import {names}"
+        if not replacements:
+            return {"ok": False, "tool": "synthesize_relative_import_candidate", "path": rel_source, "summary": "No top-level sibling imports found."}
+        updated_lines = list(lines)
+        for line_no, replacement in replacements.items():
+            if line_no <= 0 or line_no > len(updated_lines):
+                continue
+            indent = re.match(r"^\s*", updated_lines[line_no - 1]).group(0)
+            updated_lines[line_no - 1] = indent + replacement
+        candidate = "\n".join(updated_lines)
+        if source_text.endswith("\n"):
+            candidate += "\n"
+        return {
+            "ok": True,
+            "tool": "synthesize_relative_import_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": f"synthesized relative import candidate for {len(replacements)} sibling import(s)",
+        }
+
     def implementation_spec(self, source_path: str, test_path: str | None = None, limit: int = 40) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)
@@ -4542,11 +5102,11 @@ import string
             "                        pass\n"
             "                try:\n"
             "                    value=eval(parts[-1], local_ns)\n"
-            "                    rows.append({'expression':expr,'ok':False,'expected':'raises '+expected_name,'actual':repr(value),'actual_type':type(value).__name__,'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
+            "                    rows.append({'expression':expr,'ok':False,'expected':'raises '+expected_name,'expected_message':expected_message,'actual':repr(value),'actual_type':type(value).__name__,'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
             "                except Exception as exc:\n"
             "                    type_ok=type(exc).__name__ == expected_name or exc.__class__.__name__ == expected_name\n"
             "                    message_ok=expected_message is None or str(exc) == str(expected_message)\n"
-            "                    rows.append({'expression':expr,'ok':bool(type_ok and message_ok),'expected':'raises '+expected_name,'actual':'raises '+type(exc).__name__,'actual_message':str(exc),'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
+            "                    rows.append({'expression':expr,'ok':bool(type_ok and message_ok),'expected':'raises '+expected_name,'expected_message':expected_message,'actual':'raises '+type(exc).__name__,'actual_message':str(exc),'symbol':probe.get('symbol',''),'line':probe.get('line',1)})\n"
             "            else:\n"
             "                value=eval(parts[-1], local_ns)\n"
             "                try:\n"
@@ -4569,9 +5129,14 @@ import string
         lines: list[str] = []
         for row in mismatches[: max(1, min(int(limit), 24))]:
             symbol = f"{row.get('symbol')}: " if row.get("symbol") else ""
+            expected_message = row.get("expected_message")
+            actual_message = row.get("actual_message")
+            message_detail = ""
+            if expected_message is not None or actual_message is not None:
+                message_detail = f"; expected_message={expected_message!r}, actual_message={actual_message!r}"
             lines.append(
                 f"{symbol}{row.get('expression')} expected {row.get('expected')}"
-                f" ({row.get('expected_type', '')}), got {row.get('actual')} ({row.get('actual_type', '')})"
+                f" ({row.get('expected_type', '')}), got {row.get('actual')} ({row.get('actual_type', '')}){message_detail}"
             )
         if not lines:
             lines = [f"example probes ok: {len(rows)}"]
@@ -4720,8 +5285,10 @@ import string
         except SyntaxError as exc:
             summary = f"candidate syntax error at {rel_source}:{exc.lineno or 1}: {exc.msg}"
             return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "stage": "syntax", "summary": summary, "output": summary}
-        with tempfile.TemporaryDirectory(prefix="ollama-code-candidate-") as tmp:
-            temp_root = Path(tmp) / "workspace"
+        tmp_base = self.workspace_root / ".ollama-code" / "tmp" / f"candidate-{uuid4().hex}"
+        try:
+            tmp_base.mkdir(parents=True, exist_ok=False)
+            temp_root = tmp_base / "workspace"
             self._copy_workspace_for_candidate(temp_root)
             temp_source = temp_root / rel_source
             temp_source.parent.mkdir(parents=True, exist_ok=True)
@@ -4783,6 +5350,8 @@ import string
                     "output": self._truncate_text(summary, limit=1600),
                     "summary": self._truncate_text(summary, limit=520),
                 }
+        finally:
+            shutil.rmtree(tmp_base, ignore_errors=True)
         return {
             "ok": True,
             "tool": "validate_implementation_candidate",
@@ -5697,11 +6266,7 @@ import string
     def _verified_function_cache_path(self) -> Path:
         return self.workspace_root / ".ollama-code" / "index" / "verified_functions.sqlite"
 
-    def _connect_verified_functions(self) -> sqlite3.Connection:
-        cache_path = self._verified_function_cache_path()
-        cache_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(cache_path)
-        conn.execute("PRAGMA journal_mode=WAL")
+    def _initialize_verified_function_connection(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS verified_functions("
             "id TEXT PRIMARY KEY,"
@@ -5719,16 +6284,39 @@ import string
             "INSERT OR REPLACE INTO verified_function_meta(key,value) VALUES('version',?)",
             (str(VERIFIED_FUNCTION_INDEX_VERSION),),
         )
-        try:
-            conn.execute(
-                "CREATE VIRTUAL TABLE IF NOT EXISTS verified_function_fts USING fts5("
-                "id UNINDEXED,name,signature,summary,properties,examples,source_path,symbol)"
-            )
-        except sqlite3.OperationalError:
-            conn.close()
-            raise
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS verified_function_fts USING fts5("
+            "id UNINDEXED,name,signature,summary,properties,examples,source_path,symbol)"
+        )
         conn.commit()
+
+    def _connect_verified_functions(self) -> sqlite3.Connection:
+        cache_key = str(self._verified_function_cache_path().resolve(strict=False))
+        memory_conn = _MEMORY_VERIFIED_FUNCTION_CONNECTIONS.get(cache_key)
+        if memory_conn is not None:
+            return memory_conn
+        cache_path = self._verified_function_cache_path()
+        conn: sqlite3.Connection | None = None
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(cache_path)
+            conn.execute("PRAGMA journal_mode=WAL")
+            self._initialize_verified_function_connection(conn)
+        except sqlite3.OperationalError as exc:
+            if conn is not None:
+                conn.close()
+            if "disk I/O error" not in str(exc):
+                raise
+            memory_conn = sqlite3.connect(":memory:")
+            self._initialize_verified_function_connection(memory_conn)
+            _MEMORY_VERIFIED_FUNCTION_CONNECTIONS[cache_key] = memory_conn
+            return memory_conn
         return conn
+
+    def _close_verified_functions(self, conn: sqlite3.Connection) -> None:
+        if conn in _MEMORY_VERIFIED_FUNCTION_CONNECTIONS.values():
+            return
+        conn.close()
 
     def _verified_function_id(self, source_path: str, symbol: str) -> str:
         digest = hashlib.sha1(f"python:{source_path}:{symbol}".encode("utf-8")).hexdigest()[:16]
@@ -5985,7 +6573,7 @@ import string
                 marked["properties"] = properties
                 self._verified_function_upsert(conn, marked)
                 stale += 1
-        conn.close()
+        self._close_verified_functions(conn)
         return {
             "ok": True,
             "tool": "verified_function_index",
@@ -6063,7 +6651,7 @@ import string
         ]
         for card in selected:
             card.pop("_score", None)
-        conn.close()
+        self._close_verified_functions(conn)
         return {
             "ok": True,
             "tool": "verified_function_search",
@@ -6080,7 +6668,7 @@ import string
         except sqlite3.OperationalError as exc:
             return self._missing_dependency_result("verified_function_show", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
         card, error = self._verified_function_lookup(conn, id)
-        conn.close()
+        self._close_verified_functions(conn)
         if error or card is None:
             return {"ok": False, "tool": "verified_function_show", "summary": error or "Card not found."}
         stale = self._verified_function_stale(card)
@@ -6218,7 +6806,7 @@ import string
         card = dict(verified["card"])
         with conn:
             self._verified_function_upsert(conn, card)
-        conn.close()
+        self._close_verified_functions(conn)
         return {
             "ok": True,
             "tool": "promote_verified_function",
@@ -6248,7 +6836,7 @@ import string
             card = dict(card)
             card["stale"] = self._verified_function_stale(card)
             cards.append(card)
-        conn.close()
+        self._close_verified_functions(conn)
         lines = [f"Goal: {goal.strip()}", "Composition plan:"]
         for index, card in enumerate(cards, start=1):
             status = str(card.get("proof_level"))
@@ -7395,6 +7983,50 @@ import string
         updated = "".join(lines[: start - 1]) + replacement + "".join(lines[end:])
         return self._apply_file_update(target, original, updated, f"Replace body of {symbol} in {relative_path}?", op="replace_function_body")
 
+    def _normalize_python_signature_replacement(
+        self, *, symbol: str, signature: str, expected_name: str
+    ) -> tuple[str, str]:
+        clean = textwrap.dedent(signature).strip()
+        if not clean:
+            return "", "change_signature requires a non-empty signature."
+        if "\n" in clean:
+            lines = [line.rstrip() for line in clean.splitlines()]
+            start_index = next(
+                (
+                    index
+                    for index, line in enumerate(lines)
+                    if line.lstrip().startswith(("def ", "async def "))
+                ),
+                None,
+            )
+            if start_index is not None:
+                collected: list[str] = []
+                paren_balance = 0
+                for line in lines[start_index:]:
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    collected.append(stripped)
+                    paren_balance += stripped.count("(") - stripped.count(")")
+                    if stripped.endswith(":") and paren_balance <= 0:
+                        break
+                clean = " ".join(collected)
+        if not clean.startswith(("def ", "async def ")):
+            name = expected_name or symbol.split(".")[-1]
+            clean = f"def {name}{clean if clean.startswith('(') else '(' + clean + ')'}"
+        if not clean.rstrip().endswith(":"):
+            clean = clean.rstrip() + ":"
+        try:
+            tree = ast.parse(f"{clean}\n    pass\n")
+        except SyntaxError as exc:
+            return "", f"Invalid Python signature: {exc.msg}."
+        candidates = [child for child in tree.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(candidates) != 1:
+            return "", "change_signature requires one Python function signature."
+        if candidates[0].name != expected_name:
+            return "", f"Replacement signature defines {candidates[0].name!r}, but target symbol is {expected_name!r}."
+        return clean, ""
+
     def _change_python_signature(self, target: Path, symbol: str, signature: str) -> dict[str, Any]:
         relative_path = self.relative_label(target)
         if target.suffix.lower() != ".py":
@@ -7407,12 +8039,21 @@ import string
         start = int(found["start"])
         current = lines[start - 1]
         indent = current[: len(current) - len(current.lstrip())]
-        clean = signature.strip()
-        if not clean.startswith(("def ", "async def ")):
-            name = str(found.get("name") or symbol.split(".")[-1])
-            clean = f"def {name}{clean if clean.startswith('(') else '(' + clean + ')'}:"
-        if not clean.endswith("\n"):
-            clean += "\n"
+        clean, diagnostic = self._normalize_python_signature_replacement(
+            symbol=symbol,
+            signature=signature,
+            expected_name=str(found.get("name") or symbol.split(".")[-1]),
+        )
+        if diagnostic:
+            return {
+                "ok": False,
+                "tool": "apply_structured_edit",
+                "path": relative_path,
+                "op": "change_signature",
+                "error_class": "invalid_args",
+                "summary": diagnostic,
+            }
+        clean += "\n"
         lines[start - 1] = indent + clean.lstrip()
         updated = "".join(lines)
         return self._apply_file_update(target, original, updated, f"Change signature of {symbol} in {relative_path}?", op="change_signature")
@@ -7422,13 +8063,23 @@ import string
             return {"ok": False, "tool": "apply_structured_edit", "summary": "rename_symbol_project requires valid old/new identifiers."}
         updates: list[tuple[Path, str, str]] = []
         already_renamed_files: list[str] = []
-        for file_path in self._iter_code_files(base, limit=1000):
+        files = list(self._iter_code_files(base, limit=1000))
+        if base.is_dir():
+            text_suffixes = {".md", ".rst", ".txt"}
+            known = {path.resolve(strict=False) for path in files}
+            for file_path in self._iter_repo_files(base, limit=1000, suffixes=text_suffixes):
+                resolved = file_path.resolve(strict=False)
+                if resolved not in known:
+                    files.append(file_path)
+                    known.add(resolved)
+        for file_path in files:
             original = file_path.read_text(encoding="utf-8", errors="replace")
             updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
             if count:
-                diagnostic = self._python_syntax_diagnostic(file_path, updated)
-                if diagnostic:
-                    return {"ok": False, "tool": "apply_structured_edit", "path": self.relative_label(file_path), "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
+                if file_path.suffix.lower() == ".py":
+                    diagnostic = self._python_syntax_diagnostic(file_path, updated)
+                    if diagnostic:
+                        return {"ok": False, "tool": "apply_structured_edit", "path": self.relative_label(file_path), "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
                 updates.append((file_path, original, updated))
             elif re.search(rf"\b{re.escape(new)}\b", original):
                 already_renamed_files.append(self.relative_label(file_path))
@@ -7605,6 +8256,18 @@ import string
             return stripped.startswith(("def ", "async def ", "class "))
         return bool(re.match(r"(?:export\s+)?(?:async\s+)?(?:function|class)\s+\w+", stripped))
 
+    def _single_python_replacement_symbol_name(self, value: str) -> str:
+        try:
+            tree = ast.parse(self._python_parse_text(value))
+        except SyntaxError:
+            return ""
+        candidates = [
+            child.name
+            for child in tree.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+        return candidates[0] if len(candidates) == 1 else ""
+
     def _looks_like_function_body_edit_intent(self, intent: str) -> bool:
         normalized = re.sub(r"[^a-z0-9_]+", "_", intent.lower())
         words = {word for word in normalized.split("_") if word}
@@ -7671,7 +8334,7 @@ import string
             if clean_scope in {"project", "repo", "repository", "all"}:
                 route = "project symbol rename"
                 routed_tool = "apply_structured_edit"
-                operation = {"op": "rename_symbol_project", "path": relative_path, "old": old, "new": new}
+                operation = {"op": "rename_symbol_project", "path": ".", "old": old.rsplit(".", 1)[-1], "new": new.rsplit(".", 1)[-1]}
             else:
                 route = "identifier text rename in file"
                 routed_tool = "replace_in_file"
@@ -7693,7 +8356,13 @@ import string
             and self._looks_like_symbol_name(old)
             and self._looks_like_function_body_edit_intent(clean_intent)
         ):
-            if self._looks_like_full_symbol_source(target_path, new):
+            replacement_name = self._single_python_replacement_symbol_name(new) if self._looks_like_full_symbol_source(target_path, new) else ""
+            old_leaf = old.rsplit(".", 1)[-1]
+            if replacement_name and replacement_name != old_leaf:
+                route = "project symbol rename from replacement source"
+                routed_tool = "apply_structured_edit"
+                operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name}
+            elif self._looks_like_full_symbol_source(target_path, new):
                 route = "replace symbol source"
                 routed_tool = "replace_symbol"
             else:
@@ -7701,7 +8370,13 @@ import string
                 routed_tool = "apply_structured_edit"
                 operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
         elif clean_intent in {"replace_symbol", "replace_function", "replace_class", "symbol"}:
-            if self._looks_like_symbol_name(old) and self._looks_like_full_symbol_source(target_path, new):
+            replacement_name = self._single_python_replacement_symbol_name(new) if target_path.suffix.lower() == ".py" and self._looks_like_full_symbol_source(target_path, new) else ""
+            old_leaf = old.rsplit(".", 1)[-1]
+            if replacement_name and replacement_name != old_leaf and self._looks_like_symbol_name(old_leaf):
+                route = "project symbol rename from replacement source"
+                routed_tool = "apply_structured_edit"
+                operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name}
+            elif self._looks_like_symbol_name(old) and self._looks_like_full_symbol_source(target_path, new):
                 route = "replace symbol source"
                 routed_tool = "replace_symbol"
             elif target_path.suffix.lower() == ".py" and self._looks_like_symbol_name(old):

@@ -81,7 +81,7 @@ def resolve_model(requested: str, available: set[str]) -> str:
     raise SystemExit(f"Requested model {requested!r} is not installed on {ollama_host()}. Available: {sorted(available)}")
 
 
-def build_workspace(root: Path) -> bool:
+def build_workspace(root: Path, *, init_git: bool = True) -> bool:
     (root / "docs").mkdir(parents=True, exist_ok=True)
     (root / "src").mkdir(parents=True, exist_ok=True)
     (root / "scratch").mkdir(parents=True, exist_ok=True)
@@ -99,6 +99,8 @@ def build_workspace(root: Path) -> bool:
         "import unittest\n\n\nclass SampleTests(unittest.TestCase):\n    def test_truth(self) -> None:\n        self.assertEqual(6 * 7, 42)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
         encoding="utf-8",
     )
+    if not init_git:
+        return False
     return init_git_repo(root)
 
 

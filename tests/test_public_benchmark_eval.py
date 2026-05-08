@@ -129,6 +129,8 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
             (source / "exercise.py").write_text("def answer():\n    pass\n", encoding="utf-8")
             (workspace / "exercise.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
             (workspace / "exercise_test.py").write_text("assert answer() == 42\n", encoding="utf-8")
+            (workspace / ".ollama-code" / "tmp").mkdir(parents=True)
+            (workspace / ".ollama-code" / "tmp" / "candidate.py").write_text("def answer():\n    return 99\n", encoding="utf-8")
 
             diffs = public_bench._changed_source_diffs(source, workspace)
             snippets = public_bench._final_source_snippets(workspace)
@@ -153,6 +155,22 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertFalse((workspace / ".meta").exists())
         self.assertEqual(snippets[0]["path"], ".meta/example.py")
         self.assertEqual([item["path"] for item in visible], ["exercise.py"])
+
+    def test_public_benchmark_meta_detach_falls_back_to_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            workspace.mkdir()
+            (workspace / ".meta").mkdir()
+            (workspace / ".meta" / "example.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
+
+            with patch.object(Path, "rename", side_effect=PermissionError("locked")):
+                detached = public_bench._detach_model_visible_meta(workspace)
+            snippets = public_bench._evaluator_meta_snippets(detached)
+            meta_still_present = (workspace / ".meta").exists()
+
+        self.assertIsNotNone(detached)
+        self.assertTrue(meta_still_present)
+        self.assertEqual(snippets[0]["path"], ".meta/example.py")
 
     def test_summarize_counts_runs_tokens_and_failures(self) -> None:
         results = [

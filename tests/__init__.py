@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import os
 from pathlib import Path
 from uuid import uuid4
 
 
-_TEST_TEMP_ROOT = Path(__file__).resolve().parents[1] / "scratch" / "test-temp"
+_TEST_TEMP_ROOT = Path(os.environ.get("OLLAMA_CODE_TEST_TEMP_ROOT", Path.home() / ".codex" / "memories" / "ollama-interactive-test-temp"))
 
 
 class _WorkspaceTemporaryDirectory:
