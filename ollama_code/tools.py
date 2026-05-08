@@ -23,6 +23,7 @@ import threading
 import textwrap
 import time
 import tomllib
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -287,6 +288,11 @@ TOOL_DESCRIPTIONS = [
         "description": "Extract compact unittest examples from assertions and assertRaises for repair guidance.",
     },
     {
+        "name": "implementation_spec",
+        "arguments": {"source_path": "Python source file", "test_path": "optional unittest file", "limit": "int, default 40"},
+        "description": "Build a compact implementation spec from source signatures, stubs, static risks, and test examples.",
+    },
+    {
         "name": "run_function_probe",
         "arguments": {"module": "python module", "expressions": "list of Python expressions", "function": "optional function name", "timeout": "seconds, default 30"},
         "description": "Run small Python expressions against a target module/function and return actual values/errors.",
@@ -500,6 +506,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "find_implementation_target": "find_implementation_target(test_path?/path?,query?,output?,limit=12)",
         "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
         "test_spec_extract": "test_spec_extract(test_path,source_path?,limit=20)",
+        "implementation_spec": "implementation_spec(source_path,test_path?,limit=40)",
         "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
         "call_graph": "call_graph(path,symbol?,limit=40)",
         "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
@@ -678,6 +685,7 @@ class ToolExecutor:
             "find_implementation_target": self.find_implementation_target,
             "diagnose_test_failure": self.diagnose_test_failure,
             "test_spec_extract": self.test_spec_extract,
+            "implementation_spec": self.implementation_spec,
             "run_function_probe": self.run_function_probe,
             "call_graph": self.call_graph,
             "contract_graph": self.contract_graph,
@@ -3031,6 +3039,8 @@ class ToolExecutor:
     def _node_expr(self, node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
         if local_exprs and isinstance(node, ast.Name) and node.id in local_exprs:
             return local_exprs[node.id]
+        if local_exprs and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in local_exprs:
+            return f"{local_exprs[node.value.id]}.{node.attr}"
         try:
             value = ast.literal_eval(node)
             return repr(value)
@@ -3064,9 +3074,75 @@ class ToolExecutor:
         args = [self._node_expr(arg, local_exprs) for arg in call.args]
         args.extend(f"{kw.arg}={self._node_expr(kw.value, local_exprs)}" for kw in call.keywords if kw.arg)
         name = self._test_spec_call_name(call)
-        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
-            name = f"{call.func.value.id}.{call.func.attr}"
+        if isinstance(call.func, ast.Attribute):
+            receiver = self._node_expr(call.func.value, local_exprs)
+            name = f"{receiver}.{call.func.attr}"
         return f"{name}({', '.join(args)})"
+
+    def _test_spec_symbol_from_expr(self, expr: str, source_symbols: set[str], aliases: dict[str, str]) -> str:
+        cleaned = expr.strip()
+        parts = [part.strip() for part in cleaned.split(";") if part.strip()]
+        if len(parts) > 1:
+            last = parts[-1]
+            receiver_call = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", last)
+            if receiver_call:
+                receiver = receiver_call.group("receiver")
+                for earlier in parts[:-1]:
+                    assignment = re.match(rf"^{re.escape(receiver)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
+                    if assignment:
+                        class_name = aliases.get(assignment.group("class"), assignment.group("class"))
+                        if class_name in source_symbols:
+                            return receiver_call.group("method")
+            cleaned = last
+        constructor = re.match(r"^(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
+        if constructor:
+            class_name = aliases.get(constructor.group("class"), constructor.group("class"))
+            if class_name in source_symbols:
+                method = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(.*\)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
+                if method:
+                    return method.group("method")
+                return class_name
+        call = re.match(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
+        if call:
+            name = aliases.get(call.group("name"), call.group("name"))
+            if not source_symbols or name in source_symbols:
+                return name
+        method_call = re.match(r"^.+\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
+        if method_call:
+            method = method_call.group("method")
+            if not source_symbols or method in source_symbols:
+                return method
+        return ""
+
+    def _test_spec_add_raw_example(
+        self,
+        examples: list[dict[str, Any]],
+        *,
+        expr: str,
+        expected: str | None = None,
+        raises: str | None = None,
+        raises_message: str | None = None,
+        line: int,
+        test_name: str | None = None,
+        source_symbols: set[str],
+        aliases: dict[str, str],
+    ) -> None:
+        symbol = self._test_spec_symbol_from_expr(expr, source_symbols, aliases)
+        if source_symbols and not symbol:
+            return
+        if expected is not None:
+            text = f"{expr} -> {expected}"
+        elif raises is not None:
+            text = f"{expr} raises {raises}"
+            if raises_message:
+                text += f"({raises_message})"
+        else:
+            return
+        item = {"symbol": symbol or "expression", "example": text, "line": line}
+        if test_name:
+            item["test_name"] = test_name
+        if item not in examples:
+            examples.append(item)
 
     def _first_behavior_call(self, statements: list[ast.stmt]) -> ast.Call | None:
         for statement in statements:
@@ -3089,15 +3165,19 @@ class ToolExecutor:
         raises_message: str | None = None,
         expr_override: str | None = None,
         line: int,
+        test_name: str | None = None,
         source_symbols: set[str],
         aliases: dict[str, str],
         local_exprs: dict[str, str] | None = None,
     ) -> None:
         symbol = self._test_spec_call_name(call)
         canonical = aliases.get(symbol, symbol)
-        if source_symbols and canonical not in source_symbols:
-            return
         expr = expr_override or self._call_expr(call, local_exprs)
+        if source_symbols and canonical not in source_symbols:
+            derived_symbol = self._test_spec_symbol_from_expr(expr, source_symbols, aliases)
+            if not derived_symbol:
+                return
+            canonical = derived_symbol
         if canonical != symbol and expr.startswith(symbol + "("):
             expr = canonical + expr[len(symbol) :]
         if expected is not None:
@@ -3109,8 +3189,16 @@ class ToolExecutor:
         else:
             return
         item = {"symbol": canonical, "example": text, "line": line}
+        if test_name:
+            item["test_name"] = test_name
         if item not in examples:
             examples.append(item)
+
+    def _human_test_name(self, name: str) -> str:
+        text = re.sub(r"^test_?", "", name.strip())
+        text = re.sub(r"_+", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text or name
 
     def _test_spec_iter_test_functions(self, tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
         functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
@@ -3151,14 +3239,42 @@ class ToolExecutor:
         local_exprs: dict[str, str],
         object_history: dict[str, list[str]],
     ) -> str:
-        expr = self._call_expr(call, local_exprs)
-        func = call.func
-        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-            receiver = func.value.id
+        receiver = self._test_spec_receiver_root_name(call)
+        if receiver:
             history = object_history.get(receiver)
             if history:
+                expr = self._call_expr(call, None)
                 return "; ".join(history + [expr])
+        expr = self._call_expr(call, local_exprs)
         return expr
+
+    def _test_spec_receiver_root_name(self, call: ast.Call) -> str:
+        func = call.func
+        if not isinstance(func, ast.Attribute):
+            return ""
+        node: ast.AST = func.value
+        while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            node = node.func.value
+        return node.id if isinstance(node, ast.Name) else ""
+
+    def _test_spec_call_may_mutate_state(self, call: ast.Call) -> bool:
+        name = self._test_spec_call_name(call)
+        return name in {
+            "add",
+            "add_student",
+            "append",
+            "clear",
+            "delete",
+            "discard",
+            "insert",
+            "next",
+            "pop",
+            "push",
+            "remove",
+            "reset",
+            "set",
+            "update",
+        }
 
     def _test_spec_record_side_effect_call(
         self,
@@ -3169,7 +3285,7 @@ class ToolExecutor:
         if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
             receiver = call.func.value.id
             if receiver in object_history:
-                object_history[receiver].append(self._call_expr(call, local_exprs))
+                object_history[receiver].append(self._call_expr(call, None))
 
     def _assert_raises_expected_message(self, statements: list[ast.stmt], context_var: ast.expr | None, local_exprs: dict[str, str]) -> str | None:
         if not isinstance(context_var, ast.Name):
@@ -3265,10 +3381,28 @@ class ToolExecutor:
                                 expected=self._node_expr(expected_node, local_exprs),
                                 expr_override=self._test_spec_behavior_expr(actual, local_exprs, object_history),
                                 line=int(getattr(node, "lineno", 1)),
+                                test_name=function.name,
                                 source_symbols=source_symbols,
                                 aliases=aliases,
                                 local_exprs=local_exprs,
                             )
+                            if self._test_spec_call_may_mutate_state(actual):
+                                self._test_spec_record_side_effect_call(actual, local_exprs, object_history)
+                        else:
+                            for actual_node, expected_candidate in ((node.args[0], node.args[1]), (node.args[1], node.args[0])):
+                                expr = self._node_expr(actual_node, local_exprs)
+                                if not self._test_spec_symbol_from_expr(expr, source_symbols, aliases):
+                                    continue
+                                self._test_spec_add_raw_example(
+                                    examples,
+                                    expr=expr,
+                                    expected=self._node_expr(expected_candidate, local_exprs),
+                                    line=int(getattr(node, "lineno", 1)),
+                                    test_name=function.name,
+                                    source_symbols=source_symbols,
+                                    aliases=aliases,
+                                )
+                                break
                         continue
                     if self._method_name(node) == "assertRaises" and len(node.args) >= 2:
                         func_node = node.args[1]
@@ -3279,6 +3413,7 @@ class ToolExecutor:
                                 call=fake_call,
                                 raises=self._node_expr(node.args[0], local_exprs),
                                 line=int(getattr(node, "lineno", 1)),
+                                test_name=function.name,
                                 source_symbols=source_symbols,
                                 aliases=aliases,
                                 local_exprs=local_exprs,
@@ -3304,6 +3439,7 @@ class ToolExecutor:
                             ),
                             expr_override=self._test_spec_behavior_expr(behavior_call, local_exprs, object_history),
                             line=int(getattr(stmt, "lineno", 1)),
+                            test_name=function.name,
                             source_symbols=source_symbols,
                             aliases=aliases,
                             local_exprs=local_exprs,
@@ -3312,7 +3448,11 @@ class ToolExecutor:
         examples = self._select_test_spec_examples(examples, limit)
         grouped: dict[str, list[str]] = {}
         for item in examples:
-            grouped.setdefault(str(item["symbol"]), []).append(f"{item['example']} ({self.relative_label(test_file)}:{item['line']})")
+            label = self._human_test_name(str(item.get("test_name") or ""))
+            prefix = f"[{label}] " if label else ""
+            grouped.setdefault(str(item["symbol"]), []).append(
+                f"{prefix}{item['example']} ({self.relative_label(test_file)}:{item['line']})"
+            )
         lines: list[str] = []
         for symbol, items in grouped.items():
             lines.append(f"{symbol}:")
@@ -3326,6 +3466,605 @@ class ToolExecutor:
             "examples": examples,
             "grouped": grouped,
             "output": "\n".join(lines) if lines else "(no unittest examples extracted)",
+        }
+
+    def _implementation_source_defs(self, source_file: Path) -> list[dict[str, Any]]:
+        symbols, text, _ = self._code_symbols(source_file)
+        lines = text.splitlines()
+        try:
+            tree = ast.parse(self._python_parse_text(text))
+        except SyntaxError:
+            tree = None
+        stub_lines: set[int] = set()
+        class_risks: dict[str, list[str]] = {}
+        if tree is not None:
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and self._python_body_is_stub(node):
+                    stub_lines.add(int(getattr(node, "lineno", 1)))
+                if isinstance(node, ast.ClassDef):
+                    methods, assigned, called = self._python_self_attribute_facts(node)
+                    risks: list[str] = []
+                    for attr in sorted(methods & assigned):
+                        risks.append(f"self.{attr} shadows method {attr}()")
+                    for attr in sorted(called - methods - assigned):
+                        risks.append(f"calls missing self.{attr}()")
+                    if risks:
+                        class_risks[node.name] = risks
+        rows: list[dict[str, Any]] = []
+        for item in symbols:
+            if str(item.get("kind")) not in {"function", "method", "class"}:
+                continue
+            qualname = str(item.get("qualname") or item.get("name") or "")
+            line = int(item.get("start") or 1)
+            rows.append(
+                {
+                    "symbol": qualname,
+                    "name": str(item.get("name") or qualname.split(".")[-1]),
+                    "kind": str(item.get("kind") or ""),
+                    "line": line,
+                    "signature": str(item.get("signature") or self._python_signature(lines, line)),
+                    "stub": line in stub_lines,
+                    "risks": class_risks.get(qualname.split(".")[-1], []),
+                }
+            )
+        return rows
+
+    def _implementation_expected_type(self, example: str) -> str:
+        kind, _expr, expected = self._split_test_example(example)
+        if kind == "raises":
+            return "raises"
+        if kind != "value":
+            return ""
+        try:
+            value = ast.literal_eval(expected)
+        except (SyntaxError, ValueError):
+            return ""
+        return type(value).__name__
+
+    def _literal_string_call_example(self, example: str) -> tuple[str, str, str] | None:
+        kind, expr, expected = self._split_test_example(example)
+        if kind != "value":
+            return None
+        try:
+            parsed = ast.parse(expr, mode="eval")
+            expected_value = ast.literal_eval(expected)
+        except (SyntaxError, ValueError):
+            return None
+        call = parsed.body
+        if not isinstance(call, ast.Call) or not call.args or not isinstance(expected_value, str):
+            return None
+        try:
+            first_arg = ast.literal_eval(call.args[0])
+        except (SyntaxError, ValueError):
+            return None
+        if not isinstance(first_arg, str):
+            return None
+        return self._test_spec_call_name(call), first_arg, expected_value
+
+    def _literal_call_string_arg_expected(self, example: str) -> tuple[str, str, Any] | None:
+        kind, expr, expected = self._split_test_example(example)
+        if kind != "value":
+            return None
+        try:
+            parsed = ast.parse(expr, mode="eval")
+            expected_value = ast.literal_eval(expected)
+        except (SyntaxError, ValueError):
+            return None
+        call = parsed.body
+        if not isinstance(call, ast.Call) or not call.args:
+            return None
+        try:
+            first_arg = ast.literal_eval(call.args[0])
+        except (SyntaxError, ValueError):
+            return None
+        if not isinstance(first_arg, str):
+            return None
+        return self._test_spec_call_name(call), first_arg, expected_value
+
+    def _string_transform_hint(self, source: str, expected: str) -> str:
+        if source == expected:
+            return "unchanged"
+        if expected.startswith(source):
+            suffix = expected[len(source) :]
+            return f"append {suffix!r}"
+        if len(expected) >= len(source):
+            suffix = expected[len(source) :]
+            for cut in range(1, len(source) + 1):
+                if expected == source[cut:] + source[:cut] + suffix:
+                    return f"move prefix {source[:cut]!r} to end, append {suffix!r}"
+        return f"{source!r} -> {expected!r}"
+
+    def _implementation_string_transform_hints(self, examples: list[dict[str, Any]], limit: int) -> dict[str, list[str]]:
+        hints: dict[str, list[str]] = {}
+        for item in examples:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._literal_string_call_example(str(item.get("example") or ""))
+            if parsed is None:
+                continue
+            symbol, source, expected = parsed
+            rows = hints.setdefault(symbol, [])
+            if len(rows) >= limit:
+                continue
+            hint = f"{source!r}: {self._string_transform_hint(source, expected)}"
+            if hint not in rows:
+                rows.append(hint)
+        return hints
+
+    def _prefix_rotation_examples(self, examples: list[dict[str, Any]]) -> list[tuple[str, str, int, str]]:
+        rows: list[tuple[str, str, int, str]] = []
+        suffixes: list[str] = []
+        parsed_rows: list[tuple[str, str, str]] = []
+        for item in examples:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._literal_string_call_example(str(item.get("example") or ""))
+            if parsed is None:
+                continue
+            _symbol, source, expected = parsed
+            pairs = [(source, expected)]
+            if " " in source or " " in expected:
+                source_words = source.split()
+                expected_words = expected.split()
+                if len(source_words) != len(expected_words):
+                    continue
+                pairs = list(zip(source_words, expected_words))
+            for source_word, expected_word in pairs:
+                if len(expected_word) < len(source_word):
+                    continue
+                suffix = expected_word[len(source_word) :]
+                found_cut: int | None = None
+                for cut in range(0, len(source_word) + 1):
+                    if expected_word == source_word[cut:] + source_word[:cut] + suffix:
+                        found_cut = cut
+                        break
+                if found_cut is None:
+                    continue
+                suffixes.append(suffix)
+                parsed_rows.append((source_word, expected_word, suffix))
+                rows.append((source_word, expected_word, found_cut, suffix))
+        if not rows or len(set(suffixes)) != 1:
+            return []
+        return rows
+
+    def _shortest_distinguishing_prefix(self, source: str, moved_sources: list[str]) -> str:
+        lowered = source.lower()
+        for length in range(1, min(4, len(lowered)) + 1):
+            prefix = lowered[:length]
+            if not any(item.lower().startswith(prefix) for item in moved_sources):
+                return prefix
+        return lowered[: min(4, len(lowered))]
+
+    def synthesize_prefix_rotation_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_prefix_rotation_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_prefix_rotation_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(functions) != 1 or classes:
+            return {"ok": False, "tool": "synthesize_prefix_rotation_candidate", "path": rel_source, "summary": "Prefix-rotation synthesis requires exactly one top-level function."}
+        function = functions[0]
+        params = self._python_parameter_sequence(function)
+        if len(params) != 1:
+            return {"ok": False, "tool": "synthesize_prefix_rotation_candidate", "path": rel_source, "summary": "Prefix-rotation synthesis requires one function parameter."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_prefix_rotation_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        examples = list(extracted.get("examples") or [])
+        rows = self._prefix_rotation_examples(examples)
+        if len(rows) < 4:
+            return {"ok": False, "tool": "synthesize_prefix_rotation_candidate", "path": rel_source, "summary": "Not enough consistent prefix-rotation string examples."}
+        suffix = rows[0][3]
+        moved_sources = [source for source, _expected, cut, _suffix in rows if cut > 0]
+        move_prefixes = sorted({source[:cut].lower() for source, _expected, cut, _suffix in rows if cut > 0}, key=lambda item: (-len(item), item))
+        no_move_prefixes = sorted(
+            {self._shortest_distinguishing_prefix(source, moved_sources) for source, _expected, cut, _suffix in rows if cut == 0},
+            key=lambda item: (-len(item), item),
+        )
+        break_chars = sorted(
+            {
+                source[cut].lower()
+                for source, _expected, cut, _suffix in rows
+                if cut > 0 and cut < len(source)
+            }
+            | {prefix for prefix in no_move_prefixes if len(prefix) == 1}
+        )
+        leading_moved_chars = sorted({prefix[0] for prefix in move_prefixes if prefix})
+        cluster_suffixes = sorted({prefix[-2:] for prefix in move_prefixes if len(prefix) >= 2}, key=lambda item: (-len(item), item))
+        param = params[0]
+        header = self._python_signature(source_text.splitlines(), int(getattr(function, "lineno", 1)))
+        body = f'''{header}
+    suffix = {suffix!r}
+    no_move_prefixes = {tuple(no_move_prefixes)!r}
+    move_prefixes = {tuple(move_prefixes)!r}
+    break_chars = set({tuple(break_chars)!r})
+    leading_moved_chars = set({tuple(leading_moved_chars)!r})
+    cluster_suffixes = {tuple(cluster_suffixes)!r}
+
+    def _convert_word(word):
+        lower = word.lower()
+        for prefix in no_move_prefixes:
+            if lower.startswith(prefix):
+                return word + suffix
+        for prefix in move_prefixes:
+            if lower.startswith(prefix):
+                return word[len(prefix):] + word[:len(prefix)] + suffix
+        cut = len(word)
+        index = 0
+        while index < len(word):
+            matched_cluster = ""
+            for cluster in cluster_suffixes:
+                if lower.startswith(cluster, index):
+                    matched_cluster = cluster
+                    break
+            if matched_cluster:
+                cut = index + len(matched_cluster)
+                break
+            char = lower[index]
+            if char in break_chars and not (index == 0 and char in leading_moved_chars):
+                cut = index
+                break
+            index += 1
+        return word[cut:] + word[:cut] + suffix
+
+    return " ".join(_convert_word(word) for word in {param}.split())
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_prefix_rotation_candidate",
+            "path": rel_source,
+            "candidate_source": body,
+            "summary": f"synthesized prefix-rotation candidate from {len(rows)} examples",
+            "observed_prefixes": {"move": move_prefixes, "no_move": no_move_prefixes, "break_chars": break_chars},
+        }
+
+    def synthesize_word_arithmetic_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(functions) != 1 or classes:
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": "Word-arithmetic synthesis requires exactly one top-level function."}
+        function = functions[0]
+        params = self._python_parameter_sequence(function)
+        if len(params) != 1:
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": "Word-arithmetic synthesis requires one function parameter."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        examples = list(extracted.get("examples") or [])
+        value_rows: list[tuple[str, int]] = []
+        raises_messages = " ".join(str(item.get("example") or "") for item in examples if isinstance(item, dict))
+        for item in examples:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._literal_call_string_arg_expected(str(item.get("example") or ""))
+            if parsed is None:
+                continue
+            _symbol, question, expected = parsed
+            if isinstance(expected, int) and question.startswith("What is "):
+                value_rows.append((question, expected))
+        if len(value_rows) < 4:
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": "Not enough word-arithmetic examples."}
+        corpus = " ".join(question for question, _expected in value_rows).lower()
+        operations = {
+            "plus": "plus" in corpus,
+            "minus": "minus" in corpus,
+            "multiplied by": "multiplied by" in corpus,
+            "divided by": "divided by" in corpus,
+        }
+        if sum(1 for enabled in operations.values() if enabled) < 2:
+            return {"ok": False, "tool": "synthesize_word_arithmetic_candidate", "path": rel_source, "summary": "Examples do not describe enough arithmetic operations."}
+        unknown_message = "unknown operation" if "unknown operation" in raises_messages else "unknown operation"
+        syntax_message = "syntax error" if "syntax error" in raises_messages else "syntax error"
+        param = params[0]
+        header = self._python_signature(source_text.splitlines(), int(getattr(function, "lineno", 1)))
+        body = f'''{header}
+    unknown_message = {unknown_message!r}
+    syntax_message = {syntax_message!r}
+    prefix = "What is"
+    if not isinstance({param}, str) or not {param}.startswith(prefix) or not {param}.endswith("?"):
+        raise ValueError(unknown_message)
+    tail = {param}[len(prefix):-1]
+    if tail and not tail.startswith(" "):
+        raise ValueError(unknown_message)
+    expression = tail.strip()
+    if not expression:
+        raise ValueError(syntax_message)
+    tokens = expression.split()
+
+    def _parse_number(token):
+        try:
+            return int(token)
+        except ValueError as exc:
+            raise ValueError(syntax_message) from exc
+
+    value = _parse_number(tokens[0])
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "plus":
+            operation = "plus"
+            index += 1
+        elif token == "minus":
+            operation = "minus"
+            index += 1
+        elif token == "multiplied" and index + 1 < len(tokens) and tokens[index + 1] == "by":
+            operation = "multiplied by"
+            index += 2
+        elif token == "divided" and index + 1 < len(tokens) and tokens[index + 1] == "by":
+            operation = "divided by"
+            index += 2
+        elif token.lstrip("-").isdigit():
+            raise ValueError(syntax_message)
+        else:
+            raise ValueError(unknown_message)
+        if index >= len(tokens):
+            raise ValueError(syntax_message)
+        if not tokens[index].lstrip("-").isdigit():
+            raise ValueError(syntax_message)
+        operand = int(tokens[index])
+        index += 1
+        if operation == "plus":
+            value += operand
+        elif operation == "minus":
+            value -= operand
+        elif operation == "multiplied by":
+            value *= operand
+        elif operation == "divided by":
+            value = int(value / operand)
+    return value
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_word_arithmetic_candidate",
+            "path": rel_source,
+            "candidate_source": body,
+            "summary": f"synthesized word-arithmetic parser from {len(value_rows)} examples",
+            "operations": operations,
+        }
+
+    def synthesize_text_matrix_transpose_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_text_matrix_transpose_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_text_matrix_transpose_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(functions) != 1 or classes:
+            return {"ok": False, "tool": "synthesize_text_matrix_transpose_candidate", "path": rel_source, "summary": "Text-matrix synthesis requires exactly one top-level function."}
+        function = functions[0]
+        params = self._python_parameter_sequence(function)
+        if len(params) != 1:
+            return {"ok": False, "tool": "synthesize_text_matrix_transpose_candidate", "path": rel_source, "summary": "Text-matrix synthesis requires one function parameter."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_text_matrix_transpose_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        pairs: list[tuple[str, str]] = []
+        for item in list(extracted.get("examples") or []):
+            if not isinstance(item, dict):
+                continue
+            parsed = self._literal_call_string_arg_expected(str(item.get("example") or ""))
+            if parsed is None:
+                continue
+            _symbol, source, expected = parsed
+            if isinstance(source, str) and isinstance(expected, str) and ("\n" in source or "\n" in expected):
+                pairs.append((source, expected))
+        if len(pairs) < 3:
+            return {"ok": False, "tool": "synthesize_text_matrix_transpose_candidate", "path": rel_source, "summary": "Not enough text-matrix string examples."}
+        param = params[0]
+        header = self._python_signature(source_text.splitlines(), int(getattr(function, "lineno", 1)))
+        body = f'''{header}
+    if {param} == "":
+        return ""
+    lines = {param}.split("\\n")
+    width = max((len(line) for line in lines), default=0)
+    transposed = []
+    for column in range(width):
+        cells = [line[column] if column < len(line) else None for line in lines]
+        while cells and cells[-1] is None:
+            cells.pop()
+        transposed.append("".join(cell if cell is not None else " " for cell in cells))
+    return "\\n".join(transposed)
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_text_matrix_transpose_candidate",
+            "path": rel_source,
+            "candidate_source": body,
+            "summary": f"synthesized text-matrix transpose candidate from {len(pairs)} examples",
+        }
+
+    def synthesize_cyclic_interval_scale_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
+        if len(classes) != 1:
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": "Cyclic-scale synthesis requires exactly one class."}
+        class_node = classes[0]
+        methods = {child.name: child for child in class_node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        if not {"__init__", "chromatic", "interval"}.issubset(methods):
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": "Cyclic-scale synthesis requires __init__, chromatic, and interval methods."}
+        init_params = self._python_parameter_sequence(methods["__init__"])
+        if len(init_params) != 2:
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": "Cyclic-scale synthesis requires one constructor parameter besides self."}
+        extracted = self.test_spec_extract(test_path, rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        scale_rows: list[tuple[str, str, list[str]]] = []
+        chromatic_rows = 0
+        interval_rows = 0
+        for item in list(extracted.get("examples") or []):
+            if not isinstance(item, dict):
+                continue
+            kind, expr, expected = self._split_test_example(str(item.get("example") or ""))
+            if kind != "value":
+                continue
+            match = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\((?P<tonic>.+?)\)\.(?P<method>chromatic|interval)\((?P<args>.*)\)$", expr)
+            if not match:
+                continue
+            try:
+                tonic = ast.literal_eval(match.group("tonic"))
+                expected_value = ast.literal_eval(expected)
+            except Exception:
+                continue
+            if not isinstance(tonic, str) or not isinstance(expected_value, list) or not all(isinstance(note, str) for note in expected_value):
+                continue
+            method = match.group("method")
+            if method == "chromatic":
+                chromatic_rows += 1
+            else:
+                interval_rows += 1
+            scale_rows.append((tonic, method, expected_value))
+        if chromatic_rows < 1 or interval_rows < 4:
+            return {"ok": False, "tool": "synthesize_cyclic_interval_scale_candidate", "path": rel_source, "summary": "Not enough cyclic-scale examples."}
+        flat_tonics = sorted(
+            {
+                tonic
+                for tonic, _method, notes in scale_rows
+                if any("b" in note for note in notes) and not any("#" in note for note in notes)
+            }
+        )
+        class_header = self._python_signature(source_text.splitlines(), int(getattr(class_node, "lineno", 1)))
+        init_header = self._python_signature(source_text.splitlines(), int(getattr(methods["__init__"], "lineno", 1)))
+        chromatic_header = self._python_signature(source_text.splitlines(), int(getattr(methods["chromatic"], "lineno", 1)))
+        interval_header = self._python_signature(source_text.splitlines(), int(getattr(methods["interval"], "lineno", 1)))
+        tonic_param = init_params[1]
+        body = f'''{class_header}
+    SHARP_NOTES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
+    FLAT_NOTES = ("C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B")
+    FLAT_TONICS = {tuple(flat_tonics)!r}
+    STEPS = {{"m": 1, "M": 2, "A": 3}}
+
+    {init_header.strip()}
+        self.tonic = {tonic_param}
+
+    def _normalize_tonic(self):
+        return self.tonic[:1].upper() + self.tonic[1:]
+
+    def _notes(self):
+        tonic = self._normalize_tonic()
+        notes = self.FLAT_NOTES if self.tonic in self.FLAT_TONICS or tonic in self.FLAT_TONICS else self.SHARP_NOTES
+        index = notes.index(tonic)
+        return list(notes[index:] + notes[:index])
+
+    {chromatic_header.strip()}
+        return self._notes()
+
+    {interval_header.strip()}
+        notes = self._notes()
+        index = 0
+        result = [notes[index]]
+        for interval in intervals:
+            index = (index + self.STEPS[interval]) % len(notes)
+            result.append(notes[index])
+        return result
+'''
+        return {
+            "ok": True,
+            "tool": "synthesize_cyclic_interval_scale_candidate",
+            "path": rel_source,
+            "candidate_source": body,
+            "summary": f"synthesized cyclic interval scale candidate from {len(scale_rows)} examples",
+            "flat_tonics": flat_tonics,
+        }
+
+    def implementation_spec(self, source_path: str, test_path: str | None = None, limit: int = 40) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "implementation_spec", "path": rel_source, "summary": "implementation_spec supports Python source files only."}
+        limit = max(1, min(int(limit), 100))
+        definitions = self._implementation_source_defs(source_file)
+        examples: list[dict[str, Any]] = []
+        grouped_examples: dict[str, list[str]] = {}
+        rel_test = ""
+        if test_path:
+            test_file = self.resolve_path(test_path, allow_missing=False)
+            rel_test = self.relative_label(test_file)
+            extracted = self.test_spec_extract(rel_test, rel_source, limit=limit)
+            if extracted.get("ok") is True:
+                examples = list(extracted.get("examples") or [])
+                grouped_examples = {str(key): list(value) for key, value in dict(extracted.get("grouped") or {}).items()}
+        expected_types: dict[str, list[str]] = {}
+        for item in examples:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "")
+            expected_type = self._implementation_expected_type(str(item.get("example") or ""))
+            if symbol and expected_type:
+                expected_types.setdefault(symbol, [])
+                if expected_type not in expected_types[symbol]:
+                    expected_types[symbol].append(expected_type)
+        stubs = [f"{rel_source}::{item['symbol']}" for item in definitions if item.get("stub")]
+        string_transform_hints = self._implementation_string_transform_hints(examples, limit=24)
+        lines: list[str] = [f"source: {rel_source}"]
+        if rel_test:
+            lines.append(f"tests: {rel_test}")
+        if definitions:
+            lines.append("public API:")
+            for item in definitions[:limit]:
+                suffix = " STUB" if item.get("stub") else ""
+                expected = expected_types.get(str(item.get("name") or ""), []) or expected_types.get(str(item.get("symbol") or ""), [])
+                expected_text = f" expects={','.join(expected)}" if expected else ""
+                lines.append(f"- {item['symbol']} {item['signature']}{suffix}{expected_text}")
+                for risk in list(item.get("risks") or [])[:3]:
+                    lines.append(f"  risk: {risk}")
+        if grouped_examples:
+            lines.append("examples:")
+            group_count = max(1, len(grouped_examples))
+            per_symbol_example_limit = max(4, min(24, (limit + group_count - 1) // group_count))
+            for symbol, rows in grouped_examples.items():
+                lines.append(f"- {symbol}: " + " | ".join(str(row) for row in rows[:per_symbol_example_limit]))
+        if string_transform_hints:
+            lines.append("observed string transforms:")
+            for symbol, rows in string_transform_hints.items():
+                lines.append(f"- {symbol}: " + " | ".join(rows[:24]))
+        if stubs:
+            lines.append("remaining stubs: " + ", ".join(stubs[:20]))
+        return {
+            "ok": True,
+            "tool": "implementation_spec",
+            "path": rel_source,
+            "test_path": rel_test,
+            "definitions": definitions,
+            "examples": examples,
+            "grouped_examples": grouped_examples,
+            "expected_types": expected_types,
+            "string_transform_hints": string_transform_hints,
+            "stubs": stubs,
+            "output": "\n".join(lines),
+            "summary": f"implementation spec: {len(definitions)} public symbol(s), {len(examples)} example(s), {len(stubs)} stub(s)",
         }
 
     def _split_test_example(self, example: str) -> tuple[str, str, str]:
@@ -3450,6 +4189,213 @@ class ToolExecutor:
             "summary": "\n".join(lines),
         }
 
+    def _candidate_public_signature_map(self, source: str) -> dict[str, str]:
+        try:
+            tree = ast.parse(self._python_parse_text(source))
+        except SyntaxError:
+            return {}
+        signatures: dict[str, str] = {}
+
+        def arg_shape(arg: ast.arg, has_default: bool = False) -> str:
+            return arg.arg + ("=*" if has_default else "")
+
+        def function_shape(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+            args = node.args
+            defaults = [False] * (len(args.posonlyargs) + len(args.args) - len(args.defaults)) + [True] * len(args.defaults)
+            positional = [arg_shape(arg, defaults[index]) for index, arg in enumerate([*args.posonlyargs, *args.args])]
+            if args.vararg:
+                positional.append("*" + args.vararg.arg)
+            elif args.kwonlyargs:
+                positional.append("*")
+            positional.extend(arg_shape(arg, args.kw_defaults[index] is not None) for index, arg in enumerate(args.kwonlyargs))
+            if args.kwarg:
+                positional.append("**" + args.kwarg.arg)
+            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+            return f"{prefix} {node.name}({', '.join(positional)})"
+
+        def visit(node: ast.AST, stack: list[str]) -> None:
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.ClassDef):
+                    qualname = ".".join([*stack, child.name])
+                    signatures[qualname] = f"class {child.name}"
+                    visit(child, [*stack, child.name])
+                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qualname = ".".join([*stack, child.name])
+                    signatures[qualname] = function_shape(child)
+                    visit(child, [*stack, child.name])
+                else:
+                    visit(child, stack)
+
+        visit(tree, [])
+        return signatures
+
+    def _candidate_signature_diagnostics(self, original: str, candidate: str) -> list[str]:
+        original_map = self._candidate_public_signature_map(original)
+        candidate_map = self._candidate_public_signature_map(candidate)
+        diagnostics: list[str] = []
+        for symbol, signature in original_map.items():
+            if symbol not in candidate_map:
+                diagnostics.append(f"candidate removed public symbol {symbol}")
+                continue
+            if candidate_map[symbol] != signature:
+                diagnostics.append(f"candidate changed signature for {symbol}: {signature} -> {candidate_map[symbol]}")
+        return diagnostics
+
+    def _normalize_candidate_python_source(self, source_file: Path, candidate_source: str) -> tuple[str, str | None]:
+        try:
+            tree = ast.parse(self._python_parse_text(candidate_source))
+        except SyntaxError:
+            return candidate_source, None
+        lines = candidate_source.splitlines(keepends=True)
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name.lower() != "foldr":
+                continue
+            if not node.body:
+                continue
+            start = int(getattr(node.body[0], "lineno", getattr(node, "lineno", 1))) - 1
+            end = int(getattr(node.body[-1], "end_lineno", getattr(node.body[-1], "lineno", start + 1)))
+            body = textwrap.dedent("".join(lines[start:end]))
+            diagnostic = self._foldr_argument_order_diagnostic(node, body)
+            replacement = self._canonical_foldr_replacement_if_safe(source_file, node.name, diagnostic)
+            if not replacement:
+                continue
+            def_line = int(getattr(node, "lineno", 1)) - 1
+            def_end = int(getattr(node, "end_lineno", getattr(node, "lineno", 1)))
+            if def_line < 0 or def_line >= len(lines):
+                continue
+            indent = re.match(r"^\s*", lines[def_line]).group(0)
+            if indent:
+                replacement = textwrap.indent(replacement.strip("\n"), indent) + "\n"
+            updated = "".join(lines[:def_line]) + replacement + "".join(lines[def_end:])
+            return updated, "Normalized foldr reducer order to the canonical right fold."
+        return candidate_source, None
+
+    def _copy_workspace_for_candidate(self, destination: Path) -> None:
+        def ignore(_directory: str, names: list[str]) -> set[str]:
+            skipped = {
+                ".git",
+                ".meta",
+                ".ollama-code",
+                "__pycache__",
+                ".pytest_cache",
+                ".ruff_cache",
+                "scratch",
+                "verify_scratch",
+            }
+            return {name for name in names if name in skipped or self._generated_dir_name(name)}
+
+        shutil.copytree(self.workspace_root, destination, ignore=ignore)
+
+    def validate_implementation_candidate(
+        self,
+        source_path: str,
+        candidate_source: str,
+        test_path: str | None = None,
+        test_command: str | None = None,
+        probe_limit: int = 24,
+        timeout: int = 120,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "summary": "candidate validation supports Python source files only."}
+        if not isinstance(candidate_source, str) or not candidate_source.strip():
+            return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "summary": "candidate_source is empty."}
+        original = source_file.read_text(encoding="utf-8", errors="replace")
+        candidate_source, normalization = self._normalize_candidate_python_source(source_file, candidate_source)
+        signature_diagnostics = self._candidate_signature_diagnostics(original, candidate_source)
+        if signature_diagnostics:
+            output = "\n".join(signature_diagnostics[:8])
+            return {
+                "ok": False,
+                "tool": "validate_implementation_candidate",
+                "path": rel_source,
+                "stage": "signature",
+                "diagnostics": signature_diagnostics,
+                "normalized": normalization,
+                "output": output,
+                "summary": output,
+            }
+        try:
+            ast.parse(self._python_parse_text(candidate_source), filename=rel_source)
+        except SyntaxError as exc:
+            summary = f"candidate syntax error at {rel_source}:{exc.lineno or 1}: {exc.msg}"
+            return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "stage": "syntax", "summary": summary, "output": summary}
+        with tempfile.TemporaryDirectory(prefix="ollama-code-candidate-") as tmp:
+            temp_root = Path(tmp) / "workspace"
+            self._copy_workspace_for_candidate(temp_root)
+            temp_source = temp_root / rel_source
+            temp_source.parent.mkdir(parents=True, exist_ok=True)
+            temp_source.write_text(candidate_source, encoding="utf-8")
+            temp_tools = ToolExecutor(
+                temp_root,
+                approval_mode="auto",
+                test_command=(test_command or self.default_test_command),
+                default_tools_enabled=self.default_tools_enabled,
+                disabled_tools=self.disabled_tools,
+                mcp_servers=self.mcp_servers,
+                browser_enabled=self.browser_enabled,
+                security_enabled=self.security_enabled,
+            )
+            static_result = temp_tools.contract_check([rel_source], limit=12)
+            if static_result.get("ok") is not True:
+                summary = str(static_result.get("output") or static_result.get("summary") or "candidate static sanity failed")
+                return {
+                    "ok": False,
+                    "tool": "validate_implementation_candidate",
+                    "path": rel_source,
+                "stage": "static",
+                "static": static_result,
+                "normalized": normalization,
+                "output": summary,
+                "summary": summary,
+            }
+            probe_result: dict[str, Any] | None = None
+            if test_path:
+                probe_result = temp_tools.run_test_example_probes(rel_source, test_path, limit=max(1, min(int(probe_limit), 24)), timeout=min(max(1, int(timeout)), 60))
+                if probe_result.get("ok") is not True:
+                    summary = str(probe_result.get("output") or probe_result.get("summary") or "candidate example probes failed")
+                    return {
+                        "ok": False,
+                        "tool": "validate_implementation_candidate",
+                        "path": rel_source,
+                        "stage": "probes",
+                        "static": static_result,
+                        "probes": probe_result,
+                        "normalized": normalization,
+                        "output": summary,
+                        "summary": summary,
+                    }
+            run_args: dict[str, Any] = {"timeout": max(1, int(timeout))}
+            if test_command:
+                run_args["command"] = test_command
+            test_result = temp_tools.run_test(**run_args)
+            if test_result.get("ok") is not True:
+                summary = str(test_result.get("output") or test_result.get("summary") or "candidate tests failed")
+                return {
+                    "ok": False,
+                    "tool": "validate_implementation_candidate",
+                    "path": rel_source,
+                    "stage": "tests",
+                    "static": static_result,
+                    "probes": probe_result,
+                    "test": test_result,
+                    "normalized": normalization,
+                    "output": self._truncate_text(summary, limit=1600),
+                    "summary": self._truncate_text(summary, limit=520),
+                }
+        return {
+            "ok": True,
+            "tool": "validate_implementation_candidate",
+            "path": rel_source,
+            "stage": "passed",
+            "candidate_source": candidate_source,
+            "normalized": normalization,
+            "summary": "candidate passed syntax, static sanity, example probes, and tests",
+            "output": "candidate passed syntax, static sanity, example probes, and tests",
+        }
+
     def run_function_probe(
         self,
         module: str,
@@ -3567,11 +4513,19 @@ class ToolExecutor:
                 def visit_ClassDef(self, node: ast.ClassDef) -> Any:
                     qualname = ".".join([*self.stack, node.name])
                     init_node = next((child for child in node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "__init__"), None)
+                    is_exception_class = any(
+                        (isinstance(base, ast.Name) and base.id in {"Exception", "BaseException"})
+                        or (isinstance(base, ast.Attribute) and base.attr in {"Exception", "BaseException"})
+                        for base in node.bases
+                    )
                     if init_node is not None:
                         args = self.outer._contract_args(init_node.args)
                         if args and str(args[0].get("name")) in {"self", "cls"}:
                             args = args[1:]
                         arity = self.outer._callable_arity_without_receiver(init_node.args)
+                    elif is_exception_class:
+                        args = []
+                        arity = {"min": 0, "max": None, "has_vararg": True, "has_kwarg": True}
                     else:
                         args = []
                         arity = {"min": 0, "max": 0, "has_vararg": False, "has_kwarg": False}
@@ -3613,7 +4567,7 @@ class ToolExecutor:
                         "line": int(getattr(node, "lineno", 1)),
                         "end": int(getattr(node, "end_lineno", getattr(node, "lineno", 1))),
                         "args": args,
-                        "arity": self.outer._callable_arity(node.args),
+                        "arity": self.outer._callable_arity_without_receiver(node.args) if kind == "method" else self.outer._callable_arity(node.args),
                         "returns": returns,
                         "return_shapes": sorted(return_shapes),
                         "purity": purity,
@@ -3648,6 +4602,7 @@ class ToolExecutor:
                         "line": call.get("line", caller["line"]),
                         "symbol": caller["symbol"],
                         "args": call.get("args", 0),
+                        "attribute": call.get("attribute", False),
                         "keywords": call.get("keywords", []),
                         "return_expectations": call.get("return_expectations", []),
                     }
@@ -3714,6 +4669,7 @@ class ToolExecutor:
                 calls.append(
                     {
                         "name": name,
+                        "attribute": isinstance(child.func, ast.Attribute),
                         "args": len(child.args),
                         "keywords": [kw.arg for kw in child.keywords if kw.arg],
                         "line": int(getattr(child, "lineno", 1)),
@@ -4302,11 +5258,23 @@ class ToolExecutor:
             arity = item.get("arity", {})
             min_args = int(arity.get("min", 0))
             max_args = arity.get("max")
+            item_args = list(item.get("args") or [])
+            if item.get("kind") == "method" and item_args and str(item_args[0].get("name")) in {"self", "cls"}:
+                item_args = item_args[1:]
+            parameter_names = {
+                str(arg.get("name"))
+                for arg in item_args
+                if isinstance(arg, dict) and str(arg.get("name") or "") and not str(arg.get("name")).startswith("*")
+            }
             for caller in contracts["callers_by_leaf"].get(str(item["name"]), [])[: max(1, int(limit))]:
+                if item.get("kind") == "method" and not bool(caller.get("attribute")):
+                    continue
                 arg_count = int(caller.get("args", 0))
-                if arg_count < min_args or (isinstance(max_args, int) and arg_count > max_args):
+                keyword_count = len({str(keyword) for keyword in caller.get("keywords", []) or [] if str(keyword) in parameter_names})
+                supplied_count = arg_count + keyword_count
+                if supplied_count < min_args or (isinstance(max_args, int) and supplied_count > max_args):
                     diagnostics.append(
-                        f"{caller['path']}:{caller['line']} {caller['symbol']} calls {item['name']} with {arg_count} positional args; expected {min_args}"
+                        f"{caller['path']}:{caller['line']} {caller['symbol']} calls {item['name']} with {supplied_count} supplied args; expected {min_args}"
                         + (f"-{max_args}" if isinstance(max_args, int) and max_args != min_args else "")
                     )
                 for expectation in caller.get("return_expectations", []) or []:

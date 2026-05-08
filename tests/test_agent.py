@@ -3112,6 +3112,489 @@ class AgentTests(unittest.TestCase):
         self.assertIn("return left + right", final_text)
         self.assertIn("return left - right", final_text)
 
+    def test_spec_guided_repair_applies_validated_candidate_after_failed_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text(
+                "def add(left, right):\n    pass\n\n"
+                "def sub(left, right):\n    pass\n\n"
+                "def double(value):\n    pass\n",
+                encoding="utf-8",
+            )
+            (root / "ops_test.py").write_text(
+                "import unittest\nfrom ops import add, sub, double\n\n"
+                "class OpsTest(unittest.TestCase):\n"
+                "    def test_add_one(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "    def test_add_two(self):\n"
+                "        self.assertEqual(add(-1, 4), 3)\n"
+                "    def test_sub_one(self):\n"
+                "        self.assertEqual(sub(5, 2), 3)\n"
+                "    def test_sub_two(self):\n"
+                "        self.assertEqual(sub(2, 5), -3)\n"
+                "    def test_double_one(self):\n"
+                "        self.assertEqual(double(4), 8)\n"
+                "    def test_double_two(self):\n"
+                "        self.assertEqual(double(-3), -6)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            candidate = (
+                "def add(left, right):\n"
+                "    return left + right\n\n"
+                "def sub(left, right):\n"
+                "    return left - right\n\n"
+                "def double(value):\n"
+                "    return value * 2\n"
+            )
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    candidate,
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "ops.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided repair applied", result.message)
+        self.assertIn("return left + right", final_text)
+        self.assertIn("return left - right", final_text)
+        self.assertIn("return value * 2", final_text)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), None)
+        self.assertGreaterEqual(tools.execute_counts.get("implementation_spec", 0), 1)
+        candidate_call = next(call for call in client.calls if call["response_format"] is None)
+        candidate_prompt = candidate_call["messages"][1]["content"]  # type: ignore[index]
+        self.assertIn("--- implementation spec ---", candidate_prompt)
+        self.assertIn("test method", candidate_prompt)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("candidate_validation", phases)
+
+    def test_spec_guided_repair_uses_verifier_model_after_candidate_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text(
+                "def add(left, right):\n    pass\n\n"
+                "def sub(left, right):\n    pass\n\n"
+                "def double(value):\n    pass\n",
+                encoding="utf-8",
+            )
+            (root / "ops_test.py").write_text(
+                "import unittest\nfrom ops import add, sub, double\n\n"
+                "class OpsTest(unittest.TestCase):\n"
+                "    def test_add_one(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "    def test_add_two(self):\n"
+                "        self.assertEqual(add(-1, 4), 3)\n"
+                "    def test_sub_one(self):\n"
+                "        self.assertEqual(sub(5, 2), 3)\n"
+                "    def test_sub_two(self):\n"
+                "        self.assertEqual(sub(2, 5), -3)\n"
+                "    def test_double_one(self):\n"
+                "        self.assertEqual(double(4), 8)\n"
+                "    def test_double_two(self):\n"
+                "        self.assertEqual(double(-3), -6)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            bad_candidate = (
+                "def add(left, right):\n"
+                "    return left - right\n\n"
+                "def sub(left, right):\n"
+                "    return left - right\n\n"
+                "def double(value):\n"
+                "    return value * 2\n"
+            )
+            good_candidate = (
+                "def add(left, right):\n"
+                "    return left + right\n\n"
+                "def sub(left, right):\n"
+                "    return left - right\n\n"
+                "def double(value):\n"
+                "    return value * 2\n"
+            )
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    bad_candidate,
+                    good_candidate,
+                ],
+                models=["fake-model", "strong-model"],
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                verifier_model="strong-model",
+                debate_enabled=False,
+                max_tool_rounds=8,
+            )
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            validation_models = [
+                event.get("model")
+                for event in agent.events
+                if event.get("type") == "spec_guided_repair" and event.get("phase") == "candidate_validation"
+            ]
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided repair applied", result.message)
+        self.assertEqual(validation_models, ["fake-model", "strong-model"])
+
+    def test_spec_guided_repair_fails_closed_after_candidate_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "ops_test.py").write_text(
+                "import unittest\nfrom ops import add\n\n"
+                "class OpsTest(unittest.TestCase):\n"
+                "    def test_add_one(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "    def test_add_two(self):\n"
+                "        self.assertEqual(add(-1, 4), 3)\n"
+                "    def test_add_three(self):\n"
+                "        self.assertEqual(add(0, 0), 0)\n"
+                "    def test_add_four(self):\n"
+                "        self.assertEqual(add(10, -7), 3)\n"
+                "    def test_add_five(self):\n"
+                "        self.assertEqual(add(2, 2), 4)\n"
+                "    def test_add_six(self):\n"
+                "        self.assertEqual(add(-3, -4), -7)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            bad_candidate = "def add(left, right):\n    return left - right\n"
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    bad_candidate,
+                ],
+                models=["fake-model"],
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "ops.py").read_text(encoding="utf-8")
+
+        self.assertFalse(result.completed)
+        self.assertIn("Spec-guided candidate repair did not produce", result.message)
+        self.assertIn("expected 3", result.message)
+        self.assertIn("pass", final_text)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("failed_closed", phases)
+
+    def test_spec_guided_repair_runs_after_malformed_edit_with_tests_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "ops_test.py").write_text(
+                "import unittest\nfrom ops import add\n\n"
+                "class OpsTest(unittest.TestCase):\n"
+                "    def test_add_one(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "    def test_add_two(self):\n"
+                "        self.assertEqual(add(-1, 4), 3)\n"
+                "    def test_add_three(self):\n"
+                "        self.assertEqual(add(0, 0), 0)\n"
+                "    def test_add_four(self):\n"
+                "        self.assertEqual(add(10, -7), 3)\n"
+                "    def test_add_five(self):\n"
+                "        self.assertEqual(add(2, 2), 4)\n"
+                "    def test_add_six(self):\n"
+                "        self.assertEqual(add(-3, -4), -7)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            candidate = "def add(left, right):\n    return left + right\n"
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_intent",
+                            "arguments": {"intent": "replace_body", "path": "ops.py", "symbol": "add", "body": "return \""},
+                        }
+                    ),
+                    candidate,
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "ops.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided repair applied", result.message)
+        self.assertIn("return left + right", final_text)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertGreaterEqual(tools.execute_counts.get("implementation_spec", 0), 1)
+        candidate_call = next(call for call in client.calls if call["response_format"] is None)
+        candidate_prompt = candidate_call["messages"][1]["content"]  # type: ignore[index]
+        self.assertIn("Direct edit skipped", candidate_prompt)
+        self.assertNotIn('return "', candidate_prompt)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("start", phases)
+
+    def test_spec_guided_repair_runs_after_post_edit_probe_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "ops_test.py").write_text(
+                "import unittest\nfrom ops import add\n\n"
+                "class OpsTest(unittest.TestCase):\n"
+                "    def test_add_one(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "    def test_add_two(self):\n"
+                "        self.assertEqual(add(-1, 4), 3)\n"
+                "    def test_add_three(self):\n"
+                "        self.assertEqual(add(0, 0), 0)\n"
+                "    def test_add_four(self):\n"
+                "        self.assertEqual(add(10, -7), 3)\n"
+                "    def test_add_five(self):\n"
+                "        self.assertEqual(add(2, 2), 4)\n"
+                "    def test_add_six(self):\n"
+                "        self.assertEqual(add(-3, -4), -7)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            fixed_candidate = "def add(left, right):\n    return left + right\n"
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_intent",
+                            "arguments": {"intent": "replace_body", "path": "ops.py", "symbol": "add", "body": "return left - right"},
+                        }
+                    ),
+                    fixed_candidate,
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "ops.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided repair applied", result.message)
+        self.assertIn("return left + right", final_text)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("candidate_validation", phases)
+
+    def test_spec_guided_repair_applies_mechanical_prefix_rotation_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pig.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
+            (root / "pig_test.py").write_text(
+                "import unittest\nfrom pig import translate\n\n"
+                "class PigTest(unittest.TestCase):\n"
+                "    def test_word_beginning_with_a_vowel(self):\n"
+                "        self.assertEqual(translate('apple'), 'appleay')\n"
+                "    def test_word_beginning_with_p(self):\n"
+                "        self.assertEqual(translate('pig'), 'igpay')\n"
+                "    def test_word_beginning_with_qu(self):\n"
+                "        self.assertEqual(translate('queen'), 'eenquay')\n"
+                "    def test_word_with_consonant_before_qu(self):\n"
+                "        self.assertEqual(translate('square'), 'aresquay')\n"
+                "    def test_word_beginning_with_xr(self):\n"
+                "        self.assertEqual(translate('xray'), 'xrayay')\n"
+                "    def test_y_after_consonant_cluster(self):\n"
+                "        self.assertEqual(translate('rhythm'), 'ythmrhay')\n"
+                "    def test_phrase(self):\n"
+                "        self.assertEqual(translate('quick fast run'), 'ickquay astfay unray')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "pig.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "pig_test.py"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "pig.py", "intent": "replace_body", "target": "translate", "replacement": "return text"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "pig.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("mechanical repair applied", result.message)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertIn("move_prefixes", final_text)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("mechanical_candidate_validation", phases)
+
+    def test_spec_guided_repair_applies_mechanical_word_arithmetic_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wordy.py").write_text("def answer(question):\n    pass\n", encoding="utf-8")
+            (root / "wordy_test.py").write_text(
+                "import unittest\nfrom wordy import answer\n\n"
+                "class WordyTest(unittest.TestCase):\n"
+                "    def test_just_a_number(self):\n"
+                "        self.assertEqual(answer('What is 5?'), 5)\n"
+                "    def test_addition(self):\n"
+                "        self.assertEqual(answer('What is 1 plus 1?'), 2)\n"
+                "    def test_subtraction(self):\n"
+                "        self.assertEqual(answer('What is 4 minus -12?'), 16)\n"
+                "    def test_multiplication(self):\n"
+                "        self.assertEqual(answer('What is -3 multiplied by 25?'), -75)\n"
+                "    def test_division(self):\n"
+                "        self.assertEqual(answer('What is 33 divided by -3?'), -11)\n"
+                "    def test_multiple_operations(self):\n"
+                "        self.assertEqual(answer('What is 17 minus 6 plus 3?'), 14)\n"
+                "    def test_unknown_operation(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is 52 cubed?')\n"
+                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
+                "    def test_syntax_error(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is 1 plus?')\n"
+                "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
+                "    def test_empty_question(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is?')\n"
+                "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
+                "    def test_non_math_question(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('Who is the President of the United States?')\n"
+                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "wordy.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "wordy_test.py"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "wordy.py", "intent": "replace_body", "target": "answer", "replacement": "return 0"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "wordy.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("mechanical repair applied", result.message)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertIn("multiplied by", final_text)
+        self.assertIn("raise ValueError(unknown_message)", final_text)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("mechanical_candidate_validation", phases)
+
+    def test_spec_guided_repair_applies_mechanical_text_matrix_transpose_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "transpose.py").write_text("def transpose(text):\n    pass\n", encoding="utf-8")
+            (root / "transpose_test.py").write_text(
+                "import unittest\nfrom transpose import transpose\n\n"
+                "class TransposeTest(unittest.TestCase):\n"
+                "    def test_two_characters_in_a_row(self):\n"
+                "        self.assertEqual(transpose('A1'), 'A\\n1')\n"
+                "    def test_two_characters_in_a_column(self):\n"
+                "        self.assertEqual(transpose('A\\n1'), 'A1')\n"
+                "    def test_simple(self):\n"
+                "        self.assertEqual(transpose('ABC\\n123'), 'A1\\nB2\\nC3')\n"
+                "    def test_single_line(self):\n"
+                "        self.assertEqual(transpose('A B'), 'A\\n \\nB')\n"
+                "    def test_rectangle(self):\n"
+                "        self.assertEqual(transpose('FRA\\nOUT'), 'FO\\nRU\\nAT')\n"
+                "    def test_jagged_triangle(self):\n"
+                "        self.assertEqual(transpose('11\\n2\\n3333\\n444\\n555555\\n66666'), '123456\\n1 3456\\n  3456\\n  3 56\\n    56\\n    5')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "transpose.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "transpose_test.py"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "transpose.py", "intent": "replace_body", "target": "transpose", "replacement": "return text"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "transpose.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("mechanical repair applied", result.message)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertIn("for column in range(width)", final_text)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("mechanical_candidate_validation", phases)
+
+    def test_spec_guided_repair_applies_mechanical_cyclic_scale_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scale_generator.py").write_text(
+                "class Scale:\n"
+                "    def __init__(self, tonic):\n"
+                "        pass\n"
+                "    def chromatic(self):\n"
+                "        pass\n"
+                "    def interval(self, intervals):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "scale_generator_test.py").write_text(
+                "import unittest\nfrom scale_generator import Scale\n\n"
+                "class ScaleTest(unittest.TestCase):\n"
+                "    def test_chromatic_scale_with_sharps(self):\n"
+                "        self.assertEqual(Scale('C').chromatic(), ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'])\n"
+                "    def test_chromatic_scale_with_flats(self):\n"
+                "        self.assertEqual(Scale('F').chromatic(), ['F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B', 'C', 'Db', 'D', 'Eb', 'E'])\n"
+                "    def test_simple_major_scale(self):\n"
+                "        self.assertEqual(Scale('C').interval('MMmMMMm'), ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C'])\n"
+                "    def test_major_scale_with_flats(self):\n"
+                "        self.assertEqual(Scale('F').interval('MMmMMMm'), ['F', 'G', 'A', 'Bb', 'C', 'D', 'E', 'F'])\n"
+                "    def test_minor_scale_with_sharps(self):\n"
+                "        self.assertEqual(Scale('f#').interval('MmMMmMM'), ['F#', 'G#', 'A', 'B', 'C#', 'D', 'E', 'F#'])\n"
+                "    def test_enigmatic(self):\n"
+                "        self.assertEqual(Scale('G').interval('mAMMMmm'), ['G', 'G#', 'B', 'C#', 'D#', 'F', 'F#', 'G'])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "scale_generator.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "scale_generator_test.py"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "scale_generator.py", "intent": "replace_body", "target": "Scale.interval", "replacement": "return []"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "scale_generator.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("mechanical repair applied", result.message)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertIn("STEPS", final_text)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("mechanical_candidate_validation", phases)
+
     def test_static_sanity_guard_blocks_tests_after_bad_python_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

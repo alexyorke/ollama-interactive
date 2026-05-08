@@ -119,6 +119,8 @@ MAX_VERIFICATION_RETRIES = 2
 MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
 MAX_ASSUMPTION_AUDIT_RETRIES = 2
 MAX_RECONCILIATION_RETRIES = 2
+SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT = 150
+SPEC_GUIDED_REPAIR_MAX_ATTEMPTS = 2
 AUDIT_LIST_ITEM_LIMIT = 3
 AUDIT_TEXT_ITEM_LIMIT = 140
 CANDIDATE_CLAIM_LIMIT = 5
@@ -156,6 +158,7 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "systems_lens",
     "find_implementation_target",
     "diagnose_test_failure",
+    "implementation_spec",
     "diagnose_dependency_error",
     "call_graph",
     "contract_graph",
@@ -168,7 +171,7 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "git_status",
     "git_diff",
 }
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "implementation_spec", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
 CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
 INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh", "verified_function_index"}
 STRUCTURAL_SEARCH_TOOL_NAMES = {"semgrep_scan", "ast_search"}
@@ -176,12 +179,12 @@ LSP_TOOL_NAMES = {"lsp_diagnostics", "lsp_definition", "lsp_references"}
 GRAPH_TOOL_NAMES = {"call_graph", "contract_graph"}
 EDIT_TOOL_NAMES = {"edit_intent", "write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
 LOW_LEVEL_EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
-TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "test_spec_extract", "diagnose_dependency_error", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "generate_tests_from_spec"}
+TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "test_spec_extract", "implementation_spec", "diagnose_dependency_error", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "generate_tests_from_spec"}
 SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "mcp_list_tools"}
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
+CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "implementation_spec", "mcp_list_tools"}
+GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "implementation_spec", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
 VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "verify_function_contract", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
@@ -211,6 +214,7 @@ MODEL_TOOL_RESULT_LIMITS = {
     "systems_lens": 900,
     "find_implementation_target": 800,
     "diagnose_test_failure": 900,
+    "implementation_spec": 1300,
     "run_function_probe": 700,
     "call_graph": 900,
     "contract_graph": 1000,
@@ -4865,6 +4869,355 @@ class OllamaCodeAgent:
         response["ok"] = True
         return response
 
+    def _spec_guided_repair_paths(self, successful_tool_results: list[dict[str, Any]]) -> tuple[str, str] | None:
+        source_paths = self._recent_source_paths(successful_tool_results)
+        test_paths = self._recent_test_paths(successful_tool_results)
+        if not source_paths or not test_paths:
+            return None
+        source_path = source_paths[-1]
+        test_path = test_paths[-1]
+        try:
+            source_file = self.tools.resolve_path(source_path, allow_missing=False)
+            line_count = len(source_file.read_text(encoding="utf-8", errors="replace").splitlines())
+        except Exception:
+            return None
+        if line_count > 260:
+            return None
+        return source_path, test_path
+
+    def _extract_candidate_python_source(self, text: str) -> str:
+        raw = text.strip()
+        if not raw:
+            return ""
+        fence = re.search(r"```(?:python|py)?\s*(?P<code>.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
+        if fence:
+            raw = fence.group("code").strip()
+        lines = raw.splitlines()
+        start = 0
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(("import ", "from ", "def ", "class ", "@")):
+                start = index
+                break
+        candidate = "\n".join(lines[start:]).strip()
+        if not re.search(r"^\s*(?:def|class)\s+", candidate, flags=re.MULTILINE):
+            return ""
+        return candidate + "\n"
+
+    def _spec_guided_repair_messages(
+        self,
+        *,
+        source_path: str,
+        test_path: str,
+        source_text: str,
+        spec_output: str,
+        failed_test_output: str,
+        prior_feedback: str,
+    ) -> list[dict[str, str]]:
+        user = (
+            "Repair this Python implementation file using the tests as the executable spec.\n"
+            "Return only the complete replacement source for the implementation file. No JSON, no markdown, no explanation.\n"
+            "Preserve public class/function/method names and signatures exactly.\n\n"
+            "Use unittest method names, transform hints, and assertion order as requirement labels; they often describe edge-case rules.\n\n"
+            f"Source path: {source_path}\n"
+            f"Test path: {test_path}\n\n"
+            "--- current source ---\n"
+            + self._truncate_text(source_text, limit=9000)
+            + "\n\n--- implementation spec ---\n"
+            + self._truncate_text(spec_output, limit=5000)
+            + "\n\n--- failing tests ---\n"
+            + self._truncate_text(failed_test_output, limit=2600)
+        )
+        if prior_feedback:
+            user += "\n\n--- previous candidate validation failure ---\n" + self._truncate_text(prior_feedback, limit=1800)
+        return [
+            {
+                "role": "system",
+                "content": "You generate complete Python source files for a coding CLI repair engine. Output only source code.",
+            },
+            {"role": "user", "content": user},
+        ]
+
+    def _spec_guided_repair_candidate_models(self) -> list[str]:
+        models = [self.model]
+        available: set[str] = set()
+        list_models = getattr(self.client, "list_models", None)
+        if callable(list_models):
+            try:
+                available = {str(model) for model in list_models()}
+            except Exception:
+                available = set()
+        for candidate in (
+            self.verifier_model,
+            "gemma4:26b",
+            "qwen3:8b",
+            "granite4.1:8b-q6_K",
+            "granite4.1:8b-q8_0",
+        ):
+            if not candidate or candidate in models:
+                continue
+            if available and candidate not in available:
+                continue
+            models.append(candidate)
+            if len(models) >= SPEC_GUIDED_REPAIR_MAX_ATTEMPTS:
+                break
+        return models
+
+    def _try_spec_guided_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        failed_run_test_result: dict[str, Any],
+        run_test_arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        paths = self._spec_guided_repair_paths(successful_tool_results)
+        if paths is None:
+            return None
+        source_path, test_path = paths
+        try:
+            source_file = self.tools.resolve_path(source_path, allow_missing=False)
+            source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        try:
+            quick_spec = self.tools.implementation_spec(source_path, test_path, limit=60)
+        except Exception:
+            return None
+        if quick_spec.get("ok") is not True:
+            return None
+        if len(list(quick_spec.get("stubs") or [])) < 3 and len(list(quick_spec.get("examples") or [])) < 6:
+            return None
+        failed_tool = str(failed_run_test_result.get("tool") or "").strip()
+        if failed_tool == "preemptive_spec_repair":
+            failed_output = str(failed_run_test_result.get("output") or failed_run_test_result.get("summary") or "").strip()
+        elif failed_tool and failed_tool != "run_test":
+            failed_output = "Previous edit candidate was rejected before applying. Ignore that malformed edit and implement from the source plus executable spec."
+        else:
+            failed_output = str(failed_run_test_result.get("output") or failed_run_test_result.get("summary") or "").strip()
+        self._record_event(
+            "spec_guided_repair",
+            phase="start",
+            source_path=source_path,
+            test_path=test_path,
+            rounds=round_number,
+        )
+        spec_result = self._execute_controller_tool(
+            name="implementation_spec",
+            arguments={"source_path": source_path, "test_path": test_path, "limit": 60},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if spec_result.get("ok") is not True:
+            return None
+        spec_output = str(spec_result.get("output") or spec_result.get("summary") or "")
+        test_command = str(run_test_arguments.get("command") or self.tools.default_test_command or "").strip()
+        feedback = ""
+        for synthesis_name in (
+            "synthesize_word_arithmetic_candidate",
+            "synthesize_prefix_rotation_candidate",
+            "synthesize_text_matrix_transpose_candidate",
+            "synthesize_cyclic_interval_scale_candidate",
+        ):
+            try:
+                synthesize = getattr(self.tools, synthesis_name)
+                synthesized = synthesize(source_path, test_path, limit=80)
+            except Exception as exc:
+                synthesized = {"ok": False, "summary": f"{synthesis_name} failed: {exc}"}
+            if synthesized.get("ok") is not True or not isinstance(synthesized.get("candidate_source"), str):
+                continue
+            candidate = str(synthesized["candidate_source"])
+            validation = self.tools.validate_implementation_candidate(
+                source_path,
+                candidate,
+                test_path=test_path,
+                test_command=test_command or None,
+                probe_limit=24,
+                timeout=120,
+            )
+            self._record_event(
+                "spec_guided_repair",
+                phase="mechanical_candidate_validation",
+                ok=validation.get("ok") is True,
+                stage=validation.get("stage"),
+                summary=self._truncate_text(str(validation.get("summary") or validation.get("output") or ""), limit=700),
+                candidate_chars=len(candidate),
+                synthesis_summary=synthesized.get("summary"),
+                rounds=round_number,
+            )
+            if validation.get("ok") is True:
+                candidate_to_apply = str(validation.get("candidate_source") or candidate)
+                apply_result = self._execute_controller_tool(
+                    name="write_file",
+                    arguments={"path": source_path, "content": candidate_to_apply},
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                if apply_result.get("ok") is True:
+                    final_test_args = dict(run_test_arguments)
+                    if test_command and "command" not in final_test_args:
+                        final_test_args["command"] = test_command
+                    final_result = self._execute_controller_tool(
+                        name="run_test",
+                        arguments=final_test_args,
+                        request_text=request_text,
+                        round_number=round_number,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if final_result.get("ok") is True:
+                        message = "Spec-guided mechanical repair applied and tests passed."
+                        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+                        self._record_event("assistant", content=message, rounds=round_number)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=message, rounds=round_number, completed=True)
+                    feedback = str(final_result.get("output") or final_result.get("summary") or "mechanical candidate failed after applying")
+                else:
+                    feedback = str(apply_result.get("summary") or "mechanical candidate could not be applied")
+            else:
+                feedback = str(validation.get("output") or validation.get("summary") or "mechanical candidate validation failed")
+        candidate_models = self._spec_guided_repair_candidate_models()
+        for attempt, candidate_model in enumerate(candidate_models, start=1):
+            self._record_event(
+                "spec_guided_repair",
+                phase="candidate_start",
+                attempt=attempt,
+                model=candidate_model,
+                source_path=source_path,
+                test_path=test_path,
+                rounds=round_number,
+            )
+            old_timeout: int | None = None
+            if isinstance(self.client, OllamaClient):
+                old_timeout = self.client.timeout
+                self.client.timeout = min(self.client.timeout, SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT)
+            try:
+                response = self._chat(
+                    purpose="candidate_repair",
+                    model=candidate_model,
+                    messages=self._spec_guided_repair_messages(
+                        source_path=source_path,
+                        test_path=test_path,
+                        source_text=source_text,
+                        spec_output=spec_output,
+                        failed_test_output=failed_output,
+                        prior_feedback=feedback,
+                    ),
+                    response_format=None,
+                    think=False,
+                    options={"temperature": 0, "num_predict": 4096},
+                    primary_can_emit_large_payload=True,
+                )
+            except Exception as exc:
+                feedback = f"candidate generation failed: {exc}"
+                self._record_event(
+                    "spec_guided_repair",
+                    phase="candidate_generation_failed",
+                    attempt=attempt,
+                    model=candidate_model,
+                    error_class=exc.__class__.__name__,
+                    summary=self._truncate_text(feedback, limit=700),
+                    rounds=round_number,
+                )
+                continue
+            finally:
+                if old_timeout is not None and isinstance(self.client, OllamaClient):
+                    self.client.timeout = old_timeout
+            candidate = self._extract_candidate_python_source(response.content)
+            if not candidate:
+                feedback = "candidate generation did not return a complete Python source file"
+                self._record_event(
+                    "spec_guided_repair",
+                    phase="candidate_invalid",
+                    attempt=attempt,
+                    model=candidate_model,
+                    summary=feedback,
+                    rounds=round_number,
+                )
+                continue
+            validation = self.tools.validate_implementation_candidate(
+                source_path,
+                candidate,
+                test_path=test_path,
+                test_command=test_command or None,
+                probe_limit=24,
+                timeout=120,
+            )
+            self._record_event(
+                "spec_guided_repair",
+                phase="candidate_validation",
+                attempt=attempt,
+                model=candidate_model,
+                ok=validation.get("ok") is True,
+                stage=validation.get("stage"),
+                normalized=validation.get("normalized"),
+                summary=self._truncate_text(str(validation.get("summary") or validation.get("output") or ""), limit=700),
+                candidate_chars=len(candidate),
+                rounds=round_number,
+            )
+            if validation.get("ok") is not True:
+                feedback = str(validation.get("output") or validation.get("summary") or "candidate validation failed")
+                continue
+            candidate_to_apply = str(validation.get("candidate_source") or candidate)
+            apply_result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": source_path, "content": candidate_to_apply},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if apply_result.get("ok") is not True:
+                feedback = str(apply_result.get("summary") or "validated candidate could not be applied")
+                continue
+            final_test_args = dict(run_test_arguments)
+            if test_command and "command" not in final_test_args:
+                final_test_args["command"] = test_command
+            final_result = self._execute_controller_tool(
+                name="run_test",
+                arguments=final_test_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if final_result.get("ok") is True:
+                message = "Spec-guided repair applied and tests passed."
+                self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+                self._record_event("assistant", content=message, rounds=round_number)
+                self._flush_llm_call_events()
+                return AgentResult(message=message, rounds=round_number, completed=True)
+            feedback = str(final_result.get("output") or final_result.get("summary") or "validated candidate failed after applying")
+        if feedback:
+            message = "Spec-guided candidate repair did not produce a passing implementation: " + self._truncate_text(
+                feedback,
+                limit=900,
+            )
+            self._record_event(
+                "spec_guided_repair",
+                phase="failed_closed",
+                source_path=source_path,
+                test_path=test_path,
+                summary=message,
+                rounds=round_number,
+            )
+            self._record_event("assistant", content=message, rounds=round_number)
+            self._flush_llm_call_events()
+            return AgentResult(message=message, rounds=round_number, completed=False)
+        return None
+
     def handle_user(self, text: str) -> AgentResult:
         self._reset_turn_cache()
         self._pending_llm_call_events = []
@@ -4942,6 +5295,7 @@ class OllamaCodeAgent:
         previous_run_test_failure_summary = ""
         failed_test_context_reads = 0
         bulk_stub_guard_counts: dict[str, int] = {}
+        spec_guided_repair_attempted = False
         failed_test_mutation_version: int | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
         unresolved_static_diagnostics: dict[str, str] = {}
@@ -5905,6 +6259,31 @@ class OllamaCodeAgent:
                     )
                     self.messages.append({"role": "user", "content": self._trajectory_ground_guard_message(text)})
                     continue
+                if (
+                    name in MUTATING_TOOL_NAMES
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_paths(successful_tool_results) is not None
+                ):
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result={
+                            "ok": False,
+                            "tool": "preemptive_spec_repair",
+                            "summary": "Direct edit skipped for spec-guided candidate validation.",
+                            "output": "Direct edit skipped for spec-guided candidate validation.",
+                        },
+                        run_test_arguments={},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
                 if self._tool_call_needs_assumption_audit(
                     request_text=text,
                     name=name,
@@ -6100,6 +6479,28 @@ class OllamaCodeAgent:
                 for feedback in post_tool_feedback:
                     self.messages.append({"role": "user", "content": feedback})
                 if (
+                    name in MUTATING_TOOL_NAMES
+                    and result.get("ok") is True
+                    and post_tool_feedback
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                ):
+                    spec_guided_repair_attempted = True
+                    feedback_text = "\n".join(post_tool_feedback)
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result={"ok": False, "summary": feedback_text, "output": feedback_text},
+                        run_test_arguments={},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
+                if (
                     latest_run_test_failed
                     and (mutation_required or code_mutation_required)
                     and test_run_required
@@ -6116,6 +6517,58 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                     self.messages.append({"role": "user", "content": self._failed_test_no_edit_guard_message(successful_tool_results)})
+                if (
+                    name == "run_test"
+                    and result.get("ok") is not True
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                ):
+                    spec_guided_repair_attempted = True
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result=result,
+                        run_test_arguments=arguments,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
+                if (
+                    name in MUTATING_TOOL_NAMES
+                    and result.get("ok") is not True
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and any(
+                        token in str(result.get("summary") or result.get("output") or "").lower()
+                        for token in (
+                            "syntax error",
+                            "syntaxerror",
+                            "indentationerror",
+                            "invalid syntax",
+                            "invalid",
+                            "requires",
+                            "bad arguments",
+                        )
+                    )
+                ):
+                    spec_guided_repair_attempted = True
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result=result,
+                        run_test_arguments={},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
                 self._autosave()
                 if self._tool_result_needs_reconciliation(
                     request_text=text,

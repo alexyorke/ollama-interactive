@@ -35,7 +35,10 @@ class _MalformedResponseHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def do_GET(self) -> None:
         if self.path != "/api/tags":
@@ -46,7 +49,10 @@ class _MalformedResponseHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(type(self).response_body)
+        try:
+            self.wfile.write(type(self).response_body)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            return
 
     def log_message(self, format: str, *args: object) -> None:
         return
@@ -100,6 +106,20 @@ class OllamaClientTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_chat_enforces_total_wall_clock_timeout(self) -> None:
+        client, server, thread = self._with_server(b'{"message":{"content":"ok"}}', delay=1.0)
+        client.timeout = 0.1
+        started = time.perf_counter()
+        try:
+            with self.assertRaisesRegex(OllamaError, r"timed out after 0.1 seconds"):
+                client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            elapsed = time.perf_counter() - started
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+        self.assertLess(elapsed, 0.8)
 
     def test_chat_enables_thinking_by_default(self) -> None:
         client, server, thread = self._with_server(b'{"message":{"content":"ok"}}')

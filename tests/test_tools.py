@@ -1541,10 +1541,12 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         output = result["output"]
+        self.assertIn("[add] answer('What is 1 plus 1?') -> 2", output)
         self.assertIn("answer('What is 1 plus 1?') -> 2", output)
         self.assertIn("keep(lambda value: value > 1, [1, 2]) -> [2]", output)
         self.assertIn("answer('What is 52 cubed?') raises ValueError", output)
         self.assertIn("answer('What is?') raises ValueError", output)
+        self.assertEqual(result["examples"][0]["test_name"], "test_add")
 
     def test_test_spec_extract_resolves_local_expected_values_and_messages(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1598,6 +1600,87 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertIn("school = School(); school.add_student(name='Aimee', grade=2); school.roster() -> ['Aimee']", result["output"])
 
+    def test_test_spec_extract_keeps_constructor_attribute_and_receiver_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "phone_number.py").write_text("class PhoneNumber:\n    def __init__(self, number):\n        pass\n", encoding="utf-8")
+            (root / "phone_number_test.py").write_text(
+                "import unittest\nfrom phone_number import PhoneNumber\n\n"
+                "class PhoneNumberTest(unittest.TestCase):\n"
+                "    def test_number_attribute(self):\n"
+                "        number = PhoneNumber('(223) 456-7890').number\n"
+                "        self.assertEqual(number, '2234567890')\n"
+                "    def test_area_code_attribute(self):\n"
+                "        number = PhoneNumber('2234567890')\n"
+                "        self.assertEqual(number.area_code, '223')\n"
+                "    def test_missing_method_required_by_tests(self):\n"
+                "        number = PhoneNumber('2234567890')\n"
+                "        self.assertEqual(number.pretty(), '(223)-456-7890')\n",
+                encoding="utf-8",
+            )
+            (root / "scale_generator.py").write_text(
+                "class Scale:\n"
+                "    def __init__(self, tonic):\n"
+                "        pass\n"
+                "    def interval(self, intervals):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "scale_generator_test.py").write_text(
+                "import unittest\nfrom scale_generator import Scale\n\n"
+                "class ScaleTest(unittest.TestCase):\n"
+                "    def test_major(self):\n"
+                "        expected = ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C']\n"
+                "        self.assertEqual(Scale('C').interval('MMmMMMm'), expected)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            phone = tools.test_spec_extract("phone_number_test.py", source_path="phone_number.py", limit=10)
+            scale = tools.test_spec_extract("scale_generator_test.py", source_path="scale_generator.py", limit=10)
+
+        self.assertTrue(phone["ok"], phone)
+        self.assertIn("PhoneNumber('(223) 456-7890').number -> '2234567890'", phone["output"])
+        self.assertIn("PhoneNumber('2234567890').area_code -> '223'", phone["output"])
+        self.assertIn("number = PhoneNumber('2234567890'); number.pretty() -> '(223)-456-7890'", phone["output"])
+        self.assertTrue(scale["ok"], scale)
+        self.assertIn("Scale('C').interval('MMmMMMm') -> ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C']", scale["output"])
+
+    def test_test_spec_extract_preserves_nested_receiver_and_repeated_mutation_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "simple_linked_list.py").write_text(
+                "class LinkedList:\n"
+                "    def __init__(self, values=None):\n"
+                "        pass\n"
+                "    def head(self):\n"
+                "        pass\n"
+                "    def pop(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "simple_linked_list_test.py").write_text(
+                "import unittest\nfrom simple_linked_list import LinkedList\n\n"
+                "class LinkedListTest(unittest.TestCase):\n"
+                "    def test_nested_head_value(self):\n"
+                "        sut = LinkedList([1])\n"
+                "        self.assertEqual(sut.head().value(), 1)\n"
+                "    def test_repeated_pop(self):\n"
+                "        sut = LinkedList([1, 2])\n"
+                "        sut.push(3)\n"
+                "        self.assertEqual(sut.pop(), 3)\n"
+                "        self.assertEqual(sut.pop(), 2)\n"
+                "        self.assertEqual(sut.pop(), 1)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("simple_linked_list_test.py", source_path="simple_linked_list.py", limit=10)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("sut = LinkedList([1]); sut.head().value() -> 1", result["output"])
+        self.assertIn("sut = LinkedList([1, 2]); sut.push(3); sut.pop() -> 3", result["output"])
+        self.assertIn("sut = LinkedList([1, 2]); sut.push(3); sut.pop(); sut.pop() -> 2", result["output"])
+        self.assertIn("sut = LinkedList([1, 2]); sut.push(3); sut.pop(); sut.pop(); sut.pop() -> 1", result["output"])
+
     def test_test_spec_extract_balances_examples_across_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1631,6 +1714,321 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("append:", result["output"])
         self.assertIn("foldr:", result["output"])
         self.assertIn("reverse:", result["output"])
+
+    def test_implementation_spec_groups_signatures_stubs_examples_and_risks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "bag.py").write_text(
+                "class Bag:\n"
+                "    def __init__(self):\n"
+                "        self.items = []\n"
+                "        self.size = 0\n"
+                "\n"
+                "    def size(self):\n"
+                "        pass\n"
+                "\n"
+                "def add(left, right):\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
+            (root / "bag_test.py").write_text(
+                "import unittest\nfrom bag import add, Bag\n\n"
+                "class BagTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "    def test_bag_size(self):\n"
+                "        bag = Bag()\n"
+                "        self.assertEqual(bag.size(), 0)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.implementation_spec("bag.py", "bag_test.py", limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Bag.size", result["output"])
+        self.assertIn("add(1, 2) -> 3", result["output"])
+        self.assertIn("self.size shadows method size()", result["output"])
+        self.assertIn("bag.py::add", result["stubs"])
+
+    def test_implementation_spec_does_not_hide_late_single_symbol_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "words.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
+            tests = "import unittest\nfrom words import translate\n\nclass WordsTest(unittest.TestCase):\n"
+            for index in range(12):
+                tests += (
+                    f"    def test_case_{index}(self):\n"
+                    f"        self.assertEqual(translate('word{index}'), 'out{index}')\n"
+                )
+            (root / "words_test.py").write_text(tests, encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.implementation_spec("words.py", "words_test.py", limit=40)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("translate('word0') -> 'out0'", result["output"])
+        self.assertIn("translate('word11') -> 'out11'", result["output"])
+
+    def test_implementation_spec_includes_string_transform_hints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pig.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
+            (root / "pig_test.py").write_text(
+                "import unittest\nfrom pig import translate\n\n"
+                "class PigTest(unittest.TestCase):\n"
+                "    def test_word_beginning_with_a_vowel(self):\n"
+                "        self.assertEqual(translate('apple'), 'appleay')\n"
+                "    def test_word_beginning_with_qu(self):\n"
+                "        self.assertEqual(translate('queen'), 'eenquay')\n"
+                "    def test_word_with_consonant_before_qu(self):\n"
+                "        self.assertEqual(translate('square'), 'aresquay')\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.implementation_spec("pig.py", "pig_test.py", limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("observed string transforms:", result["output"])
+        self.assertIn("'apple': append 'ay'", result["output"])
+        self.assertIn("'queen': move prefix 'qu' to end, append 'ay'", result["output"])
+        self.assertIn("'square': move prefix 'squ' to end, append 'ay'", result["output"])
+
+    def test_synthesize_prefix_rotation_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pig.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
+            (root / "pig_test.py").write_text(
+                "import unittest\nfrom pig import translate\n\n"
+                "class PigTest(unittest.TestCase):\n"
+                "    def test_word_beginning_with_a_vowel(self):\n"
+                "        self.assertEqual(translate('apple'), 'appleay')\n"
+                "    def test_word_beginning_with_p(self):\n"
+                "        self.assertEqual(translate('pig'), 'igpay')\n"
+                "    def test_word_beginning_with_qu(self):\n"
+                "        self.assertEqual(translate('queen'), 'eenquay')\n"
+                "    def test_word_with_consonant_before_qu(self):\n"
+                "        self.assertEqual(translate('square'), 'aresquay')\n"
+                "    def test_word_beginning_with_xr(self):\n"
+                "        self.assertEqual(translate('xray'), 'xrayay')\n"
+                "    def test_y_after_consonant_cluster(self):\n"
+                "        self.assertEqual(translate('rhythm'), 'ythmrhay')\n"
+                "    def test_phrase(self):\n"
+                "        self.assertEqual(translate('quick fast run'), 'ickquay astfay unray')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_prefix_rotation_candidate("pig.py", "pig_test.py")
+            validation = tools.validate_implementation_candidate(
+                "pig.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="pig_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("squ", synthesized["observed_prefixes"]["move"])
+
+    def test_synthesize_word_arithmetic_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wordy.py").write_text("def answer(question):\n    pass\n", encoding="utf-8")
+            (root / "wordy_test.py").write_text(
+                "import unittest\nfrom wordy import answer\n\n"
+                "class WordyTest(unittest.TestCase):\n"
+                "    def test_just_a_number(self):\n"
+                "        self.assertEqual(answer('What is 5?'), 5)\n"
+                "    def test_addition(self):\n"
+                "        self.assertEqual(answer('What is 1 plus 1?'), 2)\n"
+                "    def test_subtraction(self):\n"
+                "        self.assertEqual(answer('What is 4 minus -12?'), 16)\n"
+                "    def test_multiplication(self):\n"
+                "        self.assertEqual(answer('What is -3 multiplied by 25?'), -75)\n"
+                "    def test_division(self):\n"
+                "        self.assertEqual(answer('What is 33 divided by -3?'), -11)\n"
+                "    def test_multiple_operations(self):\n"
+                "        self.assertEqual(answer('What is 17 minus 6 plus 3?'), 14)\n"
+                "    def test_unknown_operation(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is 52 cubed?')\n"
+                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
+                "    def test_syntax_error(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is 1 plus?')\n"
+                "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
+                "    def test_empty_question(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is?')\n"
+                "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
+                "    def test_non_math_question(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('Who is the President of the United States?')\n"
+                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_word_arithmetic_candidate("wordy.py", "wordy_test.py")
+            validation = tools.validate_implementation_candidate(
+                "wordy.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="wordy_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertTrue(synthesized["operations"]["multiplied by"])
+        self.assertIn("unknown operation", synthesized["candidate_source"])
+
+    def test_synthesize_text_matrix_transpose_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "transpose.py").write_text("def transpose(text):\n    pass\n", encoding="utf-8")
+            (root / "transpose_test.py").write_text(
+                "import unittest\nfrom transpose import transpose\n\n"
+                "class TransposeTest(unittest.TestCase):\n"
+                "    def test_empty_string(self):\n"
+                "        self.assertEqual(transpose(''), '')\n"
+                "    def test_two_characters_in_a_row(self):\n"
+                "        self.assertEqual(transpose('A1'), 'A\\n1')\n"
+                "    def test_two_characters_in_a_column(self):\n"
+                "        self.assertEqual(transpose('A\\n1'), 'A1')\n"
+                "    def test_simple(self):\n"
+                "        self.assertEqual(transpose('ABC\\n123'), 'A1\\nB2\\nC3')\n"
+                "    def test_single_line_with_space(self):\n"
+                "        self.assertEqual(transpose('A B'), 'A\\n \\nB')\n"
+                "    def test_jagged_triangle(self):\n"
+                "        self.assertEqual(transpose('11\\n2\\n3333\\n444\\n555555\\n66666'), '123456\\n1 3456\\n  3456\\n  3 56\\n    56\\n    5')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_text_matrix_transpose_candidate("transpose.py", "transpose_test.py")
+            validation = tools.validate_implementation_candidate(
+                "transpose.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="transpose_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("for column in range(width)", synthesized["candidate_source"])
+
+    def test_synthesize_cyclic_interval_scale_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scale_generator.py").write_text(
+                "class Scale:\n"
+                "    def __init__(self, tonic):\n"
+                "        pass\n"
+                "    def chromatic(self):\n"
+                "        pass\n"
+                "    def interval(self, intervals):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / "scale_generator_test.py").write_text(
+                "import unittest\nfrom scale_generator import Scale\n\n"
+                "class ScaleTest(unittest.TestCase):\n"
+                "    def test_chromatic_scale_with_sharps(self):\n"
+                "        self.assertEqual(Scale('C').chromatic(), ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'])\n"
+                "    def test_chromatic_scale_with_flats(self):\n"
+                "        self.assertEqual(Scale('F').chromatic(), ['F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B', 'C', 'Db', 'D', 'Eb', 'E'])\n"
+                "    def test_simple_major_scale(self):\n"
+                "        self.assertEqual(Scale('C').interval('MMmMMMm'), ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C'])\n"
+                "    def test_major_scale_with_flats(self):\n"
+                "        self.assertEqual(Scale('F').interval('MMmMMMm'), ['F', 'G', 'A', 'Bb', 'C', 'D', 'E', 'F'])\n"
+                "    def test_minor_scale_with_sharps(self):\n"
+                "        self.assertEqual(Scale('f#').interval('MmMMmMM'), ['F#', 'G#', 'A', 'B', 'C#', 'D', 'E', 'F#'])\n"
+                "    def test_enigmatic(self):\n"
+                "        self.assertEqual(Scale('G').interval('mAMMMmm'), ['G', 'G#', 'B', 'C#', 'D#', 'F', 'F#', 'G'])\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_cyclic_interval_scale_candidate("scale_generator.py", "scale_generator_test.py")
+            validation = tools.validate_implementation_candidate(
+                "scale_generator.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="scale_generator_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("F", synthesized["flat_tonics"])
+
+    def test_validate_implementation_candidate_uses_temp_workspace_and_preserves_signatures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "ops.py"
+            source.write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "ops_test.py").write_text(
+                "import unittest\nfrom ops import add\n\n"
+                "class OpsTest(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            changed_signature = tools.validate_implementation_candidate(
+                "ops.py",
+                "def add(left, right, extra=None):\n    return left + right\n",
+                test_path="ops_test.py",
+                test_command=command,
+            )
+            passing = tools.validate_implementation_candidate(
+                "ops.py",
+                "def add(left, right):\n    return left + right\n",
+                test_path="ops_test.py",
+                test_command=command,
+            )
+            annotated = tools.validate_implementation_candidate(
+                "ops.py",
+                "def add(left: int, right: int) -> int:\n    return left + right\n",
+                test_path="ops_test.py",
+                test_command=command,
+            )
+            final_text = source.read_text(encoding="utf-8")
+
+        self.assertFalse(changed_signature["ok"])
+        self.assertEqual(changed_signature["stage"], "signature")
+        self.assertTrue(passing["ok"], passing)
+        self.assertTrue(annotated["ok"], annotated)
+        self.assertIn("pass", final_text)
+
+    def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "list_ops.py"
+            source.write_text("def foldr(function, list, initial):\n    pass\n", encoding="utf-8")
+            (root / "list_ops_test.py").write_text(
+                "import unittest\nfrom list_ops import foldr\n\n"
+                "class ListOpsTest(unittest.TestCase):\n"
+                "    def test_foldr_direction(self):\n"
+                "        self.assertEqual(foldr(lambda acc, el: el / acc, [1, 2, 3, 4], 24), 9)\n"
+                "        self.assertEqual(foldr(lambda acc, el: el + acc, ['e', 'x'], '!'), 'ex!')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.validate_implementation_candidate(
+                "list_ops.py",
+                "def foldr(function, list, initial):\n"
+                "    result = initial\n"
+                "    for item in reversed(list):\n"
+                "        result = function(item, result)\n"
+                "    return result\n",
+                test_path="list_ops_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized foldr reducer order", result["normalized"])
+        self.assertIn("accumulator = function(accumulator, item)", result["candidate_source"])
 
     def test_run_test_example_probes_report_value_and_type_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1750,8 +2148,75 @@ class ToolExecutorTests(unittest.TestCase):
             result = tools.contract_check(["robot_name.py", "scale_generator.py"], limit=20)
 
         self.assertFalse(result["ok"], result)
-        self.assertIn("calls Robot with 0 positional args; expected 1", result["output"])
+        self.assertIn("calls Robot with 0 supplied args; expected 1", result["output"])
         self.assertIn("placeholder", result["output"].lower())
+
+    def test_contract_check_treats_instance_methods_as_bound_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "phone_number.py").write_text(
+                "class PhoneNumber:\n"
+                "    def __init__(self, number):\n"
+                "        self.number = number\n"
+                "    def pretty(self):\n"
+                "        return self.number\n",
+                encoding="utf-8",
+            )
+            (root / "phone_number_test.py").write_text(
+                "from phone_number import PhoneNumber\n\n"
+                "def test_pretty():\n"
+                "    number = PhoneNumber('2234567890')\n"
+                "    return number.pretty()\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["phone_number.py", "phone_number_test.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("calls pretty with 0 supplied args; expected 1", result["output"])
+
+    def test_contract_check_counts_keyword_arguments_for_arity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "grade_school.py").write_text(
+                "class School:\n"
+                "    def add_student(self, name, grade):\n"
+                "        return True\n\n"
+                "def scenario():\n"
+                "    school = School()\n"
+                "    return school.add_student(name='Aimee', grade=2)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["grade_school.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("calls add_student with", result["output"])
+
+    def test_contract_check_allows_exception_messages_and_bare_builtin_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "linked.py").write_text(
+                "class EmptyListException(Exception):\n"
+                "    pass\n\n"
+                "class LinkedList:\n"
+                "    def __init__(self, values=None):\n"
+                "        for value in reversed(values or []):\n"
+                "            self.push(value)\n"
+                "    def push(self, value):\n"
+                "        return value\n"
+                "    def reversed(self):\n"
+                "        return LinkedList()\n"
+                "    def pop(self):\n"
+                "        raise EmptyListException('The list is empty.')\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["linked.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("calls EmptyListException with 1 supplied args", result["output"])
+        self.assertNotIn("calls reversed with 1 supplied args", result["output"])
 
     def test_contract_check_allows_nested_helper_closure_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2208,7 +2673,7 @@ def double(value: int) -> int:
             result = tools.contract_check(["app.py"], changed_symbols=["total"])
 
         self.assertFalse(result["ok"])
-        self.assertIn("calls total with 1 positional args", result["output"])
+        self.assertIn("calls total with 1 supplied args", result["output"])
 
     def test_contract_check_flags_return_annotation_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

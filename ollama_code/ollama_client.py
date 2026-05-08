@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -160,9 +161,12 @@ class OllamaClient:
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
+        started = time.perf_counter()
         while not done.wait(0.05):
             if self._interrupt_event is not None and self._interrupt_event.is_set():
                 raise OperationInterrupted("Interrupted while waiting for Ollama.")
+            if time.perf_counter() - started > self.timeout:
+                raise TimeoutError(f"Ollama timed out after {self.timeout} seconds.")
         if "value" in error:
             raise error["value"]
         return result["value"]
@@ -292,9 +296,12 @@ class OllamaClient:
 
         thread = threading.Thread(target=worker, daemon=True)
         thread.start()
+        started = time.perf_counter()
         while not done.wait(0.05):
             if self._interrupt_event is not None and self._interrupt_event.is_set():
                 raise OperationInterrupted("Interrupted while waiting for Ollama.")
+            if time.perf_counter() - started > self.timeout:
+                raise TimeoutError(f"Ollama timed out after {self.timeout} seconds.")
         if "value" in error:
             raise error["value"]
         return result["value"]
