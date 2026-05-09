@@ -26,10 +26,25 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
     def test_public_task_prompt_is_task_agnostic(self) -> None:
         prompt = public_bench.public_task_prompt("Python").lower()
 
-        for task_name in public_bench.DEFAULT_POLYGLOT_TASKS:
+        for task_name in public_bench.HARD_POLYGLOT_TASKS:
             self.assertNotIn(task_name, prompt)
         for solution_hint in ("foldr", "pig latin", "question", "return 99", "token_"):
             self.assertNotIn(solution_hint, prompt)
+
+    def test_public_task_set_returns_expected_tasks(self) -> None:
+        self.assertEqual(tuple(public_bench.public_task_set("smoke")), public_bench.DEFAULT_POLYGLOT_TASKS)
+        self.assertEqual(tuple(public_bench.public_task_set("hard")), public_bench.HARD_POLYGLOT_TASKS)
+        self.assertIn("affine-cipher", public_bench.public_task_set("expanded"))
+        self.assertIn("list-ops", public_bench.public_task_set("expanded"))
+        self.assertIn("zebra-puzzle", public_bench.public_task_set("expanded"))
+        self.assertIn("zipper", public_bench.public_task_set("expanded"))
+        self.assertIn("book-store", public_bench.public_task_set("expanded"))
+        self.assertGreater(len(public_bench.public_task_set("expanded")), len(public_bench.HARD_POLYGLOT_TASKS))
+        self.assertTrue(set(public_bench.HARD_POLYGLOT_TASKS).issubset(set(public_bench.public_task_set("expanded"))))
+
+    def test_public_task_set_rejects_unknown(self) -> None:
+        with self.assertRaises(ValueError):
+            public_bench.public_task_set("no-such-set")
 
     def test_polyglot_task_path_validates_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

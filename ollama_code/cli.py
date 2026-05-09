@@ -210,9 +210,12 @@ def build_agent(
             raise ValueError(f"No saved sessions found in {workspace_root.as_posix()}/.ollama-code/sessions")
         restored_payload = load_transcript_payload(resume_path)
 
+    explicit_model = _non_empty_string(args.model)
+    session_model: str | None = None
     model = config.model or DEFAULT_MODEL
     model_source = f"config:{config.path.as_posix()}" if config.model and config.path is not None else "built-in default"
     env_model = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_MODEL))
+    explicit_model_from_env = env_model is not None
     if env_model:
         model = env_model
         model_source = ENV_OLLAMA_CODE_MODEL
@@ -220,16 +223,20 @@ def build_agent(
     if restored_payload is not None:
         saved_model = restored_payload.get("model")
         saved_approval = restored_payload.get("approval_mode")
-        explicit_model = _non_empty_string(args.model)
         if explicit_model is None and isinstance(saved_model, str) and saved_model.strip():
-            model = saved_model
+            session_model = saved_model.strip()
+            model = session_model
             model_source = f"session:{resume_path.as_posix() if resume_path is not None else '(unknown)'}"
         if args.approval is None and saved_approval in {"ask", "auto", "read-only"}:
             approval = str(saved_approval)
-    explicit_model = _non_empty_string(args.model)
     if explicit_model:
         model = explicit_model
         model_source = "--model"
+
+    # If model selection is not explicitly controlled by CLI/env/session, allow startup to
+    # repair stale persisted config values by resolving to installed defaults.
+    explicit_runtime_model = explicit_model is not None or explicit_model_from_env or session_model is not None
+    allow_model_fallback = not explicit_runtime_model
     verifier_model = config.verifier_model
     env_verifier_model = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_VERIFIER_MODEL))
     if env_verifier_model:
@@ -320,6 +327,7 @@ def build_agent(
         agent.session_file = resolve_transcript_path(workspace_root, session_file)
     agent.config_path = config.path
     agent.model_source = model_source
+    setattr(agent, "_allow_model_fallback", allow_model_fallback)
     return agent
 
 
@@ -334,9 +342,7 @@ def _should_resolve_runtime_default_model(args: argparse.Namespace) -> bool:
         return False
     if args.resume or args.continue_session:
         return False
-    workspace_root = Path(args.cwd).resolve()
-    config = load_config(workspace_root, args.config)
-    return config.model is None
+    return True
 
 
 def _resolve_model_candidate(candidate: str, available: set[str]) -> str | None:
@@ -349,7 +355,14 @@ def _resolve_model_candidate(candidate: str, available: set[str]) -> str | None:
     return None
 
 
-def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespace, renderer: CliStatusRenderer, *, quiet: bool = False) -> None:
+def ensure_runtime_default_model(
+    agent: OllamaCodeAgent,
+    args: argparse.Namespace,
+    renderer: CliStatusRenderer,
+    *,
+    quiet: bool = False,
+    allow_model_fallback: bool,
+) -> None:
     if not _should_resolve_runtime_default_model(args):
         return
     available_models = agent.list_models()
@@ -363,6 +376,10 @@ def ensure_runtime_default_model(agent: OllamaCodeAgent, args: argparse.Namespac
         if current != agent.model:
             agent.set_model(current)
             agent.model_source = f"{getattr(agent, 'model_source', 'built-in default')} -> installed tag"
+        return
+    if not allow_model_fallback:
+        if not quiet:
+            renderer.status(f"configured model {agent.model} is not installed locally.")
         return
     for candidate in PREFERRED_FALLBACK_MODELS:
         resolved = _resolve_model_candidate(candidate, available)
@@ -789,7 +806,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if not args.doctor:
         try:
-            ensure_runtime_default_model(agent, args, renderer, quiet=args.quiet)
+            ensure_runtime_default_model(
+                agent,
+                args,
+                renderer,
+                quiet=args.quiet,
+                allow_model_fallback=getattr(agent, "_allow_model_fallback", True),
+            )
         except OllamaError as exc:
             renderer.clear_thinking()
             print(f"error: {exc}", file=sys.stderr)

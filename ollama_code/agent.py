@@ -108,6 +108,14 @@ class MechanicalToolSpec:
     arguments: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class MechanicalToolOccurrence:
+    start: int
+    end: int
+    spec: MechanicalToolSpec
+    fragment: str
+
+
 KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
 APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
 VERIFICATION_HISTORY_LIMIT = 1
@@ -223,6 +231,23 @@ SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
 CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "implementation_spec", "mcp_list_tools"}
+BROAD_CONTEXT_GATHERING_TOOL_NAMES = {
+    "list_files",
+    "read_file",
+    "search",
+    "file_search",
+    "fd_search",
+    "file_index_refresh",
+    "everything_search",
+    "repo_index_search",
+    "fts_search",
+    "fts_refresh",
+    "indexed_search",
+    "repo_index_refresh",
+    "semgrep_scan",
+    "ast_search",
+    "discover_validators",
+}
 GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "implementation_spec", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
 VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "verify_function_contract", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
@@ -3018,6 +3043,12 @@ class OllamaCodeAgent:
             return False
         return any(phrase in lowered for phrase in ["text on line", "line text", "line only", "that line only"])
 
+    def _request_asks_direct_file_contents(self, text: str) -> bool:
+        lowered = text.lower()
+        if any(word in lowered for word in ["summarize", "summary", "explain", "why"]):
+            return False
+        return self._requested_natural_read_file_path(text) is not None
+
     def _extract_uppercase_token_from_output(self, output: str) -> str | None:
         for token in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", output):
             if token in {"OK"}:
@@ -3025,13 +3056,19 @@ class OllamaCodeAgent:
             return token
         return None
 
-    def _extract_numbered_line_from_output(self, output: str, line_number: int) -> str | None:
+    def _extract_numbered_lines(self, output: str) -> list[tuple[int, str]]:
+        rows: list[tuple[int, str]] = []
         for line in output.splitlines():
             match = re.match(r"\s*(\d+)\s+\|\s?(.*)$", line)
             if not match:
                 continue
-            if int(match.group(1)) == line_number:
-                return match.group(2)
+            rows.append((int(match.group(1)), match.group(2)))
+        return rows
+
+    def _extract_numbered_line_from_output(self, output: str, line_number: int) -> str | None:
+        for current_line, text in self._extract_numbered_lines(output):
+            if current_line == line_number:
+                return text
         return None
 
     def _extract_return_value_from_symbol_output(self, output: str) -> str | None:
@@ -3072,6 +3109,20 @@ class OllamaCodeAgent:
                 path = match.group("path").strip().rstrip(".,;:")
                 if path:
                     return path
+        return None
+
+    def _requested_natural_read_file_path(self, text: str) -> str | None:
+        patterns = [
+            r"\bwhat does\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:say|contain)\b",
+            r"\btell me what\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:says|contains)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            path = match.group("path").strip().rstrip(".,;:")
+            if path:
+                return path
         return None
 
     def _requested_mutation_paths(self, text: str) -> set[str]:
@@ -3161,13 +3212,14 @@ class OllamaCodeAgent:
             return None
         patterns = [
             r"\buse\s+search\s+to\s+find\s+(?P<query>.+?)(?:\s+and\b|[.?!]|$)",
-            r"\b(?:search|grep|rg)\s+(?:for\s+)?(?P<query>.+?)(?:\s+in\s+(?P<path>[\w./\\:-]+))?(?:\s+and\b|[.?!]|$)",
+            r"\b(?:search|grep|rg)\s+(?:for\s+)?(?P<query>.+?)(?:\s+in\s+(?P<path>[\w./\\:-]+))?(?:\s+and\b|[,.?!]|$)",
         ]
         for pattern in patterns:
             match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
             if not match:
                 continue
             query = match.group("query").strip().strip("`'\" ")
+            query = re.sub(r"\s+in\s+(?:the\s+)?(?:repo|repository|workspace|project)\s*$", "", query, flags=re.IGNORECASE)
             path = (match.groupdict().get("path") or ".").strip().rstrip(".,;:")
             if query and len(query) <= 160:
                 return {"query": query, "path": path or ".", "limit": 20}
@@ -3177,6 +3229,18 @@ class OllamaCodeAgent:
         lowered = text.lower()
         mutation_required = self._request_requires_mutation(text)
         path = self._requested_git_tool_path(text)
+        wants_validator_listing = bool(
+            re.search(
+                r"\bdiscover_validators\b|\b(?:discover|show|list|find)\s+(?:the\s+)?(?:test|lint|validation|validator)s?\s+(?:commands?|tools?)\b",
+                lowered,
+            )
+        ) or (
+            not mutation_required
+            and any(verb in lowered for verb in ["discover", "show", "list", "find"])
+            and "command" in lowered
+            and "test" in lowered
+            and any(term in lowered for term in ["validation", "validator", "lint"])
+        )
         if (
             not mutation_required
             and "git_status" not in forbidden_tool_names
@@ -3194,10 +3258,7 @@ class OllamaCodeAgent:
             if mode == "staged" or "git diff --cached" in lowered:
                 arguments["cached"] = True
             return MechanicalToolSpec("git_diff", arguments)
-        if not mutation_required and "discover_validators" not in forbidden_tool_names and re.search(
-            r"\bdiscover_validators\b|\b(?:discover|show|list|find)\s+(?:the\s+)?(?:test|lint|validation|validator)s?\s+(?:commands?|tools?)\b",
-            lowered,
-        ):
+        if not mutation_required and "discover_validators" not in forbidden_tool_names and wants_validator_listing:
             return MechanicalToolSpec("discover_validators", {"path": "."})
         run_test_command = self._requested_run_test_command(text)
         has_extra_context_action = bool(re.search(r"\b(?:read|open|inspect|search|grep|list)\b", lowered))
@@ -3287,6 +3348,164 @@ class OllamaCodeAgent:
         if not path or line < 1:
             return None
         return TargetLineReadSpec(path=path, start=max(1, line - 5), end=line + 5, line=line)
+
+    def _should_chain_run_test_after_mechanical(
+        self,
+        *,
+        request_text: str,
+        mechanical_tool_name: str,
+        forbidden_tool_names: set[str],
+    ) -> bool:
+        if self._request_requires_mutation(request_text):
+            return False
+        if not self._request_requires_test_run(request_text):
+            return False
+        if "run_test" in forbidden_tool_names:
+            return False
+        if mechanical_tool_name not in {"list_files", "discover_validators", "search"}:
+            return False
+        return bool(self.tools.default_test_command or self._workspace_has_test_signal())
+
+    def _requested_context_followup_mechanical_sequence(
+        self,
+        text: str,
+        *,
+        forbidden_tool_names: set[str],
+    ) -> list[tuple[str, MechanicalToolSpec]]:
+        if self._request_requires_mutation(text):
+            return []
+        allowed_roots = {"list_files", "search", "discover_validators"}
+        allowed_followups = {"run_test", "lint_typecheck", "git_status", "git_diff"}
+        occurrences: list[MechanicalToolOccurrence] = []
+        seen: set[tuple[int, int, str, str]] = set()
+
+        def register(start: int, end: int, spec: MechanicalToolSpec) -> None:
+            fragment = text[start:end].strip(" \t\r\n,;:.")
+            if not fragment:
+                return
+            key = (start, end, spec.name, json.dumps(spec.arguments, sort_keys=True))
+            if key in seen:
+                return
+            seen.add(key)
+            occurrences.append(MechanicalToolOccurrence(start=start, end=end, spec=spec, fragment=fragment))
+
+        if "search" not in forbidden_tool_names:
+            search_patterns = [
+                r"\buse\s+search\s+to\s+find\s+(?P<query>.+?)(?:\s+and\b|[.?!]|$)",
+                r"\b(?:search|grep|rg)\s+(?:for\s+)?(?P<query>.+?)(?:\s+in\s+(?P<path>[\w./\\:-]+))?(?:\s+and\b|[,.?!]|$)",
+            ]
+            lowered = text.lower()
+            if "web" not in lowered or any(term in lowered for term in ["workspace", "repo", "repository", "code", "files", "project"]):
+                for pattern in search_patterns:
+                    for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+                        query = match.group("query").strip().strip("`'\" ")
+                        query = re.sub(r"\s+in\s+(?:the\s+)?(?:repo|repository|workspace|project)\s*$", "", query, flags=re.IGNORECASE)
+                        path = (match.groupdict().get("path") or ".").strip().rstrip(".,;:")
+                        if query and len(query) <= 160:
+                            register(match.start(), match.end(), MechanicalToolSpec("search", {"query": query, "path": path or ".", "limit": 20}))
+
+        if "list_files" not in forbidden_tool_names:
+            list_patterns = [
+                r"\b(?:list|show)\s+(?:the\s+)?files\s+(?:in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
+                r"\b(?:ls|dir)\s+(?P<path>[\w./\\:-]+)",
+                r"\b(?:list|show)\s+(?:the\s+)?files\b",
+            ]
+            for pattern in list_patterns:
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                    raw_path = (match.groupdict().get("path") or ".").strip().rstrip(".,;:")
+                    path = "." if raw_path.lower() in {"", "the", "workspace", "repo", "repository", "project", "directory", "folder"} else raw_path
+                    register(match.start(), match.end(), MechanicalToolSpec("list_files", {"path": path}))
+
+        if "discover_validators" not in forbidden_tool_names:
+            validator_patterns = [
+                r"\bdiscover_validators\b",
+                r"\b(?:discover|show|list|find)\s+(?:the\s+)?(?:test|lint|validation|validator)s?(?:\s+and\s+(?:test|lint|validation|validator)s?)*\s+(?:commands?|tools?)\b",
+            ]
+            for pattern in validator_patterns:
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                    register(match.start(), match.end(), MechanicalToolSpec("discover_validators", {"path": "."}))
+
+        if "run_test" not in forbidden_tool_names:
+            explicit_patterns = [
+                r"\brun_test\s+to\s+execute\s+(?P<command>.+?)(?:\s+and\b|[.?!]\s|$)",
+                r"\buse\s+run_test\s+to\s+execute\s+(?P<command>.+?)(?:\s+and\b|[.?!]\s|$)",
+            ]
+            for pattern in explicit_patterns:
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+                    command = match.group("command").strip().strip("` ")
+                    if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
+                        command = command[1:-1].strip()
+                    if command:
+                        register(match.start(), match.end(), MechanicalToolSpec("run_test", {"command": command}))
+            if self._workspace_has_test_signal():
+                for match in re.finditer(r"\b(?:run|execute)\s+(?:the\s+)?tests?\b", text, flags=re.IGNORECASE):
+                    if self.tools.default_test_command:
+                        register(match.start(), match.end(), MechanicalToolSpec("run_test", {"command": self.tools.default_test_command}))
+                    else:
+                        register(match.start(), match.end(), MechanicalToolSpec("run_test", {}))
+
+        if "lint_typecheck" not in forbidden_tool_names:
+            lint_pattern = r"\b(?:run|execute)\s+(?:ruff\s+check|lint|linter|typecheck|type\s+check|mypy|pyright|tsc)\b|\blint_typecheck\b"
+            for match in re.finditer(lint_pattern, text, flags=re.IGNORECASE):
+                lowered_fragment = match.group(0).lower()
+                command = None
+                if "ruff check" in lowered_fragment:
+                    command = "ruff check ."
+                elif "mypy" in lowered_fragment:
+                    command = "mypy ."
+                elif "pyright" in lowered_fragment:
+                    command = "pyright"
+                elif "tsc" in lowered_fragment:
+                    command = "tsc --noEmit"
+                arguments = {"command": command} if command else {"paths": "."}
+                register(match.start(), match.end(), MechanicalToolSpec("lint_typecheck", arguments))
+
+        if "git_status" not in forbidden_tool_names:
+            git_status_patterns = [
+                r"\bgit_status\s+on\s+(?P<path>[\w./\\:-]+)",
+                r"\bgit(?:_|\s+)status\b(?:\s+on\s+(?P<path>[\w./\\:-]+))?",
+                r"\bstatus\s+of\s+(?:this\s+)?(?:workspace|repo|repository)\b",
+            ]
+            for pattern in git_status_patterns:
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                    raw_path = (match.groupdict().get("path") or "").strip().rstrip(".,;:")
+                    arguments = {"path": raw_path} if raw_path else {}
+                    register(match.start(), match.end(), MechanicalToolSpec("git_status", arguments))
+
+        if "git_diff" not in forbidden_tool_names:
+            git_diff_patterns = [
+                r"\bgit_diff\s+on\s+(?P<path>[\w./\\:-]+)",
+                r"\bgit\s+diff\s+(?P<path>[\w./\\:-]+)",
+                r"\b(?:show|print|display)\s+(?:the\s+)?(?:staged\s+|working[-\s]tree\s+|unstaged\s+)?diff\b",
+                r"\bgit(?:_|\s+)diff\b",
+            ]
+            for pattern in git_diff_patterns:
+                for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+                    raw_path = (match.groupdict().get("path") or "").strip().rstrip(".,;:")
+                    arguments: dict[str, Any] = {"path": raw_path} if raw_path else {}
+                    mode = self._requested_git_diff_mode(match.group(0))
+                    if mode == "staged":
+                        arguments["cached"] = True
+                    register(match.start(), match.end(), MechanicalToolSpec("git_diff", arguments))
+
+        if len(occurrences) < 2:
+            return []
+        occurrences.sort(key=lambda occurrence: (occurrence.start, occurrence.end))
+        ordered: list[MechanicalToolOccurrence] = []
+        for occurrence in occurrences:
+            if ordered and occurrence.start < ordered[-1].end:
+                previous = ordered[-1]
+                previous_length = previous.end - previous.start
+                current_length = occurrence.end - occurrence.start
+                if occurrence.spec.name == previous.spec.name and current_length > previous_length:
+                    ordered[-1] = occurrence
+                continue
+            ordered.append(occurrence)
+        if len(ordered) < 2 or ordered[0].spec.name not in allowed_roots:
+            return []
+        if any(occurrence.spec.name not in allowed_roots | allowed_followups for occurrence in ordered[1:]):
+            return []
+        return [(occurrence.fragment, occurrence.spec) for occurrence in ordered]
 
     def _requested_symbol_read(self, text: str) -> SymbolReadSpec | None:
         symbol_pattern = r"[A-Za-z_][\w.]*"
@@ -3578,6 +3797,21 @@ class OllamaCodeAgent:
             count += 1
         return count
 
+    def _broad_context_tool_streak(self, tool_calls: list[dict[str, Any]]) -> int:
+        count = 0
+        for item in reversed(tool_calls):
+            if str(item.get("name", "")).strip() not in BROAD_CONTEXT_GATHERING_TOOL_NAMES:
+                break
+            count += 1
+        return count
+
+    def _context_planner_message(self) -> str:
+        return (
+            "Pause broad inspection. Name the smallest missing fact and use a narrower next step: "
+            "search_symbols/read_symbol/code_outline for a concrete symbol, find_implementation_target for tests/traceback, "
+            "discover_validators/run_test for evidence, or answer/edit from current evidence. Next JSON only."
+        )
+
     def _trajectory_loop_guard_message(self) -> str:
         return (
             "Too many context-only tool steps. Choose one narrower next step: read_symbol/code_outline for a specific symbol, "
@@ -3669,6 +3903,19 @@ class OllamaCodeAgent:
         if not cache_hit and self._same_tool_call_count(tool_calls, name, arguments) >= 2:
             return True
         return False
+
+    def _context_planner_blocks(
+        self,
+        *,
+        name: str,
+        tool_calls: list[dict[str, Any]],
+        latest_run_test_failed: bool,
+    ) -> bool:
+        if latest_run_test_failed:
+            return False
+        if name not in BROAD_CONTEXT_GATHERING_TOOL_NAMES:
+            return False
+        return self._broad_context_tool_streak(tool_calls) >= 2
 
     def _has_grounding_evidence(
         self,
@@ -3927,6 +4174,13 @@ class OllamaCodeAgent:
                 line_text = self._extract_numbered_line_from_output(output, target_line_read.line)
                 if line_text is not None:
                     return line_text
+            if name == "read_file" and self._request_asks_direct_file_contents(request_text):
+                numbered_lines = self._extract_numbered_lines(output)
+                content_lines = [text for _, text in numbered_lines]
+                if content_lines and len(content_lines) <= 4:
+                    candidate = "\n".join(content_lines).strip()
+                    if candidate and len(candidate) <= 240:
+                        return candidate
             if name == "read_symbol" and "return" in request_text.lower() and "value" in request_text.lower():
                 value = self._extract_return_value_from_symbol_output(output)
                 if value:
@@ -4012,6 +4266,19 @@ class OllamaCodeAgent:
 
         if name == "search" and result.get("ok") is True:
             lowered = request_text.lower()
+            if self._request_requires_test_run(request_text):
+                output = str(result.get("output", ""))
+                for line in output.splitlines():
+                    match = re.match(r"(?P<path>.+):\d+:", line)
+                    if not match:
+                        continue
+                    raw_path = match.group("path").strip()
+                    try:
+                        path = Path(raw_path)
+                        label = self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
+                    except (OSError, ValueError):
+                        label = raw_path.replace("\\", "/")
+                    return f"{label} contains the match."
             if "which file" in lowered or "file contains" in lowered or "files contain" in lowered:
                 output = str(result.get("output", ""))
                 for line in output.splitlines():
@@ -4034,6 +4301,8 @@ class OllamaCodeAgent:
             and (
                 mechanical_tool_name == name
                 or "whether tests passed" in request_text.lower()
+                or "whether they passed" in request_text.lower()
+                or "did they pass" in request_text.lower()
                 or "tests passed" in request_text.lower()
             )
         ):
@@ -4686,6 +4955,58 @@ class OllamaCodeAgent:
                     return self._record_synthesized_final(message, tool="git_diff", round_number=round_number)
             return None
 
+        context_followup_sequence = self._requested_context_followup_mechanical_sequence(
+            request_text,
+            forbidden_tool_names=forbidden_tool_names,
+        )
+        if context_followup_sequence:
+            messages: list[str] = []
+            final_tool = context_followup_sequence[-1][1].name
+            for index, (fragment, spec) in enumerate(context_followup_sequence):
+                step_request_text = fragment
+                round_number += 1
+                result = self._execute_controller_tool(
+                    name=spec.name,
+                    arguments=spec.arguments,
+                    request_text=step_request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                message = self._synthesize_final_from_tool_result(
+                    request_text=step_request_text,
+                    name=spec.name,
+                    arguments=spec.arguments,
+                    result=result,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    required_tool_names={spec.name},
+                    expected_exact_reply_text=expected_exact_reply_text,
+                )
+                if spec.name == "search":
+                    output = str(result.get("output", ""))
+                    for line in output.splitlines():
+                        match = re.match(r"(?P<path>.+):\d+:", line)
+                        if not match:
+                            continue
+                        raw_path = match.group("path").strip()
+                        try:
+                            path = Path(raw_path)
+                            label = self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
+                        except (OSError, ValueError):
+                            label = raw_path.replace("\\", "/")
+                        message = f"{label} contains the match."
+                        break
+                if message and (
+                    index == len(context_followup_sequence) - 1
+                    or spec.name in {"list_files", "search", "discover_validators"}
+                ):
+                    messages.append(message)
+            if messages:
+                return self._record_synthesized_final("\n".join(messages), tool=final_tool, round_number=round_number)
+            return None
+
         mechanical_tool = self._requested_mechanical_tool_call(request_text, forbidden_tool_names=forbidden_tool_names)
         if mechanical_tool is not None:
             round_number += 1
@@ -4708,6 +5029,41 @@ class OllamaCodeAgent:
                 required_tool_names=required_tool_names,
                 expected_exact_reply_text=expected_exact_reply_text,
             )
+            if self._should_chain_run_test_after_mechanical(
+                request_text=request_text,
+                mechanical_tool_name=mechanical_tool.name,
+                forbidden_tool_names=forbidden_tool_names,
+            ):
+                context_message = message
+                round_number += 1
+                test_args = {"command": self.tools.default_test_command} if self.tools.default_test_command else {}
+                test_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments=test_args,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                test_message = self._synthesize_final_from_tool_result(
+                    request_text=request_text,
+                    name="run_test",
+                    arguments=test_args,
+                    result=test_result,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    required_tool_names=required_tool_names,
+                    expected_exact_reply_text=expected_exact_reply_text,
+                )
+                if context_message and test_message:
+                    return self._record_synthesized_final(
+                        context_message + "\n" + test_message,
+                        tool="run_test",
+                        round_number=round_number,
+                    )
+                if test_message:
+                    return self._record_synthesized_final(test_message, tool="run_test", round_number=round_number)
             if message:
                 return self._record_synthesized_final(message, tool=mechanical_tool.name, round_number=round_number)
             return None
@@ -4756,10 +5112,15 @@ class OllamaCodeAgent:
                 return self._record_synthesized_final(message, tool="read_symbol", round_number=round_number)
             return None
 
-        read_path = target_line_read.path if target_line_read is not None else self._requested_read_file_path(request_text)
+        natural_read_path = self._requested_natural_read_file_path(request_text)
+        read_path = target_line_read.path if target_line_read is not None else (self._requested_read_file_path(request_text) or natural_read_path)
         exact_line_read_requested = target_line_read is not None and self._request_asks_exact_line_text(request_text)
+        direct_file_contents_requested = natural_read_path is not None and self._request_asks_direct_file_contents(request_text)
         if read_path and "read_file" not in forbidden_tool_names and (
-            self._request_asks_token_only(request_text) or self._request_expects_exact_tool_error(request_text) or exact_line_read_requested
+            self._request_asks_token_only(request_text)
+            or self._request_expects_exact_tool_error(request_text)
+            or exact_line_read_requested
+            or direct_file_contents_requested
         ):
             if target_line_read is not None:
                 read_args = {"path": target_line_read.path, "start": target_line_read.start, "end": target_line_read.end}
@@ -5293,6 +5654,29 @@ class OllamaCodeAgent:
             return None
         return source_path, test_path
 
+    def _spec_guided_repair_has_actionable_spec(
+        self,
+        *,
+        source_text: str,
+        quick_spec: dict[str, Any],
+        failed_output: str,
+    ) -> bool:
+        quick_examples = [item for item in list(quick_spec.get("examples") or []) if isinstance(item, dict)]
+        quick_stubs = [item for item in list(quick_spec.get("stubs") or []) if str(item).strip()]
+        quick_definitions = [item for item in list(quick_spec.get("definitions") or []) if isinstance(item, dict)]
+        quick_example_text = "\n".join(str(item.get("example") or "") for item in quick_examples)
+        has_structured_behavior_constraints = " matches " in quick_example_text or " != " in quick_example_text
+        has_import_failure = "ModuleNotFoundError" in failed_output or "ImportError" in failed_output
+        has_string_transform_hints = bool(quick_spec.get("string_transform_hints"))
+        has_definition_risks = any(list(item.get("risks") or []) for item in quick_definitions)
+        source_line_count = len(source_text.splitlines())
+        small_module = source_line_count <= 220 and len(quick_definitions) <= 8
+        if has_import_failure or has_structured_behavior_constraints or has_string_transform_hints or has_definition_risks:
+            return True
+        if quick_stubs:
+            return True
+        return small_module and len(quick_examples) >= 4
+
     def _extract_candidate_python_source(self, text: str) -> str:
         raw = text.strip()
         if not raw:
@@ -5682,11 +6066,11 @@ class OllamaCodeAgent:
             failed_output = "Previous edit candidate was rejected before applying. Ignore that malformed edit and implement from the source plus executable spec."
         else:
             failed_output = str(failed_run_test_result.get("output") or failed_run_test_result.get("summary") or "").strip()
-        quick_examples = list(quick_spec.get("examples") or [])
-        quick_example_text = "\n".join(str(item.get("example") or "") for item in quick_examples if isinstance(item, dict))
-        has_structured_behavior_constraints = " matches " in quick_example_text or " != " in quick_example_text
-        has_import_failure = "ModuleNotFoundError" in failed_output or "ImportError" in failed_output
-        if len(list(quick_spec.get("stubs") or [])) < 3 and len(quick_examples) < 6 and not has_structured_behavior_constraints and not has_import_failure:
+        if not self._spec_guided_repair_has_actionable_spec(
+            source_text=source_text,
+            quick_spec=quick_spec,
+            failed_output=failed_output,
+        ):
             return None
         self._record_event(
             "spec_guided_repair",
@@ -5997,6 +6381,7 @@ class OllamaCodeAgent:
         latest_run_test_failure_summary = ""
         previous_run_test_failure_summary = ""
         failed_test_context_reads = 0
+        context_planner_prompted = False
         bulk_stub_guard_counts: dict[str, int] = {}
         spec_guided_repair_attempted = False
         failed_test_mutation_version: int | None = None
@@ -6945,6 +7330,27 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                     self.messages.append({"role": "user", "content": self._tool_error_guard_message(name, repeated_error_class)})
+                    continue
+                if (
+                    not context_planner_prompted
+                    and self._context_planner_blocks(
+                        name=name,
+                        tool_calls=tool_calls_this_turn,
+                        latest_run_test_failed=latest_run_test_failed,
+                    )
+                ):
+                    self._append_assistant_payload(payload)
+                    prior_tools = [str(item.get("name", "")) for item in tool_calls_this_turn[-4:]]
+                    self._record_event(
+                        "controller_guard",
+                        guard="context-planner",
+                        candidate_tool=name,
+                        prior_tools=prior_tools,
+                        forced_next_classes=["narrow_context", "implementation_target", "edit", "validation", "final"],
+                        rounds=round_number,
+                    )
+                    context_planner_prompted = True
+                    self.messages.append({"role": "user", "content": self._context_planner_message()})
                     continue
                 if self._trajectory_loop_guard_blocks(
                     name=name,

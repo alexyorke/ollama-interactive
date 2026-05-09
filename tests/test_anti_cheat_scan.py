@@ -19,7 +19,7 @@ class AntiCheatScanTests(unittest.TestCase):
             root = Path(tmp)
             package = root / "ollama_code"
             package.mkdir()
-            (package / "agent.py").write_text("if task == 'pig-latin': return 'BENCH_EXACT'\n", encoding="utf-8")
+            (package / "agent.py").write_text("if task == 'scale-generator': return 'BENCH_EXACT'\n", encoding="utf-8")
 
             findings = anti_cheat_scan.scan_runtime(root)
 

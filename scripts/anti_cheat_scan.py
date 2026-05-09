@@ -14,15 +14,23 @@ except ModuleNotFoundError:  # Imported as scripts.anti_cheat_scan in unit tests
     from scripts import public_benchmark_eval as public_bench
 
 
+_PUBLIC_TASK_IDS = tuple(
+    task
+    for task in getattr(public_bench, "HARD_POLYGLOT_TASKS", ())
+    if task != "transpose"
+)
+_PUBLIC_TASK_PATTERN = r"(?i)\b(?:" + "|".join(re.escape(task) for task in _PUBLIC_TASK_IDS) + r")\b"
+
+
 RUNTIME_FORBIDDEN_PATTERNS: dict[str, str] = {
     "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
-    "hard-coded public smoke task": r"(?i)\b(?:list-ops|pig-latin|wordy)\b",
+    "hard-coded public smoke task": _PUBLIC_TASK_PATTERN,
     "polyglot benchmark name": r"(?i)\bpolyglot-benchmark\b",
     "local benchmark case switch": r"(?i)\b(?:issue_fix_hidden_tests|multi_file_refactor|large_repo_symbol_nav|test_repair_task)\b",
 }
 
 PUBLIC_PROMPT_FORBIDDEN_PATTERNS: dict[str, str] = {
-    "public smoke task": r"(?i)\b(?:list-ops|pig-latin|wordy)\b",
+    "public smoke task": _PUBLIC_TASK_PATTERN,
     "task-specific solution hint": r"(?i)\b(?:foldr|pig latin|wordy|question)\b",
     "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
 }
