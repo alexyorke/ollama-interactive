@@ -512,6 +512,24 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("    def value(self):\n        return 2\n", final_text)
 
+    def test_replace_symbol_normalizes_parameter_names(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol(
+            "ops.py",
+            "append",
+            "def append(list, function):\n    return list + [function]\n",
+        )
+
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized replacement signature", result["summary"])
+        self.assertIn("def append(list1, list2):", final_text)
+        self.assertIn("return list1 + [list2]", final_text)
+
     def test_replace_symbol_rejects_python_syntax_error_without_writing(self) -> None:
         root = self._workspace_scratch()
         sample = root / "sample.py"
@@ -608,6 +626,22 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Normalized replacement signature", result["summary"])
         self.assertIn("def foldl(function, list, initial):", final_text)
         self.assertIn("for item in list:", final_text)
+
+    def test_replace_symbols_normalizes_parameter_names(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbols(
+            "ops.py",
+            [{"symbol": "append", "content": "def append(list, function):\n    return list + [function]\n"}],
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized replacement signature", result["summary"])
+        self.assertIn("def append(list1, list2):", final_text)
+        self.assertIn("return list1 + [list2]", final_text)
 
     def test_replace_symbols_rejects_python_syntax_error_without_writing(self) -> None:
         root = self._workspace_scratch()
@@ -1483,7 +1517,7 @@ class ToolExecutorTests(unittest.TestCase):
                 "ops.py",
                 "foldl",
                 (
-                    "def foldl(function, values, initial):\n"
+                    "def foldl(function, values, initial, mode):\n"
                     "    accumulator = initial\n"
                     "    for item in values:\n"
                     "        accumulator = function(accumulator, item)\n"
@@ -1517,6 +1551,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "replace_symbol")
         self.assertIn("return left + right", final_text)
         self.assertNotIn("def def", final_text)
+
+    def test_edit_intent_routes_symbol_name_replacement_to_file_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "pricing.py"
+            sample.write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "pricing.py",
+                "replace_symbol",
+                "total",
+                "cart_total",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "apply_structured_edit")
+        self.assertEqual(result["op"], "rename_symbol")
+        self.assertIn("def cart_total(prices):", final_text)
+        self.assertNotIn("def total(", final_text)
 
     def test_test_spec_extract_parses_unittest_examples_and_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

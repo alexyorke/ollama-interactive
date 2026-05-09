@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ast
 import json
 import os
@@ -41,10 +42,72 @@ HARD_POLYGLOT_TASKS = (
     "transpose",
     "scale-generator",
 )
+EXTENDED_POLYGLOT_TASKS = (
+    *HARD_POLYGLOT_TASKS,
+    "bottle-song",
+    "connect",
+    "dominoes",
+    "dot-dsl",
+    "affine-cipher",
+    "rest-api",
+    "sgf-parsing",
+    "tree-building",
+    "zebra-puzzle",
+    "zipper",
+    "paasio",
+    "beer-song",
+    "book-store",
+    "bowling",
+    "forth",
+    "grep",
+    "hangman",
+    "food-chain",
+    "pov",
+    "proverb",
+    "react",
+    "two-bucket",
+    "poker",
+)
 
 
-def _run(command: list[str], cwd: Path, *, timeout: int) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
+def public_task_set(task_set: str, *, polyglot_root: Path | None = None) -> tuple[str, ...]:
+    if task_set == "smoke":
+        return DEFAULT_POLYGLOT_TASKS
+    if task_set == "hard":
+        return HARD_POLYGLOT_TASKS
+    if task_set == "expanded":
+        return EXTENDED_POLYGLOT_TASKS
+    if task_set == "all-python":
+        if polyglot_root is None:
+            return EXTENDED_POLYGLOT_TASKS
+        discovered = all_python_tasks(polyglot_root)
+        return discovered if discovered else EXTENDED_POLYGLOT_TASKS
+    raise ValueError(f"Unknown task set: {task_set}")
+
+
+def all_python_tasks(root: Path) -> tuple[str, ...]:
+    practice = root / "python" / "exercises" / "practice"
+    tasks: list[str] = []
+    if practice.exists():
+        for entry in sorted(practice.iterdir()):
+            if entry.is_dir() and not entry.name.startswith("."):
+                tasks.append(entry.name)
+    return tuple(tasks)
+
+
+def _run(command: list[str], cwd: Path, *, timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    return subprocess.run(
+        command,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=merged_env,
+        check=False,
+    )
 
 
 def warm_model(model: str, *, timeout: int = 120) -> dict[str, Any]:
@@ -220,6 +283,29 @@ def _source_has_stub(content: str) -> bool:
     return False
 
 
+def _mech_repair_events(session_events: list[dict[str, Any]] | None = None) -> bool:
+    events = session_events or []
+    for item in events:
+        if item.get("type") == "spec_guided_repair":
+            return True
+    return False
+
+
+def _mech_repair_summary(
+    *,
+    status: str,
+    usage: dict[str, Any],
+    session_events: list[dict[str, Any]] | None,
+) -> dict[str, bool]:
+    used = _mech_repair_events(session_events)
+    llm_calls = int(usage.get("llm_calls", 0))
+    return {
+        "repair_used": used,
+        "llm_used": llm_calls > 0,
+        "mechanical_only": status == "pass" and used and llm_calls == 0,
+    }
+
+
 def failure_classes(
     *,
     status: str,
@@ -280,6 +366,7 @@ def evaluate_polyglot_python_task(
     debate: str,
     reconcile: str,
     timeout: int,
+    disable_mechanical_repair: bool = False,
     keep_workspaces_on_fail: bool = False,
 ) -> dict[str, Any]:
     source = polyglot_task_path(polyglot_root, task)
@@ -319,9 +406,14 @@ def evaluate_polyglot_python_task(
             str(session_file),
             public_task_prompt("Python"),
         ]
+        if disable_mechanical_repair:
+            cli_cmd.append("--disable-spec-guided-repair")
         timed_out = False
+        run_env: dict[str, str] | None = None
+        if disable_mechanical_repair:
+            run_env = {"OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR": "1"}
         try:
-            cli = _run(cli_cmd, project_root, timeout=timeout)
+            cli = _run(cli_cmd, project_root, timeout=timeout, env=run_env)
         except subprocess.TimeoutExpired as exc:
             timed_out = True
             cli = subprocess.CompletedProcess(cli_cmd, 124, exc.stdout or "", exc.stderr or str(exc))
@@ -337,6 +429,8 @@ def evaluate_polyglot_python_task(
         final_source_snippets = _final_source_snippets(workspace)
         meta_snippets = _evaluator_meta_snippets(evaluator_meta)
         session_events = list(session.get("events") or []) + list(session.get("llm_telemetry_events") or [])
+        usage = usage_totals(session)
+        mech = _mech_repair_summary(status=status, usage=usage, session_events=session_events)
         if not keep_workspace and evaluator_meta is not None:
             shutil.rmtree(evaluator_meta, ignore_errors=True)
         return {
@@ -353,7 +447,9 @@ def evaluate_polyglot_python_task(
             "initial_tests_returncode": initial.returncode,
             "cli_returncode": cli.returncode,
             "final_tests_returncode": final_tests_returncode,
-            "usage": usage_totals(session),
+            "usage": usage,
+            "mechanical_repair_used": mech["repair_used"],
+            "mechanical_only_pass": mech["mechanical_only"],
             "tool_calls": calls,
             "failed_tools": failures,
             "failure_classes": failure_classes(
@@ -386,6 +482,11 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "fail": sum(1 for item in results if item.get("status") != "pass"),
         "total_llm_calls": sum(int(item.get("usage", {}).get("llm_calls", 0)) for item in results),
         "total_tokens": sum(int(item.get("usage", {}).get("total_tokens", 0)) for item in results),
+        "mechanical_repair_used": sum(1 for item in results if bool(item.get("mechanical_repair_used"))),
+        "mechanical_only_pass": sum(1 for item in results if bool(item.get("mechanical_only_pass"))),
+        "llm_only_pass": sum(
+            1 for item in results if item.get("status") == "pass" and not bool(item.get("mechanical_only_pass"))
+        ),
     }
 
 
@@ -408,18 +509,59 @@ def write_payload(
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _evaluate_case(
+    *,
+    index: int,
+    project_root: Path,
+    polyglot_root: Path,
+    task: str,
+    model: str,
+    debate: str,
+    reconcile: str,
+    timeout: int,
+    disable_mechanical_repair: bool,
+    keep_workspace: bool,
+) -> tuple[int, dict[str, Any]]:
+    return (
+        index,
+        evaluate_polyglot_python_task(
+            project_root=project_root,
+            polyglot_root=polyglot_root,
+            task=task,
+            model=model,
+            debate=debate,
+            reconcile=reconcile,
+            timeout=timeout,
+            disable_mechanical_repair=disable_mechanical_repair,
+            keep_workspaces_on_fail=keep_workspace,
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run serial public coding benchmark smoke tests.")
+    parser = argparse.ArgumentParser(description="Run public coding benchmark smoke tests.")
     parser.add_argument("--models", nargs="+", default=["granite4.1:8b"])
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off"])
     parser.add_argument("--reconcile-modes", nargs="+", choices=["off", "on", "auto"], default=["auto"])
     parser.add_argument("--tasks", nargs="+", default=None)
-    parser.add_argument("--task-set", choices=["smoke", "hard"], default="smoke", help="Use the default 3-task smoke set or 10-task hard public sample unless --tasks is provided.")
+    parser.add_argument(
+        "--task-set",
+        choices=["smoke", "hard", "expanded", "all-python"],
+        default="smoke",
+        help="Use the default 3-task smoke set, the 10-task hard public sample, the open-source expanded set, or all python tasks unless --tasks is provided.",
+    )
     parser.add_argument("--cache-dir", default="scratch/external")
     parser.add_argument("--output", default="scratch/public-bench/aider-polyglot-python-smoke.json")
     parser.add_argument("--compare", default=None)
+    parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=480)
     parser.add_argument("--keep-workspaces-on-fail", action="store_true", help="Keep failed copied task workspaces under scratch/public-bench for inspection.")
+    parser.add_argument("--disable-mechanical-repair", action="store_true", help="Disable spec-guided mechanical repair and require normal LLM-tool loops.")
+    parser.add_argument(
+        "--require-llm-pass",
+        action="store_true",
+        help="Fail runs that pass only via mechanical-only repair (no LLM calls).",
+    )
     parser.add_argument("--strict-accuracy", action="store_true")
     args = parser.parse_args(argv)
 
@@ -428,31 +570,67 @@ def main(argv: list[str] | None = None) -> int:
     if not output.is_absolute():
         output = project_root / output
     polyglot_root = ensure_polyglot_repo(project_root / args.cache_dir)
-    tasks = list(args.tasks) if args.tasks is not None else list(HARD_POLYGLOT_TASKS if args.task_set == "hard" else DEFAULT_POLYGLOT_TASKS)
-    results: list[dict[str, Any]] = []
+    tasks = list(args.tasks) if args.tasks is not None else list(public_task_set(args.task_set, polyglot_root=polyglot_root))
+    job_plan: list[tuple[int, str, str, str, str]] = []
     for model in args.models:
         for mode in args.modes:
             for reconcile in args.reconcile_modes:
                 for task in tasks:
-                    outcome = evaluate_polyglot_python_task(
-                        project_root=project_root,
-                        polyglot_root=polyglot_root,
-                        task=task,
-                        model=model,
-                        debate=mode,
-                        reconcile=reconcile,
-                        timeout=args.timeout,
-                        keep_workspaces_on_fail=args.keep_workspaces_on_fail,
-                    )
-                    results.append(outcome)
-                    write_payload(output, results=results, partial=True)
-                    usage = outcome["usage"]
-                    print(
-                        "[public-bench]"
-                        f" model={model} debate={mode} reconcile={reconcile} case={task} status={outcome['status']}"
-                        f" calls={usage['llm_calls']} tokens={usage['total_tokens']}"
-                        f" latency_s={outcome['latency_s']}"
-                    )
+                    index = len(job_plan)
+                    job_plan.append((index, task, model, mode, reconcile))
+    jobs = max(1, int(args.jobs))
+    max_workers = min(jobs, len(job_plan))
+
+    results: list[dict[str, Any]] = [dict() for _ in range(len(job_plan))]
+    if max_workers == 1:
+        ordered_results: list[tuple[int, dict[str, Any]]] = []
+        for index, task, model, mode, reconcile in job_plan:
+            ordered_results.append(
+                _evaluate_case(
+                    index=index,
+                    project_root=project_root,
+                    polyglot_root=polyglot_root,
+                    task=task,
+                    model=model,
+                    debate=mode,
+                    reconcile=reconcile,
+                    timeout=args.timeout,
+                    disable_mechanical_repair=args.disable_mechanical_repair,
+                    keep_workspace=args.keep_workspaces_on_fail,
+                )
+            )
+    else:
+        ordered_results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    _evaluate_case,
+                    index=index,
+                    project_root=project_root,
+                    polyglot_root=polyglot_root,
+                    task=task,
+                    model=model,
+                    debate=mode,
+                    reconcile=reconcile,
+                    timeout=args.timeout,
+                    disable_mechanical_repair=args.disable_mechanical_repair,
+                    keep_workspace=args.keep_workspaces_on_fail,
+                ): index
+                for index, task, model, mode, reconcile in job_plan
+            }
+            for future in as_completed(futures):
+                ordered_results.append(future.result())
+
+    for index, outcome in sorted(ordered_results, key=lambda item: item[0]):
+        results[index] = outcome
+        usage = outcome["usage"]
+        print(
+            "[public-bench]"
+            f" model={outcome['model']} debate={outcome['debate']} reconcile={outcome['reconcile']} case={outcome['case']} status={outcome['status']}"
+            f" calls={usage['llm_calls']} tokens={usage['total_tokens']}"
+            f" latency_s={outcome['latency_s']}"
+        )
+        write_payload(output, results=[item for item in results if item], partial=True)
 
     baseline_results = None
     if args.compare:
@@ -470,6 +648,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     write_payload(output, results=results, comparisons=comparisons, partial=False)
 
+    if args.require_llm_pass and any(item.get("mechanical_only_pass") for item in results):
+        return 1
     if args.strict_accuracy and any(item.get("status") != "pass" for item in results):
         return 1
     return 0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
@@ -32,6 +33,49 @@ FAIL_CLOSED_MESSAGES = {
     "Stopped because artifact reconciliation could not approve a repair path.",
     "Stopped after reaching the maximum tool rounds.",
 }
+
+
+def _public_hard_slug_patterns() -> tuple[str, ...]:
+    fallback = (
+        "list-ops",
+        "pig-latin",
+        "wordy",
+        "phone-number",
+        "grade-school",
+        "variable-length-quantity",
+        "robot-name",
+        "simple-linked-list",
+        "transpose",
+        "scale-generator",
+    )
+    try:
+        from scripts import public_benchmark_eval as public_bench
+    except (ModuleNotFoundError, ImportError):
+        try:
+            scripts_root = Path(__file__).resolve().parent
+            repo_root = scripts_root.parent
+            if str(repo_root) not in sys.path:
+                sys.path.insert(0, str(repo_root))
+            import public_benchmark_eval as public_bench
+        except ModuleNotFoundError:
+            return fallback
+    if not hasattr(public_bench, "HARD_POLYGLOT_TASKS"):
+        return fallback
+    slugs = tuple(getattr(public_bench, "HARD_POLYGLOT_TASKS"))  # type: ignore[assignment]
+    if not slugs:
+        return fallback
+    return slugs
+
+
+def _public_benchmark_patterns() -> tuple[str, ...]:
+    try:
+        try:
+            from scripts import public_benchmark_eval as public_bench
+        except ModuleNotFoundError:
+            import public_benchmark_eval as public_bench
+        return tuple(public_bench.public_task_set("expanded"))
+    except Exception:
+        return _public_hard_slug_patterns()
 
 
 def unload_model(model: str) -> None:
@@ -72,8 +116,14 @@ def prompt_integrity_findings(case: BenchmarkCase) -> list[str]:
     if case.benchmark_kind != "coding_accuracy":
         return []
     text = "\n".join(case.turns)
+    slugs = [slug for slug in _public_benchmark_patterns() if isinstance(slug, str)]
+    slug_pattern = "|".join(re.escape(slug) for slug in sorted(set(slug.lower() for slug in slugs)))
+    module_names = sorted({slug for slug in slugs} | {slug.replace("-", "_") for slug in slugs})
+    module_pattern = "|".join(re.escape(name) for name in module_names)
     checks = {
         "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
+        "public benchmark task slug": rf"(?i)\b(?:{slug_pattern})\b",
+        "public benchmark module name": rf"(?i)\b(?:{module_pattern})(?:\.py)?\b",
         "exact git-diff answer": r"\breturn\s+(?:22|99)\b",
         "exact shell command": r"\bexecute exactly\b",
         "forced read_file path": r"\bUse read_file\b",
@@ -503,6 +553,103 @@ def validate_nested_package_import_fix(ctx: BenchmarkContext) -> str:
     return "pass" if _run_default_tests(ctx.workspace) else "fail"
 
 
+def prepare_renamed_simple_expression_hidden(workspace: Path) -> None:
+    _write(workspace / "src" / "scoreboard.py", "def score_delta(base: int, bonus: int) -> int:\n    pass\n")
+    _write(
+        workspace / "tests" / "test_scoreboard.py",
+        _standard_test_import("scoreboard")
+        + "import unittest\n\n\nclass ScoreboardTests(unittest.TestCase):\n"
+        + "    def test_positive_values(self) -> None:\n        self.assertEqual(score_delta(2, 3), 5)\n"
+        + "    def test_mixed_values(self) -> None:\n        self.assertEqual(score_delta(-1, 4), 3)\n"
+        + "    def test_zero_values(self) -> None:\n        self.assertEqual(score_delta(0, 0), 0)\n"
+        + "    def test_negative_values(self) -> None:\n        self.assertEqual(score_delta(-5, -2), -7)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+
+
+def validate_renamed_simple_expression_hidden(ctx: BenchmarkContext) -> str:
+    hidden = "import sys; sys.path.insert(0, 'src'); from scoreboard import score_delta; assert score_delta(9, -4) == 5; assert score_delta(-8, 3) == -5"
+    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+
+
+def prepare_renamed_prefix_rotation_hidden(workspace: Path) -> None:
+    _write(workspace / "src" / "syllables.py", "def transform_words(text: str) -> str:\n    pass\n")
+    _write(
+        workspace / "tests" / "test_syllables.py",
+        _standard_test_import("syllables")
+        + "import unittest\n\n\nclass SyllableTests(unittest.TestCase):\n"
+        + "    def test_word_beginning_with_a_vowel(self) -> None:\n        self.assertEqual(transform_words('apple'), 'appleay')\n"
+        + "    def test_word_beginning_with_p(self) -> None:\n        self.assertEqual(transform_words('pig'), 'igpay')\n"
+        + "    def test_word_beginning_with_qu(self) -> None:\n        self.assertEqual(transform_words('queen'), 'eenquay')\n"
+        + "    def test_word_with_consonant_before_qu(self) -> None:\n        self.assertEqual(transform_words('square'), 'aresquay')\n"
+        + "    def test_word_beginning_with_xr(self) -> None:\n        self.assertEqual(transform_words('xray'), 'xrayay')\n"
+        + "    def test_y_after_consonant_cluster(self) -> None:\n        self.assertEqual(transform_words('rhythm'), 'ythmrhay')\n"
+        + "    def test_phrase(self) -> None:\n        self.assertEqual(transform_words('quick fast run'), 'ickquay astfay unray')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+
+
+def validate_renamed_prefix_rotation_hidden(ctx: BenchmarkContext) -> str:
+    hidden = (
+        "import sys; sys.path.insert(0, 'src'); from syllables import transform_words; "
+        "assert transform_words('therapy square apple') == 'erapythay aresquay appleay'; "
+        "assert transform_words('rhythm pig') == 'ythmrhay igpay'"
+    )
+    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+
+
+def prepare_renamed_word_arithmetic_hidden(workspace: Path) -> None:
+    _write(workspace / "src" / "story_solver.py", "def solve(question):\n    pass\n")
+    _write(
+        workspace / "tests" / "test_story_solver.py",
+        _standard_test_import("story_solver")
+        + "import unittest\n\n\nclass StorySolverTests(unittest.TestCase):\n"
+        + "    def test_just_a_number(self) -> None:\n        self.assertEqual(solve('What is 5?'), 5)\n"
+        + "    def test_addition(self) -> None:\n        self.assertEqual(solve('What is 1 plus 1?'), 2)\n"
+        + "    def test_subtraction(self) -> None:\n        self.assertEqual(solve('What is 4 minus -12?'), 16)\n"
+        + "    def test_multiplication(self) -> None:\n        self.assertEqual(solve('What is -3 multiplied by 25?'), -75)\n"
+        + "    def test_division(self) -> None:\n        self.assertEqual(solve('What is 33 divided by -3?'), -11)\n"
+        + "    def test_multiple_operations(self) -> None:\n        self.assertEqual(solve('What is 17 minus 6 plus 3?'), 14)\n"
+        + "    def test_unknown_operation(self) -> None:\n"
+        + "        with self.assertRaises(ValueError) as err:\n            solve('What is 52 cubed?')\n"
+        + "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
+        + "    def test_syntax_error(self) -> None:\n"
+        + "        with self.assertRaises(ValueError) as err:\n            solve('What is 1 plus?')\n"
+        + "        self.assertEqual(err.exception.args[0], 'syntax error')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+
+
+def validate_renamed_word_arithmetic_hidden(ctx: BenchmarkContext) -> str:
+    hidden = (
+        "import sys; sys.path.insert(0, 'src'); from story_solver import solve; "
+        "assert solve('What is 10 minus 3 multiplied by 2?') == 14; "
+        "assert solve('What is -6 divided by 3 plus 5?') == 3"
+    )
+    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+
+
+def prepare_renamed_text_matrix_hidden(workspace: Path) -> None:
+    _write(workspace / "src" / "text_grid.py", "def flip_text(block):\n    pass\n")
+    _write(
+        workspace / "tests" / "test_text_grid.py",
+        _standard_test_import("text_grid")
+        + "import unittest\n\n\nclass TextGridTests(unittest.TestCase):\n"
+        + "    def test_empty(self) -> None:\n        self.assertEqual(flip_text(''), '')\n"
+        + "    def test_single_row(self) -> None:\n        self.assertEqual(flip_text('A1'), 'A\\n1')\n"
+        + "    def test_single_column(self) -> None:\n        self.assertEqual(flip_text('A\\n1'), 'A1')\n"
+        + "    def test_square(self) -> None:\n        self.assertEqual(flip_text('ABC\\n123'), 'A1\\nB2\\nC3')\n"
+        + "    def test_with_space(self) -> None:\n        self.assertEqual(flip_text('A B'), 'A\\n \\nB')\n"
+        + "    def test_ragged(self) -> None:\n        self.assertEqual(flip_text('11\\n2\\n3333\\n444\\n555555\\n66666'), '123456\\n1 3456\\n  3456\\n  3 56\\n    56\\n    5')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+
+
+def validate_renamed_text_matrix_hidden(ctx: BenchmarkContext) -> str:
+    hidden = (
+        "import sys; sys.path.insert(0, 'src'); from text_grid import flip_text; "
+        "assert flip_text('AB\\n12\\nxy') == 'A1x\\nB2y'; "
+        "assert flip_text('NO\\nUP') == 'NU\\nOP'"
+    )
+    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+
+
 def prepare_staged_vs_worktree_diff(workspace: Path) -> None:
     commit_all(workspace, "checkpoint before staged diff")
     _write(workspace / "src" / "app.py", "def meaning() -> int:\n    return 11\n")
@@ -531,6 +678,67 @@ def validate_large_file_targeted_read(ctx: BenchmarkContext) -> str:
         if path.endswith("docs/huge.md") and start <= 420 <= end and (end - start) <= 80:
             targeted = True
     return "pass" if targeted and "BENCH_NEEDLE_420" in ctx.stdout else "fail"
+
+
+def prepare_single_file_literal_read(workspace: Path) -> None:
+    _write(workspace / "notes" / "hello.txt", "hello bench\n")
+
+
+def validate_single_file_literal_read(ctx: BenchmarkContext) -> str:
+    calls = tool_calls(ctx.session)
+    reads = tool_results(ctx.session, "read_file")
+    used_read = len(calls) == 1 and calls[0] == "read_file"
+    readback_ok = any(result.get("ok") and "hello bench" in str(result.get("output", "")) for result in reads)
+    no_llm = usage_totals(ctx.session).get("llm_calls", 0) == 0
+    return "pass" if used_read and readback_ok and no_llm and "hello bench" in ctx.stdout else "fail"
+
+
+def validate_discover_validators_natural(ctx: BenchmarkContext) -> str:
+    calls = tool_calls(ctx.session)
+    validators = tool_results(ctx.session, "discover_validators")
+    no_llm = usage_totals(ctx.session).get("llm_calls", 0) == 0
+    return "pass" if calls == ["discover_validators"] and validators and no_llm and "test python:" in ctx.stdout else "fail"
+
+
+def validate_search_then_run_test_summary(ctx: BenchmarkContext) -> str:
+    calls = tool_calls(ctx.session)
+    no_llm = usage_totals(ctx.session).get("llm_calls", 0) == 0
+    return (
+        "pass"
+        if calls == ["search", "run_test"] and no_llm and "docs/guide.md contains the match." in ctx.stdout and "Tests passed: yes" in ctx.stdout
+        else "fail"
+    )
+
+
+def prepare_search_then_git_status(workspace: Path) -> None:
+    _write(workspace / "src" / "app.py", "def meaning() -> int:\n    return 99\n")
+
+
+def validate_search_then_git_status(ctx: BenchmarkContext) -> str:
+    calls = tool_calls(ctx.session)
+    no_llm = usage_totals(ctx.session).get("llm_calls", 0) == 0
+    return (
+        "pass"
+        if calls == ["search", "git_status"] and no_llm and "docs/guide.md contains the match." in ctx.stdout and "src/app.py" in ctx.stdout
+        else "fail"
+    )
+
+
+def validate_list_files_then_git_status(ctx: BenchmarkContext) -> str:
+    calls = tool_calls(ctx.session)
+    no_llm = usage_totals(ctx.session).get("llm_calls", 0) == 0
+    return "pass" if calls == ["list_files", "git_status"] and no_llm and "docs/guide.md" in ctx.stdout and "src/app.py" in ctx.stdout else "fail"
+
+
+def validate_discover_validators_then_lint(ctx: BenchmarkContext) -> str:
+    calls = tool_calls(ctx.session)
+    no_llm = usage_totals(ctx.session).get("llm_calls", 0) == 0
+    lint_ok = _tool_success(ctx.session, "lint_typecheck")
+    return (
+        "pass"
+        if calls == ["discover_validators", "lint_typecheck"] and no_llm and lint_ok and "test python:" in ctx.stdout
+        else "fail"
+    )
 
 
 def validate_exact_literal_write_readback(ctx: BenchmarkContext) -> str:
@@ -709,6 +917,46 @@ LOCAL_CASES: list[BenchmarkCase] = [
         budget_on=SMALL_BUDGET_ON,
     ),
     BenchmarkCase(
+        name="renamed_simple_expression_hidden",
+        suite="local-full",
+        turns=("Implement src/scoreboard.py from the tests. Read source and tests, replace stubs with complete code, run tests, and summarize briefly.",),
+        prepare=prepare_renamed_simple_expression_hidden,
+        validate=validate_renamed_simple_expression_hidden,
+        test_cmd=_python_test_cmd(),
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="renamed_prefix_rotation_hidden",
+        suite="local-full",
+        turns=("Implement src/syllables.py from the tests. Read source and tests, replace stubs with complete code, run tests, and summarize briefly.",),
+        prepare=prepare_renamed_prefix_rotation_hidden,
+        validate=validate_renamed_prefix_rotation_hidden,
+        test_cmd=_python_test_cmd(),
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="renamed_word_arithmetic_hidden",
+        suite="local-full",
+        turns=("Implement src/story_solver.py from the tests. Read source and tests, replace stubs with complete code, run tests, and summarize briefly.",),
+        prepare=prepare_renamed_word_arithmetic_hidden,
+        validate=validate_renamed_word_arithmetic_hidden,
+        test_cmd=_python_test_cmd(),
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="renamed_text_matrix_hidden",
+        suite="local-full",
+        turns=("Implement src/text_grid.py from the tests. Read source and tests, replace stubs with complete code, run tests, and summarize briefly.",),
+        prepare=prepare_renamed_text_matrix_hidden,
+        validate=validate_renamed_text_matrix_hidden,
+        test_cmd=_python_test_cmd(),
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
         name="staged_vs_worktree_diff",
         suite="local-full",
         turns=("Use git_status on src/app.py, then git_diff on src/app.py for working tree only, not cached. Do not use read_file. Tell me whether the working-tree diff adds return 22.",),
@@ -727,6 +975,86 @@ LOCAL_CASES: list[BenchmarkCase] = [
         benchmark_kind="tool_contract",
         prepare=prepare_large_file_targeted_read,
         validate=validate_large_file_targeted_read,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+    ),
+    BenchmarkCase(
+        name="single_file_literal_read",
+        suite="local-full",
+        turns=("What does notes/hello.txt say?",),
+        benchmark_kind="tool_contract",
+        prepare=prepare_single_file_literal_read,
+        validate=validate_single_file_literal_read,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+    ),
+    BenchmarkCase(
+        name="discover_validators_natural",
+        suite="local-full",
+        turns=("List the test and validation commands for this repo.",),
+        benchmark_kind="tool_contract",
+        validate=validate_discover_validators_natural,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+    ),
+    BenchmarkCase(
+        name="search_then_run_test_summary",
+        suite="local-full",
+        turns=("Search for TOKEN_42 in the repo, then run tests and tell me whether tests passed.",),
+        benchmark_kind="tool_contract",
+        validate=validate_search_then_run_test_summary,
+        test_cmd=_python_test_cmd(),
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+    ),
+    BenchmarkCase(
+        name="search_then_git_status",
+        suite="local-full",
+        turns=("Search for TOKEN_42 in the repo, then show git status.",),
+        benchmark_kind="tool_contract",
+        prepare=prepare_search_then_git_status,
+        validate=validate_search_then_git_status,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+        requires_git=True,
+    ),
+    BenchmarkCase(
+        name="search_and_git_status",
+        suite="local-full",
+        turns=("Search for TOKEN_42 in the repo and show git status.",),
+        benchmark_kind="tool_contract",
+        prepare=prepare_search_then_git_status,
+        validate=validate_search_then_git_status,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+        requires_git=True,
+    ),
+    BenchmarkCase(
+        name="list_files_and_git_status",
+        suite="local-full",
+        turns=("List files in the workspace and show git status.",),
+        benchmark_kind="tool_contract",
+        prepare=prepare_search_then_git_status,
+        validate=validate_list_files_then_git_status,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+        requires_git=True,
+    ),
+    BenchmarkCase(
+        name="discover_validators_then_lint",
+        suite="local-full",
+        turns=("List the test and validation commands for this repo, then run lint.",),
+        benchmark_kind="tool_contract",
+        validate=validate_discover_validators_then_lint,
+        budget_off=ZERO_LLM,
+        budget_on=ZERO_LLM,
+    ),
+    BenchmarkCase(
+        name="discover_validators_and_lint",
+        suite="local-full",
+        turns=("List the test and validation commands for this repo and run lint.",),
+        benchmark_kind="tool_contract",
+        validate=validate_discover_validators_then_lint,
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
     ),
@@ -809,6 +1137,16 @@ def _benchmark_workspace_parent(repo_root: Path, *, requires_git: bool) -> Path:
         except OSError:
             return repo_root
     return repo_root
+
+
+def default_benchmark_jobs() -> int:
+    configured = os.environ.get("OLLAMA_CODE_BENCH_JOBS", "").strip()
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            return 1
+    return 12 if os.environ.get("OLLAMA_HOST", "").strip() else 1
 
 
 def evaluate_case(
@@ -969,6 +1307,55 @@ def evaluate_case(
         return outcome
 
 
+def evaluate_case_batch(
+    repo_root: Path,
+    model: str,
+    verifier_model: str | None,
+    mode: str,
+    cases: list[BenchmarkCase],
+    timeout: int,
+    *,
+    reconcile: str = "auto",
+    feature_profile: str = "baseline",
+    jobs: int = 1,
+) -> list[dict[str, Any]]:
+    if not cases:
+        return []
+    if jobs <= 1 or len(cases) <= 1:
+        return [
+            evaluate_case(
+                repo_root,
+                model,
+                verifier_model,
+                mode,
+                case,
+                timeout,
+                reconcile=reconcile,
+                feature_profile=feature_profile,
+            )
+            for case in cases
+        ]
+    ordered: list[dict[str, Any] | None] = [None] * len(cases)
+    with ThreadPoolExecutor(max_workers=min(jobs, len(cases))) as executor:
+        future_to_index = {
+            executor.submit(
+                evaluate_case,
+                repo_root,
+                model,
+                verifier_model,
+                mode,
+                case,
+                timeout,
+                reconcile=reconcile,
+                feature_profile=feature_profile,
+            ): index
+            for index, case in enumerate(cases)
+        }
+        for future in as_completed(future_to_index):
+            ordered[future_to_index[future]] = future.result()
+    return [outcome for outcome in ordered if outcome is not None]
+
+
 def failed_tools(session: dict[str, Any]) -> list[dict[str, Any]]:
     failures: list[dict[str, Any]] = []
     for event in session.get("events", []):
@@ -1019,6 +1406,18 @@ def budget_violations(outcome: dict[str, Any], case: BenchmarkCase) -> list[str]
     if budget.max_total_tokens is not None and total_tokens > budget.max_total_tokens:
         violations.append(f"total_tokens {total_tokens}>{budget.max_total_tokens}")
     return violations
+
+
+def llm_bypass_failures(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for outcome in results:
+        if outcome.get("benchmark_kind") != "coding_accuracy":
+            continue
+        usage = outcome.get("usage") if isinstance(outcome.get("usage"), dict) else {}
+        if int(usage.get("llm_calls", 0)) != 0:
+            continue
+        failures.append({**outcome, "llm_bypass_reason": "coding_accuracy case completed with zero LLM calls"})
+    return failures
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1201,6 +1600,7 @@ def write_results_payload(
     comparisons: list[dict[str, Any]] | None = None,
     accuracy_regressions: list[dict[str, Any]] | None = None,
     budget_failures: list[dict[str, Any]] | None = None,
+    llm_bypass_failures: list[dict[str, Any]] | None = None,
     partial: bool = False,
 ) -> None:
     payload = {
@@ -1213,6 +1613,7 @@ def write_results_payload(
         "comparisons": comparisons or [],
         "accuracy_regressions": accuracy_regressions or [],
         "budget_failures": budget_failures or [],
+        "llm_bypass_failures": llm_bypass_failures or [],
     }
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -1229,8 +1630,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--compare", default=None, help="Optional prior JSON path for token/accuracy deltas.")
     parser.add_argument("--feature-profiles", nargs="+", choices=FEATURE_PROFILES, default=["baseline"], help="A/B controller feature profiles.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-turn timeout in seconds.")
+    parser.add_argument("--jobs", type=int, default=default_benchmark_jobs(), help="Parallel benchmark cases per model/profile.")
     parser.add_argument("--strict-accuracy", action="store_true", help="Fail if any run status is not acceptable.")
     parser.add_argument("--strict-budget", action="store_true", help="Fail if a local case exceeds its token or LLM-call budget.")
+    parser.add_argument("--require-llm-for-coding-accuracy", action="store_true", help="Fail if any coding_accuracy case completes with zero LLM calls.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -1242,6 +1645,7 @@ def main(argv: list[str] | None = None) -> int:
         comparisons: list[dict[str, Any]] = []
         accuracy_regressions: list[dict[str, Any]] = []
         budget_failures: list[dict[str, Any]] = []
+        llm_bypass_rows: list[dict[str, Any]] = []
         print_table(results, [])
     else:
         requested_cases = set(args.cases) if args.cases else None
@@ -1280,17 +1684,18 @@ def main(argv: list[str] | None = None) -> int:
             for mode in modes:
                 for reconcile in args.reconcile_modes:
                     for feature_profile in args.feature_profiles:
-                        for case in cases:
-                            outcome = evaluate_case(
-                                repo_root,
-                                model,
-                                verifier_model,
-                                mode,
-                                case,
-                                args.timeout,
-                                reconcile=reconcile,
-                                feature_profile=feature_profile,
-                            )
+                        batch_results = evaluate_case_batch(
+                            repo_root,
+                            model,
+                            verifier_model,
+                            mode,
+                            cases,
+                            args.timeout,
+                            reconcile=reconcile,
+                            feature_profile=feature_profile,
+                            jobs=max(1, args.jobs),
+                        )
+                        for outcome in batch_results:
                             results.append(outcome)
                             print_table([outcome], [])
                             write_results_payload(output, repo_root=repo_root, suite=args.suite, results=results, partial=True)
@@ -1307,6 +1712,7 @@ def main(argv: list[str] | None = None) -> int:
         comparisons = comparison_rows(results, baseline_results)
         accuracy_regressions = [row for row in comparisons if row.get("before_status") == "pass" and row.get("after_status") != "pass"]
         budget_failures = []
+        llm_bypass_rows = llm_bypass_failures(results) if args.require_llm_for_coding_accuracy else []
         if args.strict_budget:
             for outcome in results:
                 case = cases_by_name.get(str(outcome.get("case")))
@@ -1326,6 +1732,7 @@ def main(argv: list[str] | None = None) -> int:
         comparisons=comparisons,
         accuracy_regressions=accuracy_regressions,
         budget_failures=budget_failures,
+        llm_bypass_failures=llm_bypass_rows,
         partial=False,
     )
 
@@ -1335,6 +1742,8 @@ def main(argv: list[str] | None = None) -> int:
     failures.extend(accuracy_regressions)
     if args.strict_budget:
         failures.extend(budget_failures)
+    if args.require_llm_for_coding_accuracy:
+        failures.extend(llm_bypass_rows)
     if failures:
         print(f"[coding-bench] strict failures: {len(failures)}")
         return 1

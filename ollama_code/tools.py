@@ -8997,7 +8997,7 @@ import string
                 or self._toml_tool_section(pyproject, "ruff")
                 or shutil.which("ruff")
             ):
-                add("lint", "python", "ruff check .", "ruff config or executable found.")
+                add("lint", "python", "ruff check . --no-cache", "ruff config or executable found.")
             if (
                 (root / "mypy.ini").exists()
                 or (root / ".mypy.ini").exists()
@@ -9824,26 +9824,120 @@ import string
             return ""
         existing_params = self._python_parameter_sequence(node)
         replacement_params = self._python_parameter_sequence(candidate)
+        existing_names = [entry for entry in existing_params if not entry.startswith("*")]
+        replacement_names = [entry for entry in replacement_params if not entry.startswith("*")]
+
+        if not existing_names or not replacement_names:
+            return ""
+        if len(existing_names) != len(replacement_names):
+            return ""
+
+        # Reorder-only correction for same-name permutations.
+        if sorted(existing_names) == sorted(replacement_names):
+            if (
+                replacement_names == existing_names
+                or node.args.defaults
+                or candidate.args.defaults
+                or node.args.kw_defaults
+                or candidate.args.kw_defaults
+                or node.args.vararg
+                or candidate.args.vararg
+                or node.args.kwarg
+                or candidate.args.kwarg
+                or node.args.kwonlyargs
+                or candidate.args.kwonlyargs
+            ):
+                return ""
+            lines = replacement.splitlines()
+            header_index = int(getattr(candidate, "lineno", 1)) - 1
+            if header_index < 0 or header_index >= len(lines):
+                return ""
+            header = lines[header_index]
+            match = re.match(rf"^(\s*(?:async\s+)?def\s+{re.escape(candidate.name)}\s*)\([^)]*\)(\s*(?:->\s*[^:]+)?\s*:\s*)$", header)
+            if not match:
+                return ""
+            lines[header_index] = f"{match.group(1)}({', '.join(existing_names)}){match.group(2)}"
+            return "\n".join(lines) + ("\n" if replacement.endswith(("\n", "\r")) else "")
+
+        # Name-only correction for same arity, same parameter shape.
         if (
-            replacement_params == existing_params
-            or sorted(replacement_params) != sorted(existing_params)
-            or any(param.startswith("*") for param in [*existing_params, *replacement_params])
+            len(existing_params) != len(replacement_params)
             or node.args.defaults
             or candidate.args.defaults
             or node.args.kw_defaults
             or candidate.args.kw_defaults
+            or node.args.vararg
+            or candidate.args.vararg
+            or node.args.kwarg
+            or candidate.args.kwarg
+            or node.args.kwonlyargs
+            or candidate.args.kwonlyargs
+            or any(name.startswith("*") for name in existing_params + replacement_params)
         ):
             return ""
-        lines = replacement.splitlines()
-        header_index = int(getattr(candidate, "lineno", 1)) - 1
-        if header_index < 0 or header_index >= len(lines):
+
+        # Avoid rewriting when a candidate parameter name is rebound in function body.
+        for child in ast.walk(candidate):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)) and child.id in replacement_names:
+                return ""
+
+        class _CanonicalBodyRenamer(ast.NodeTransformer):
+            def __init__(self, mapping: dict[str, str]):
+                self._mapping = mapping
+                self._depth = 0
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+                if self._depth == 0:
+                    self._depth = 1
+                    node.body = [self.visit(child) for child in node.body]
+                    self._depth = 0
+                    return node
+                return node
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+                if self._depth == 0:
+                    self._depth = 1
+                    node.body = [self.visit(child) for child in node.body]
+                    self._depth = 0
+                    return node
+                return node
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+                return node
+
+            def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
+                return node
+
+            def visit_Name(self, node: ast.Name) -> ast.Name:
+                if self._depth == 1 and isinstance(node.ctx, ast.Load):
+                    mapped = self._mapping.get(node.id)
+                    if mapped is not None:
+                        node = ast.copy_location(ast.Name(id=mapped, ctx=node.ctx), node)
+                return node
+
+        mapping = {replacement_name: existing_name for replacement_name, existing_name in zip(replacement_names, existing_names)}
+        candidate_rebuilt = deepcopy(candidate)
+        posonly_count = len(candidate.args.posonlyargs)
+
+        # Keep the argument shape and defaults; only normalize parameter identifiers.
+        for index, param_name in enumerate(existing_names):
+            if index < posonly_count:
+                if index >= len(candidate_rebuilt.args.posonlyargs):
+                    return ""
+                candidate_rebuilt.args.posonlyargs[index].arg = param_name
+            else:
+                arg_index = index - posonly_count
+                if arg_index >= len(candidate_rebuilt.args.args):
+                    return ""
+                candidate_rebuilt.args.args[arg_index].arg = param_name
+
+        candidate_rebuilt = _CanonicalBodyRenamer(mapping).visit(candidate_rebuilt)
+        ast.fix_missing_locations(candidate_rebuilt)
+        try:
+            normalized = ast.unparse(candidate_rebuilt)
+        except (SyntaxError, ValueError):
             return ""
-        header = lines[header_index]
-        match = re.match(rf"^(\s*(?:async\s+)?def\s+{re.escape(candidate.name)}\s*)\([^)]*\)(\s*(?:->\s*[^:]+)?\s*:\s*)$", header)
-        if not match:
-            return ""
-        lines[header_index] = f"{match.group(1)}({', '.join(existing_params)}){match.group(2)}"
-        return "\n".join(lines) + ("\n" if replacement.endswith(("\n", "\r")) else "")
+        return normalized + "\n"
 
     def _canonical_foldr_replacement_if_safe(self, target: Path, symbol: str, diagnostic: str) -> str:
         if "foldr reducer arguments look reversed" not in diagnostic:
@@ -10323,7 +10417,17 @@ import string
         elif clean_intent in {"replace_symbol", "replace_function", "replace_class", "symbol"}:
             replacement_name = self._single_python_replacement_symbol_name(new) if target_path.suffix.lower() == ".py" and self._looks_like_full_symbol_source(target_path, new) else ""
             old_leaf = old.rsplit(".", 1)[-1]
-            if replacement_name and replacement_name != old_leaf and self._looks_like_symbol_name(old_leaf):
+            new_leaf = new.rsplit(".", 1)[-1]
+            if self._looks_like_symbol_name(old_leaf) and self._looks_like_symbol_name(new_leaf):
+                if clean_scope in {"project", "repo", "repository", "all"}:
+                    route = "project symbol rename"
+                    routed_tool = "apply_structured_edit"
+                    operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": new_leaf}
+                else:
+                    route = "file symbol rename"
+                    routed_tool = "apply_structured_edit"
+                    operation = {"op": "rename_symbol", "path": relative_path, "old": old_leaf, "new": new_leaf}
+            elif replacement_name and replacement_name != old_leaf and self._looks_like_symbol_name(old_leaf):
                 route = "project symbol rename from replacement source"
                 routed_tool = "apply_structured_edit"
                 operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name}

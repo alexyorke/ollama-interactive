@@ -26,10 +26,34 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
     def test_public_task_prompt_is_task_agnostic(self) -> None:
         prompt = public_bench.public_task_prompt("Python").lower()
 
-        for task_name in public_bench.DEFAULT_POLYGLOT_TASKS:
+        for task_name in public_bench.HARD_POLYGLOT_TASKS:
             self.assertNotIn(task_name, prompt)
         for solution_hint in ("foldr", "pig latin", "question", "return 99", "token_"):
             self.assertNotIn(solution_hint, prompt)
+
+    def test_public_task_set_returns_expected_tasks(self) -> None:
+        self.assertEqual(tuple(public_bench.public_task_set("smoke")), public_bench.DEFAULT_POLYGLOT_TASKS)
+        self.assertEqual(tuple(public_bench.public_task_set("hard")), public_bench.HARD_POLYGLOT_TASKS)
+        self.assertIn("affine-cipher", public_bench.public_task_set("expanded"))
+        self.assertIn("list-ops", public_bench.public_task_set("expanded"))
+        self.assertIn("zebra-puzzle", public_bench.public_task_set("expanded"))
+        self.assertIn("zipper", public_bench.public_task_set("expanded"))
+        self.assertIn("book-store", public_bench.public_task_set("expanded"))
+        self.assertGreater(len(public_bench.public_task_set("expanded")), len(public_bench.HARD_POLYGLOT_TASKS))
+        self.assertTrue(set(public_bench.HARD_POLYGLOT_TASKS).issubset(set(public_bench.public_task_set("expanded"))))
+        self.assertTrue(all(task in public_bench.public_task_set("all-python") for task in ("list-ops", "scale-generator")))
+
+    def test_public_task_set_all_python_discovers_practice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "polyglot"
+            (root / "python" / "exercises" / "practice" / "task-one").mkdir(parents=True)
+            (root / "python" / "exercises" / "practice" / ".local").mkdir(parents=True)
+            tasks = public_bench.public_task_set("all-python", polyglot_root=root)
+        self.assertEqual(tasks, ("task-one",))
+
+    def test_public_task_set_rejects_unknown(self) -> None:
+        with self.assertRaises(ValueError):
+            public_bench.public_task_set("no-such-set")
 
     def test_polyglot_task_path_validates_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,6 +225,16 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
             self.assertTrue(payload["partial"])
             self.assertEqual(payload["summary"]["total_tokens"], 2)
             self.assertEqual(payload["comparisons"], [{"case": "wordy"}])
+
+    def test_mechanical_repair_summary_classifies_zero_llm_passes(self) -> None:
+        summary = public_bench._mech_repair_summary(
+            status="pass",
+            usage={"llm_calls": 0},
+            session_events=[{"type": "spec_guided_repair", "phase": "start"}],
+        )
+        self.assertTrue(summary["repair_used"])
+        self.assertFalse(summary["llm_used"])
+        self.assertTrue(summary["mechanical_only"])
 
 
 if __name__ == "__main__":

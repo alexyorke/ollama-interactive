@@ -364,13 +364,13 @@ class AgentTests(unittest.TestCase):
 
     def test_trajectory_loop_cap_blocks_fourth_context_tool(self) -> None:
         root = self._workspace_scratch()
-        (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+        (root / "app.py").write_text("def greet():\n    return 'hello world'\n", encoding="utf-8")
         client = FakeClient(
             [
-                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
-                '{"type":"tool","name":"search","arguments":{"query":"hello"}}',
-                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt","start":1,"end":1}}',
-                '{"type":"tool","name":"search","arguments":{"query":"world"}}',
+                '{"type":"tool","name":"search_symbols","arguments":{"query":"greet","path":"app.py"}}',
+                '{"type":"tool","name":"read_symbol","arguments":{"path":"app.py","symbol":"greet"}}',
+                '{"type":"tool","name":"code_outline","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
                 '{"type":"final","message":"hello world"}',
             ]
         )
@@ -378,11 +378,32 @@ class AgentTests(unittest.TestCase):
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
 
         with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
-            result = agent.handle_user("Inspect this repo and summarize the relevant text.")
+            result = agent.handle_user("Inspect app.py and summarize the relevant text.")
 
         self.assertEqual(result.message, "hello world")
         self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "loop-cap" for event in agent.events))
-        self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["read_file", "search", "read_file"])
+        self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["search_symbols", "read_symbol", "code_outline"])
+
+    def test_context_planner_blocks_third_broad_context_tool(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"hello"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt","start":1,"end":1}}',
+                '{"type":"final","message":"hello world"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect this repo and find the relevant hello text.")
+
+        self.assertEqual(result.message, "hello world")
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "context-planner" for event in agent.events))
+        self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["read_file", "search"])
 
     def test_trajectory_ground_guard_rejects_ungrounded_mutation_then_allows_after_read(self) -> None:
         root = self._workspace_scratch()
@@ -1549,6 +1570,31 @@ class AgentTests(unittest.TestCase):
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_calls[0]["name"], "git_diff")
 
+    def test_agent_require_llm_for_turn_bypasses_deterministic_git_diff_shortcut(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "app.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "base"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "app.py").write_text("def value():\n    return 2\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"git_diff","arguments":{"path":"app.py"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                require_llm_for_turn=True,
+            )
+
+            result = agent.handle_user("Show git diff app.py.")
+
+        self.assertIn("+    return 2", result.message)
+        self.assertEqual(len(client.calls), 1)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "git_diff")
+
     def test_agent_retries_after_unknown_tool_does_not_count_as_real_tool_use(self) -> None:
         client = FakeClient(
             [
@@ -1754,7 +1800,21 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "second line")
         self.assertEqual(len(client.calls), 0)
-        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_deterministically_reads_single_file_contents_without_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("What does note.txt say?")
+
+        self.assertEqual(result.message, "hello world")
+        self.assertEqual(len(client.calls), 0)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual([event["name"] for event in tool_calls], ["read_file"])
 
     def test_agent_normalizes_exact_shell_command_and_synthesizes_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1840,6 +1900,207 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.message, "notes/repl.txt contains the match.")
         self.assertEqual(len(client.calls), 0)
         self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_synthesizes_discover_validators_for_natural_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("List the test and validation commands for this repo.")
+
+        self.assertIn("test python:", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["discover_validators"])
+
+    def test_agent_chains_search_then_run_test_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(6 * 7, 42)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Search for TOKEN_42 in the repo, then run tests and tell me whether tests passed.")
+
+        self.assertIn("docs/guide.md contains the match.", result.message)
+        self.assertIn("Tests passed: yes", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search", "run_test"])
+
+    def test_agent_chains_discover_validators_then_run_test_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Discover the test commands for this repo, then run tests and tell me whether they passed.")
+
+        self.assertIn("test python:", result.message)
+        self.assertIn("Tests passed: yes", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["discover_validators", "run_test"])
+
+    def test_agent_chains_search_then_git_status_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Search for TOKEN_42 in the repo, then show git status.")
+
+        self.assertIn("docs/guide.md contains the match.", result.message)
+        self.assertIn("src/app.py", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search", "git_status"])
+
+    def test_agent_chains_search_and_git_status_without_then(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Search for TOKEN_42 in the repo and show git status.")
+
+        self.assertIn("docs/guide.md contains the match.", result.message)
+        self.assertIn("src/app.py", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search", "git_status"])
+
+    def test_agent_chains_search_after_that_git_status_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Search for TOKEN_42 in the repo, after that show git status.")
+
+        self.assertIn("docs/guide.md contains the match.", result.message)
+        self.assertIn("src/app.py", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search", "git_status"])
+
+    def test_agent_chains_list_files_and_git_status_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("List files in the workspace and show git status.")
+
+        self.assertIn("docs/guide.md", result.message)
+        self.assertIn("src/app.py", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["list_files", "git_status"])
+
+    def test_agent_chains_discover_validators_then_lint_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("List the test and validation commands for this repo, then run lint.")
+
+        self.assertIn("lint python:", result.message)
+        self.assertTrue(
+            "All checks passed!" in result.message
+            or "Lint/typecheck passed." in result.message
+            or "syntax ok:" in result.message
+        )
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["discover_validators", "lint_typecheck"])
+
+    def test_agent_chains_discover_validators_and_lint_without_then(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("List the test and validation commands for this repo and run lint.")
+
+        self.assertIn("lint python:", result.message)
+        self.assertTrue(
+            "All checks passed!" in result.message
+            or "Lint/typecheck passed." in result.message
+            or "syntax ok:" in result.message
+        )
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["discover_validators", "lint_typecheck"])
 
     def test_agent_audits_shell_tool_under_debate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -3016,7 +3277,8 @@ class AgentTests(unittest.TestCase):
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
 
-            result = agent.handle_user("Implement app.py and run tests.")
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Implement app.py and run tests.")
             final_text = (root / "app.py").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "fixed")
@@ -3066,7 +3328,8 @@ class AgentTests(unittest.TestCase):
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=9)
 
-            result = agent.handle_user("Implement app.py and run tests.")
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Implement app.py and run tests.")
             final_text = (root / "app.py").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "fixed")
@@ -3122,7 +3385,8 @@ class AgentTests(unittest.TestCase):
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
 
-            result = agent.handle_user("Implement app.py and run tests.")
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Implement app.py and run tests.")
             final_text = (root / "app.py").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "fixed")
@@ -3195,6 +3459,49 @@ class AgentTests(unittest.TestCase):
         phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
         self.assertIn("candidate_validation", phases)
 
+    def test_spec_guided_repair_runs_for_small_single_stub_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scoreboard.py").write_text("def score_delta(base, bonus):\n    pass\n", encoding="utf-8")
+            (root / "scoreboard_test.py").write_text(
+                "import unittest\nfrom scoreboard import score_delta\n\n"
+                "class ScoreboardTest(unittest.TestCase):\n"
+                "    def test_positive_values(self):\n"
+                "        self.assertEqual(score_delta(2, 3), 5)\n"
+                "    def test_mixed_values(self):\n"
+                "        self.assertEqual(score_delta(-1, 4), 3)\n"
+                "    def test_zero_values(self):\n"
+                "        self.assertEqual(score_delta(0, 0), 0)\n"
+                "    def test_negative_values(self):\n"
+                "        self.assertEqual(score_delta(-5, -2), -7)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            candidate = "def score_delta(base, bonus):\n    return base + bonus\n"
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "scoreboard.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "scoreboard_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    candidate,
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise and run tests.")
+            final_text = (root / "scoreboard.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided repair applied", result.message)
+        self.assertEqual(final_text, candidate)
+        self.assertGreaterEqual(tools.execute_counts.get("implementation_spec", 0), 1)
+        candidate_call = next(call for call in client.calls if call["response_format"] is None)
+        candidate_prompt = candidate_call["messages"][1]["content"]  # type: ignore[index]
+        self.assertIn("score_delta(2, 3) -> 5", candidate_prompt)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("candidate_validation", phases)
+
     def test_preemptive_mechanical_spec_guided_repair_skips_primary_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3237,6 +3544,114 @@ class AgentTests(unittest.TestCase):
         self.assertIn("Spec-guided mechanical repair applied", result.message)
         self.assertIn("plus", final_text)
         self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
+        self.assertIn("preemptive_mechanical_start", phases)
+        self.assertIn("mechanical_candidate_validation", phases)
+        validation_events = [
+            event
+            for event in agent.events
+            if event.get("type") == "spec_guided_repair" and event.get("phase") == "mechanical_candidate_validation"
+        ]
+        self.assertTrue(any(event.get("preemptive") is True for event in validation_events))
+
+    def test_agent_require_llm_for_turn_skips_preemptive_mechanical_repair(self) -> None:
+        class SingleToolClient(FakeClient):
+            def __init__(self) -> None:
+                super().__init__([])
+
+            def chat(
+                self,
+                *,
+                model: str,
+                messages: list[dict[str, str]],
+                response_format: str = "json",
+                on_thinking: object | None = None,
+                think: bool | None = None,
+                options: dict[str, object] | None = None,
+            ) -> ChatResponse:
+                self.calls.append(
+                    {
+                        "model": model,
+                        "messages": list(messages),
+                        "response_format": response_format,
+                        "on_thinking": on_thinking,
+                        "think": think,
+                        "options": options,
+                    }
+                )
+                return ChatResponse(
+                    content='{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return 1","new":"return 2"}}',
+                    model=model,
+                    raw={},
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+            client = SingleToolClient()
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                require_llm_for_turn=True,
+            )
+
+            with patch.object(
+                agent,
+                "_try_preemptive_mechanical_spec_guided_repair",
+                side_effect=AssertionError("preemptive repair should be skipped when an LLM call is required"),
+            ):
+                result = agent.handle_user("Edit app.py to return 2.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(final_text, "def value():\n    return 2\n")
+        self.assertGreaterEqual(len(client.calls), 1)
+        self.assertGreaterEqual(tools.execute_counts.get("replace_in_file", 0), 1)
+
+    def test_preemptive_mechanical_repair_without_explicit_test_request_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "wordy.py").write_text("def answer(question):\n    pass\n", encoding="utf-8")
+            (root / "wordy_test.py").write_text(
+                "import unittest\nfrom wordy import answer\n\n"
+                "class WordyTest(unittest.TestCase):\n"
+                "    def test_just_a_number(self):\n"
+                "        self.assertEqual(answer('What is 5?'), 5)\n"
+                "    def test_addition(self):\n"
+                "        self.assertEqual(answer('What is 1 plus 1?'), 2)\n"
+                "    def test_subtraction(self):\n"
+                "        self.assertEqual(answer('What is 4 minus -12?'), 16)\n"
+                "    def test_multiplication(self):\n"
+                "        self.assertEqual(answer('What is -3 multiplied by 25?'), -75)\n"
+                "    def test_division(self):\n"
+                "        self.assertEqual(answer('What is 33 divided by -3?'), -11)\n"
+                "    def test_multiple_operations(self):\n"
+                "        self.assertEqual(answer('What is 17 minus 6 plus 3?'), 14)\n"
+                "    def test_unknown_operation(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is 52 cubed?')\n"
+                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
+                "    def test_syntax_error(self):\n"
+                "        with self.assertRaises(ValueError) as err:\n"
+                "            answer('What is 1 plus?')\n"
+                "        self.assertEqual(err.exception.args[0], 'syntax error')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Implement this Python exercise.")
+            final_text = (root / "wordy.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(len(client.calls), 0)
+        self.assertIn("Spec-guided mechanical repair applied", result.message)
+        self.assertNotIn("pass", final_text)
         phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
         self.assertIn("preemptive_mechanical_start", phases)
         self.assertIn("mechanical_candidate_validation", phases)
@@ -3818,7 +4233,8 @@ class AgentTests(unittest.TestCase):
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
 
-            result = agent.handle_user("Implement app.py and run tests.")
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Implement app.py and run tests.")
 
         self.assertEqual(result.message, "fixed")
         self.assertEqual(tools.execute_counts.get("run_test"), 2)
@@ -3854,7 +4270,8 @@ class AgentTests(unittest.TestCase):
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
 
-            result = agent.handle_user("Implement transpose.py and run tests.")
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Implement transpose.py and run tests.")
 
         self.assertEqual(result.message, "fixed")
         self.assertEqual(tools.execute_counts.get("run_test"), 2)

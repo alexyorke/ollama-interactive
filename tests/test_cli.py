@@ -168,6 +168,8 @@ class CliCommandTests(unittest.TestCase):
     def test_parser_defaults_max_tool_rounds_to_100(self) -> None:
         args = build_parser().parse_args([])
         self.assertIsNone(args.max_tool_rounds)
+        self.assertFalse(args.disable_spec_guided_repair)
+        self.assertFalse(args.require_llm_for_turn)
 
     def test_build_agent_uses_config_default_model(self) -> None:
         root = self._workspace_scratch()
@@ -207,6 +209,26 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("\x1b[1A", output)
         self.assertIn("[status] tool read_file {}", output)
 
+    def test_build_agent_respects_disable_spec_guided_repair_env(self) -> None:
+        root = self._workspace_scratch()
+        with patch.dict("os.environ", {"OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR": "1"}):
+            args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+            agent = build_agent(args)
+        self.assertTrue(agent.disable_spec_guided_repair)
+
+    def test_build_agent_respects_require_llm_for_turn_flag(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root), "--quiet", "--require-llm-for-turn"])
+        agent = build_agent(args)
+        self.assertTrue(agent.require_llm_for_turn)
+
+    def test_build_agent_respects_require_llm_for_turn_env(self) -> None:
+        root = self._workspace_scratch()
+        with patch.dict("os.environ", {"OLLAMA_CODE_REQUIRE_LLM_FOR_TURN": "1"}):
+            args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+            agent = build_agent(args)
+        self.assertTrue(agent.require_llm_for_turn)
+
     def test_runtime_default_fallback_prints_default_pull_hint(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root)])
@@ -215,11 +237,39 @@ class CliCommandTests(unittest.TestCase):
         stream = io.StringIO()
         renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
 
-        ensure_runtime_default_model(agent, args, renderer)
+        ensure_runtime_default_model(agent, args, renderer, allow_model_fallback=True)
 
         self.assertEqual(agent.model, "gemma3:4b")
         self.assertEqual(agent.model_source, "runtime fallback:gemma3:4b")
         self.assertIn(f"ollama pull {DEFAULT_MODEL}", stream.getvalue())
+
+    def test_runtime_default_fallback_can_repair_stale_configured_model(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root)])
+        agent = DummyAgent()
+        agent.model = "stale-model"
+        agent.list_models = lambda: ["gemma3:4b"]  # type: ignore[method-assign]
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
+
+        ensure_runtime_default_model(agent, args, renderer, allow_model_fallback=True)
+
+        self.assertEqual(agent.model, "gemma3:4b")
+        self.assertIn("default model", stream.getvalue())
+
+    def test_runtime_default_keeps_explicit_model_when_not_fallback_enabled(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root)])
+        agent = DummyAgent()
+        agent.model = "stale-explicit"
+        agent.list_models = lambda: ["gemma3:4b"]  # type: ignore[method-assign]
+        stream = io.StringIO()
+        renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
+
+        ensure_runtime_default_model(agent, args, renderer, allow_model_fallback=False)
+
+        self.assertEqual(agent.model, "stale-explicit")
+        self.assertIn("configured model stale-explicit is not installed", stream.getvalue())
 
     def test_runtime_default_fallback_ignores_unpreferred_custom_model(self) -> None:
         root = self._workspace_scratch()
@@ -229,7 +279,7 @@ class CliCommandTests(unittest.TestCase):
         stream = io.StringIO()
         renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
 
-        ensure_runtime_default_model(agent, args, renderer)
+        ensure_runtime_default_model(agent, args, renderer, allow_model_fallback=True)
 
         self.assertEqual(agent.model, DEFAULT_MODEL)
         self.assertIn("no preferred fallback model is available", stream.getvalue())
@@ -242,7 +292,7 @@ class CliCommandTests(unittest.TestCase):
         stream = io.StringIO()
         renderer = CliStatusRenderer(stream=stream, use_ansi=False, update_interval=0.0)
 
-        ensure_runtime_default_model(agent, args, renderer, quiet=True)
+        ensure_runtime_default_model(agent, args, renderer, quiet=True, allow_model_fallback=True)
 
         self.assertEqual(agent.model, "gemma3:4b")
         self.assertEqual(stream.getvalue(), "")

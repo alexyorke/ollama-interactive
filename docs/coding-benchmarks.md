@@ -18,7 +18,7 @@ External benchmark inspiration:
 ## Suites
 
 - `local-small`: 8 fast tasks for regular local checks.
-- `local-full`: 20 tasks including larger symbol navigation, multi-turn editing, refactors, path/shell/git regressions, and token traps.
+- `local-full`: current 32-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, path/shell/git regressions, and token traps.
 - `external-smoke`: preflight checks for optional external harnesses; not CI-blocking and not leaderboard-comparable.
 - `scripts/public_benchmark_eval.py`: serial public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
 
@@ -45,6 +45,12 @@ Run A/B feature profiles without changing prompts:
 
 ```bash
 python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline trajectory-guards contract-guards all --compare scratch/coding-benchmark/baseline.json --strict-accuracy --strict-budget
+```
+
+Require coding-accuracy cases to actually call the model at least once:
+
+```bash
+python scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b --modes off --feature-profiles all --require-llm-for-coding-accuracy
 ```
 
 Run the fuller local suite for deeper regression checks:

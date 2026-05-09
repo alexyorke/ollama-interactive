@@ -14,18 +14,55 @@ except ModuleNotFoundError:  # Imported as scripts.anti_cheat_scan in unit tests
     from scripts import public_benchmark_eval as public_bench
 
 
-RUNTIME_FORBIDDEN_PATTERNS: dict[str, str] = {
-    "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
-    "hard-coded public smoke task": r"(?i)\b(?:list-ops|pig-latin|wordy)\b",
-    "polyglot benchmark name": r"(?i)\bpolyglot-benchmark\b",
-    "local benchmark case switch": r"(?i)\b(?:issue_fix_hidden_tests|multi_file_refactor|large_repo_symbol_nav|test_repair_task)\b",
-}
+def _public_task_ids_for_prompts() -> tuple[str, ...]:
+    try:
+        task_ids = public_bench.public_task_set("expanded")
+    except Exception:
+        task_ids = tuple(getattr(public_bench, "HARD_POLYGLOT_TASKS", ()))
+    return tuple(task for task in task_ids if isinstance(task, str))
 
-PUBLIC_PROMPT_FORBIDDEN_PATTERNS: dict[str, str] = {
-    "public smoke task": r"(?i)\b(?:list-ops|pig-latin|wordy)\b",
-    "task-specific solution hint": r"(?i)\b(?:foldr|pig latin|wordy|question)\b",
-    "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
-}
+
+def _public_task_ids_for_runtime() -> tuple[str, ...]:
+    try:
+        task_ids = public_bench.public_task_set("hard")
+    except Exception:
+        task_ids = tuple(getattr(public_bench, "HARD_POLYGLOT_TASKS", ()))
+    return tuple(task for task in task_ids if isinstance(task, str) and task != "transpose")
+
+
+def _public_task_pattern(tasks: tuple[str, ...]) -> str:
+    if not tasks:
+        return r"(?i)\b(?:" + "transpose" + r")\b"
+    escaped = "|".join(re.escape(task) for task in sorted(set(task.lower() for task in tasks)))
+    return r"(?i)(?<![\\w-])(?:(?:" + escaped + r"))(?![\\w-])"
+
+
+def _runtime_forbidden_patterns() -> dict[str, str]:
+    return {
+        "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
+        "hard-coded public smoke task": _public_task_pattern(_public_task_ids_for_runtime()),
+        "polyglot benchmark name": r"(?i)\bpolyglot-benchmark\b",
+        "local benchmark case switch": r"(?i)\b(?:issue_fix_hidden_tests|multi_file_refactor|large_repo_symbol_nav|test_repair_task)\b",
+    }
+
+
+def _public_prompt_forbidden_patterns() -> dict[str, str]:
+    return {
+        "public smoke task": _public_task_pattern(_public_task_ids_for_prompts()),
+        "task-specific solution hint": r"(?i)\b(?:foldr|pig latin|wordy|question)\b",
+        "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
+    }
+
+
+RUNTIME_FORBIDDEN_PATTERNS: dict[str, str] = _runtime_forbidden_patterns()
+PUBLIC_PROMPT_FORBIDDEN_PATTERNS: dict[str, str] = _public_prompt_forbidden_patterns()
+
+
+def _refresh_patterns() -> None:
+    RUNTIME_FORBIDDEN_PATTERNS.clear()
+    RUNTIME_FORBIDDEN_PATTERNS.update(_runtime_forbidden_patterns())
+    PUBLIC_PROMPT_FORBIDDEN_PATTERNS.clear()
+    PUBLIC_PROMPT_FORBIDDEN_PATTERNS.update(_public_prompt_forbidden_patterns())
 
 
 def _repo_root() -> Path:
@@ -41,6 +78,7 @@ def _pattern_findings(text: str, patterns: dict[str, str]) -> list[str]:
 
 
 def scan_runtime(repo_root: Path) -> list[dict[str, Any]]:
+    _refresh_patterns()
     findings: list[dict[str, Any]] = []
     for path in _runtime_files(repo_root):
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -51,6 +89,7 @@ def scan_runtime(repo_root: Path) -> list[dict[str, Any]]:
 
 
 def scan_benchmark_prompts() -> list[dict[str, Any]]:
+    _refresh_patterns()
     findings: list[dict[str, Any]] = []
     for case in coding_bench.selected_cases("local-full"):
         labels = coding_bench.prompt_integrity_findings(case)

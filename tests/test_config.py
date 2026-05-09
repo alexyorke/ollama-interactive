@@ -237,7 +237,8 @@ class ConfigCliSmokeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip().splitlines()[-1], "config smoke ok")
         self.assertEqual(len(_FakeOllamaHandler.requests), 1)
-        self.assertEqual(_FakeOllamaHandler.tag_requests, 0)
+        # model resolution now validates the configured model against local tags.
+        self.assertEqual(_FakeOllamaHandler.tag_requests, 1)
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "config-model")
 
     def test_one_shot_cli_falls_back_to_installed_runtime_default_model(self) -> None:
@@ -254,6 +255,42 @@ class ConfigCliSmokeTests(unittest.TestCase):
             try:
                 (config_dir / "config.json").write_text(
                     json.dumps({"host": f"http://127.0.0.1:{server.server_port}"}),
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [sys.executable, "-m", "ollama_code", "--cwd", str(root), "--quiet", "Reply with ok."],
+                    cwd=Path(__file__).resolve().parents[1],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env={key: value for key, value in os.environ.items() if key not in {"OLLAMA_HOST", "OLLAMA_CODE_MODEL", "OLLAMA_CODE_VERIFIER_MODEL"}},
+                    timeout=30,
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "config smoke ok")
+        self.assertEqual(_FakeOllamaHandler.tag_requests, 1)
+        self.assertEqual(len(_FakeOllamaHandler.requests), 1)
+        self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "gemma3:4b")
+
+    def test_one_shot_cli_falls_back_when_configured_model_is_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / ".ollama-code"
+            config_dir.mkdir(parents=True)
+            _FakeOllamaHandler.requests = []
+            _FakeOllamaHandler.tag_requests = 0
+            _FakeOllamaHandler.available_models = [{"name": "gemma3:4b"}]
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                (config_dir / "config.json").write_text(
+                    json.dumps({"host": f"http://127.0.0.1:{server.server_port}", "model": "stale-config-model"}),
                     encoding="utf-8",
                 )
                 result = subprocess.run(
