@@ -2958,6 +2958,19 @@ class OllamaCodeAgent:
         response_type = normalized.get("type")
         tool_name = normalized.get("name")
         arguments = normalized.get("arguments")
+        if isinstance(tool_name, str) and tool_name == "final" and response_type in {"tool", None, "", "function", "tool_call"}:
+            message = normalized.get("message")
+            if not isinstance(message, str):
+                if isinstance(arguments, dict):
+                    arg_message = arguments.get("message")
+                    if isinstance(arg_message, str):
+                        message = arg_message
+                    else:
+                        arg_content = arguments.get("content")
+                        if isinstance(arg_content, str):
+                            message = arg_content
+            normalized = {"type": "final", "message": str(message or "").strip()}
+            return normalized
         if isinstance(response_type, str) and response_type in KNOWN_TOOL_NAMES:
             normalized["type"] = "tool"
             if not isinstance(tool_name, str) or not tool_name:
@@ -5589,6 +5602,254 @@ class OllamaCodeAgent:
         suffix = f" Available models include: {available_preview}." if available_preview else ""
         return requested_model, None, f"Sub-agent model is not installed: {requested_model}.{suffix}"
 
+    def _request_looks_like_python_test_driven_repair(
+        self,
+        *,
+        request_text: str,
+        session_memory_request: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> bool:
+        if session_memory_request or not mutation_required or not test_run_required:
+            return False
+        if required_tool_names or forbidden_tool_names:
+            return False
+        if not self.tools.default_test_command:
+            return False
+        lowered = request_text.lower()
+        requested_paths = self._requested_mutation_paths(request_text)
+        if any(path.endswith(".py") and not self._path_looks_like_test_file(path) for path in requested_paths):
+            return True
+        return bool(
+            re.search(
+                r"\b(?:python exercise|from the tests?|read source and tests|read tests and source|implement .*tests?|fix .*tests?)\b",
+                lowered,
+            )
+        )
+
+    def _focused_python_repair_paths(self, request_text: str) -> tuple[str, str] | None:
+        requested_paths = sorted(
+            path for path in self._requested_mutation_paths(request_text) if path.endswith(".py") and not self._path_looks_like_test_file(path)
+        )
+        for source_path in requested_paths:
+            test_path = self._focused_python_repair_test_path(source_path)
+            if test_path is not None:
+                return source_path, test_path
+        return self._preemptive_spec_guided_repair_paths()
+
+    def _focused_python_repair_test_path(self, source_path: str) -> str | None:
+        try:
+            source_file = self.tools.resolve_path(source_path, allow_missing=False)
+        except Exception:
+            return None
+        rel_source = self.tools.relative_label(source_file)
+        source_stem = source_file.stem.lower()
+        candidates: list[tuple[int, str]] = []
+        try:
+            files = self.tools._iter_code_files(self.tools.workspace_root, limit=160)
+        except Exception:
+            files = []
+        for path in files:
+            rel_test = self.tools.relative_label(path)
+            if path.suffix.lower() != ".py" or not self._path_looks_like_test_file(rel_test):
+                continue
+            score = 0
+            name = path.name.lower()
+            if source_stem in name:
+                score += 20
+            try:
+                match = self.tools.find_implementation_target(test_path=rel_test, limit=8)
+            except Exception:
+                match = {}
+            targets = match.get("targets") if isinstance(match.get("targets"), list) else []
+            if any(isinstance(item, dict) and str(item.get("path") or "").strip() == rel_source for item in targets):
+                score += 100
+            if score:
+                candidates.append((score, rel_test))
+        if candidates:
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            return candidates[0][1]
+        return None
+
+    def _repair_strategy_messages(
+        self,
+        *,
+        request_text: str,
+        source_path: str,
+        test_path: str,
+        source_text: str,
+        spec_output: str,
+        quick_spec: dict[str, Any],
+    ) -> list[dict[str, str]]:
+        example_count = len(list(quick_spec.get("examples") or []))
+        stub_count = len(list(quick_spec.get("stubs") or []))
+        definition_count = len(list(quick_spec.get("definitions") or []))
+        payload = {
+            "request": self._truncate_text(request_text, limit=320),
+            "source_path": source_path,
+            "test_path": test_path,
+            "source_line_count": len(source_text.splitlines()),
+            "definition_count": definition_count,
+            "example_count": example_count,
+            "stub_count": stub_count,
+            "source_preview": self._truncate_text(source_text, limit=1200),
+            "implementation_spec": self._truncate_text(spec_output, limit=2200),
+        }
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a repair strategy planner for a coding CLI controller. "
+                    "Choose spec_guided_repair when the task is a focused Python source repair with executable tests, "
+                    "small scope, and enough structured evidence to safely synthesize or validate a full replacement. "
+                    "Choose normal_loop when the task is broader, multi-file, or the spec is too weak."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
+        ]
+
+    def _normalize_repair_strategy_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        decision = payload if isinstance(payload, dict) else {}
+        strategy = str(decision.get("strategy", "")).strip().lower()
+        if strategy not in {"spec_guided_repair", "normal_loop"}:
+            strategy = "normal_loop"
+        notes = [str(item).strip() for item in list(decision.get("notes") or []) if isinstance(item, str) and str(item).strip()]
+        return {
+            "strategy": strategy,
+            "reason": str(decision.get("reason", "")).strip(),
+            "notes": notes,
+        }
+
+    def _plan_repair_strategy(
+        self,
+        *,
+        request_text: str,
+        source_path: str,
+        test_path: str,
+        source_text: str,
+        spec_output: str,
+        quick_spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.status_printer("planning repair strategy")
+        response = self._chat(
+            purpose="repair_strategy",
+            model=self.model,
+            messages=self._repair_strategy_messages(
+                request_text=request_text,
+                source_path=source_path,
+                test_path=test_path,
+                source_text=source_text,
+                spec_output=spec_output,
+                quick_spec=quick_spec,
+            ),
+            think=False,
+        )
+        decision = self._normalize_repair_strategy_payload(extract_json_response(response.content))
+        self._record_event(
+            "repair_strategy",
+            strategy=decision["strategy"],
+            reason=decision["reason"],
+            notes=decision["notes"],
+            source_path=source_path,
+            test_path=test_path,
+            planner=response.content,
+        )
+        return decision
+
+    def _try_structured_test_driven_repair(
+        self,
+        *,
+        request_text: str,
+        session_memory_request: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
+            return None
+        if not self._request_looks_like_python_test_driven_repair(
+            request_text=request_text,
+            session_memory_request=session_memory_request,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        ):
+            return None
+        paths = self._focused_python_repair_paths(request_text)
+        if paths is None:
+            return None
+        source_path, test_path = paths
+        try:
+            source_text = self.tools.resolve_path(source_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        source_result = self._execute_controller_tool(
+            name="read_file",
+            arguments={"path": source_path},
+            request_text=request_text,
+            round_number=0,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        test_result = self._execute_controller_tool(
+            name="read_file",
+            arguments={"path": test_path},
+            request_text=request_text,
+            round_number=0,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        spec_result = self._execute_controller_tool(
+            name="implementation_spec",
+            arguments={"source_path": source_path, "test_path": test_path, "limit": 60},
+            request_text=request_text,
+            round_number=0,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if source_result.get("ok") is not True or test_result.get("ok") is not True or spec_result.get("ok") is not True:
+            return None
+        if not self._spec_guided_repair_has_actionable_spec(
+            source_text=source_text,
+            quick_spec=spec_result,
+            failed_output="Focused Python test-driven repair requested.",
+        ):
+            return None
+        strategy = self._plan_repair_strategy(
+            request_text=request_text,
+            source_path=source_path,
+            test_path=test_path,
+            source_text=source_text,
+            spec_output=str(spec_result.get("output") or spec_result.get("summary") or ""),
+            quick_spec=spec_result,
+        )
+        if strategy["strategy"] != "spec_guided_repair":
+            return None
+        return self._try_spec_guided_repair(
+            request_text=request_text,
+            round_number=0,
+            failed_run_test_result={
+                "ok": False,
+                "tool": "structured_test_repair",
+                "summary": "Focused Python source+test repair selected by controller strategy planning.",
+                "output": "Focused Python source+test repair selected by controller strategy planning.",
+            },
+            run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -6453,6 +6714,20 @@ class OllamaCodeAgent:
             if preemptive_repair_result is not None:
                 return preemptive_repair_result
             tool_used_this_turn = tool_used_this_turn or bool(tool_calls_this_turn)
+        structured_repair_result = self._try_structured_test_driven_repair(
+            request_text=text,
+            session_memory_request=session_memory_request,
+            mutation_required=mutation_required or code_mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if structured_repair_result is not None:
+            return structured_repair_result
+        tool_used_this_turn = tool_used_this_turn or bool(tool_calls_this_turn)
         if self._should_preload_context_pack(
             request_text=text,
             session_memory_request=session_memory_request,
@@ -8048,6 +8323,28 @@ class OllamaCodeAgent:
                     self._record_event("assistant", content=message, rounds=self.max_tool_rounds)
                     self._flush_llm_call_events()
                     return AgentResult(message=message, rounds=self.max_tool_rounds, completed=True)
+                if (
+                    not spec_guided_repair_attempted
+                    and self._spec_guided_repair_enabled()
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_paths(successful_tool_results) is not None
+                ):
+                    spec_guided_repair_attempted = True
+                    failed_validation_result = dict(validation_result)
+                    failed_validation_result.setdefault("tool", validation_name)
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=self.max_tool_rounds,
+                        failed_run_test_result=failed_validation_result,
+                        run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
                 summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
                 failure = "Stopped because final-chance post-edit validation failed."
                 if summary:

@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.agent import GROUNDING_EVIDENCE_TOOL_NAMES, OllamaCodeAgent, _workspace_roots_match
+from ollama_code.agent import AgentResult, GROUNDING_EVIDENCE_TOOL_NAMES, OllamaCodeAgent, _workspace_roots_match
 from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
 from ollama_code.ollama_client import ChatResponse, TokenUsage
 from ollama_code.tools import ToolExecutor
@@ -135,6 +135,18 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(any(event.get("type") == "tool_call" and event.get("name") == "read_file" for event in agent.events))
         tool_result = next(event for event in agent.events if event.get("type") == "tool_result" and event.get("name") == "read_file")
         self.assertIsInstance(tool_result.get("duration_ms"), float)
+
+    def test_agent_normalizes_tool_named_final_into_final_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(['{"type":"tool","name":"final","arguments":{"message":"done"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertFalse(any(event.get("type") == "tool_call" and event.get("name") == "final" for event in agent.events))
 
     def test_agent_records_llm_call_usage_events(self) -> None:
         class UsageClient(FakeClient):
@@ -3234,6 +3246,7 @@ class AgentTests(unittest.TestCase):
             command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
             client = FakeClient(
                 [
+                    json.dumps({"strategy": "normal_loop", "reason": "exercise failed-test feedback in the normal loop"}),
                     json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
                     json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
                     json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
@@ -3610,6 +3623,104 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(final_text, "def value():\n    return 2\n")
         self.assertGreaterEqual(len(client.calls), 1)
         self.assertGreaterEqual(tools.execute_counts.get("replace_in_file", 0), 1)
+
+    def test_agent_require_llm_for_turn_uses_structured_test_driven_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scoreboard.py").write_text("def score_delta(base, bonus):\n    pass\n", encoding="utf-8")
+            (root / "scoreboard_test.py").write_text(
+                "import unittest\nfrom scoreboard import score_delta\n\n"
+                "class ScoreboardTest(unittest.TestCase):\n"
+                "    def test_positive_values(self):\n"
+                "        self.assertEqual(score_delta(2, 3), 5)\n"
+                "    def test_mixed_values(self):\n"
+                "        self.assertEqual(score_delta(-1, 4), 3)\n"
+                "    def test_zero_values(self):\n"
+                "        self.assertEqual(score_delta(0, 0), 0)\n"
+                "    def test_negative_values(self):\n"
+                "        self.assertEqual(score_delta(-5, -2), -7)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            candidate = "def score_delta(base, bonus):\n    return base + bonus\n"
+            client = FakeClient(
+                [
+                    json.dumps({"strategy": "spec_guided_repair", "reason": "small Python stub with executable tests"}),
+                    candidate,
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                require_llm_for_turn=True,
+                max_tool_rounds=8,
+            )
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "all"}):
+                result = agent.handle_user("Implement scoreboard.py from the tests, run tests, and summarize briefly.")
+            final_text = (root / "scoreboard.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided repair applied", result.message)
+        self.assertEqual(final_text, candidate)
+        self.assertGreaterEqual(tools.execute_counts.get("implementation_spec", 0), 1)
+        self.assertEqual(tools.execute_counts.get("context_pack"), None)
+        strategy_events = [event for event in agent.events if event.get("type") == "repair_strategy"]
+        self.assertEqual(len(strategy_events), 1)
+        self.assertEqual(strategy_events[0].get("strategy"), "spec_guided_repair")
+        self.assertGreaterEqual(len(client.calls), 2)
+        self.assertEqual(client.calls[0]["messages"][0]["content"].startswith("You are a repair strategy planner"), True)  # type: ignore[index]
+
+    def test_final_chance_validation_failure_uses_spec_guided_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scoreboard.py").write_text("def score_delta(base, bonus):\n    pass\n", encoding="utf-8")
+            (root / "scoreboard_test.py").write_text(
+                "import unittest\nfrom scoreboard import score_delta\n\n"
+                "class ScoreboardTest(unittest.TestCase):\n"
+                "    def test_positive_values(self):\n"
+                "        self.assertEqual(score_delta(2, 3), 5)\n"
+                "    def test_mixed_values(self):\n"
+                "        self.assertEqual(score_delta(-1, 4), 3)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "scoreboard.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "scoreboard_test.py"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {"path": "scoreboard.py", "old": "pass", "new": "return new_score - old_score"},
+                        }
+                    ),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+            recovery_calls: list[str] = []
+
+            def fake_repair(**kwargs: object) -> AgentResult | None:
+                failed = kwargs.get("failed_run_test_result")
+                tool = str(failed.get("tool", "")) if isinstance(failed, dict) else ""
+                recovery_calls.append(tool)
+                if tool in {"contract_check", "lint_typecheck", "run_test"}:
+                    round_number = int(kwargs.get("round_number", 0))
+                    return AgentResult("Recovered after validation failure.", rounds=round_number, completed=True)
+                return None
+
+            with patch.object(agent, "_try_structured_test_driven_repair", return_value=None):
+                with patch.object(agent, "_try_spec_guided_repair", side_effect=fake_repair):
+                    result = agent.handle_user("Implement scoreboard.py from the tests and run tests.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Recovered after validation failure.")
+        self.assertIn("preemptive_spec_repair", recovery_calls)
+        self.assertTrue(any(tool in {"contract_check", "lint_typecheck", "run_test"} for tool in recovery_calls))
 
     def test_preemptive_mechanical_repair_without_explicit_test_request_phrase(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4582,6 +4693,7 @@ class AgentTests(unittest.TestCase):
             pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
             client = FakeClient(
                 [
+                    json.dumps({"strategy": "normal_loop", "reason": "exercise the generic write-file guard path"}),
                     json.dumps(
                         {
                             "type": "tool",
@@ -4604,10 +4716,11 @@ class AgentTests(unittest.TestCase):
             agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
             with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
-                result = agent.handle_user(
-                    "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
-                    "do not edit tests, replace stubs with complete code, run tests with configured test command."
-                )
+                with patch.object(agent, "_try_structured_test_driven_repair", return_value=None):
+                    result = agent.handle_user(
+                        "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
+                        "do not edit tests, replace stubs with complete code, run tests with configured test command."
+                    )
 
             self.assertEqual(result.message, "list_ops.py fixed; tests passed.")
             self.assertFalse((root / "palindrome_solution.py").exists())

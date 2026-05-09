@@ -22,9 +22,11 @@ from ollama_code.ollama_client import OllamaClient, OllamaError  # noqa: E402
 
 try:
     from coding_benchmark_eval import comparison_rows, failed_tools, tests_run, tool_calls, usage_totals
+    from coding_benchmark_eval import default_benchmark_jobs
     from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:  # Imported as scripts.public_benchmark_eval in unit tests.
     from scripts.coding_benchmark_eval import comparison_rows, failed_tools, tests_run, tool_calls, usage_totals
+    from scripts.coding_benchmark_eval import default_benchmark_jobs
     from scripts.workspace_temp import workspace_temp_dir
 
 
@@ -436,6 +438,8 @@ def evaluate_polyglot_python_task(
         return {
             "case": task,
             "suite": "aider-polyglot-python-smoke",
+            "benchmark_kind": "coding_accuracy",
+            "benchmark_class": "agent",
             "source": POLYGLOT_REPO_URL,
             "model": model,
             "verifier_model": None,
@@ -553,7 +557,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--cache-dir", default="scratch/external")
     parser.add_argument("--output", default="scratch/public-bench/aider-polyglot-python-smoke.json")
     parser.add_argument("--compare", default=None)
-    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--jobs", type=int, default=default_benchmark_jobs())
     parser.add_argument("--timeout", type=int, default=480)
     parser.add_argument("--keep-workspaces-on-fail", action="store_true", help="Keep failed copied task workspaces under scratch/public-bench for inspection.")
     parser.add_argument("--disable-mechanical-repair", action="store_true", help="Disable spec-guided mechanical repair and require normal LLM-tool loops.")

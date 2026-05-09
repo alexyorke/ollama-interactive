@@ -1,6 +1,14 @@
 # Coding Benchmarks
 
-`scripts/coding_benchmark_eval.py` measures coding-task accuracy and token cost from saved Ollama Code sessions. It is serial-only and writes raw JSON under ignored `scratch/` by default.
+`scripts/coding_benchmark_eval.py` measures coding-task accuracy and token cost from saved Ollama Code sessions. It supports parallel case execution and writes raw JSON under ignored `scratch/` by default.
+
+For the current pooled two-GPU local proxy (`OLLAMA_HOST=http://127.0.0.1:11437`), the measured sweet spot is `12` jobs. Throughput improved through `12` workers, then flattened; `16` was effectively no faster and had worse latency.
+
+Start that pooled proxy with:
+
+```bash
+python scripts/ollama_pool_proxy.py --listen-port 11437 --backends http://127.0.0.1:11435 http://127.0.0.1:11436
+```
 
 ## Why Local First
 
@@ -20,7 +28,12 @@ External benchmark inspiration:
 - `local-small`: 8 fast tasks for regular local checks.
 - `local-full`: current 32-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, path/shell/git regressions, and token traps.
 - `external-smoke`: preflight checks for optional external harnesses; not CI-blocking and not leaderboard-comparable.
-- `scripts/public_benchmark_eval.py`: serial public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
+- `scripts/public_benchmark_eval.py`: public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
+
+## Benchmark Classes
+
+- `agent`: tools are allowed, but the benchmark must use the LLM at least once. This is the main coding benchmark class.
+- `controller`: zero-LLM fast paths are allowed. These cases measure routing/tool correctness and should not be mixed into agent-model accuracy claims.
 
 ## Metrics
 
@@ -32,37 +45,44 @@ Each result records:
 - assumption-audit count/retries, verifier retries/rewrites
 - prompt profile: chars by role and largest prompt messages
 - feature profile: `baseline`, `schema`, `context-pack`, `evidence-handles`, `num-predict-caps`, `structured-edits`, `trajectory-guards`, `contract-guards`, or `all`
+- benchmark class summary: agent vs controller runs, passes, LLM calls, and token totals are reported separately
 
 ## Commands
 
 Run the frequent local suite:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b qwen3:8b granite4.1:8b --modes off on --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b qwen3:8b granite4.1:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Run A/B feature profiles without changing prompts:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline trajectory-guards contract-guards all --compare scratch/coding-benchmark/baseline.json --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline trajectory-guards contract-guards all --benchmark-classes agent --jobs 12 --compare scratch/coding-benchmark/baseline.json --strict-accuracy --strict-budget
 ```
 
-Require coding-accuracy cases to actually call the model at least once:
+Run agent benchmarks only and require a real model call:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b --modes off --feature-profiles all --require-llm-for-coding-accuracy
+python scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b --modes off --feature-profiles all --benchmark-classes agent --jobs 12 --require-llm-for-agent-benchmarks
+```
+
+Run controller-only routing checks without mixing them into agent numbers:
+
+```bash
+python scripts/coding_benchmark_eval.py --suite local-full --models gemma4:e4b --modes off --benchmark-classes controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Run the fuller local suite for deeper regression checks:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-full --models gemma3:4b --modes off on --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-full --models gemma3:4b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Compare against a previous run:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --output scratch/coding-benchmark/after.json --compare scratch/coding-benchmark/before.json --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-small --benchmark-classes agent --jobs 12 --output scratch/coding-benchmark/after.json --compare scratch/coding-benchmark/before.json --strict-accuracy --strict-budget
 ```
 
 Check optional external harness availability:
@@ -74,13 +94,13 @@ python scripts/coding_benchmark_eval.py --suite external-smoke --output scratch/
 Run public Aider Polyglot Python smoke:
 
 ```bash
-python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --tasks list-ops pig-latin wordy --output scratch/public-bench/aider-polyglot-python-smoke.json
+python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --jobs 12 --tasks list-ops pig-latin wordy --output scratch/public-bench/aider-polyglot-python-smoke.json
 ```
 
 Compare public smoke before/after:
 
 ```bash
-python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --tasks list-ops pig-latin wordy --compare scratch/public-bench/baseline.json --output scratch/public-bench/after.json
+python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --jobs 12 --tasks list-ops pig-latin wordy --compare scratch/public-bench/baseline.json --output scratch/public-bench/after.json
 ```
 
 Raw JSON stays ignored under `scratch/`. Track only concise summaries when results are worth preserving.
@@ -90,5 +110,6 @@ Raw JSON stays ignored under `scratch/`. Track only concise summaries when resul
 - `coding_accuracy` prompts must not include synthetic marker tokens, exact answer literals, forced tool clauses, or public task-specific answers.
 - Runtime code under `ollama_code/` must not special-case public smoke task names such as `list-ops`, `pig-latin`, or `wordy`.
 - Synthetic exact-answer cases stay marked as `tool_contract`, not coding accuracy.
+- Agent benchmark claims should cite only `agent` class results, not controller routing checks.
 - Run `python scripts/anti_cheat_scan.py` before reporting benchmark gains; it checks runtime code for task names/synthetic answer markers and benchmark prompts for leaked answers.
 - Public benchmark results are local smoke only unless official harness/settings are used.

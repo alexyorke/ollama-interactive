@@ -91,6 +91,17 @@ REWRITER_RESPONSE_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
 }
 
+REPAIR_STRATEGY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "strategy": {"type": "string", "enum": ["spec_guided_repair", "normal_loop"]},
+        "reason": {"type": "string"},
+        "notes": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["strategy"],
+    "additionalProperties": True,
+}
+
 
 def response_format_for_purpose(purpose: str, fallback: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
     if not feature_enabled("schema") or fallback != "json":
@@ -101,6 +112,8 @@ def response_format_for_purpose(purpose: str, fallback: str | dict[str, Any] | N
         return VERDICT_SCHEMA
     if purpose in {"verification_rewrite", "final_rewrite"}:
         return REWRITER_RESPONSE_SCHEMA
+    if purpose == "repair_strategy":
+        return REPAIR_STRATEGY_SCHEMA
     return fallback
 
 
@@ -111,6 +124,8 @@ def options_for_purpose(purpose: str, *, primary_can_emit_large_payload: bool = 
         return {} if primary_can_emit_large_payload else {"num_predict": 256}
     if purpose == "question_planner":
         return {"temperature": 0, "num_predict": 384}
+    if purpose == "repair_strategy":
+        return {"temperature": 0, "num_predict": 160}
     if purpose in {"verification", "final_verifier", "assumption_audit", "artifact_reconciliation", "reconciliation"}:
         return {"temperature": 0, "num_predict": 192}
     if purpose in {"verification_rewrite", "final_rewrite"}:

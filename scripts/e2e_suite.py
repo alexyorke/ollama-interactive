@@ -4,7 +4,9 @@ import argparse
 import atexit
 import json
 import os
+import secrets
 import shlex
+import string
 import subprocess
 import sys
 import urllib.request
@@ -120,6 +122,11 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _nonce(prefix: str, *, width: int = 3) -> str:
+    suffix = "".join(secrets.choice(string.digits) for _ in range(width))
+    return f"{prefix}_{suffix}"
+
+
 def _standard_test_import(module: str) -> str:
     return (
         "import sys\n"
@@ -153,6 +160,7 @@ def run_cli(
     stdin_text: str | None = None,
     extra_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
+    require_llm_for_turn: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -164,12 +172,13 @@ def run_cli(
         model,
         "--approval",
         approval,
-        "--require-llm-for-turn",
         "--max-tool-rounds",
         "12",
         "--max-agent-depth",
         "2",
     ]
+    if require_llm_for_turn:
+        command.append("--require-llm-for-turn")
     if extra_args:
         command.extend(extra_args)
     if session_file is not None:
@@ -199,6 +208,7 @@ def run_repl(
     approval: str = "ask",
     timeout: int = 420,
     session_file: Path | None = None,
+    require_llm_for_turn: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         sys.executable,
@@ -210,12 +220,13 @@ def run_repl(
         model,
         "--approval",
         approval,
-        "--require-llm-for-turn",
         "--max-tool-rounds",
         "12",
         "--max-agent-depth",
         "2",
     ]
+    if require_llm_for_turn:
+        command.append("--require-llm-for-turn")
     if session_file is not None:
         command.extend(["--session-file", str(session_file)])
     return subprocess.run(
@@ -508,6 +519,329 @@ def scenario_nested_package_import_fix(repo_root: Path, workspace: Path, model: 
     require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for package import fix", stdout=result.stdout, stderr=result.stderr, session=session)
 
 
+def scenario_api_docs_callsite_sync(repo_root: Path, workspace: Path, model: str) -> None:
+    fetch_user = _nonce("fetch_user")
+    build_summary = _nonce("build_summary")
+    api_module = "api"
+    dashboard_module = "dashboard"
+    docs_name = "api.md"
+    _write(
+        workspace / "src" / f"{api_module}.py",
+        f"def {fetch_user}(user_id: str, include_orders: bool = False) -> dict[str, object]:\n    return {{'id': user_id}}\n",
+    )
+    _write(
+        workspace / "src" / f"{dashboard_module}.py",
+        f"from {api_module} import {fetch_user}\n\n\ndef {build_summary}(user_id: str):\n    return {fetch_user}(user_id)\n",
+    )
+    _write(workspace / "docs" / docs_name, f"`{fetch_user}(user_id, include_orders=False)` returns a user dict.\n")
+    _write(
+        workspace / "tests" / "test_api_dashboard.py",
+        _standard_test_import(api_module)
+        + f"from {dashboard_module} import {build_summary}\n"
+        + "import unittest\n\n\nclass ApiDashboardTests(unittest.TestCase):\n"
+        + f"    def test_fetch_user_default(self) -> None:\n        self.assertEqual({fetch_user}('7'), {{'id': '7'}})\n"
+        + f"    def test_build_summary_includes_orders(self) -> None:\n        self.assertEqual({build_summary}('7'), {{'id': '7', 'orders': []}})\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    session_file = workspace / "scratch" / "api-docs-callsite-sync.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        (
+            f"Update {fetch_user} in src/{api_module}.py so include_orders=True returns a user dict with an empty orders list. "
+            f"Update src/{dashboard_module}.py so {build_summary} passes include_orders=True. "
+            f"Update tests and docs/{docs_name}, run tests, and summarize briefly."
+        ),
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    api_source = (workspace / "src" / f"{api_module}.py").read_text(encoding="utf-8")
+    dashboard_source = (workspace / "src" / f"{dashboard_module}.py").read_text(encoding="utf-8")
+    docs = (workspace / "docs" / docs_name).read_text(encoding="utf-8")
+    hidden = (
+        f"import sys; sys.path.insert(0, 'src'); from {api_module} import {fetch_user}; from {dashboard_module} import {build_summary}; "
+        f"assert {fetch_user}('2') == {{'id': '2'}}; "
+        f"assert {fetch_user}('2', include_orders=True) == {{'id': '2', 'orders': []}}; "
+        f"assert {build_summary}('3') == {{'id': '3', 'orders': []}}"
+    )
+    require(result.returncode == 0, "api docs callsite sync command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="api docs callsite sync did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require("include_orders" in api_source and "'orders': []" in api_source, "api.py was not updated for include_orders", stdout=result.stdout, stderr=result.stderr, session=session)
+    require("include_orders=True" in dashboard_source, "dashboard.py did not update the fetch_user call site", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(fetch_user in docs and "include_orders" in docs, "api docs were not updated", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden api/dashboard assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after api/docs sync", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for api/docs sync", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_scoreboard_hidden(repo_root: Path, workspace: Path, model: str) -> None:
+    module = "scoreboard"
+    function_name = "score_delta"
+    _write(workspace / "src" / f"{module}.py", f"def {function_name}(base: int, bonus: int) -> int:\n    pass\n")
+    _write(
+        workspace / "tests" / "test_scoreboard.py",
+        _standard_test_import(module)
+        + "import unittest\n\n\nclass ScoreboardTests(unittest.TestCase):\n"
+        + f"    def test_positive_values(self) -> None:\n        self.assertEqual({function_name}(2, 3), 5)\n"
+        + f"    def test_mixed_values(self) -> None:\n        self.assertEqual({function_name}(-1, 4), 3)\n"
+        + f"    def test_zero_values(self) -> None:\n        self.assertEqual({function_name}(0, 0), 0)\n"
+        + f"    def test_negative_values(self) -> None:\n        self.assertEqual({function_name}(-5, -2), -7)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    session_file = workspace / "scratch" / "scoreboard-hidden.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        f"Implement {function_name} in src/{module}.py from the tests. Read source and tests, replace stubs with complete code, run tests, and summarize briefly.",
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    source = (workspace / "src" / f"{module}.py").read_text(encoding="utf-8")
+    hidden = (
+        f"import sys; sys.path.insert(0, 'src'); from {module} import {function_name}; "
+        f"assert {function_name}(9, -4) == 5; assert {function_name}(-8, 3) == -5"
+    )
+    require(result.returncode == 0, "scoreboard hidden command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="scoreboard hidden did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require("pass" not in source, "scoreboard module still contains a stub", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden scoreboard assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after scoreboard implementation", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for scoreboard", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_checkout_callsite_refactor(repo_root: Path, workspace: Path, model: str) -> None:
+    old_name = "total"
+    new_name = "cart_total"
+    caller_name = "checkout_total"
+    _write(workspace / "src" / "pricing.py", f"def {old_name}(prices: list[int]) -> int:\n    return sum(prices)\n")
+    _write(
+        workspace / "src" / "checkout.py",
+        f"from pricing import {old_name}\n\n\ndef {caller_name}(prices: list[int]) -> int:\n    return {old_name}(prices)\n",
+    )
+    _write(
+        workspace / "tests" / "test_checkout_refactor.py",
+        _standard_test_import("pricing")
+        + f"from checkout import {caller_name}\n"
+        + "import unittest\n\n\nclass CheckoutRefactorTests(unittest.TestCase):\n"
+        + f"    def test_public_pricing_api(self) -> None:\n        self.assertEqual({new_name}([2, 3, 4]), 9)\n"
+        + f"    def test_checkout_callsite(self) -> None:\n        self.assertEqual({caller_name}([1, 5]), 6)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    _write(workspace / "docs" / "pricing.md", f"Call `{old_name}(prices)` to compute a cart total.\n")
+    session_file = workspace / "scratch" / "checkout-callsite-refactor.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        (
+            f"Refactor the pricing API from {old_name}(prices) to {new_name}(prices). Update src/pricing.py, "
+            f"src/checkout.py, tests, and docs/pricing.md. Run tests and summarize briefly."
+        ),
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    pricing_source = (workspace / "src" / "pricing.py").read_text(encoding="utf-8")
+    checkout_source = (workspace / "src" / "checkout.py").read_text(encoding="utf-8")
+    docs = (workspace / "docs" / "pricing.md").read_text(encoding="utf-8")
+    hidden = (
+        f"import sys; sys.path.insert(0, 'src'); from pricing import {new_name}; from checkout import {caller_name}; "
+        f"assert {new_name}([9, 1]) == 10; assert {caller_name}([4, 6]) == 10"
+    )
+    require(result.returncode == 0, "checkout callsite refactor command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="checkout callsite refactor did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require(f"def {new_name}" in pricing_source and f"def {old_name}(" not in pricing_source, "pricing.py was not refactored", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(f"from pricing import {new_name}" in checkout_source and f"return {new_name}(prices)" in checkout_source and f"from pricing import {old_name}" not in checkout_source and f"return {old_name}(prices)" not in checkout_source, "checkout.py did not update the pricing call site", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(new_name in docs and f"`{old_name}(prices)`" not in docs, "pricing docs were not updated", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden checkout refactor assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after checkout refactor", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for checkout refactor", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_retry_policy_hidden(repo_root: Path, workspace: Path, model: str) -> None:
+    should_retry = "should_retry"
+    next_action = "next_action"
+    _write(
+        workspace / "src" / "retry.py",
+        f"def {should_retry}(status_code: int, attempt: int) -> bool:\n    return status_code >= 500 and attempt > 2\n",
+    )
+    _write(
+        workspace / "src" / "client.py",
+        f"from retry import {should_retry}\n\n\ndef {next_action}(status_code: int, attempt: int) -> str:\n    return 'retry' if {should_retry}(status_code, attempt) else 'stop'\n",
+    )
+    _write(
+        workspace / "tests" / "test_retry_policy.py",
+        _standard_test_import("retry")
+        + f"from client import {next_action}\n"
+        + "import unittest\n\n\nclass RetryPolicyTests(unittest.TestCase):\n"
+        + f"    def test_retries_initial_attempts(self) -> None:\n        self.assertTrue({should_retry}(503, 0))\n"
+        + f"    def test_does_not_retry_non_server_error(self) -> None:\n        self.assertFalse({should_retry}(404, 0))\n"
+        + f"    def test_retries_upper_server_range(self) -> None:\n        self.assertTrue({should_retry}(599, 2))\n"
+        + f"    def test_does_not_retry_client_error_boundary(self) -> None:\n        self.assertFalse({should_retry}(499, 0))\n"
+        + f"    def test_client_retry_action(self) -> None:\n        self.assertEqual({next_action}(503, 1), 'retry')\n"
+        + f"    def test_client_stop_after_budget(self) -> None:\n        self.assertEqual({next_action}(503, 3), 'stop')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    session_file = workspace / "scratch" / "retry-policy-hidden.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        (
+            f"The retry policy in src/retry.py is wrong. Attempts 0, 1, and 2 should retry for HTTP status codes 500 through 599; "
+            f"attempt 3 and above should stop, and 499 or 404 should not retry. Read source and tests, fix {should_retry}, run tests, and summarize briefly."
+        ),
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    hidden = (
+        f"import sys; sys.path.insert(0, 'src'); from retry import {should_retry}; from client import {next_action}; "
+        f"assert {should_retry}(502, 2) is True; assert {should_retry}(502, 3) is False; assert {next_action}(500, 2) == 'retry'"
+    )
+    require(result.returncode == 0, "retry policy hidden command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="retry policy hidden did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require(_hidden_python(workspace, hidden), "hidden retry policy assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after retry policy fix", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for retry policy", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_balance_credit_hidden(repo_root: Path, workspace: Path, model: str) -> None:
+    _write(workspace / "src" / "balance.py", "def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n")
+    _write(
+        workspace / "src" / "report.py",
+        "from balance import apply_credit\n\n\ndef closing_balance(amount: int, credit: int) -> str:\n    return f'closing={apply_credit(amount, credit)}'\n",
+    )
+    _write(
+        workspace / "tests" / "test_balance_credit.py",
+        _standard_test_import("balance")
+        + "from report import closing_balance\n"
+        + "import unittest\n\n\nclass BalanceCreditTests(unittest.TestCase):\n"
+        + "    def test_apply_credit(self) -> None:\n        self.assertEqual(apply_credit(10, 3), 13)\n"
+        + "    def test_report_uses_credit(self) -> None:\n        self.assertEqual(closing_balance(10, 3), 'closing=13')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    session_file = workspace / "scratch" / "balance-credit-hidden.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Bug in src/balance.py: apply_credit(amount, credit) returns the wrong value. Read source and tests, fix it, run tests, and summarize briefly.",
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    source = (workspace / "src" / "balance.py").read_text(encoding="utf-8")
+    hidden = (
+        "import sys; sys.path.insert(0, 'src'); from balance import apply_credit; from report import closing_balance; "
+        "assert apply_credit(0, 0) == 0; assert apply_credit(-2, 5) == 3; assert closing_balance(7, 1) == 'closing=8'"
+    )
+    require(result.returncode == 0, "balance credit hidden command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="balance credit hidden did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require("return amount + credit" in source, "balance.py was not fixed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden balance credit assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after balance credit fix", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for balance credit", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_slug_repair_hidden(repo_root: Path, workspace: Path, model: str) -> None:
+    module = "slug"
+    function_name = _nonce("slugify")
+    _write(workspace / "src" / f"{module}.py", f"def {function_name}(value: str) -> str:\n    pass\n")
+    _write(
+        workspace / "tests" / "test_slug.py",
+        _standard_test_import(module)
+        + "import unittest\n\n\nclass SlugTests(unittest.TestCase):\n"
+        + f"    def test_slugifies_spaces(self) -> None:\n        self.assertEqual({function_name}('Hello Local Model'), 'hello-local-model')\n"
+        + f"    def test_trims_edges(self) -> None:\n        self.assertEqual({function_name}('  Mixed Case  '), 'mixed-case')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    session_file = workspace / "scratch" / "slug-repair-hidden.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        (
+            f"Implement {function_name} in src/{module}.py from the tests. Read source and tests, replace the stub with "
+            f"complete code so whitespace collapses to single hyphens and output is lowercase, run tests, and summarize briefly."
+        ),
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    source = (workspace / "src" / f"{module}.py").read_text(encoding="utf-8")
+    hidden = (
+        f"import sys; sys.path.insert(0, 'src'); from {module} import {function_name}; "
+        f"assert {function_name}('  Many   Spaces ') == 'many-spaces'; "
+        f"assert {function_name}('Tabs\\tand\\nlines') == 'tabs-and-lines'"
+    )
+    require(result.returncode == 0, "slug repair hidden command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="slug repair hidden did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require("lower" in source and "-" in source, "slug repair module was not updated meaningfully", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden slug repair assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after slug repair", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for slug repair", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
+def scenario_flag_constant_sync(repo_root: Path, workspace: Path, model: str) -> None:
+    module = "flags"
+    consumer_module = "consumer"
+    constant_name = _nonce("old_flag").upper()
+    function_name = _nonce("flag_name")
+    consumer_name = _nonce("describe_flag")
+    docs_name = "flags.md"
+    _write(
+        workspace / "src" / f"{module}.py",
+        f"{constant_name} = 'old'\n\n\ndef {function_name}() -> str:\n    return {constant_name}\n",
+    )
+    _write(
+        workspace / "src" / f"{consumer_module}.py",
+        f"from {module} import {function_name}\n\n\ndef {consumer_name}() -> str:\n    return f'flag={{{function_name}()}}'\n",
+    )
+    _write(
+        workspace / "tests" / "test_flags_consumer.py",
+        _standard_test_import(module)
+        + f"from {consumer_module} import {consumer_name}\n"
+        + "import unittest\n\n\nclass FlagSyncTests(unittest.TestCase):\n"
+        + f"    def test_public_function(self) -> None:\n        self.assertEqual({function_name}(), 'new')\n"
+        + f"    def test_consumer_output(self) -> None:\n        self.assertEqual({consumer_name}(), 'flag=new')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    _write(workspace / "docs" / docs_name, f"`{function_name}()` returns the current flag value from `{constant_name}`. Right now `{constant_name}` is `'old'`.\n")
+    session_file = workspace / "scratch" / "flag-constant-sync.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        (
+            f"Change {constant_name} in src/{module}.py from 'old' to 'new' while keeping {function_name}() as the public function. "
+            f"Update src/{consumer_module}.py, tests, and docs/{docs_name} if needed. Run tests and summarize briefly."
+        ),
+        session_file=session_file,
+        extra_args=["--test-cmd", _python_test_cmd()],
+        timeout=1200,
+    )
+    session = load_session(session_file)
+    source = (workspace / "src" / f"{module}.py").read_text(encoding="utf-8")
+    consumer_source = (workspace / "src" / f"{consumer_module}.py").read_text(encoding="utf-8")
+    docs = (workspace / "docs" / docs_name).read_text(encoding="utf-8")
+    hidden = (
+        f"import sys; sys.path.insert(0, 'src'); from {module} import {function_name}; from {consumer_module} import {consumer_name}; "
+        f"assert {function_name}() == 'new'; assert {consumer_name}() == 'flag=new'"
+    )
+    require(result.returncode == 0, "flag constant sync command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="flag constant sync did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require(f"{constant_name} = 'new'" in source, "constant was not updated", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(function_name in consumer_source and "flag=" in consumer_source, "consumer module was damaged", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(constant_name in docs and "'new'" in docs, "flag docs were not updated", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden flag sync assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after flag sync", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for flag sync", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
 def scenario_subagent_transcript(repo_root: Path, workspace: Path, model: str) -> None:
     session_file = workspace / "scratch" / "subagent.json"
     result = run_cli(
@@ -621,6 +955,7 @@ def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> Non
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run stricter end-to-end checks against a real Ollama Code model.")
     parser.add_argument("--model", default="gemma4:e4b", help="Model to test.")
+    parser.add_argument("--scenarios", nargs="+", help="Optional scenario names to run.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -637,18 +972,32 @@ def main(argv: list[str] | None = None) -> int:
         ("scenario_multi_file_refactor", scenario_multi_file_refactor),
         ("scenario_large_repo_symbol_nav", scenario_large_repo_symbol_nav),
         ("scenario_nested_package_import_fix", scenario_nested_package_import_fix),
+        ("scenario_scoreboard_hidden", scenario_scoreboard_hidden),
+        ("scenario_checkout_callsite_refactor", scenario_checkout_callsite_refactor),
+        ("scenario_retry_policy_hidden", scenario_retry_policy_hidden),
+        ("scenario_balance_credit_hidden", scenario_balance_credit_hidden),
+        ("scenario_slug_repair_hidden", scenario_slug_repair_hidden),
         ("scenario_subagent_transcript", scenario_subagent_transcript),
         ("scenario_git_tools", scenario_git_tools),
         ("scenario_continue_session", scenario_continue_session),
         ("scenario_multiturn_repl", scenario_multiturn_repl),
     ]
+    if args.scenarios:
+        requested = set(args.scenarios)
+        selected = [item for item in scenarios if item[0] in requested]
+        missing = sorted(requested - {name for name, _ in selected})
+        if missing:
+            raise SystemExit(f"Unknown scenario(s): {', '.join(missing)}")
+        scenarios = selected
 
     with workspace_temp_dir("ollama-code-e2e-", repo_root) as tmp:
-        workspace = Path(tmp)
-        git_available = build_workspace(workspace)
+        run_root = Path(tmp)
         print(f"[e2e] model={model}")
         _LOADED_MODELS.add(model)
         for name, scenario in scenarios:
+            workspace = run_root / name
+            workspace.mkdir(parents=True, exist_ok=True)
+            git_available = build_workspace(workspace)
             if name == "scenario_git_tools" and not git_available:
                 print(f"[e2e]   {name} (skipped: git workspace unavailable)")
                 continue

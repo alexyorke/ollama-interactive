@@ -1655,6 +1655,26 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertIn("school = School(); school.add_student(name='Aimee', grade=2); school.roster() -> ['Aimee']", result["output"])
 
+    def test_test_spec_extract_captures_assert_true_and_false_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "retry.py").write_text("def should_retry(status_code, attempt):\n    pass\n", encoding="utf-8")
+            (root / "retry_test.py").write_text(
+                "import unittest\nfrom retry import should_retry\n\n"
+                "class RetryPolicyTest(unittest.TestCase):\n"
+                "    def test_retries_initial_attempts(self):\n"
+                "        self.assertTrue(should_retry(503, 0))\n"
+                "    def test_does_not_retry_non_server_error(self):\n"
+                "        self.assertFalse(should_retry(404, 0))\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("retry_test.py", source_path="retry.py", limit=10)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("should_retry(503, 0) -> True", result["output"])
+        self.assertIn("should_retry(404, 0) -> False", result["output"])
+
     def test_test_spec_extract_keeps_constructor_attribute_and_receiver_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3691,6 +3711,32 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
 
+    def test_contract_check_resolves_workspace_star_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "pricing.py").write_text(
+                "__all__ = ['cart_total']\n\n"
+                "def cart_total(prices):\n"
+                "    return sum(prices)\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_pricing.py").write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
+                "from pricing import *\n\n"
+                "def test_cart_total():\n"
+                "    assert cart_total([2, 3, 4]) == 9\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["src/pricing.py", "tests/test_pricing.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("undefined local/global name 'cart_total'", result["output"])
+
     def test_broad_scans_skip_public_benchmark_meta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4174,6 +4220,21 @@ def double(value: int) -> int:
         self.assertIn("returns shape dict", result["output"])
         self.assertIn("may return None", result["output"])
 
+    def test_contract_check_allows_returning_local_dict_variable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def fetch_user(user_id: str) -> dict[str, str]:\n"
+                "    user_data = {'id': user_id}\n"
+                "    return user_data\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"])
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertNotIn("returns shape name:user_data", result["output"])
+
     def test_contract_check_flags_caller_return_shape_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4323,6 +4384,26 @@ def double(value: int) -> int:
 
         self.assertTrue(result["ok"])
         self.assertIn("def fetch_user(user_id, include_orders=False):", sample.read_text(encoding="utf-8"))
+
+    def test_apply_structured_edit_changes_signature_from_bare_callable_signature(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def fetch_user(user_id: str) -> dict[str, str]:\n    return {'id': user_id}\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit(
+            {
+                "op": "change_signature",
+                "path": "ops.py",
+                "symbol": "fetch_user",
+                "signature": "fetch_user(user_id: str, include_orders: bool = False) -> dict[str, str]:",
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn(
+            "def fetch_user(user_id: str, include_orders: bool = False) -> dict[str, str]:",
+            sample.read_text(encoding="utf-8"),
+        )
 
     def test_apply_structured_edit_changes_signature_from_full_function_input(self) -> None:
         root = self._workspace_scratch()

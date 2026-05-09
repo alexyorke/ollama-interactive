@@ -3598,6 +3598,21 @@ class ToolExecutor:
                             aliases=aliases,
                         )
                         continue
+                    if method_name in {"assertTrue", "assertFalse"} and node.args:
+                        actual_node = node.args[0]
+                        expr = self._test_spec_behavior_expr(actual_node, local_exprs, object_history) if isinstance(actual_node, ast.Call) else self._node_expr(actual_node, local_exprs)
+                        self._test_spec_add_raw_example(
+                            examples,
+                            expr=expr,
+                            expected="True" if method_name == "assertTrue" else "False",
+                            line=int(getattr(node, "lineno", 1)),
+                            test_name=function.name,
+                            source_symbols=source_symbols,
+                            aliases=aliases,
+                        )
+                        if isinstance(actual_node, ast.Call) and self._test_spec_call_may_mutate_state(actual_node):
+                            self._test_spec_record_side_effect_call(actual_node, local_exprs, object_history)
+                        continue
                     if method_name in {"assertRegex", "assertRegexpMatches"} and len(node.args) >= 2:
                         expr = self._node_expr(node.args[0], local_exprs)
                         pattern = self._node_expr(node.args[1], local_exprs)
@@ -7678,13 +7693,50 @@ import string
             shape = self._annotation_expected_shape(str(arg.get("annotation", "")))
             if name and shape:
                 arg_shapes[name] = shape
+        local_shapes = dict(arg_shapes)
         has_return = False
-        for child in ast.walk(node):
-            if isinstance(child, ast.Return):
+
+        class ReturnShapeVisitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> Any:
+                if nested is not node:
+                    return None
+                self.generic_visit(nested)
+                return None
+
+            def visit_AsyncFunctionDef(self, nested: ast.AsyncFunctionDef) -> Any:
+                if nested is not node:
+                    return None
+                self.generic_visit(nested)
+                return None
+
+            def visit_Assign(self, assign: ast.Assign) -> Any:
+                shape = self_outer._value_shape_hint(assign.value, local_shapes)
+                if shape:
+                    for target in assign.targets:
+                        if isinstance(target, ast.Name):
+                            local_shapes[target.id] = shape
+                self.generic_visit(assign)
+
+            def visit_AnnAssign(self, assign: ast.AnnAssign) -> Any:
+                shape = self_outer._annotation_expected_shape(self_outer._annotation_text(assign.annotation))
+                if not shape and assign.value is not None:
+                    shape = self_outer._value_shape_hint(assign.value, local_shapes)
+                if shape and isinstance(assign.target, ast.Name):
+                    local_shapes[assign.target.id] = shape
+                self.generic_visit(assign)
+
+            def visit_Return(self, child: ast.Return) -> Any:
+                nonlocal has_return
                 has_return = True
                 value = child.value
+                inferred = self_outer._value_shape_hint(value, local_shapes) if value is not None else None
                 if value is None or isinstance(value, ast.Constant) and value.value is None:
                     shapes.add("none")
+                elif inferred:
+                    if inferred == "tuple" and isinstance(value, ast.Tuple):
+                        shapes.add(f"tuple[{len(value.elts)}]")
+                    else:
+                        shapes.add(inferred)
                 elif isinstance(value, ast.Tuple):
                     shapes.add(f"tuple[{len(value.elts)}]")
                 elif isinstance(value, ast.List):
@@ -7696,11 +7748,14 @@ import string
                 elif isinstance(value, ast.Constant):
                     shapes.add(type(value.value).__name__)
                 elif isinstance(value, ast.Call):
-                    shapes.add(f"call:{self._call_name(value.func) or 'unknown'}")
+                    shapes.add(f"call:{self_outer._call_name(value.func) or 'unknown'}")
                 elif isinstance(value, ast.Name):
                     shapes.add(arg_shapes.get(value.id, f"name:{value.id}"))
                 else:
                     shapes.add(type(value).__name__.lower())
+
+        self_outer = self
+        ReturnShapeVisitor().visit(node)
         if not has_return:
             shapes.add("implicit_none")
         return shapes
@@ -8025,7 +8080,47 @@ import string
             names.add(node.args.kwarg.arg)
         return names
 
-    def _python_module_defined_names(self, tree: ast.AST) -> set[str]:
+    def _python_string_sequence_literal(self, node: ast.AST | None) -> list[str] | None:
+        if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return None
+        values: list[str] = []
+        for child in node.elts:
+            if not isinstance(child, ast.Constant) or not isinstance(child.value, str):
+                return None
+            values.append(child.value)
+        return values
+
+    def _python_explicit_module_exports(self, tree: ast.AST) -> set[str] | None:
+        for node in getattr(tree, "body", []):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+            if not any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
+                continue
+            values = self._python_string_sequence_literal(getattr(node, "value", None))
+            if values is not None:
+                return {value for value in values if value}
+        return None
+
+    def _python_star_import_names(self, module_name: str, seen_modules: set[str] | None = None) -> set[str]:
+        seen = set(seen_modules or ())
+        if module_name in seen:
+            return set()
+        seen.add(module_name)
+        module_file = self._resolve_python_module_file(module_name)
+        if module_file is None:
+            return set()
+        try:
+            text = module_file.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(self._python_parse_text(text), filename=self.relative_label(module_file))
+        except SyntaxError:
+            return set()
+        explicit = self._python_explicit_module_exports(tree)
+        if explicit is not None:
+            return explicit
+        return {name for name in self._python_module_defined_names(tree, seen_modules=seen) if name and not name.startswith("_")}
+
+    def _python_module_defined_names(self, tree: ast.AST, seen_modules: set[str] | None = None) -> set[str]:
         names = {"__name__", "__file__", "__package__"}
         for node in getattr(tree, "body", []):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -8036,7 +8131,14 @@ import string
                     for child in ast.walk(target):
                         if isinstance(child, ast.Name):
                             names.add(child.id)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and any(alias.name == "*" for alias in node.names):
+                    names.update(self._python_star_import_names(node.module, seen_modules=seen_modules))
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    names.add((alias.asname or alias.name).split(".", 1)[0])
+            elif isinstance(node, ast.Import):
                 for alias in node.names:
                     names.add((alias.asname or alias.name).split(".", 1)[0])
         return names
@@ -10058,7 +10160,14 @@ import string
                 clean = " ".join(collected)
         if not clean.startswith(("def ", "async def ")):
             name = expected_name or symbol.split(".")[-1]
-            clean = f"def {name}{clean if clean.startswith('(') else '(' + clean + ')'}"
+            bare_name = re.match(r"^(?P<prefix>async\s+)?(?P<name>[A-Za-z_]\w*)\s*\(", clean)
+            if bare_name:
+                prefix = "async def " if bare_name.group("prefix") else "def "
+                clean = prefix + clean
+            elif clean.startswith("("):
+                clean = f"def {name}{clean}"
+            else:
+                clean = f"def {name}({clean})"
         if not clean.rstrip().endswith(":"):
             clean = clean.rstrip() + ":"
         try:
