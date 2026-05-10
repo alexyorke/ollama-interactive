@@ -265,6 +265,29 @@ If you want a shell inside the container instead of launching the CLI, pass `bas
 docker compose run --rm ollama-code bash
 ```
 
+### Self-host loop (watchdog + rollback)
+
+Run a loop container that supervises the CLI, restarts after each exit, and rolls back to the last known-good git commit if a run crashes or fails a health check.
+
+```bash
+OLLAMA_CODE_MODEL=gemma4:e4b \
+OLLAMA_SELF_LOOP=1 \
+OLLAMA_SELF_CHECKPOINT_ON_SUCCESS=1 \
+OLLAMA_SELF_HEALTH_CMD='python -m pytest -q tests/test_tools.py tests/test_agent.py tests/test_config.py tests/test_cli.py -q' \
+docker compose run --rm ollama-code-selfhost
+```
+
+The supervisor runs `python -m ollama_code.cli` against the mounted source tree, so edits done inside the container are what gets restarted.
+
+Key knobs:
+- `OLLAMA_SELF_LOOP`: `1` keeps restarting after clean exits, `0` exits after one run (default `0`)
+- `OLLAMA_SELF_MAX_RESTARTS`: maximum consecutive failures before stop (default `8`)
+- `OLLAMA_SELF_RESTART_DELAY`: seconds to wait before restart (default `2`)
+- `OLLAMA_SELF_HEALTH_CMD`: shell check command run after each clean exit (empty = no check)
+- `OLLAMA_SELF_CHECKPOINT_ON_SUCCESS`: `1` auto-commits successful changes
+- `OLLAMA_SELF_STATE_DIR`: directory for supervisor state (default `.ollama-code/self-host` inside workspace)
+- `OLLAMA_SELF_ROLLBACK`: `1` enables rollback to the saved good commit on failures (default `1`)
+
 ## WSL + tmux
 
 From WSL in the repo root:
