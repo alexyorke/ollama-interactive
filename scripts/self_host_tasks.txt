@@ -1,0 +1,6 @@
+# Self-improvement tasks for the watchdog loop.
+# One prompt is consumed per watchdog cycle; prompts rotate from this file.
+
+Run this baseline quality loop: execute /test on tests/test_tools.py tests/test_agent.py tests/test_config.py tests/test_cli.py, fix any failing cases with minimal edits, then rerun the same tests and only keep changes that improve behavior without changing public interfaces.
+Run one advanced e2e check from scripts/e2e_suite.py focused on git+test integration, then make a root-cause fix that is model-agnostic and run the corresponding e2e case again.
+Run a hard coding benchmark smoke via scripts/coding_benchmark_eval.py, fix the first blocking failure with minimal changes, rerun the failing benchmark case, and report what changed with short rationale.

@@ -5,6 +5,8 @@ set -o pipefail
 workspace="${OLLAMA_SELF_WORKSPACE:-/workspace}"
 state_dir="${OLLAMA_SELF_STATE_DIR:-${workspace}/.ollama-code/self-host}"
 cli_loop="${OLLAMA_SELF_LOOP:-0}"
+task_file="${OLLAMA_SELF_TASK_FILE:-}"
+task_index_file="${state_dir}/task_index"
 max_restarts="${OLLAMA_SELF_MAX_RESTARTS:-8}"
 restart_delay="${OLLAMA_SELF_RESTART_DELAY:-2}"
 rollback_on_crash="${OLLAMA_SELF_ROLLBACK:-1}"
@@ -44,6 +46,55 @@ run_health_check() {
   fi
 
   bash -lc "${health_check_cmd}"
+}
+
+next_task_prompt() {
+  local -a tasks
+  local idx next_idx count
+  local selected
+
+  if [ -z "${task_file}" ] || [ ! -f "${task_file}" ]; then
+    return 1
+  fi
+
+  mapfile -t tasks < <(
+    sed -e "s/\r$//" "${task_file}" \
+      | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//" \
+      | sed -e "/^$/d" -e "/^#/d"
+  )
+  count="${#tasks[@]}"
+  if [ "${count}" -eq 0 ]; then
+    return 1
+  fi
+
+  if [ -f "${task_index_file}" ]; then
+    idx="$(cat "${task_index_file}")"
+  else
+    idx=""
+  fi
+
+  case "${idx}" in
+    ''|*[!0-9]*)
+      idx=0
+      ;;
+  esac
+
+  if [ "${idx}" -ge "${count}" ]; then
+    idx=0
+  fi
+
+  selected="${tasks[${idx}]}"
+  if [ -z "${selected}" ]; then
+    idx=0
+    selected="${tasks[0]}"
+  fi
+
+  next_idx=$((idx + 1))
+  if [ "${next_idx}" -ge "${count}" ]; then
+    next_idx=0
+  fi
+  echo "${next_idx}" > "${task_index_file}"
+  printf '%s\n' "${selected}"
 }
 
 checkpoint_if_needed() {
@@ -98,9 +149,23 @@ restarter() {
 }
 
 run_once() {
-  echo "${log_prefix} starting: ${cli_args[*]}"
+  local prompt=""
+  if [ -n "${task_file}" ]; then
+    prompt="$(next_task_prompt || true)"
+  fi
+
+  if [ -n "${prompt}" ]; then
+    echo "${log_prefix} starting: ${cli_args[*]} [task: ${prompt}]"
+  else
+    echo "${log_prefix} starting: ${cli_args[*]}"
+  fi
+
   set +e
-  "${cli_args[@]}"
+  if [ -n "${prompt}" ]; then
+    "${cli_args[@]}" "${prompt}"
+  else
+    "${cli_args[@]}"
+  fi
   cli_rc=$?
   set -e
 
@@ -132,7 +197,16 @@ while true; do
   run_once
   status=$?
   case "${status}" in
+<<<<<<< HEAD
     0) break ;;
+=======
+    0)
+      if [ "${cli_loop}" = "1" ] && [ -n "${task_file}" ]; then
+        continue
+      fi
+      break
+      ;;
+>>>>>>> 3d4296e (Add task-driven self-host improvement loop)
     1) continue ;;
     *) exit "${status}" ;;
   esac

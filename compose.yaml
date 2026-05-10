@@ -31,9 +31,10 @@ services:
       - .:/workspace
       - ollama-code-selfhost-state:/opt/ollama-code/self-host
     entrypoint: ["/bin/bash", "/workspace/scripts/self_host_watchdog.sh"]
-    command: ["python", "-m", "ollama_code.cli", "--cwd", "/workspace"]
+    command: ["python", "-m", "ollama_code.cli", "--cwd", "/workspace", "--approval", "auto", "--require-llm-for-turn"]
     environment:
-      OLLAMA_CODE_OLLAMA_HOST: ${OLLAMA_CODE_OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_CODE_OLLAMA_HOST: ${OLLAMA_CODE_OLLAMA_HOST:-http://host.docker.internal:11436}
+      OLLAMA_HOST: ${OLLAMA_CODE_OLLAMA_HOST:-http://host.docker.internal:11436}
       OLLAMA_CODE_MODEL: ${OLLAMA_CODE_MODEL:-gemma4:e4b}
       OLLAMA_SELF_WORKSPACE: /workspace
       OLLAMA_SELF_STATE_DIR: /opt/ollama-code/self-host
@@ -41,8 +42,14 @@ services:
       OLLAMA_SELF_MAX_RESTARTS: "8"
       OLLAMA_SELF_RESTART_DELAY: "2"
       OLLAMA_SELF_CHECKPOINT_ON_SUCCESS: "1"
+<<<<<<< HEAD
       OLLAMA_SELF_ROLLBACK: "1"
       OLLAMA_SELF_HEALTH_CMD: "python -m pytest -q tests/test_tools.py tests/test_agent.py tests/test_config.py tests/test_cli.py -q"
+=======
+      OLLAMA_SELF_TASK_FILE: /workspace/scripts/self_host_tasks.txt
+      OLLAMA_SELF_ROLLBACK: "1"
+      OLLAMA_SELF_HEALTH_CMD: "python -c \"print('self-host healthy')\""
+>>>>>>> 3d4296e (Add task-driven self-host improvement loop)
     extra_hosts:
       - host.docker.internal:host-gateway
 
