@@ -187,7 +187,7 @@ Use a stronger serial verifier/rewrite model while keeping the main working mode
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-ollama-code --model gemma3:4b --verifier-model granite4.1:8b
+ollama-code --model gemma4:e4b --verifier-model granite4.1:8b
 ```
 
 Resume a specific saved transcript:
@@ -218,7 +218,7 @@ The verified function library stores Python cards in `.ollama-code/index/verifie
 Profile local Ollama speed with raw load/prompt/generation counters:
 
 ```bash
-python scripts/ollama_perf_probe.py --models gemma3:4b qwen3:8b granite4.1:8b --output scratch/perf/ollama.json
+python scripts/ollama_perf_probe.py --models gemma4:e4b qwen3:8b granite4.1:8b --output scratch/perf/ollama.json
 ```
 
 ## Docker
@@ -290,16 +290,15 @@ python3 scripts/live_matrix.py
 
 The default serial smoke matrix tries the installed baseline models first, then optional Granite and Gemma eval targets:
 
-- `gemma3:4b`
+- `gemma4:e4b`
 - `qwen3:8b`
 - `granite4.1:8b`
-- `gemma4:e4b`
 
 If your Ollama daemon is on a non-default host or port, set `OLLAMA_HOST` first. Example for the tested WSL daemon on `127.0.0.1:11434`:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-python3 scripts/live_matrix.py --models gemma3:4b qwen3:8b
+python3 scripts/live_matrix.py --models gemma4:e4b qwen3:8b
 ```
 
 For stricter transcript-verified end-to-end checks against one model:
@@ -320,7 +319,7 @@ To test a stronger verifier model serially:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-python3 scripts/verification_eval.py --models gemma3:4b --verifier-model granite4.1:8b --strict-on
+python3 scripts/verification_eval.py --models gemma4:e4b --verifier-model granite4.1:8b --strict-on
 ```
 
 For serial token-efficiency A/B runs, write raw ignored JSON under `scratch/` and compare against a prior run:
@@ -334,7 +333,7 @@ For realistic coding-task accuracy plus token-profile checks:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-python3 scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b qwen3:8b granite4.1:8b --modes off on --strict-accuracy --strict-budget
+python3 scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b qwen3:8b granite4.1:8b --modes off on --strict-accuracy --strict-budget
 ```
 
 See [docs/coding-benchmarks.md](docs/coding-benchmarks.md) for the local suites, recorded metrics, and optional external benchmark preflights.
@@ -404,5 +403,5 @@ git push origin v0.1.0
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
 - `todo_read` and `todo_write` give the model a Claude Code-style in-session checklist for complex tasks. Todo state is saved in session transcripts, does not touch workspace files, and is shown to the model only when the current request benefits from it.
 - The recommended default coding model is `gemma4:e4b`; install it with `ollama pull gemma4:e4b`.
-- The recommended serial eval order is `gemma4:e4b`, `granite4.1:8b`, `gemma3:4b`, then `qwen3:8b`.
+- The recommended serial eval order is `gemma4:e4b`, `granite4.1:8b`, then `qwen3:8b`.
 - If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back only to a known preferred local model and prints the pull command. Custom `hf.co/...` or vendor tags are never selected implicitly; pass `--model` for those.

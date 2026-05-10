@@ -369,6 +369,7 @@ def evaluate_polyglot_python_task(
     reconcile: str,
     timeout: int,
     disable_mechanical_repair: bool = False,
+    require_llm_for_turn: bool = True,
     keep_workspaces_on_fail: bool = False,
 ) -> dict[str, Any]:
     source = polyglot_task_path(polyglot_root, task)
@@ -408,6 +409,8 @@ def evaluate_polyglot_python_task(
             str(session_file),
             public_task_prompt("Python"),
         ]
+        if require_llm_for_turn:
+            cli_cmd.append("--require-llm-for-turn")
         if disable_mechanical_repair:
             cli_cmd.append("--disable-spec-guided-repair")
         timed_out = False
@@ -524,6 +527,7 @@ def _evaluate_case(
     reconcile: str,
     timeout: int,
     disable_mechanical_repair: bool,
+    require_llm_for_turn: bool,
     keep_workspace: bool,
 ) -> tuple[int, dict[str, Any]]:
     return (
@@ -537,6 +541,7 @@ def _evaluate_case(
             reconcile=reconcile,
             timeout=timeout,
             disable_mechanical_repair=disable_mechanical_repair,
+            require_llm_for_turn=require_llm_for_turn,
             keep_workspaces_on_fail=keep_workspace,
         ),
     )
@@ -600,6 +605,7 @@ def main(argv: list[str] | None = None) -> int:
                     reconcile=reconcile,
                     timeout=args.timeout,
                     disable_mechanical_repair=args.disable_mechanical_repair,
+                    require_llm_for_turn=True,
                     keep_workspace=args.keep_workspaces_on_fail,
                 )
             )
@@ -618,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
                     reconcile=reconcile,
                     timeout=args.timeout,
                     disable_mechanical_repair=args.disable_mechanical_repair,
+                    require_llm_for_turn=True,
                     keep_workspace=args.keep_workspaces_on_fail,
                 ): index
                 for index, task, model, mode, reconcile in job_plan

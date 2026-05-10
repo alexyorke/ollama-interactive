@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -205,6 +206,8 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
     def test_local_full_includes_generic_renamed_hidden_cases(self) -> None:
         cases = {case.name: case for case in bench.selected_cases("local-full")}
 
+        self.assertIn("bad_test_command_recovery", cases)
+        self.assertEqual(cases["bad_test_command_recovery"].benchmark_kind, "coding_accuracy")
         for name in (
             "renamed_simple_expression_hidden",
             "renamed_prefix_rotation_hidden",
@@ -553,6 +556,30 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             (workspace / "docs" / "pricing.md").write_text("Call `cart_total(prices)` to compute a cart total.\n", encoding="utf-8")
 
             status = bench.validate_multi_file_refactor(self._context(workspace, {"events": []}))
+
+        self.assertEqual(status, "pass")
+
+    def test_bad_test_command_recovery_validator_requires_fallback_and_hidden_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bench.prepare_bad_test_command_recovery(workspace)
+            (workspace / "src" / "inventory.py").write_text("def total_units(counts: list[int]) -> int:\n    return sum(counts)\n", encoding="utf-8")
+            session = {
+                "events": [
+                    {
+                        "type": "tool_result",
+                        "name": "run_test",
+                        "result": {
+                            "ok": True,
+                            "recovered": True,
+                            "original_command": "pytesst -q",
+                            "command": f"{sys.executable} -m unittest discover -s tests -v",
+                        },
+                    }
+                ]
+            }
+
+            status = bench.validate_bad_test_command_recovery(self._context(workspace, session))
 
         self.assertEqual(status, "pass")
 

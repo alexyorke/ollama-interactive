@@ -26,7 +26,7 @@ External benchmark inspiration:
 ## Suites
 
 - `local-small`: 8 fast tasks for regular local checks.
-- `local-full`: current 32-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, path/shell/git regressions, and token traps.
+- `local-full`: current 33-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, validator-recovery, path/shell/git regressions, and token traps.
 - `external-smoke`: preflight checks for optional external harnesses; not CI-blocking and not leaderboard-comparable.
 - `scripts/public_benchmark_eval.py`: public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
 
@@ -52,7 +52,7 @@ Each result records:
 Run the frequent local suite:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models gemma3:4b qwen3:8b granite4.1:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b qwen3:8b granite4.1:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Run A/B feature profiles without changing prompts:
@@ -76,7 +76,7 @@ python scripts/coding_benchmark_eval.py --suite local-full --models gemma4:e4b -
 Run the fuller local suite for deeper regression checks:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-full --models gemma3:4b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-full --models gemma4:e4b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Compare against a previous run:

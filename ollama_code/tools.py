@@ -22,13 +22,25 @@ import sys
 import threading
 import textwrap
 import time
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from ollama_code.interrupts import OperationInterrupted
+
+try:
+    import tomllib  # type: ignore[attr-defined]
+    _TOMLDecodeError = tomllib.TOMLDecodeError
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+        _TOMLDecodeError = tomllib.TOMLDecodeError
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
+
+        class _TOMLDecodeError(ValueError):
+            pass
 
 ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
@@ -450,6 +462,16 @@ TOOL_DESCRIPTIONS = [
         "description": "Show a git diff for working tree or staged changes. Leave cached unset for working-tree changes; use cached=true only when the user explicitly asks for staged diff.",
     },
     {
+        "name": "git_branch",
+        "arguments": {"path": "optional relative path inside the repo", "all_branches": "bool, default false"},
+        "description": "List git branches for the active repo, optionally including remotes.",
+    },
+    {
+        "name": "git_log",
+        "arguments": {"path": "optional relative path inside the repo", "max_count": "int, default 10", "oneline": "bool, default true"},
+        "description": "Show recent git commits for the active repo or path.",
+    },
+    {
         "name": "git_commit",
         "arguments": {"message": "commit message", "add_all": "bool, default true"},
         "description": "Create a git commit for the current workspace changes.",
@@ -538,6 +560,8 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "run_test": "run_test(command?,cwd='.',timeout=1200)",
         "git_status": "git_status(path?)",
         "git_diff": "git_diff(path?,cached=false,context=3)",
+        "git_branch": "git_branch(path?,all_branches=false)",
+        "git_log": "git_log(path?,max_count=10,oneline=true)",
         "git_commit": "git_commit(message,add_all=true)",
         "run_agent": "run_agent(prompt,model?,approval?,rounds?)",
     }
@@ -717,6 +741,8 @@ class ToolExecutor:
             "run_test": self.run_test,
             "git_status": self.git_status,
             "git_diff": self.git_diff,
+            "git_branch": self.git_branch,
+            "git_log": self.git_log,
             "git_commit": self.git_commit,
         }
         handler = handlers.get(name)
@@ -877,7 +903,8 @@ class ToolExecutor:
         return candidate
 
     def relative_label(self, path: Path) -> str:
-        return path.resolve().relative_to(self.workspace_root).as_posix() or "."
+        candidate = path if path.is_absolute() else self.workspace_root / path
+        return candidate.resolve(strict=False).relative_to(self.workspace_root).as_posix() or "."
 
     def _confirm(self, prompt: str) -> bool:
         while True:
@@ -1012,12 +1039,65 @@ class ToolExecutor:
                     raise OperationInterrupted("Interrupted by user.")
                 continue
 
-    def _run_git(self, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    def _path_cwd(self, path: Path | None) -> Path:
+        if path is None:
+            return self.workspace_root
+        resolved = path.resolve(strict=False)
+        if resolved.exists() and resolved.is_file():
+            return resolved.parent
+        if resolved.exists() and resolved.is_dir():
+            return resolved
+        return resolved.parent if resolved.suffix else resolved
+
+    def _git_root_for_path(self, path: Path | None = None) -> Path | None:
+        starts: list[Path] = []
+        if path is not None:
+            starts.append(self._path_cwd(path))
+        starts.append(self.workspace_root)
+        seen: set[Path] = set()
+        for start in starts:
+            current = start.resolve(strict=False)
+            for candidate in (current, *current.parents):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if (candidate / ".git").exists():
+                    return candidate
+        if path is None:
+            nested = self._nested_git_roots()
+            if len(nested) == 1:
+                return nested[0]
+        return None
+
+    def _nested_git_roots(self, *, max_depth: int = 3, limit: int = 4) -> list[Path]:
+        roots: list[Path] = []
+        for root, dirs, files in os.walk(self.workspace_root):
+            root_path = Path(root)
+            try:
+                depth = len(root_path.relative_to(self.workspace_root).parts)
+            except ValueError:
+                depth = 0
+            if ".git" in dirs or ".git" in files:
+                roots.append(root_path.resolve(strict=False))
+                dirs[:] = []
+                if len(roots) >= limit:
+                    break
+                continue
+            dirs[:] = sorted(
+                directory
+                for directory in dirs
+                if directory == ".git" or (not directory.startswith(".") and not self._generated_dir_name(directory))
+            )
+            if depth >= max_depth:
+                dirs[:] = []
+        return roots
+
+    def _run_git(self, args: list[str], *, timeout: int = 30, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         if shutil.which("git") is None:
             raise RuntimeError("git is not installed.")
         return self._run_process(
             ["git", *args],
-            cwd=self.workspace_root,
+            cwd=self._path_cwd(cwd),
             timeout=timeout,
         )
 
@@ -1037,15 +1117,9 @@ class ToolExecutor:
         return any(self._generated_dir_name(part) for part in parts)
 
     def _repo_files_from_git(self, base: Path, *, limit: int, suffixes: set[str] | None = None) -> list[Path] | None:
-        try:
-            top_level = self._run_git(["rev-parse", "--show-toplevel"], timeout=10)
-        except OperationInterrupted:
-            raise
-        except Exception:
+        git_root = self._git_root_for_path(base)
+        if git_root is None:
             return None
-        if top_level.returncode != 0 or not top_level.stdout.strip():
-            return None
-        git_root = Path(top_level.stdout.strip()).resolve(strict=False)
         try:
             pathspec = base.resolve(strict=False).relative_to(git_root).as_posix()
         except ValueError:
@@ -1053,7 +1127,7 @@ class ToolExecutor:
         if not pathspec:
             pathspec = "."
         try:
-            completed = self._run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", pathspec], timeout=20)
+            completed = self._run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", pathspec], timeout=20, cwd=git_root)
         except OperationInterrupted:
             raise
         except Exception:
@@ -1131,14 +1205,20 @@ class ToolExecutor:
             return git_files
         return self._walk_repo_files(base, limit=limit, suffixes=suffixes)
 
-    def _ensure_git_repo(self) -> tuple[bool, str | None]:
-        probe = self._run_git(["rev-parse", "--is-inside-work-tree"])
+    def _ensure_git_repo(self, path: Path | None = None) -> tuple[bool, str | None]:
+        if self._git_root_for_path(path) is not None:
+            return True, None
+        try:
+            probe = self._run_git(["rev-parse", "--is-inside-work-tree"], cwd=path)
+        except RuntimeError as exc:
+            return False, str(exc)
         if probe.returncode == 0 and probe.stdout.strip() == "true":
             return True, None
         return False, self._collect_process_output(probe)
 
     def _git_dirty_paths(self) -> set[str]:
-        ok, _ = self._ensure_git_repo()
+        repo_root = self._git_root_for_path()
+        ok, _ = self._ensure_git_repo(repo_root)
         if not ok:
             return set()
         paths: set[str] = set()
@@ -1148,7 +1228,7 @@ class ToolExecutor:
             ["ls-files", "--others", "--exclude-standard", "-z"],
         ]
         for args in commands:
-            completed = self._run_git(args)
+            completed = self._run_git(args, cwd=repo_root)
             if completed.returncode != 0:
                 continue
             for raw_path in completed.stdout.split("\0"):
@@ -1532,6 +1612,13 @@ class ToolExecutor:
         signature = " ".join(collected)
         return signature[:180] + ("..." if len(signature) > 180 else "")
 
+    def _python_doc_summary(self, node: ast.AST) -> str:
+        doc = ast.get_docstring(node)
+        if not doc:
+            return ""
+        lines = [line.strip() for line in doc.splitlines() if line.strip()]
+        return lines[0][:120] if lines else ""
+
     def _python_symbols(self, target: Path, text: str) -> list[dict[str, Any]]:
         lines = text.splitlines()
         try:
@@ -1553,7 +1640,7 @@ class ToolExecutor:
                             "start": int(getattr(child, "lineno", 1)),
                             "end": int(getattr(child, "end_lineno", getattr(child, "lineno", 1))),
                             "signature": self._python_signature(lines, int(getattr(child, "lineno", 1))),
-                            "doc": (ast.get_docstring(child) or "").strip().splitlines()[0][:120] if ast.get_docstring(child) else "",
+                            "doc": self._python_doc_summary(child),
                         }
                     )
                     visit(child, [*stack, child.name])
@@ -1619,6 +1706,9 @@ class ToolExecutor:
         symbols = self._generic_symbols(target, text)
         return symbols, text, None
 
+    def _adaptive_index_record_limit(self, requested: int, *, minimum: int = 2000, multiplier: int = 250, maximum: int = 50_000) -> int:
+        return min(maximum, max(minimum, max(1, int(requested)) * multiplier))
+
     def search_symbols(self, query: str, path: str = ".", limit: int = 50) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
@@ -1634,22 +1724,50 @@ class ToolExecutor:
             def matcher(text: str) -> bool:
                 return lowered in text.lower()
 
-        matches: list[str] = []
-        for file_path in self._iter_code_files(base):
-            symbols, _, _ = self._code_symbols(file_path)
-            for symbol in symbols:
+        literal_query = str(query or "").strip().lower()
+        ranked: list[tuple[int, str, int, str]] = []
+        records = self._indexed_code_records(base, limit=self._adaptive_index_record_limit(limit))
+        for record in records:
+            rel = str(record.get("path") or "")
+            for symbol in record.get("symbols", []):
+                if not isinstance(symbol, dict):
+                    continue
                 haystack = " ".join(
                     str(symbol.get(key, ""))
                     for key in ("name", "qualname", "kind", "signature")
                 )
                 if not matcher(haystack):
                     continue
-                matches.append(
-                    f"{self.relative_label(file_path)}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']} {symbol['signature']}"
+                name = str(symbol.get("name", "")).lower()
+                qualname = str(symbol.get("qualname", "")).lower()
+                signature = str(symbol.get("signature", "")).lower()
+                score = 0
+                if literal_query:
+                    if literal_query == name or literal_query == qualname:
+                        score += 100
+                    if literal_query in name or literal_query in qualname:
+                        score += 60
+                    if literal_query in signature:
+                        score += 20
+                    if literal_query in rel.lower():
+                        score += 8
+                ranked.append(
+                    (
+                        score,
+                        rel,
+                        int(symbol.get("start") or 1),
+                        f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']} {symbol['signature']}",
+                    )
                 )
-                if len(matches) >= limit:
-                    return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches)}
-        return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches) if matches else "(no symbols found)"}
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+        matches = [line for _, _, _, line in ranked[: max(1, int(limit))]]
+        return {
+            "ok": True,
+            "tool": "search_symbols",
+            "path": self.relative_label(base),
+            "count": len(matches),
+            "output": "\n".join(matches) if matches else "(no symbols found)",
+        }
 
     def code_outline(self, path: str = ".", max_symbols: int = 120) -> dict[str, Any]:
         self._check_interrupted()
@@ -2291,7 +2409,7 @@ class ToolExecutor:
         terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
         if not terms:
             return {"ok": False, "tool": "repo_index_search", "summary": "repo_index_search requires a non-empty query."}
-        records = self._indexed_code_records(base, limit=1000)
+        records = self._indexed_code_records(base, limit=self._adaptive_index_record_limit(limit, minimum=2500, multiplier=300))
         return self._repo_index_search_records(terms, base, limit=max(1, int(limit)), records=records)
 
     def indexed_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
@@ -2855,6 +2973,62 @@ class ToolExecutor:
                         )
         return targets
 
+    def _python_import_targets_from_text(self, text: str, *, label: str) -> list[dict[str, Any]]:
+        snippets: list[str] = []
+        for match in re.finditer(r"```(?:python|py)?\s*(?P<body>.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+            body = str(match.group("body") or "").strip()
+            if body:
+                snippets.append(body)
+        import_lines = [
+            line.strip()
+            for line in text.splitlines()
+            if re.match(r"^\s*(?:from\s+[A-Za-z_][\w.]*\s+import\s+.+|import\s+[A-Za-z_][\w.]*(?:\s+as\s+\w+)?(?:\s*,\s*\w+)*)\s*$", line)
+        ]
+        if import_lines:
+            snippets.append("\n".join(import_lines))
+        targets: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for snippet in snippets:
+            try:
+                tree = ast.parse(self._python_parse_text(snippet), filename=label)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    module_file = self._resolve_python_module_file(node.module)
+                    for alias in node.names:
+                        if module_file is None:
+                            continue
+                        key = (self.relative_label(module_file), alias.name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        targets.append(
+                            {
+                                "path": self.relative_label(module_file),
+                                "symbol": alias.name,
+                                "reason": f"{label} imports {alias.name} from {node.module}",
+                            }
+                        )
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        module_file = self._resolve_python_module_file(alias.name)
+                        if module_file is None:
+                            continue
+                        symbol = alias.asname or alias.name.split(".")[-1]
+                        key = (self.relative_label(module_file), symbol)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        targets.append(
+                            {
+                                "path": self.relative_label(module_file),
+                                "symbol": symbol,
+                                "reason": f"{label} imports {alias.name}",
+                            }
+                        )
+        return targets
+
     def _traceback_targets(self, output: str) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []
         for match in re.finditer(r'File "([^"]+)", line (\d+), in ([A-Za-z_<>][\w<>]*)', output):
@@ -2886,6 +3060,34 @@ class ToolExecutor:
             seen_files.add(path)
             targets.extend(self._python_import_targets(path))
         return targets
+
+    def _implementation_target_score(self, item: dict[str, Any], query_text: str) -> int:
+        rel = str(item.get("path") or "").strip().replace("\\", "/")
+        symbol = str(item.get("symbol") or "").strip()
+        reason = str(item.get("reason") or "")
+        lowered_query = query_text.lower()
+        score = 0
+        if "line" in item:
+            score += 80
+        if rel:
+            path_obj = Path(rel)
+            if self._path_looks_like_test(path_obj):
+                score -= 25
+            else:
+                score += 20
+            stem = path_obj.stem.lower()
+            if stem and re.search(rf"(?<![\w.]){re.escape(stem)}(?![\w.])", lowered_query):
+                score += 8
+            module_name = rel[:-3].replace("/", ".").replace("\\", ".").lower() if rel.endswith(".py") else rel.lower()
+            if module_name and module_name in lowered_query:
+                score += 14
+        if symbol and re.search(rf"(?<![\w.]){re.escape(symbol.lower())}(?![\w.])", lowered_query):
+            score += 30
+        if reason.startswith("request text imports"):
+            score += 18
+        elif "imports" in reason:
+            score += 6
+        return score
 
     def find_implementation_target(
         self,
@@ -2929,9 +3131,19 @@ class ToolExecutor:
             target = self.resolve_path(test_path, allow_missing=False)
             if target.suffix.lower() == ".py":
                 targets.extend(self._python_import_targets(target))
+        if query:
+            targets.extend(self._python_import_targets_from_text(str(query), label="request text"))
+        ranked = sorted(
+            targets,
+            key=lambda item: (
+                -self._implementation_target_score(item, str(query or output or traceback or "")),
+                str(item.get("path", "")),
+                str(item.get("symbol", "")),
+            ),
+        )
         deduped: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
-        for item in targets:
+        for item in ranked:
             key = (str(item.get("path", "")), str(item.get("symbol", "")))
             if key in seen:
                 continue
@@ -3923,8 +4135,131 @@ class ToolExecutor:
         def all_numbers(values: list[Any]) -> bool:
             return all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)
 
+        def values_match(value: Any, expected: Any) -> bool:
+            if isinstance(expected, bool):
+                return isinstance(value, bool) and value is expected
+            if isinstance(value, float) and isinstance(expected, int) and not isinstance(expected, bool) and value.is_integer():
+                value = int(value)
+            return value == expected
+
+        def numeric_constants(index: int) -> list[int | float]:
+            raw_values: list[int | float] = []
+            for args, _expected in examples:
+                if index >= len(args):
+                    continue
+                value = args[index]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                raw_values.append(value)
+            ordered: list[int | float] = []
+            seen: set[int | float] = set()
+            for value in raw_values:
+                variants: list[int | float] = [value]
+                if isinstance(value, int) and not isinstance(value, bool):
+                    variants.extend([value - 1, value + 1])
+                for variant in variants:
+                    if variant in seen:
+                        continue
+                    seen.add(variant)
+                    ordered.append(variant)
+            return ordered[:12]
+
+        def comparison_expressions(param: str, constants: list[int | float]) -> list[str]:
+            expressions: list[str] = []
+            for constant in constants:
+                literal = repr(constant)
+                expressions.extend(
+                    [
+                        f"{param} < {literal}",
+                        f"{param} <= {literal}",
+                        f"{param} > {literal}",
+                        f"{param} >= {literal}",
+                        f"{param} == {literal}",
+                        f"{param} != {literal}",
+                    ]
+                )
+            return expressions
+
+        def range_expressions(param: str, constants: list[int | float]) -> list[str]:
+            expressions: list[str] = []
+            sorted_constants = sorted(set(constants))
+            for low_index, low in enumerate(sorted_constants):
+                for high in sorted_constants[low_index + 1 :]:
+                    expressions.extend(
+                        [
+                            f"{repr(low)} <= {param} <= {repr(high)}",
+                            f"{repr(low)} < {param} <= {repr(high)}",
+                            f"{repr(low)} <= {param} < {repr(high)}",
+                            f"{repr(low)} < {param} < {repr(high)}",
+                        ]
+                    )
+            return expressions
+
+        def heuristic_boolean_expressions(param: str, index: int) -> list[str]:
+            positives: list[int | float] = []
+            negatives: list[int | float] = []
+            for args, expected in examples:
+                if index >= len(args):
+                    continue
+                value = args[index]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if expected is True:
+                    positives.append(value)
+                elif expected is False:
+                    negatives.append(value)
+            if not positives:
+                return []
+            expressions: list[str] = []
+            pos_min = min(positives)
+            pos_max = max(positives)
+            if negatives:
+                neg_max = max(negatives)
+                neg_min = min(negatives)
+                if neg_max < pos_min:
+                    if all(isinstance(value, int) and not isinstance(value, bool) for value in [neg_max, pos_min]):
+                        expressions.append(f"{param} >= {int(neg_max) + 1}")
+                    expressions.append(f"{param} > {repr(neg_max)}")
+                    expressions.append(f"{param} >= {repr(pos_min)}")
+                if neg_min > pos_max:
+                    expressions.append(f"{param} <= {repr(pos_max)}")
+                    expressions.append(f"{param} < {repr(neg_min)}")
+            expressions.append(f"{param} <= {repr(pos_max)}")
+            expressions.append(f"{param} >= {repr(pos_min)}")
+            if pos_min != pos_max:
+                expressions.append(f"{repr(pos_min)} <= {param} <= {repr(pos_max)}")
+            return list(dict.fromkeys(expressions))
+
         candidate_exprs: list[str] = []
-        if len(params) == 1:
+        bool_outputs = all(isinstance(expected, bool) for _args, expected in examples)
+        if bool_outputs:
+            atomic_by_param: list[list[str]] = []
+            for index, param in enumerate(params):
+                constants = numeric_constants(index)
+                atomic = heuristic_boolean_expressions(param, index)
+                atomic.extend(comparison_expressions(param, constants))
+                atomic.extend(range_expressions(param, constants))
+                atomic_by_param.append(list(dict.fromkeys(atomic)))
+            if len(params) == 1:
+                candidate_exprs.extend(atomic_by_param[0])
+            elif len(params) == 2:
+                left, right = params
+                for left_expr in atomic_by_param[0]:
+                    for right_expr in atomic_by_param[1]:
+                        candidate_exprs.append(f"({left_expr}) and ({right_expr})")
+                candidate_exprs.extend(atomic_by_param[0])
+                candidate_exprs.extend(atomic_by_param[1])
+                candidate_exprs.extend([f"{left} < {right}", f"{left} <= {right}", f"{left} > {right}", f"{left} >= {right}", f"{left} == {right}", f"{left} != {right}"])
+                for left_expr in atomic_by_param[0]:
+                    for right_expr in atomic_by_param[1]:
+                        candidate_exprs.append(f"({left_expr}) or ({right_expr})")
+            elif len(params) == 3:
+                for first_expr in atomic_by_param[0]:
+                    for second_expr in atomic_by_param[1]:
+                        for third_expr in atomic_by_param[2]:
+                            candidate_exprs.append(f"({first_expr}) and ({second_expr}) and ({third_expr})")
+                candidate_exprs.extend(expr for atomic in atomic_by_param for expr in atomic)
+        elif len(params) == 1:
             a = params[0]
             candidate_exprs.extend([a, f"-{a}", f"{a} * 2", f"{a} + 1", f"{a} - 1", f"{a} * {a}", f"abs({a})", f"len({a})", f"sum({a})"])
         elif len(params) == 2:
@@ -3957,9 +4292,7 @@ class ToolExecutor:
                 except Exception:
                     matched = False
                     break
-                if isinstance(value, float) and isinstance(expected, int) and value.is_integer():
-                    value = int(value)
-                if value != expected:
+                if not values_match(value, expected):
                     matched = False
                     break
             if matched:
@@ -3988,6 +4321,110 @@ class ToolExecutor:
             "expression": selected_expr,
             "examples": len(examples),
             "summary": f"Synthesized simple expression {function.name}(...) -> {selected_expr}.",
+        }
+
+    def synthesize_string_normalizer_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis requires exactly one top-level function."}
+        function = functions[0]
+        if function.args.vararg or function.args.kwarg or function.args.kwonlyargs:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis supports positional parameters only."}
+        params = [arg.arg for arg in [*function.args.posonlyargs, *function.args.args]]
+        if len(params) != 1:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis supports exactly one parameter."}
+        extracted = self.test_spec_extract(test_path, source_path=rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        examples: list[tuple[str, str]] = []
+        for item in extracted.get("examples", []) if isinstance(extracted.get("examples"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._literal_string_call_example(str(item.get("example") or ""))
+            if parsed is None:
+                continue
+            symbol, source, expected = parsed
+            if symbol != function.name:
+                continue
+            examples.append((source, expected))
+        if not examples:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "No literal string examples found."}
+
+        param = params[0]
+        wants_lower = any(any(char.isupper() for char in source) for source, _expected in examples) and all(expected == expected.lower() for _source, expected in examples)
+        wants_trim = any(source != source.strip() for source, _expected in examples)
+        has_whitespace = any(bool(re.search(r"\s", source)) for source, _expected in examples)
+        wants_hyphen = any("-" in expected for _source, expected in examples)
+
+        preferred_base = param
+        if wants_trim:
+            preferred_base += ".strip()"
+        if wants_lower:
+            preferred_base += ".lower()"
+        base_variants = [preferred_base]
+        for candidate in (param, f"{param}.strip()", f"{param}.lower()", f"{param}.strip().lower()"):
+            if candidate not in base_variants:
+                base_variants.append(candidate)
+
+        candidate_exprs: list[str] = []
+        for base in base_variants:
+            if wants_hyphen and has_whitespace:
+                candidate_exprs.append(f"'-'.join({base}.split())")
+            if has_whitespace:
+                candidate_exprs.append(f"' '.join({base}.split())")
+                candidate_exprs.append(f"''.join({base}.split())")
+            candidate_exprs.append(base)
+            if wants_hyphen:
+                candidate_exprs.append(f"{base}.replace(' ', '-')")
+                candidate_exprs.append(f"{base}.replace('_', '-')")
+                candidate_exprs.append(f"{base}.replace('_', '-').replace(' ', '-')")
+
+        selected_expr = ""
+        for expr in dict.fromkeys(candidate_exprs):
+            matched = True
+            for source, expected in examples:
+                try:
+                    value = eval(expr, {"__builtins__": {}}, {param: source})  # noqa: S307 - fixed internal expression templates.
+                except Exception:
+                    matched = False
+                    break
+                if value != expected:
+                    matched = False
+                    break
+            if matched:
+                selected_expr = expr
+                break
+        if not selected_expr:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "No string-normalizer expression matched the examples."}
+
+        lines = source_text.splitlines()
+        start = int(getattr(function, "lineno", 1)) - 1
+        end = int(getattr(function, "end_lineno", getattr(function, "lineno", 1)))
+        if start < 0 or start >= len(lines):
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "Could not locate function source."}
+        signature = lines[start].rstrip()
+        if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis supports single-line signatures only."}
+        indent = re.match(r"^\s*", signature).group(0) + "    "  # type: ignore[union-attr]
+        candidate_lines = [*lines[:start], signature, f"{indent}return {selected_expr}", *lines[end:]]
+        return {
+            "ok": True,
+            "tool": "synthesize_string_normalizer_candidate",
+            "path": rel_source,
+            "candidate_source": "\n".join(candidate_lines).rstrip() + "\n",
+            "expression": selected_expr,
+            "examples": len(examples),
+            "summary": f"Synthesized string normalizer {function.name}(...) -> {selected_expr}.",
         }
 
     def synthesize_sequence_utilities_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
@@ -9042,9 +9479,11 @@ import string
     def _read_toml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
+        if tomllib is None:
+            return {}
         try:
             return tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
+        except (OSError, _TOMLDecodeError):
             return {}
 
     def _toml_tool_section(self, payload: dict[str, Any], name: str) -> bool:
@@ -9498,7 +9937,7 @@ import string
         approved, reason = self._approve_mutation(f"Replace symbol {found['qualname']} in {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "replace_symbol", "path": relative_path, "symbol": found["qualname"], "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         result = {
             "ok": True,
             "tool": "replace_symbol",
@@ -9631,7 +10070,7 @@ import string
         approved, reason = self._approve_mutation(f"Replace {len(prepared)} symbols in {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         result = {
             "ok": True,
             "tool": "replace_symbols",
@@ -9740,8 +10179,26 @@ import string
         approved, reason = self._approve_mutation(prompt, preview)
         if not approved:
             return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "syntax_ok": True if target.suffix.lower() == ".py" else None, "summary": f"Applied {op} to {relative_path}.", "diff": preview}
+
+    def _invalidate_python_bytecode_cache(self, target: Path) -> None:
+        if target.suffix.lower() != ".py":
+            return
+        cache_dir = target.parent / "__pycache__"
+        if not cache_dir.is_dir():
+            return
+        for pattern in (f"{target.stem}.*.pyc", f"{target.stem}.*.pyo"):
+            for cached in cache_dir.glob(pattern):
+                try:
+                    cached.unlink()
+                except OSError:
+                    continue
+
+    def _write_text_and_invalidate_python_cache(self, target: Path, content: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        self._invalidate_python_bytecode_cache(target)
 
     def _single_full_python_function_name(self, source: str) -> str | None:
         stripped = textwrap.dedent(source or "").strip()
@@ -10316,7 +10773,7 @@ import string
             approved, reason = self._approve_mutation(f"Rename {old} to {new} in {relative_path}?", preview)
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
-            target.write_text(updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(target, updated)
             return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "count": count, "summary": f"Renamed {count} occurrence(s) of {old} to {new}.", "diff": preview}
         if op == "add_import":
             target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
@@ -10337,7 +10794,7 @@ import string
             approved, reason = self._approve_mutation(f"Add import to {relative_path}?", preview)
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
-            target.write_text(updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(target, updated)
             return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": f"Added import to {relative_path}.", "diff": preview}
         if op == "delete_symbol":
             target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
@@ -10357,7 +10814,7 @@ import string
             approved, reason = self._approve_mutation(f"Delete {symbol} from {relative_path}?", preview)
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
-            target.write_text(updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(target, updated)
             return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": f"Deleted {symbol} from {relative_path}.", "diff": preview}
         if op == "move_symbol":
             source = self.resolve_path(str(payload.get("from_path") or payload.get("path") or ""), allow_missing=False)
@@ -10387,8 +10844,8 @@ import string
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "summary": reason}
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text(source_updated, encoding="utf-8")
-            destination.write_text(dest_updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(source, source_updated)
+            self._write_text_and_invalidate_python_cache(destination, dest_updated)
             return {"ok": True, "tool": "apply_structured_edit", "op": op, "path": source_rel, "to_path": dest_rel, "summary": f"Moved {symbol} to {dest_rel}.", "diff": preview}
         return {"ok": False, "tool": "apply_structured_edit", "summary": f"Unsupported structured edit op: {op or '(missing)'}"}
 
@@ -10626,19 +11083,21 @@ import string
         if not approved:
             return {"ok": False, "tool": "generate_tests_from_spec", "path": self.relative_label(target), "summary": reason}
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         return {"ok": True, "tool": "generate_tests_from_spec", "path": self.relative_label(target), "applied": True, "summary": f"Wrote generated test scaffold to {self.relative_label(target)}.", "diff": preview}
 
     def git_status(self, path: str | None = None) -> dict[str, Any]:
-        ok, error = self._ensure_git_repo()
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
         if not ok:
             return {"ok": False, "tool": "git_status", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
         command = ["status", "--short", "--branch", "--untracked-files=all"]
         relative_path = None
-        if path:
-            relative_path = self.relative_label(self.resolve_path(path, allow_missing=False))
+        if path and target_path is not None and repo_root is not None:
+            relative_path = target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
             command.extend(["--", relative_path])
-        result = self._run_git(command)
+        result = self._run_git(command, cwd=repo_root)
         output = result.stdout.strip() or "(clean)"
         if result.stderr.strip():
             output = f"{output}\n{result.stderr.strip()}"
@@ -10650,17 +11109,19 @@ import string
         }
 
     def git_diff(self, path: str | None = None, cached: bool = False, context: int = 3) -> dict[str, Any]:
-        ok, error = self._ensure_git_repo()
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
         if not ok:
             return {"ok": False, "tool": "git_diff", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
         command = ["diff", "--no-ext-diff", f"--unified={max(0, context)}"]
         if cached:
             command.append("--cached")
         relative_path = None
-        if path:
-            relative_path = self.relative_label(self.resolve_path(path, allow_missing=False))
+        if path and target_path is not None and repo_root is not None:
+            relative_path = target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
             command.extend(["--", relative_path])
-        result = self._run_git(command)
+        result = self._run_git(command, cwd=repo_root)
         output = self._collect_process_output(result)
         if output == "(no output)":
             output = "(no diff)"
@@ -10669,6 +11130,49 @@ import string
             "tool": "git_diff",
             "path": relative_path or ".",
             "cached": cached,
+            "output": output,
+        }
+
+    def git_branch(self, path: str | None = None, all_branches: bool = False) -> dict[str, Any]:
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
+        if not ok:
+            return {"ok": False, "tool": "git_branch", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
+        command = ["branch", "--list"]
+        if all_branches:
+            command.append("--all")
+        result = self._run_git(command, cwd=repo_root)
+        output = self._collect_process_output(result)
+        return {
+            "ok": result.returncode == 0,
+            "tool": "git_branch",
+            "path": path or ".",
+            "all_branches": all_branches,
+            "output": output,
+        }
+
+    def git_log(self, path: str | None = None, max_count: int = 10, oneline: bool = True) -> dict[str, Any]:
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
+        if not ok:
+            return {"ok": False, "tool": "git_log", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
+        safe_count = self._coerce_int(max_count, default=10, minimum=1)
+        command = ["log", f"--max-count={safe_count}", "--decorate"]
+        if oneline:
+            command.append("--oneline")
+        if path and target_path is not None and repo_root is not None:
+            relative_path = target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
+            command.extend(["--", relative_path])
+        result = self._run_git(command, cwd=repo_root)
+        output = self._collect_process_output(result)
+        return {
+            "ok": result.returncode == 0,
+            "tool": "git_log",
+            "path": path or ".",
+            "max_count": safe_count,
+            "oneline": oneline,
             "output": output,
         }
 
@@ -10749,8 +11253,7 @@ import string
         approved, reason = self._approve_mutation(f"Write {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "write_file", "path": relative_path, "summary": reason}
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, content)
         result = {
             "ok": True,
             "tool": "write_file",
@@ -11003,7 +11506,7 @@ import string
         approved, reason = self._approve_mutation(f"Replace text in {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "replace_in_file", "path": relative_path, "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         replaced_count = count if replace_all else 1
         result = {
             "ok": True,
@@ -11598,15 +12101,9 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         discovered = None
         if not selected_command:
             validators = self.discover_validators(cwd)
-            candidates = [
-                item
-                for item in validators.get("validators", [])
-                if isinstance(item, dict) and item.get("kind") == "test" and item.get("command") and item.get("available") is True
-            ]
-            preferred = [item for item in candidates if "unittest discover" in str(item.get("command", ""))]
-            selected = (preferred or candidates)[:1]
-            if selected:
-                selected_command = str(selected[0]["command"])
+            discovered_command = self._preferred_test_validator_command(validators)
+            if discovered_command:
+                selected_command = discovered_command
                 discovered = validators
             else:
                 return {
@@ -11623,8 +12120,38 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
                 raise
             result = self.run_shell(selected_command, cwd=".", timeout=timeout_value)
             normalized = f"Ignored run_test cwd outside workspace: {cwd}"
+        selected_from_default = bool(
+            self.default_test_command
+            and selected_command == self.default_test_command
+            and (
+                command is None
+                or (isinstance(command, str) and command.strip() == self.default_test_command)
+            )
+        )
+        recovery_validators = None
+        if selected_from_default and result.get("ok") is not True and self._run_test_needs_command_recovery(result):
+            recovery_validators = self.discover_validators(cwd)
+            fallback_command = self._preferred_test_validator_command(
+                recovery_validators,
+                exclude_commands={selected_command},
+            )
+            if fallback_command:
+                recovered = self.run_shell(fallback_command, cwd=cwd, timeout=timeout_value)
+                recovered["tool"] = "run_test"
+                recovered["command"] = fallback_command
+                recovered["original_command"] = selected_command
+                recovered["recovered"] = True
+                recovered["validators"] = recovery_validators.get("validators", [])
+                recovered["normalized"] = (
+                    "Recovered run_test from configured command "
+                    f"{selected_command} to discovered test command {fallback_command}"
+                )
+                self.set_test_command(fallback_command)
+                selected_command = fallback_command
+                result = recovered
+                normalized = str(recovered["normalized"])
         result["tool"] = "run_test"
-        result["command"] = selected_command
+        result["command"] = str(result.get("command") or selected_command)
         if discovered is not None:
             result["discovered"] = True
             result["validators"] = discovered.get("validators", [])
@@ -11637,3 +12164,45 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             result["normalized"] = normalized
             result["summary"] = normalized if result.get("ok") else f"{normalized}. {result.get('output', '')[:180]}"
         return result
+
+    def _run_test_needs_command_recovery(self, result: dict[str, Any]) -> bool:
+        validation = result.get("validation")
+        if isinstance(validation, dict) and validation.get("valid") is False:
+            return True
+        error_class = str(result.get("error_class") or "").strip().lower()
+        if error_class in {"command_not_found", "invalid_args", "missing_dependency", "path_missing", "cwd_missing"}:
+            return True
+        output = str(result.get("output") or result.get("summary") or "").lower()
+        return any(
+            marker in output
+            for marker in (
+                "no tests ran",
+                "ran 0 tests",
+                "collected 0 items",
+                "no tests collected",
+            )
+        )
+
+    def _preferred_test_validator_command(
+        self,
+        validators: dict[str, Any],
+        *,
+        exclude_commands: set[str] | None = None,
+    ) -> str | None:
+        excluded = {str(item).strip() for item in (exclude_commands or set()) if str(item).strip()}
+        candidates = [
+            item
+            for item in validators.get("validators", [])
+            if (
+                isinstance(item, dict)
+                and item.get("kind") == "test"
+                and item.get("command")
+                and item.get("available") is True
+                and str(item.get("command")).strip() not in excluded
+            )
+        ]
+        preferred = [item for item in candidates if "unittest discover" in str(item.get("command", ""))]
+        selected = (preferred or candidates)[:1]
+        if not selected:
+            return None
+        return str(selected[0]["command"])

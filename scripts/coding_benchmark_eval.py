@@ -576,6 +576,28 @@ def validate_nested_package_import_fix(ctx: BenchmarkContext) -> str:
     return "pass" if _run_default_tests(ctx.workspace) else "fail"
 
 
+def prepare_bad_test_command_recovery(workspace: Path) -> None:
+    _write(workspace / "src" / "inventory.py", "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n")
+    _write(
+        workspace / "tests" / "test_inventory.py",
+        _standard_test_import("inventory")
+        + "import unittest\n\n\nclass InventoryTests(unittest.TestCase):\n"
+        + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
+        + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+
+
+def validate_bad_test_command_recovery(ctx: BenchmarkContext) -> str:
+    hidden = "import sys; sys.path.insert(0, 'src'); from inventory import total_units; assert total_units([5, 0, 2]) == 7; assert total_units([1]) == 1"
+    recovered = any(
+        result.get("recovered") is True
+        and "pytesst -q" in str(result.get("original_command", ""))
+        and "unittest discover" in str(result.get("command", ""))
+        for result in tool_results(ctx.session, "run_test")
+    )
+    return "pass" if recovered and _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+
+
 def prepare_renamed_simple_expression_hidden(workspace: Path) -> None:
     _write(workspace / "src" / "scoreboard.py", "def score_delta(base: int, bonus: int) -> int:\n    pass\n")
     _write(
@@ -936,6 +958,16 @@ LOCAL_CASES: list[BenchmarkCase] = [
         prepare=prepare_nested_package_import_fix,
         validate=validate_nested_package_import_fix,
         test_cmd=_python_test_cmd(),
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="bad_test_command_recovery",
+        suite="local-full",
+        turns=("Run tests, fix src/inventory.py so total_units is correct, rerun tests, and summarize briefly.",),
+        prepare=prepare_bad_test_command_recovery,
+        validate=validate_bad_test_command_recovery,
+        test_cmd="pytesst -q",
         budget_off=SMALL_BUDGET_OFF,
         budget_on=SMALL_BUDGET_ON,
     ),
@@ -1698,7 +1730,7 @@ def write_results_payload(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial coding accuracy + token-efficiency benchmarks.")
     parser.add_argument("--suite", choices=["local-small", "local-full", "external-smoke"], default="local-small")
-    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b"], help="Primary models for local suites.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "qwen3:8b", "granite4.1:8b"], help="Primary models for local suites.")
     parser.add_argument("--verifier-pairs", nargs="*", default=[], help="Optional primary=verifier entries, debate-on only.")
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off", "on"])
     parser.add_argument("--reconcile-modes", nargs="+", choices=["off", "on", "auto"], default=["auto"], help="Artifact reconciliation modes to run.")

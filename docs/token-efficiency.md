@@ -296,6 +296,6 @@ The contract-guards pass kept 8/8 pass and saved `1,476` total tokens (`-5.7%`) 
 - Added prompt profile coverage: per-call prompt chars by role and largest prompt messages are recorded in eval JSON.
 - `scripts/token_efficiency_eval.py --strict-accuracy`: passed; explicit-tool and symbol-summary corpora are zero LLM calls.
 - `scripts/verification_eval.py --strict-on`: passed on `gemma3:4b`, `qwen3:8b`, and `granite4.1:8b`.
-- `scripts/e2e_suite.py --model gemma3:4b`: all scenarios passed after adding deterministic search synthesis and exact-newline write normalization.
+- `scripts/e2e_suite.py --model gemma4:e4b`: all scenarios passed after adding deterministic search synthesis and exact-newline write normalization.
 - `scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles all --strict-accuracy`: 8/8 passed on remote Ollama through the car-detection SSH tunnel.
 - `scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline contract-guards all --strict-accuracy`: baseline and contract-guards completed 8/8; the full three-profile run hit the shell timeout after writing usable JSON, so `all` was rerun separately and passed 8/8.

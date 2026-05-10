@@ -392,7 +392,7 @@ def resolve_requested_models(requested: list[str], available: set[str]) -> list[
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run live Ollama Code smoke tests against real local models.")
-    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "gemma3:4b", "qwen3:8b"], help="Models to test.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "qwen3:8b"], help="Models to test.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent

@@ -59,6 +59,57 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("alpha.txt", listed["output"])
         self.assertEqual(read["output"], "   2 | line2")
 
+    def test_non_git_tasks_work_when_git_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "alpha.txt").write_text("line1\n", encoding="utf-8")
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                tools = ToolExecutor(root, approval_mode="auto")
+                listed = tools.list_files()
+                git_status = tools.git_status()
+
+        self.assertTrue(listed["ok"])
+        self.assertIn("alpha.txt", listed["output"])
+        self.assertFalse(git_status["ok"])
+        self.assertIn("git is not installed", git_status["summary"])
+
+    def test_read_toml_gracefully_skips_when_no_toml_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "pyproject.toml"
+            config.write_text("[tool.example]\nname='demo'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.tomllib", None):
+                payload = tools._read_toml(config)
+
+        self.assertEqual(payload, {})
+
+    def test_git_tools_can_target_nested_repo_path(self) -> None:
+        root = self._workspace_scratch()
+        repo = root / "nested-repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        self.init_git_repo(repo)
+        (repo / "note.txt").write_text("hello\n", encoding="utf-8")
+
+        tools = ToolExecutor(root, approval_mode="auto")
+        status = tools.git_status("nested-repo")
+
+        self.assertTrue(status["ok"])
+        self.assertIn("##", status["output"])
+
+    def test_git_status_defaults_to_single_nested_repo(self) -> None:
+        root = self._workspace_scratch()
+        repo = root / "only-repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        self.init_git_repo(repo)
+        (repo / "note.txt").write_text("hello\n", encoding="utf-8")
+
+        tools = ToolExecutor(root, approval_mode="auto")
+        status = tools.git_status()
+
+        self.assertTrue(status["ok"])
+        self.assertIn("##", status["output"])
+
     def test_write_and_replace_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -443,6 +494,57 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("src/app.py", result["output"])
         self.assertNotIn("node_modules", result["output"])
+
+    def test_symbol_tools_tolerate_whitespace_only_python_docstrings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "mod.py").write_text(
+                "def outer():\n"
+                "    \"\"\"   \n"
+                "    \"\"\"\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            search = tools.search_symbols("outer")
+            repo = tools.repo_index_search("outer")
+            outline = tools.code_outline("pkg/mod.py")
+
+        self.assertTrue(search["ok"], search)
+        self.assertIn("pkg/mod.py", search["output"])
+        self.assertTrue(repo["ok"], repo)
+        self.assertIn("outer", repo["output"])
+        self.assertTrue(outline["ok"], outline)
+        self.assertIn("outer", outline["output"])
+
+    def test_symbol_tools_scan_beyond_first_two_hundred_code_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            for index in range(260):
+                name = f"filler_{index:03d}"
+                (src / f"{name}.py").write_text(
+                    f"def {name}():\n"
+                    f"    return {index}\n",
+                    encoding="utf-8",
+                )
+            (src / "zz_target.py").write_text(
+                "def separability_matrix():\n"
+                "    return 'needle_symbol'\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            search = tools.search_symbols("separability_matrix")
+            repo = tools.repo_index_search("separability_matrix")
+
+        self.assertTrue(search["ok"], search)
+        self.assertIn("src/zz_target.py", search["output"])
+        self.assertTrue(repo["ok"], repo)
+        self.assertIn("src/zz_target.py", repo["output"])
 
     def test_read_symbol_reports_ambiguous_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2034,6 +2136,79 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(synthesized["ok"], synthesized)
         self.assertEqual(synthesized["expression"], "left + right")
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_simple_expression_candidate_handles_boolean_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "retry.py").write_text(
+                "def should_retry(status_code: int, attempt: int) -> bool:\n    return status_code >= 500 and attempt > 2\n",
+                encoding="utf-8",
+            )
+            (root / "client.py").write_text(
+                "from retry import should_retry\n\n"
+                "def next_action(status_code: int, attempt: int) -> str:\n"
+                "    return 'retry' if should_retry(status_code, attempt) else 'stop'\n",
+                encoding="utf-8",
+            )
+            (root / "tests").mkdir()
+            (root / "tests" / "test_retry_policy.py").write_text(
+                "import unittest\nfrom retry import should_retry\nfrom client import next_action\n\n"
+                "class RetryPolicyTests(unittest.TestCase):\n"
+                "    def test_retries_initial_attempts(self):\n"
+                "        self.assertTrue(should_retry(503, 0))\n"
+                "    def test_does_not_retry_non_server_error(self):\n"
+                "        self.assertFalse(should_retry(404, 0))\n"
+                "    def test_retries_upper_server_range(self):\n"
+                "        self.assertTrue(should_retry(599, 2))\n"
+                "    def test_does_not_retry_client_error_boundary(self):\n"
+                "        self.assertFalse(should_retry(499, 0))\n"
+                "    def test_client_retry_action(self):\n"
+                "        self.assertEqual(next_action(503, 1), 'retry')\n"
+                "    def test_client_stop_after_budget(self):\n"
+                "        self.assertEqual(next_action(503, 3), 'stop')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_simple_expression_candidate("retry.py", "tests/test_retry_policy.py")
+            validation = tools.validate_implementation_candidate(
+                "retry.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="tests/test_retry_policy.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("attempt", synthesized["expression"])
+        self.assertIn("status_code", synthesized["expression"])
+
+    def test_synthesize_string_normalizer_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "slug.py").write_text("def slugify(value: str) -> str:\n    pass\n", encoding="utf-8")
+            (root / "slug_test.py").write_text(
+                "import unittest\nfrom slug import slugify\n\n"
+                "class SlugTest(unittest.TestCase):\n"
+                "    def test_spaces(self):\n"
+                "        self.assertEqual(slugify('Hello Local Model'), 'hello-local-model')\n"
+                "    def test_edges(self):\n"
+                "        self.assertEqual(slugify('  Mixed Case  '), 'mixed-case')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_string_normalizer_candidate("slug.py", "slug_test.py")
+            validation = tools.validate_implementation_candidate(
+                "slug.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="slug_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("split()", synthesized["expression"])
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_sequence_utilities_candidate_from_standard_signatures(self) -> None:
@@ -4703,6 +4878,89 @@ def double(value: int) -> int:
         self.assertTrue(result["discovered"])
         self.assertIn("unittest discover", result["command"])
 
+    def test_run_test_recovers_from_broken_configured_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto", test_command="pytesst -q")
+            result = tools.run_test()
+
+        self.assertTrue(result["ok"], result.get("output"))
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["original_command"], "pytesst -q")
+        self.assertIn("unittest discover", result["command"])
+        self.assertEqual(tools.default_test_command, result["command"])
+
+    def test_run_test_does_not_recover_from_normal_test_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add\n\n"
+                "class SampleTests(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("recovered", result)
+        self.assertEqual(result["command"], command)
+        self.assertIn("AssertionError", result["output"])
+        self.assertEqual(tools.default_test_command, command)
+
+    def test_run_test_sees_immediate_same_size_python_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "balance.py").write_text(
+                "def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_balance_credit.py").write_text(
+                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom balance import *\nimport unittest\n\n"
+                "class BalanceTests(unittest.TestCase):\n"
+                "    def test_apply_credit(self):\n"
+                "        self.assertEqual(apply_credit(10, 3), 13)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+
+            first = tools.run_test()
+            write_result = tools.write_file(
+                "src/balance.py",
+                "def apply_credit(amount: int, credit: int) -> int:\n    return amount + credit\n",
+            )
+            second = tools.run_test()
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(write_result["ok"])
+        self.assertTrue(second["ok"], second.get("output"))
+
+    def test_run_test_does_not_override_explicit_bad_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_test("pytesst -q")
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("recovered", result)
+        self.assertEqual(result["command"], "pytesst -q")
+
     def test_diagnose_test_failure_classifies_common_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
@@ -4741,6 +4999,27 @@ def double(value: int) -> int:
         self.assertIn("tracked.txt", status["output"])
         self.assertTrue(diff["ok"])
         self.assertIn("+after", diff["output"])
+
+    def test_git_branch_and_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.init_git_repo(root)
+            tracked = root / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "checkout", "-b", "feature"], cwd=root, check=True, capture_output=True, text=True)
+            tracked.write_text("after\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "feature update"], cwd=root, check=True, capture_output=True, text=True)
+            tools = ToolExecutor(root, approval_mode="auto")
+            branches = tools.git_branch(all_branches=True)
+            history = tools.git_log(max_count=5)
+
+        self.assertTrue(branches["ok"])
+        self.assertIn("feature", branches["output"])
+        self.assertIn("master", branches["output"])
+        self.assertTrue(history["ok"])
+        self.assertIn("feature update", history["output"])
 
     def test_git_commit_creates_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

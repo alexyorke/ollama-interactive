@@ -519,6 +519,43 @@ def scenario_nested_package_import_fix(repo_root: Path, workspace: Path, model: 
     require(any(item.get("ok") for item in tool_results(session, "run_test")), "run_test did not succeed for package import fix", stdout=result.stdout, stderr=result.stderr, session=session)
 
 
+def scenario_bad_test_command_recovery(repo_root: Path, workspace: Path, model: str) -> None:
+    _write(workspace / "src" / "inventory.py", "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n")
+    _write(
+        workspace / "tests" / "test_inventory.py",
+        _standard_test_import("inventory")
+        + "import unittest\n\n\nclass InventoryTests(unittest.TestCase):\n"
+        + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
+        + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+    session_file = workspace / "scratch" / "bad-test-command-recovery.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        "Run tests, fix src/inventory.py so total_units is correct, rerun tests, and summarize briefly.",
+        session_file=session_file,
+        extra_args=["--test-cmd", "pytesst -q"],
+        timeout=900,
+    )
+    session = load_session(session_file)
+    source = (workspace / "src" / "inventory.py").read_text(encoding="utf-8")
+    hidden = "import sys; sys.path.insert(0, 'src'); from inventory import total_units; assert total_units([5, 0, 2]) == 7; assert total_units([1]) == 1"
+    test_runs = tool_results(session, "run_test")
+    recovered = any(
+        item.get("recovered") is True
+        and "pytesst -q" in str(item.get("original_command", ""))
+        and "unittest discover" in str(item.get("command", ""))
+        for item in test_runs
+    )
+    require(result.returncode == 0, "bad test command recovery command failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="bad test command recovery did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require("return sum(counts)" in source, "inventory.py was not fixed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(recovered, "run_test did not recover from the broken configured command", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_hidden_python(workspace, hidden), "hidden inventory assertions failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require(_run_default_tests(workspace), "workspace tests do not pass after inventory fix", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
 def scenario_api_docs_callsite_sync(repo_root: Path, workspace: Path, model: str) -> None:
     fetch_user = _nonce("fetch_user")
     build_summary = _nonce("build_summary")
@@ -972,6 +1009,7 @@ def main(argv: list[str] | None = None) -> int:
         ("scenario_multi_file_refactor", scenario_multi_file_refactor),
         ("scenario_large_repo_symbol_nav", scenario_large_repo_symbol_nav),
         ("scenario_nested_package_import_fix", scenario_nested_package_import_fix),
+        ("scenario_bad_test_command_recovery", scenario_bad_test_command_recovery),
         ("scenario_scoreboard_hidden", scenario_scoreboard_hidden),
         ("scenario_checkout_callsite_refactor", scenario_checkout_callsite_refactor),
         ("scenario_retry_policy_hidden", scenario_retry_policy_hidden),

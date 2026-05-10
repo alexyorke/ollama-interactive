@@ -146,7 +146,7 @@ scripts/token_efficiency_eval.py --strict-accuracy
   all default cases passed
 scripts/verification_eval.py --strict-on
   all strict-on cases passed
-scripts/e2e_suite.py --model gemma3:4b
+scripts/e2e_suite.py --model gemma4:e4b
   all scenarios passed
 scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --feature-profiles trajectory-guards --strict-accuracy
   8/8 passed

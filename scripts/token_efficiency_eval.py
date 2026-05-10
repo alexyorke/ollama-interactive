@@ -536,8 +536,8 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial token-efficiency evals against local Ollama models.")
-    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b"], help="Primary models to run serially.")
-    parser.add_argument("--verifier-pairs", nargs="*", default=["gemma3:4b=granite4.1:8b"], help="Optional primary=verifier entries, run debate-on only.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "qwen3:8b", "granite4.1:8b"], help="Primary models to run serially.")
+    parser.add_argument("--verifier-pairs", nargs="*", default=["gemma4:e4b=granite4.1:8b"], help="Optional primary=verifier entries, run debate-on only.")
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off", "on"], help="Debate modes for primary-only models.")
     parser.add_argument("--cases", nargs="*", default=[case.name for case in CASES], help="Scenario names to run.")
     parser.add_argument("--output", required=True, help="Raw JSON output path.")
