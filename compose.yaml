@@ -42,14 +42,9 @@ services:
       OLLAMA_SELF_MAX_RESTARTS: "8"
       OLLAMA_SELF_RESTART_DELAY: "2"
       OLLAMA_SELF_CHECKPOINT_ON_SUCCESS: "1"
-<<<<<<< HEAD
-      OLLAMA_SELF_ROLLBACK: "1"
-      OLLAMA_SELF_HEALTH_CMD: "python -m pytest -q tests/test_tools.py tests/test_agent.py tests/test_config.py tests/test_cli.py -q"
-=======
       OLLAMA_SELF_TASK_FILE: /workspace/scripts/self_host_tasks.txt
       OLLAMA_SELF_ROLLBACK: "1"
       OLLAMA_SELF_HEALTH_CMD: "python -c \"print('self-host healthy')\""
->>>>>>> 3d4296e (Add task-driven self-host improvement loop)
     extra_hosts:
       - host.docker.internal:host-gateway
 

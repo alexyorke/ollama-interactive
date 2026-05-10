@@ -197,16 +197,12 @@ while true; do
   run_once
   status=$?
   case "${status}" in
-<<<<<<< HEAD
-    0) break ;;
-=======
     0)
       if [ "${cli_loop}" = "1" ] && [ -n "${task_file}" ]; then
         continue
       fi
       break
       ;;
->>>>>>> 3d4296e (Add task-driven self-host improvement loop)
     1) continue ;;
     *) exit "${status}" ;;
   esac
