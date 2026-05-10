@@ -17,7 +17,7 @@ COPY docker/entrypoint.sh /usr/local/bin/ollama-code-docker
 
 RUN chmod +x /usr/local/bin/ollama-code-docker \
     && python -m pip install --upgrade pip \
-    && python -m pip install -e .
+    && python -m pip install -e . pytest
 
 RUN mkdir -p /workspace
 

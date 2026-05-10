@@ -44,7 +44,7 @@ services:
       OLLAMA_SELF_CHECKPOINT_ON_SUCCESS: "1"
       OLLAMA_SELF_TASK_FILE: /workspace/scripts/self_host_tasks.txt
       OLLAMA_SELF_ROLLBACK: "1"
-      OLLAMA_SELF_HEALTH_CMD: "python -c \"print('self-host healthy')\""
+      OLLAMA_SELF_HEALTH_CMD: "python -m pytest -q tests/test_tools.py tests/test_agent.py tests/test_config.py tests/test_cli.py"
     extra_hosts:
       - host.docker.internal:host-gateway
 
