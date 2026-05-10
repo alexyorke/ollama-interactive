@@ -1223,12 +1223,17 @@ class ToolExecutor:
             return set()
         paths: set[str] = set()
         commands = [
-            ["diff", "--name-only", "-z"],
-            ["diff", "--cached", "--name-only", "-z"],
-            ["ls-files", "--others", "--exclude-standard", "-z"],
+            (["diff", "--name-only", "-z"], 120),
+            (["diff", "--cached", "--name-only", "-z"], 120),
+            (["ls-files", "--others", "--exclude-standard", "-z"], 60),
         ]
-        for args in commands:
-            completed = self._run_git(args, cwd=repo_root)
+        for args, timeout in commands:
+            try:
+                completed = self._run_git(args, cwd=repo_root, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # repo-level dirty-path scans can be slow on large workspaces; skip
+                # this command on timeout so startup can still continue.
+                continue
             if completed.returncode != 0:
                 continue
             for raw_path in completed.stdout.split("\0"):

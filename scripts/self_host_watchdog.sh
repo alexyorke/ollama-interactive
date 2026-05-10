@@ -108,9 +108,9 @@ run_once() {
     echo "${log_prefix} cli exited with ${cli_rc}"
     rollback_to_good
     if restarter; then
-      return 0
+      return 1
     fi
-    return 1
+    return 2
   fi
 
   echo "${log_prefix} cli exited cleanly"
@@ -118,19 +118,22 @@ run_once() {
     echo "${log_prefix} health check failed"
     rollback_to_good
     if restarter; then
-      return 0
+      return 1
     fi
-    return 1
+    return 2
   fi
 
   checkpoint_if_needed
   echo "0" > "${attempt_file}"
-  return 1
+  return 0
 }
 
 while true; do
   run_once
-  if [ $? -eq 1 ]; then
-    break
-  fi
+  status=$?
+  case "${status}" in
+    0) break ;;
+    1) continue ;;
+    *) exit "${status}" ;;
+  esac
 done
