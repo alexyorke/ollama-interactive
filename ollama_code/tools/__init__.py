@@ -2086,8 +2086,28 @@ class ToolExecutor:
         except sqlite3.OperationalError as exc:
             return self._missing_dependency_result("python_sdk_refresh", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
         limit_value = max(1, int(limit))
+        existing_embeddings: dict[str, tuple[str, str]] = {}
+        try:
+            for row in conn.execute(
+                "SELECT id,embedding_model,embedding_json FROM python_sdk_entries "
+                "WHERE embedding_model IS NOT NULL AND embedding_json IS NOT NULL"
+            ).fetchall():
+                existing_embeddings[str(row[0])] = (str(row[1] or ""), str(row[2] or ""))
+        except sqlite3.Error:
+            existing_embeddings = {}
         entries = self._python_sdk_entries(limit=limit_value)
         model = self._normalize_sdk_embedding_model(embedding_model)
+        cached_embeddings = 0
+        if not model and existing_embeddings:
+            for entry in entries:
+                cached = existing_embeddings.get(str(entry.get("id") or ""))
+                if not cached:
+                    continue
+                cached_model, cached_json = cached
+                if cached_model and cached_json:
+                    entry["embedding_model"] = cached_model
+                    entry["embedding_json"] = cached_json
+                    cached_embeddings += 1
         embedded = 0
         embedding_error = None
         if model:
@@ -2131,6 +2151,8 @@ class ToolExecutor:
         finally:
             conn.close()
         summary = f"Indexed {len(entries)} Python SDK item(s) from {self._stdlib_root()}."
+        if cached_embeddings:
+            summary += f" cached_embeddings={cached_embeddings}."
         if model:
             summary += f" embeddings={embedded} model={model}."
         if embedding_error:
@@ -2140,6 +2162,7 @@ class ToolExecutor:
             "tool": "python_sdk_refresh",
             "items": len(entries),
             "embedded": embedded,
+            "cached_embeddings": cached_embeddings,
             "embedding_model": model,
             "embedding_error": embedding_error,
             "cache": self.relative_label(self._python_sdk_cache_path()),
@@ -2273,6 +2296,80 @@ class ToolExecutor:
             )
         return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
 
+    def _python_sdk_candidate_embedding_rows(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        candidates: list[dict[str, Any]],
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if not candidates:
+            return [], None
+        try:
+            query_vector = self._ollama_embed_texts([query], model=model, host=host, timeout=timeout)[0]
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError, IndexError) as exc:
+            return [], str(exc)
+
+        vectors_by_id: dict[str, list[float]] = {}
+        missing_rows: list[dict[str, Any]] = []
+        for row in candidates:
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                continue
+            cached_model = str(row.get("embedding_model") or "")
+            cached_json = str(row.get("embedding_json") or "")
+            if cached_model == model and cached_json:
+                try:
+                    vector = [float(value) for value in json.loads(cached_json)]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    vector = []
+                if vector:
+                    vectors_by_id[row_id] = vector
+                    continue
+            missing_rows.append(row)
+
+        if missing_rows:
+            try:
+                vectors = self._ollama_embed_texts(
+                    [str(row.get("text", ""))[:4000] for row in missing_rows],
+                    model=model,
+                    host=host,
+                    timeout=timeout,
+                )
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                return [], str(exc)
+            for row, vector in zip(missing_rows, vectors):
+                row_id = str(row.get("id") or "")
+                if not row_id or not vector:
+                    continue
+                vectors_by_id[row_id] = vector
+                row["embedding_model"] = model
+                row["embedding_json"] = json.dumps(vector, separators=(",", ":"))
+                conn.execute(
+                    "UPDATE python_sdk_entries SET embedding_model=?, embedding_json=? WHERE id=?",
+                    (model, row["embedding_json"], row_id),
+                )
+            conn.commit()
+
+        rows: list[dict[str, Any]] = []
+        for row in candidates:
+            vector = vectors_by_id.get(str(row.get("id") or ""))
+            if not vector:
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            if score <= 0:
+                continue
+            item = dict(row)
+            item["embedding_model"] = model
+            item["embedding_score"] = score
+            item["source"] = "embedding"
+            rows.append(item)
+        return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
+
     def _format_python_sdk_rows(self, rows: list[dict[str, Any]], *, limit: int) -> str:
         lines: list[str] = []
         for row in rows[: max(1, int(limit))]:
@@ -2308,7 +2405,7 @@ class ToolExecutor:
             return {"ok": False, "tool": "python_sdk_search", "summary": "python_sdk_search requires a non-empty query."}
         model = self._normalize_sdk_embedding_model(embedding_model) if use_embeddings or embedding_model else None
         if refresh or not self._python_sdk_cache_path().exists():
-            refresh_result = self.python_sdk_refresh(limit=5000, embedding_model=model, embedding_host=embedding_host, embedding_timeout=max(1, int(embedding_timeout)))
+            refresh_result = self.python_sdk_refresh(limit=5000)
             if refresh_result.get("ok") is not True:
                 return refresh_result
         try:
@@ -2322,18 +2419,15 @@ class ToolExecutor:
             lexical_rows = self._python_sdk_lexical_rows(conn, expanded_query, limit=limit_value * 3)
             embedding_rows: list[dict[str, Any]] = []
             if model:
-                embedded_count = conn.execute("SELECT COUNT(*) FROM python_sdk_entries WHERE embedding_model=? AND embedding_json IS NOT NULL", (model,)).fetchone()[0]
-                if int(embedded_count or 0) > 0:
-                    embedding_rows, embedding_error = self._python_sdk_embedding_rows(
-                        conn,
-                        expanded_query,
-                        model=model,
-                        host=embedding_host,
-                        timeout=max(1, int(embedding_timeout)),
-                        limit=limit_value * 3,
-                    )
-                else:
-                    embedding_error = f"No cached embeddings for {model}; run python_sdk_refresh with embedding_model first."
+                embedding_rows, embedding_error = self._python_sdk_candidate_embedding_rows(
+                    conn,
+                    expanded_query,
+                    lexical_rows,
+                    model=model,
+                    host=embedding_host,
+                    timeout=max(1, int(embedding_timeout)),
+                    limit=limit_value * 3,
+                )
             merged: dict[str, dict[str, Any]] = {}
             for rank, row in enumerate(lexical_rows):
                 item = dict(row)

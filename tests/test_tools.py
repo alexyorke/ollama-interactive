@@ -1356,6 +1356,58 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["qualname"], "pathlib.Path.glob")
         self.assertIn("source=hybrid", result["output"])
 
+    def test_python_sdk_search_reranks_candidates_with_on_demand_embeddings(self) -> None:
+        entries = [
+            {
+                "id": "json",
+                "kind": "function",
+                "module": "json",
+                "qualname": "json.dumps",
+                "signature": "dumps(obj)",
+                "doc": "Serialize an object to JSON text.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "json dumps serialize object",
+            },
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            },
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            vectors: list[list[float]] = []
+            for text in texts:
+                lowered = text.lower()
+                vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
+            return vectors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
+                    refresh = tools.python_sdk_refresh(limit=10)
+                    result = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+                    refresh_again = tools.python_sdk_refresh(limit=10)
+                    second = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertEqual(refresh["embedded"], 0)
+        self.assertEqual(refresh_again["cached_embeddings"], 1)
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["embedding_error"])
+        self.assertEqual(result["results"][0]["qualname"], "pathlib.Path.glob")
+        self.assertIn("source=hybrid", result["output"])
+        self.assertTrue(second["ok"], second)
+        self.assertLessEqual(embed.call_count, 4)
+
     def test_ast_search_reports_missing_ast_grep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

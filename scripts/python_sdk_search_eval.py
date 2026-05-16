@@ -42,9 +42,6 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     refresh = tools.python_sdk_refresh(
         limit=args.index_limit,
-        embedding_model=args.embedding_model if args.use_embeddings else None,
-        embedding_host=args.embedding_host,
-        embedding_timeout=args.embedding_timeout,
     )
     refresh_elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
     rows: list[dict[str, Any]] = []
@@ -83,6 +80,7 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
             "ok": refresh.get("ok") is True,
             "items": refresh.get("items", 0),
             "embedded": refresh.get("embedded", 0),
+            "cached_embeddings": refresh.get("cached_embeddings", 0),
             "elapsed_ms": refresh_elapsed_ms,
             "embedding_error": refresh.get("embedding_error"),
         },
@@ -112,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON output path.")
     parser.add_argument("--index-limit", type=int, default=5000)
     parser.add_argument("--limit", type=int, default=8)
-    parser.add_argument("--use-embeddings", action="store_true", help="Use cached Ollama embeddings for hybrid reranking.")
+    parser.add_argument("--use-embeddings", action="store_true", help="Use cached/on-demand Ollama embeddings for hybrid candidate reranking.")
     parser.add_argument("--embedding-model", default=None, help="Ollama embedding model, e.g. nomic-embed-text.")
     parser.add_argument("--embedding-host", default=None)
     parser.add_argument("--embedding-timeout", type=int, default=120)

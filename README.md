@@ -285,10 +285,10 @@ For Python API/stdlib questions, the CLI exposes an installed-SDK index instead 
 python scripts/python_sdk_search_eval.py --strict-accuracy
 ```
 
-The `python_sdk_search` tool builds `.ollama-code/index/python_sdk.sqlite` from the current interpreter's stdlib signatures and docstrings. It uses SQLite FTS by default and can optionally cache/rerank with local Ollama embeddings:
+The `python_sdk_search` tool builds `.ollama-code/index/python_sdk.sqlite` from the current interpreter's stdlib signatures and docstrings. It uses SQLite FTS by default and can optionally rerank the top lexical candidates with cached or on-demand local Ollama embeddings, avoiding a full stdlib embedding precompute:
 
 ```bash
-python scripts/python_sdk_search_eval.py --use-embeddings --embedding-model nomic-embed-text
+python scripts/python_sdk_search_eval.py --use-embeddings --embedding-model qwen3-embedding:8b
 ```
 
 ## WSL + tmux
