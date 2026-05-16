@@ -15,3 +15,14 @@ ollama-code = "ollama_code.cli:main"
 
 [tool.setuptools]
 packages = ["ollama_code", "ollama_code.tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "ollama-code-bench-*",
+    "scratch",
+    "verify_scratch",
+]
