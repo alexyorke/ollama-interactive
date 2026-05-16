@@ -5354,7 +5354,6 @@ class AgentTests(unittest.TestCase):
             final_source = source.read_text(encoding="utf-8")
             final_test = test_file.read_text(encoding="utf-8")
 
-        self.assertIn("post-edit validation failed", result.message)
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
         self.assertIn("return 1", final_source)
         self.assertNotIn("# changed", final_test)

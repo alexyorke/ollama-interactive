@@ -4834,10 +4834,9 @@ def double(value: int) -> int:
     def test_run_shell_ignores_posix_shell_env_override(self) -> None:
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
         completed = subprocess.CompletedProcess(args=["echo", "ok"], returncode=0, stdout="ok\n", stderr="")
-        with patch("ollama_code.tools.os.name", "posix"):
-            with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
-                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
-                    result = tools.run_shell("echo ok")
+        with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
+            with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                result = tools.run_shell("echo ok")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "ok")
