@@ -14,4 +14,4 @@ authors = [{ name = "OpenAI Codex" }]
 ollama-code = "ollama_code.cli:main"
 
 [tool.setuptools]
-packages = ["ollama_code"]
+packages = ["ollama_code", "ollama_code.tools"]

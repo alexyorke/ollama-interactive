@@ -1226,6 +1226,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("disabled", result["summary"])
 
+    def test_enabled_tools_allowlist_hides_other_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto", enabled_tools=["run_test", "read_file"])
+
+            self.assertEqual(tools.available_tool_names(), {"run_test", "read_file"})
+            blocked = tools.execute("run_shell", {"command": "echo hi"})
+
+        self.assertFalse(blocked["ok"])
+        self.assertIn("disabled", blocked["summary"])
+
     def test_systems_lens_frames_complex_task_without_grounding_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1653,6 +1663,25 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "replace_symbol")
         self.assertIn("return left + right", final_text)
         self.assertNotIn("def def", final_text)
+
+    def test_edit_intent_surfacing_syntax_errors_as_failed_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "billing.py"
+            sample.write_text('def invoice_label(user_id: int) -> str:\n    return f"{user_id}"\n', encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "billing.py",
+                "replace_text",
+                'def invoice_label(user_id: int) -> str:\n    return f"{user_id}"',
+                'def invoice_label(user_id: int) -> str\n    return f"{user_id}"',
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "syntax_error")
+        self.assertIn("Python syntax error", result["summary"])
 
     def test_edit_intent_routes_symbol_name_replacement_to_file_rename(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4833,6 +4862,17 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"])
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
+
+    def test_run_test_reports_inline_python_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: None != 3'); sys.exit(1)"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("AssertionError: None != 3", result["output"])
 
     def test_run_test_allows_unittest_discover_dot_start_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

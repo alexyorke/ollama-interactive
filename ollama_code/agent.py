@@ -7,14 +7,85 @@ import json
 import re
 import textwrap
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 import threading
 
 from ollama_code.features import active_feature_profile, feature_enabled, options_for_purpose, response_format_for_purpose
+from ollama_code.agent_parsing import (
+    _workspace_roots_match,
+    extract_json_like_fields,
+    extract_json_response,
+)
+from ollama_code.agent_protocol import (
+    AGENT_TOOL_NAMES,
+    APPROVAL_RANK,
+    AUDIT_LIST_ITEM_LIMIT,
+    AUDIT_TEXT_ITEM_LIMIT,
+    BROAD_CONTEXT_GATHERING_TOOL_NAMES,
+    CANDIDATE_CLAIM_LIMIT,
+    CANDIDATE_CLAIM_TEXT_LIMIT,
+    CODE_EDIT_SUFFIXES,
+    CONTEXT_GATHERING_TOOL_NAMES,
+    CORE_READ_ONLY_WORKSPACE_TOOL_NAMES,
+    EDIT_TOOL_NAMES,
+    ExactFileWriteSpec,
+    FinalRewriteOutcome,
+    GRAPH_TOOL_NAMES,
+    GIT_TOOL_NAMES,
+    GROUNDING_EVIDENCE_TOOL_NAMES,
+    INDEX_REFRESH_TOOL_NAMES,
+    KNOWN_TOOL_NAMES,
+    LOW_LEVEL_EDIT_TOOL_NAMES,
+    LSP_TOOL_NAMES,
+    MAX_ASSUMPTION_AUDIT_RETRIES,
+    MAX_RECONCILIATION_RETRIES,
+    MAX_VERIFICATION_RETRIES,
+    MAX_VERIFICATION_REWRITE_ATTEMPTS,
+    MechanicalToolOccurrence,
+    MechanicalToolSpec,
+    MODEL_TOOL_DIFF_LIMIT,
+    MODEL_TOOL_RESULT_LIMITS,
+    MUTATING_TOOL_NAMES,
+    PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES,
+    PRIMARY_CONTEXT_CONTENT_LIMIT,
+    PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT,
+    PRIMARY_CURRENT_REQUEST_LIMIT,
+    QUESTION_PLANNER_EVIDENCE_LIMIT,
+    QUESTION_PLANNER_MAX_QUESTIONS,
+    READ_ONLY_CACHEABLE_TOOL_NAMES,
+    READ_ONLY_WORKSPACE_TOOL_NAMES,
+    RETRY_PRONE_MUTATING_TOOL_NAMES,
+    RISKY_VERIFICATION_TOOL_NAMES,
+    SHELL_TOOL_NAMES,
+    SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT,
+    SPEC_GUIDED_REPAIR_MAX_ATTEMPTS,
+    SPEC_GUIDED_SYNTHESIS_TOOL_NAMES,
+    STRUCTURAL_SEARCH_TOOL_NAMES,
+    SymbolReadSpec,
+    TEST_TOOL_NAMES,
+    TODO_TOOL_NAMES,
+    TargetLineReadSpec,
+    VALIDATION_TOOL_NAMES,
+    VERIFICATION_CONTENT_LIMIT,
+    VERIFICATION_EVIDENCE_LIMIT,
+    VERIFICATION_EVIDENCE_TEXT_LIMIT,
+    VERIFICATION_HISTORY_LIMIT,
+    VERIFICATION_TOOL_DIFF_LIMIT,
+    VERIFICATION_TOOL_RESULT_LIMIT,
+    VERIFIED_FUNCTION_TOOL_NAMES,
+    AgentResult,
+)
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
+from ollama_code.prompts import (
+    ARTIFACT_RECONCILER_SYSTEM_PROMPT,
+    FINAL_REWRITER_SYSTEM_PROMPT,
+    FINAL_VERIFIER_SYSTEM_PROMPT,
+    QUESTION_PLANNER_SYSTEM_PROMPT,
+    SYSTEM_PROMPT_TEMPLATE,
+    TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT,
+)
 from ollama_code.sessions import (
     SessionSummary,
     default_session_dir,
@@ -22,557 +93,9 @@ from ollama_code.sessions import (
     load_transcript_payload,
     resolve_transcript_path,
 )
-from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_compact_tool_help, format_tool_help
+from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_help
 
 
-SYSTEM_PROMPT_TEMPLATE = """Ollama Code. Workspace: {workspace_root}
-
-JSON only:
-{{"type":"tool","name":"list_files","arguments":{{"path":"."}}}}
-{{"type":"final","message":"..."}}
-
-Rules:
-- One tool or one final. Relative paths. No fences/thought.
-- Need repo/file/git/shell/edit/agent facts? Use tools; do not guess.
-- Inspect before edit. Preferred edit: edit_intent with intent rename|replace_text|replace_symbol|replace_body|change_signature|add_import. Low-level edits: write_file, replace_symbol/replace_symbols, replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
-- write_file content is raw file text only; no markdown fences, no leading ">" quote markers.
-- For fix/implement + tests: read tests/source, edit implementation, run_test; do not only summarize or loop on reads. If source has pass/.../return None stubs, edit those stubs directly; do not keep using read_symbol/code_outline on the same stub file.
-- If user names a source file/function to fix, edit source, not tests, unless tests are explicitly requested.
-- Code nav: use file_search/fd_search and fts_search/repo_index_search to shrink scope; prefer search_symbols, code_outline, then read_symbol before broad read_file; use inspect_library_source for installed Python library internals. Search/list before broad reads; use ranges.
-- Validation/deps: use discover_validators for unknown projects; use diagnose_dependency_error before retrying import/command/path failures.
-- Systems lens: for broad/debug/design/perf/refactor tasks, use systems_lens early; force explicit boundary, observer/metric, categories, state/scale, feedback, delays, stocks/flows, coupling, model limits, and intervention tests.
-- Clarifying questions: ask only after local evidence when the answer would change scope, acceptance, risk, tradeoff, or implementation; include a recommended default and never ask discoverable repo facts.
-- Todos: for complex multi-step tasks, when todo tools are listed, use todo_write to track steps; keep at most one in_progress and update completed items as work finishes.
-- Reuse results; avoid repeat read-only calls unless state changed.
-- Question your assumptions before acting; prove or disprove with tools when possible.
-- Never claim edit/cmd/test/agent success without current-turn success.
-- Style: caveman-lite concise; keep code, paths, commands, errors, JSON exact and syntactically complete.
-
-Tools:
-{tool_help}
-"""
-
-QUESTION_PLANNER_SYSTEM_PROMPT = """You are a clarification planner for a local coding CLI controller.
-
-Return exactly one JSON object:
-{"verdict":"proceed","reason":"brief","ambiguities":[],"questions":[]}
-{"verdict":"ask","reason":"brief","ambiguities":[{"kind":"scope|intent|acceptance|risk|tradeoff","detail":"...","evidence":"..."}],"questions":[{"question":"...","why_it_matters":"...","recommended_default":"...","choices":["..."]}]}
-
-Rules:
-- Ask only if the user answer would change implementation, acceptance criteria, risk posture, scope boundary, or an irreversible/high-cost choice.
-- Do not ask for repo facts, file paths, test commands, code locations, dependency state, or errors that tools can discover.
-- Use supplied evidence. If evidence supports a conservative default, prefer verdict proceed.
-- If asking, ask 1 question when possible, max 3. Include recommended_default for each.
-- Never ask "should I proceed?" or permission-only questions.
-- Good systems questions expose boundary, observer/metric, categories, state/history, feedback, delay, stocks/flows, coupling, incentives, model limits, or intervention effects.
-"""
-
-
-@dataclass
-class AgentResult:
-    message: str
-    rounds: int
-    completed: bool = True
-
-
-@dataclass(frozen=True)
-class ExactFileWriteSpec:
-    path: str
-    line: str
-
-
-@dataclass(frozen=True)
-class FinalRewriteOutcome:
-    accepted_message: str | None = None
-    retry_decision: dict[str, Any] | None = None
-    rejected_message: str | None = None
-
-
-@dataclass(frozen=True)
-class TargetLineReadSpec:
-    path: str
-    start: int
-    end: int
-    line: int
-
-
-@dataclass(frozen=True)
-class SymbolReadSpec:
-    path: str
-    symbol: str
-
-
-@dataclass(frozen=True)
-class MechanicalToolSpec:
-    name: str
-    arguments: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class MechanicalToolOccurrence:
-    start: int
-    end: int
-    spec: MechanicalToolSpec
-    fragment: str
-
-
-KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
-APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
-VERIFICATION_HISTORY_LIMIT = 1
-VERIFICATION_CONTENT_LIMIT = 2200
-PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT = 12
-PRIMARY_CONTEXT_CONTENT_LIMIT = 900
-PRIMARY_CURRENT_REQUEST_LIMIT = 3600
-MAX_VERIFICATION_RETRIES = 2
-MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
-MAX_ASSUMPTION_AUDIT_RETRIES = 2
-MAX_RECONCILIATION_RETRIES = 2
-SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT = 150
-SPEC_GUIDED_REPAIR_MAX_ATTEMPTS = 3
-PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
-    "synthesize_simple_expression_candidate",
-    "synthesize_string_normalizer_candidate",
-    "synthesize_sequence_utilities_candidate",
-)
-SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
-    "synthesize_bowling_game_candidate",
-    "synthesize_discounted_set_pricing_candidate",
-    "synthesize_countdown_song_candidate",
-    "synthesize_affine_substitution_candidate",
-    "synthesize_noarg_literal_candidate",
-    "synthesize_proverb_chain_candidate",
-    "synthesize_typed_graph_dsl_candidate",
-    "synthesize_parent_record_tree_candidate",
-    "synthesize_domino_chain_candidate",
-    "synthesize_food_chain_song_candidate",
-    "synthesize_grep_filter_candidate",
-    "synthesize_bucket_measure_candidate",
-    "synthesize_reactive_cells_candidate",
-    "synthesize_hangman_state_candidate",
-    "synthesize_rest_api_debt_candidate",
-    "synthesize_forth_interpreter_candidate",
-    "synthesize_sgf_tree_parser_candidate",
-    "synthesize_poker_ranking_candidate",
-    "synthesize_metered_io_candidate",
-    "synthesize_tree_pov_candidate",
-    "synthesize_binary_zipper_candidate",
-    "synthesize_go_territory_candidate",
-    "synthesize_hex_connect_candidate",
-    "synthesize_word_arithmetic_candidate",
-    "synthesize_prefix_rotation_candidate",
-    "synthesize_text_matrix_transpose_candidate",
-    "synthesize_string_normalizer_class_candidate",
-    "synthesize_grouped_roster_candidate",
-    "synthesize_vlq_candidate",
-    "synthesize_cyclic_interval_scale_candidate",
-    "synthesize_unique_regex_identifier_candidate",
-    "synthesize_node_collection_candidate",
-    "synthesize_relative_import_candidate",
-)
-AUDIT_LIST_ITEM_LIMIT = 3
-AUDIT_TEXT_ITEM_LIMIT = 140
-CANDIDATE_CLAIM_LIMIT = 5
-CANDIDATE_CLAIM_TEXT_LIMIT = 180
-VERIFICATION_EVIDENCE_LIMIT = 3
-VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
-QUESTION_PLANNER_EVIDENCE_LIMIT = 5
-QUESTION_PLANNER_MAX_QUESTIONS = 3
-TODO_TOOL_NAMES = {"todo_read", "todo_write"}
-MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent", "git_commit"}
-VERIFIED_FUNCTION_TOOL_NAMES = {"verified_function_index", "verified_function_search", "verified_function_show", "verify_function_contract", "compose_verified_functions", "promote_verified_function"}
-READ_ONLY_CACHEABLE_TOOL_NAMES = {
-    "list_files",
-    "read_file",
-    "search",
-    "file_search",
-    "fd_search",
-    "file_index_refresh",
-    "everything_search",
-    "search_symbols",
-    "code_outline",
-    "read_symbol",
-    "inspect_library_source",
-    "repo_index_search",
-    "fts_search",
-    "fts_refresh",
-    "indexed_search",
-    "repo_index_refresh",
-    "semgrep_scan",
-    "ast_search",
-    "lsp_diagnostics",
-    "lsp_definition",
-    "lsp_references",
-    "context_pack",
-    "systems_lens",
-    "find_implementation_target",
-    "diagnose_test_failure",
-    "implementation_spec",
-    "diagnose_dependency_error",
-    "call_graph",
-    "contract_graph",
-    "verified_function_search",
-    "verified_function_show",
-    "compose_verified_functions",
-    "lint_typecheck",
-    "contract_check",
-    "select_tests",
-    "git_status",
-    "git_diff",
-}
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "implementation_spec", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
-CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
-INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh", "verified_function_index"}
-STRUCTURAL_SEARCH_TOOL_NAMES = {"semgrep_scan", "ast_search"}
-LSP_TOOL_NAMES = {"lsp_diagnostics", "lsp_definition", "lsp_references"}
-GRAPH_TOOL_NAMES = {"call_graph", "contract_graph"}
-EDIT_TOOL_NAMES = {"edit_intent", "write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
-LOW_LEVEL_EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
-TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "test_spec_extract", "implementation_spec", "diagnose_dependency_error", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "generate_tests_from_spec"}
-SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
-GIT_TOOL_NAMES = {"git_status", "git_diff", "git_branch", "git_log", "git_commit"}
-AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "implementation_spec", "mcp_list_tools"}
-BROAD_CONTEXT_GATHERING_TOOL_NAMES = {
-    "list_files",
-    "read_file",
-    "search",
-    "file_search",
-    "fd_search",
-    "file_index_refresh",
-    "everything_search",
-    "repo_index_search",
-    "fts_search",
-    "fts_refresh",
-    "indexed_search",
-    "repo_index_refresh",
-    "semgrep_scan",
-    "ast_search",
-    "discover_validators",
-}
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "implementation_spec", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
-VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "verify_function_contract", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
-RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
-CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
-MODEL_TOOL_RESULT_LIMITS = {
-    "list_files": 500,
-    "read_file": 1000,
-    "search": 700,
-    "file_search": 700,
-    "fd_search": 700,
-    "file_index_refresh": 400,
-    "everything_search": 700,
-    "search_symbols": 700,
-    "code_outline": 900,
-    "read_symbol": 1100,
-    "inspect_library_source": 1400,
-    "repo_index_search": 900,
-    "fts_search": 900,
-    "fts_refresh": 500,
-    "indexed_search": 900,
-    "repo_index_refresh": 500,
-    "semgrep_scan": 900,
-    "ast_search": 900,
-    "lsp_diagnostics": 900,
-    "lsp_definition": 700,
-    "lsp_references": 900,
-    "context_pack": 900,
-    "systems_lens": 900,
-    "find_implementation_target": 800,
-    "diagnose_test_failure": 900,
-    "implementation_spec": 1300,
-    "run_function_probe": 700,
-    "call_graph": 900,
-    "contract_graph": 1000,
-    "verified_function_index": 500,
-    "verified_function_search": 1200,
-    "verified_function_show": 1400,
-    "verify_function_contract": 1400,
-    "compose_verified_functions": 1200,
-    "promote_verified_function": 1200,
-    "lint_typecheck": 800,
-    "discover_validators": 800,
-    "diagnose_dependency_error": 800,
-    "contract_check": 900,
-    "select_tests": 800,
-    "edit_intent": 1000,
-    "replace_symbol": 900,
-    "replace_symbols": 1000,
-    "apply_structured_edit": 1000,
-    "generate_tests_from_spec": 1000,
-    "browser_smoke": 900,
-    "security_scan": 900,
-    "mcp_list_tools": 900,
-    "mcp_call": 900,
-    "git_status": 700,
-    "git_diff": 900,
-    "run_shell": 700,
-    "run_test": 700,
-    "run_agent": 900,
-    "todo_read": 500,
-    "todo_write": 700,
-}
-MODEL_TOOL_DIFF_LIMIT = 700
-VERIFICATION_TOOL_RESULT_LIMIT = 450
-VERIFICATION_TOOL_DIFF_LIMIT = 450
-
-FINAL_VERIFIER_SYSTEM_PROMPT = """You are a grounded final verifier for a coding CLI controller.
-
-Check final vs evidence/constraints. JSON only.
-
-Replies:
-{"verdict":"accept","claim_checks":[{"claim":"...","status":"supported","evidence":"E1"}]}
-{"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"],"claim_checks":[{"claim":"...","status":"contradicted","evidence":"E2","correction":"..."}],"rewrite_guidance":["..."],"rewrite_from_evidence":true}
-
-Rules:
-- Accept if candidate matches request, constraints, tool results, and accepted audits.
-- Retry if contradiction, unsupported workspace claim, missing/forbidden tool, or another tool is needed.
-- claim_checks status: supported, contradicted, unverified. Cite evidence ids when possible.
-- correction/rewrite_guidance must come only from evidence.
-- rewrite_from_evidence true only if evidence can fully fix final without another tool.
-- Do not write the final answer. Tool arrays: known names only or [].
-"""
-
-FINAL_REWRITER_SYSTEM_PROMPT = """You are an evidence-backed final rewriter for a coding CLI controller.
-
-Return exactly one JSON object only.
-
-Reply:
-{"type":"final","message":"Accurate final answer grounded only in the supplied evidence."}
-
-Rules:
-- Use only evidence table, claim checks, and rewrite guidance.
-- Do not invent files, commands, diffs, outcomes, or unsupported details.
-- Use supplied corrections for contradicted claims, or omit those claims.
-- Keep final concise and useful.
-"""
-
-TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT = """You are a tool-step assumption auditor for a coding CLI controller.
-
-Decide if proposed tool is grounded next step. JSON only.
-
-Replies:
-{"verdict":"accept","reason":"","assumptions":["..."],"validation_steps":["..."],"required_tools":[],"forbidden_tools":[]}
-{"verdict":"retry","reason":"brief concrete reason","assumptions":["..."],"validation_steps":["..."],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
-
-Rules:
-- Keep assumptions/validation_steps short.
-- Accept reasonable validation steps, including expected failures/boundary probes.
-- Accept read/inspect steps after failed tests; repair needs fresh evidence more than another audit.
-- Retry if redundant, too broad, constraint-violating, mutating before inspection, or not validating the key assumption.
-- Do not rewrite the tool. Tool arrays: known names only or [].
-"""
-
-ARTIFACT_RECONCILER_SYSTEM_PROMPT = """You are an artifact reconciliation critic for a coding CLI controller.
-
-After a failed tool/test/edit artifact, decide if the main model should retry with a compact repair plan. JSON only.
-
-Replies:
-{"verdict":"accept","reason":"","repair_plan":[],"required_tools":[],"forbidden_tools":[]}
-{"verdict":"retry","reason":"brief concrete reason","repair_plan":["inspect failing symbol","edit implementation","rerun tests"],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
-
-Rules:
-- Use only supplied request, recent messages, tool calls, and artifact evidence.
-- Retry if failed tests, syntax errors, or tool errors imply a specific next validation/repair step.
-- Prefer implementation/source repair before repeated tests.
-- Keep repair_plan short. Tool arrays: known names only or [].
-- Do not write code or the final answer.
-"""
-
-
-def extract_json_response(raw_text: str, *, _depth: int = 0) -> dict[str, Any] | None:
-    candidate = raw_text.strip()
-    if not candidate:
-        return None
-    candidate = re.sub(r"<think>.*?</think>", "", candidate, flags=re.DOTALL)
-    candidate = candidate.strip()
-    if candidate.startswith("```"):
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
-        candidate = re.sub(r"\s*```$", "", candidate)
-        candidate = candidate.strip()
-    repaired_candidate = _repair_truncated_json(candidate)
-    if repaired_candidate is not None:
-        candidate = repaired_candidate
-    decoder = json.JSONDecoder()
-    if _depth < 2:
-        try:
-            top_level, end_index = decoder.raw_decode(candidate)
-        except json.JSONDecodeError:
-            top_level = None
-            end_index = -1
-        if isinstance(top_level, str) and not candidate[end_index:].strip():
-            return extract_json_response(top_level, _depth=_depth + 1)
-    starts = [index for index, char in enumerate(candidate) if char == "{"]
-    if candidate.startswith("{"):
-        starts = [0] + [index for index in starts if index != 0]
-    parsed_dicts: list[dict[str, Any]] = []
-    agent_payloads: list[dict[str, Any]] = []
-    top_level_dict: dict[str, Any] | None = None
-    for start in starts:
-        try:
-            data, end_index = decoder.raw_decode(candidate[start:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            if start == 0 and not candidate[end_index:].strip():
-                top_level_dict = data
-            parsed_dicts.append(data)
-            response_type = data.get("type")
-            tool_name = data.get("name")
-            if isinstance(response_type, str) and response_type.strip() in {"tool", "final", *KNOWN_TOOL_NAMES}:
-                agent_payloads.append(data)
-                continue
-            if isinstance(tool_name, str) and tool_name.strip() in KNOWN_TOOL_NAMES and response_type in {None, "", "function", "tool_call"}:
-                agent_payloads.append(data)
-    if agent_payloads:
-        return agent_payloads[-1]
-    if top_level_dict is not None:
-        return top_level_dict
-    if parsed_dicts:
-        return parsed_dicts[-1]
-    return None
-
-
-def _decode_json_like_string(value: str) -> str:
-    try:
-        return json.loads(f'"{value}"')
-    except json.JSONDecodeError:
-        text = value.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t").replace("\\r", "\r")
-        return text.replace("\\\\", "\\")
-
-
-def _find_json_like_array_end(raw_text: str, start_index: int) -> int | None:
-    depth = 0
-    in_string = False
-    escaped = False
-    for index in range(start_index, len(raw_text)):
-        char = raw_text[index]
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-            continue
-        if char == "[":
-            depth += 1
-            continue
-        if char == "]":
-            depth -= 1
-            if depth == 0:
-                return index
-    return None
-
-
-def extract_json_like_fields(raw_text: str, *, scalar_keys: tuple[str, ...], array_keys: tuple[str, ...]) -> dict[str, Any]:
-    candidate = re.sub(r"<think>.*?</think>", "", raw_text or "", flags=re.DOTALL).strip()
-    if not candidate:
-        return {}
-    extracted: dict[str, Any] = {}
-    for key in scalar_keys:
-        match = re.search(rf'"?{re.escape(key)}"?\s*:\s*"((?:[^"\\]|\\.)*)"', candidate, flags=re.DOTALL)
-        if match:
-            extracted[key] = _decode_json_like_string(match.group(1))
-    for key in array_keys:
-        match = re.search(rf'"?{re.escape(key)}"?\s*:\s*\[', candidate, flags=re.DOTALL)
-        if not match:
-            continue
-        start_index = match.end() - 1
-        end_index = _find_json_like_array_end(candidate, start_index)
-        if end_index is None:
-            continue
-        items = [
-            _decode_json_like_string(group)
-            for group in re.findall(r'"((?:[^"\\]|\\.)*)"', candidate[start_index + 1 : end_index], flags=re.DOTALL)
-        ]
-        extracted[key] = items
-    return extracted
-
-
-def _repair_truncated_json(candidate: str) -> str | None:
-    if not candidate or candidate[0] not in "{[":
-        return None
-    stack: list[str] = []
-    in_string = False
-    escaped = False
-    for char in candidate:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
-            continue
-        if char == '"':
-            in_string = True
-            continue
-        if char == "{":
-            stack.append("}")
-            continue
-        if char == "[":
-            stack.append("]")
-            continue
-        if char in "}]":
-            if not stack or char != stack[-1]:
-                return None
-            stack.pop()
-    if in_string or not stack:
-        return None
-    repaired = candidate + "".join(reversed(stack))
-    try:
-        _, end_index = json.JSONDecoder().raw_decode(repaired)
-    except json.JSONDecodeError:
-        return None
-    if repaired[end_index:].strip():
-        return None
-    return repaired
-
-
-def _portable_workspace_key(raw_path: str | Path) -> str | None:
-    text = str(raw_path).strip()
-    if not text:
-        return None
-    normalized = text.replace("\\", "/")
-    drive_match = re.match(r"^(?P<drive>[A-Za-z]):(?:/(?P<rest>.*))?$", normalized)
-    if drive_match:
-        drive = drive_match.group("drive").lower()
-        rest = (drive_match.group("rest") or "").strip("/")
-        return f"{drive}:/{rest}" if rest else f"{drive}:/"
-    wsl_match = re.match(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$", normalized)
-    if wsl_match:
-        drive = wsl_match.group("drive").lower()
-        rest = (wsl_match.group("rest") or "").strip("/")
-        return f"{drive}:/{rest}" if rest else f"{drive}:/"
-    try:
-        return Path(text).resolve(strict=False).as_posix()
-    except OSError:
-        return None
-
-
-def _workspace_roots_match(saved_root: object, current_root: Path) -> bool:
-    if saved_root is None:
-        return True
-    saved_text = str(saved_root).strip()
-    if not saved_text:
-        return False
-    current_root = current_root.resolve()
-    try:
-        saved_path = Path(saved_text).resolve(strict=False)
-    except OSError:
-        saved_path = None
-    if saved_path == current_root:
-        return True
-    saved_key = _portable_workspace_key(saved_text)
-    current_key = _portable_workspace_key(current_root)
-    if saved_key is None or current_key is None:
-        return False
-    if re.match(r"^[A-Za-z]:/", saved_key) or re.match(r"^[A-Za-z]:/", current_key):
-        return saved_key.casefold() == current_key.casefold()
-    return saved_key == current_key
 
 
 class OllamaCodeAgent:
@@ -1386,10 +909,15 @@ class OllamaCodeAgent:
         lowered = text.lower()
         fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", lowered)
         fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", lowered))
+        fragments.extend(re.findall(r"\bnot\s+(?:with|using|via)?\s*[^.?!\n]{0,80}", lowered))
         forbidden: set[str] = set()
         for fragment in fragments:
             forbidden.update(self._tool_names_in_fragment(fragment))
         return forbidden
+
+    def _intrinsic_forbidden_tool_names(self) -> set[str]:
+        available = self.tools.available_tool_names()
+        return {name for name in KNOWN_TOOL_NAMES if name not in available}
 
     def _requested_tool_names(self, text: str, *, forbidden_tool_names: set[str] | None = None) -> set[str]:
         lowered = text.lower()
@@ -1988,6 +1516,38 @@ class OllamaCodeAgent:
         parts.append("Choose a better next JSON object only.")
         return " ".join(parts)
 
+    def _stabilize_retry_tool_constraints(
+        self,
+        decision: dict[str, Any],
+        *,
+        sticky_required_tool_names: set[str],
+        sticky_forbidden_tool_names: set[str],
+    ) -> dict[str, Any]:
+        normalized = dict(decision)
+        available_tool_names = self.tools.available_tool_names()
+        required_tools = {
+            name
+            for name in normalized.get("required_tools", [])
+            if isinstance(name, str) and name in KNOWN_TOOL_NAMES
+        }
+        forbidden_tools = {
+            name
+            for name in normalized.get("forbidden_tools", [])
+            if isinstance(name, str) and name in KNOWN_TOOL_NAMES
+        }
+        if available_tool_names:
+            required_tools = {name for name in required_tools if name in available_tool_names}
+            sticky_required = {name for name in sticky_required_tool_names if name in available_tool_names}
+        else:
+            sticky_required = set(sticky_required_tool_names)
+        sticky_forbidden = {name for name in sticky_forbidden_tool_names if name in KNOWN_TOOL_NAMES}
+        required_tools.update(sticky_required)
+        forbidden_tools.update(sticky_forbidden)
+        required_tools.difference_update(forbidden_tools)
+        normalized["required_tools"] = sorted(required_tools)
+        normalized["forbidden_tools"] = sorted(forbidden_tools)
+        return normalized
+
     def _reset_turn_cache(self) -> None:
         self._turn_tool_cache = {}
         self._turn_cache_epoch = 0
@@ -2108,7 +1668,7 @@ class OllamaCodeAgent:
             flags=re.DOTALL,
         )
         if syntax_match:
-            path = Path(syntax_match.group("path")).name
+            path = self._display_path_basename(syntax_match.group("path"))
             line = syntax_match.group("line")
             error = syntax_match.group("error").strip()
             return (
@@ -2560,7 +2120,11 @@ class OllamaCodeAgent:
 
     def _request_prefers_structured_file_tools(self, text: str) -> bool:
         lowered = text.lower()
-        if "run_shell" in lowered or "shell" in lowered or "command" in lowered:
+        if "run_shell" in lowered and "not run_shell" not in lowered:
+            return False
+        if "shell" in lowered and "not shell" not in lowered:
+            return False
+        if "command" in lowered and "run_test" not in lowered:
             return False
         file_verbs = ["create ", "write ", "replace ", "edit ", "update ", "rewrite ", "append "]
         has_file_target = bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)) or "/" in text
@@ -3356,6 +2920,9 @@ class OllamaCodeAgent:
         return None
 
     def _requested_exact_shell_command(self, text: str) -> str | None:
+        lowered = text.lower()
+        if re.search(r"\bnot\s+run_shell\b", lowered) or re.search(r"\bnot\s+shell\b", lowered):
+            return None
         patterns = [
             r"\b(?:execute|run)\s+exactly:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
             r"\b(?:execute|run)\s+the\s+exact\s+command:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
@@ -3900,14 +3467,28 @@ class OllamaCodeAgent:
         request_text: str,
         exact_shell_command: str | None,
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "run_shell" or not self.tools.default_test_command:
+        if name != "run_shell":
             return name, arguments, None
         command = str(arguments.get("command", "")).strip()
-        if not command or not self._shell_command_looks_like_test_run(command):
+        if not command:
+            return name, arguments, None
+        request_forbidden = self._forbidden_tool_names(request_text)
+        explicit_run_shell = self._request_explicitly_requests_tool(request_text, "run_shell") and "run_shell" not in request_forbidden
+        explicit_run_test = self._request_explicitly_requests_tool(request_text, "run_test") and "run_test" not in request_forbidden
+        if explicit_run_shell:
+            return name, arguments, None
+        if explicit_run_test:
+            normalized = {"command": command}
+            if "cwd" in arguments:
+                normalized["cwd"] = arguments["cwd"]
+            if "timeout" in arguments:
+                normalized["timeout"] = arguments["timeout"]
+            return "run_test", normalized, "Normalized run_shell to run_test because the request explicitly requires run_test."
+        if not self.tools.default_test_command:
+            return name, arguments, None
+        if not self._shell_command_looks_like_test_run(command):
             return name, arguments, None
         if exact_shell_command and command == exact_shell_command:
-            return name, arguments, None
-        if self._request_explicitly_requests_tool(request_text, "run_shell"):
             return name, arguments, None
         normalized: dict[str, Any] = {"command": self.tools.default_test_command}
         if "cwd" in arguments:
@@ -4531,6 +4112,35 @@ class OllamaCodeAgent:
                 return error_class
         return None
 
+    def _mutating_failure_key(self, name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+        path = str(arguments.get("path") or arguments.get("cwd") or "").strip().replace("\\", "/").lstrip("./")
+        if path:
+            return ("path", path.lower())
+        return ("tool", name)
+
+    def _repeated_mutating_failure_escape_message(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> str:
+        target_path = str(arguments.get("path") or arguments.get("cwd") or "").strip()
+        evidence = str(result.get("summary") or result.get("output") or "").strip()
+        if target_path:
+            message = (
+                f"Stop retrying narrow edit operations on {target_path} in this turn. "
+                f"Read {target_path}, then make one broader syntactically valid repair with write_file or a full-symbol replacement, and rerun tests."
+            )
+        else:
+            message = (
+                f"Stop retrying {name} with small mutations in this turn. "
+                "Switch to a broader direct repair, then rerun tests."
+            )
+        if evidence:
+            message += " Evidence: " + self._truncate_text(evidence, limit=320)
+        return message + " Next JSON only."
+
     def _remember_tool_error(
         self,
         *,
@@ -4569,6 +4179,53 @@ class OllamaCodeAgent:
             f"{name} already failed twice with {error_class}. Do not retry the same arguments. "
             "Use a different tool class, gather new evidence, edit the cause, or fail closed. Next JSON only."
         )
+
+    def _forbidden_tool_feedback_message(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        arguments: dict[str, Any],
+        forbidden_count: int,
+        forbidden_tool_names: set[str],
+        required_tool_names: set[str],
+    ) -> str:
+        command = str(arguments.get("command", "")).strip()
+        disabled = name in getattr(self.tools, "disabled_tools", set())
+        prefix = f"Do not use {name} in this turn."
+        if disabled:
+            prefix += f" {name} is disabled by config for this workspace."
+        if name == "run_shell":
+            if command and "run_test" in required_tool_names and "run_test" not in forbidden_tool_names:
+                return (
+                    prefix
+                    + f" Use run_test instead with command {command!r}. "
+                    + "If that fails, inspect the concrete failure and try a different repair before rerunning. Next JSON only."
+                )
+            if (
+                self.tools.default_test_command
+                and "run_test" not in forbidden_tool_names
+                and command
+                and self._shell_command_looks_like_test_run(command)
+            ):
+                return (
+                    prefix
+                    + f" Use run_test instead with command {command!r}. "
+                    + "If that still fails, inspect the concrete failure and try a different repair before rerunning tests. Next JSON only."
+                )
+            if self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+                return (
+                    prefix
+                    + " Use run_test or another structured allowed tool instead, not run_shell. "
+                    + "If tests already passed, answer from the successful run_test evidence. Next JSON only."
+                )
+        if forbidden_count >= 2:
+            return (
+                prefix
+                + " You already proposed this forbidden tool before. "
+                + "Choose a different allowed tool now or answer strictly from existing verified evidence. Next JSON only."
+            )
+        return prefix + " Choose a different allowed tool or answer from existing verified tool results. Respond with the next JSON object only."
 
     def _record_command_validation_event(self, *, name: str, result: dict[str, Any], round_number: int, cached: bool = False) -> None:
         validation = result.get("validation")
@@ -5398,6 +5055,30 @@ class OllamaCodeAgent:
             if message:
                 return self._record_synthesized_final(message, tool="run_shell", round_number=round_number)
             return None
+        if exact_shell_command and "run_test" in required_tool_names and "run_test" not in forbidden_tool_names:
+            round_number += 1
+            result = self._execute_controller_tool(
+                name="run_test",
+                arguments={"command": exact_shell_command},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            message = self._synthesize_final_from_tool_result(
+                request_text=request_text,
+                name="run_test",
+                arguments={"command": exact_shell_command},
+                result=result,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                required_tool_names=required_tool_names,
+                expected_exact_reply_text=expected_exact_reply_text,
+            )
+            if message:
+                return self._record_synthesized_final(message, tool="run_test", round_number=round_number)
+            return None
 
         if "run_test" in required_tool_names and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
             round_number += 1
@@ -5702,6 +5383,12 @@ class OllamaCodeAgent:
             r"\bwas\s+(?:updated|edited|changed|modified|created|written|rewritten|deleted|removed|renamed)\b",
         ]
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _display_path_basename(self, raw_path: str) -> str:
+        normalized = str(raw_path or "").replace("\\", "/").rstrip("/")
+        if not normalized:
+            return ""
+        return normalized.rsplit("/", 1)[-1]
 
     def _final_claims_test_success(self, message: str) -> bool:
         lowered = message.lower()
@@ -7363,7 +7050,11 @@ class OllamaCodeAgent:
         self._record_event("user", content=text)
         requires_tools = self._request_requires_tools(text)
         forbidden_tool_names = self._forbidden_tool_names(text)
+        forbidden_tool_names.update(self._intrinsic_forbidden_tool_names())
+        forbidden_tool_names.update(getattr(self.tools, "disabled_tools", set()))
         required_tool_names = self._requested_tool_names(text, forbidden_tool_names=forbidden_tool_names)
+        sticky_forbidden_tool_names = set(forbidden_tool_names)
+        sticky_required_tool_names = set(required_tool_names)
         requested_git_diff_mode = self._requested_git_diff_mode(text)
         expected_exact_file_line = self._requested_exact_file_line(text)
         exact_file_write = self._requested_exact_single_line_file_write(text)
@@ -7441,6 +7132,7 @@ class OllamaCodeAgent:
         unresolved_static_diagnostics: dict[str, str] = {}
         unresolved_probe_diagnostics: dict[str, str] = {}
         tool_error_counts: dict[tuple[str, str, str], int] = {}
+        mutating_failure_counts: dict[tuple[str, str], int] = {}
         if (
             (mutation_required or code_mutation_required)
             and not exact_request
@@ -7583,7 +7275,7 @@ class OllamaCodeAgent:
             recovered_tool_audit_bypass_reason: str | None = None
             payload = extract_json_response(response.content)
             if payload is None:
-                if exact_shell_command and not tool_used_this_turn:
+                if exact_shell_command and not tool_used_this_turn and "run_shell" not in forbidden_tool_names:
                     payload = {"type": "tool", "name": "run_shell", "arguments": {"command": exact_shell_command}}
                     recovered_tool_audit_bypass_reason = "Recovered exact run_shell command after invalid model JSON."
                     self._record_event(
@@ -7591,6 +7283,23 @@ class OllamaCodeAgent:
                         original_name="",
                         original_arguments={},
                         normalized_name="run_shell",
+                        normalized_arguments={"command": exact_shell_command},
+                        reason=recovered_tool_audit_bypass_reason,
+                        rounds=round_number,
+                    )
+                elif (
+                    exact_shell_command
+                    and not tool_used_this_turn
+                    and "run_test" in required_tool_names
+                    and "run_test" not in forbidden_tool_names
+                ):
+                    payload = {"type": "tool", "name": "run_test", "arguments": {"command": exact_shell_command}}
+                    recovered_tool_audit_bypass_reason = "Recovered exact run_test command after invalid model JSON."
+                    self._record_event(
+                        "tool_normalized",
+                        original_name="",
+                        original_arguments={},
+                        normalized_name="run_test",
                         normalized_arguments={"command": exact_shell_command},
                         reason=recovered_tool_audit_bypass_reason,
                         rounds=round_number,
@@ -7610,7 +7319,7 @@ class OllamaCodeAgent:
                 continue
             payload = self._normalize_payload(payload)
             response_type = payload.get("type")
-            if response_type not in {"tool", "final"} and exact_shell_command and not tool_used_this_turn:
+            if response_type not in {"tool", "final"} and exact_shell_command and not tool_used_this_turn and "run_shell" not in forbidden_tool_names:
                 malformed_name = str(payload.get("name", ""))
                 malformed_arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
                 payload = {"type": "tool", "name": "run_shell", "arguments": {"command": exact_shell_command}}
@@ -7621,6 +7330,27 @@ class OllamaCodeAgent:
                     original_name=malformed_name,
                     original_arguments=malformed_arguments,
                     normalized_name="run_shell",
+                    normalized_arguments={"command": exact_shell_command},
+                    reason=recovered_tool_audit_bypass_reason,
+                    rounds=round_number,
+                )
+            elif (
+                response_type not in {"tool", "final"}
+                and exact_shell_command
+                and not tool_used_this_turn
+                and "run_test" in required_tool_names
+                and "run_test" not in forbidden_tool_names
+            ):
+                malformed_name = str(payload.get("name", ""))
+                malformed_arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                payload = {"type": "tool", "name": "run_test", "arguments": {"command": exact_shell_command}}
+                response_type = "tool"
+                recovered_tool_audit_bypass_reason = "Recovered exact run_test command from malformed model payload."
+                self._record_event(
+                    "tool_normalized",
+                    original_name=malformed_name,
+                    original_arguments=malformed_arguments,
+                    normalized_name="run_test",
                     normalized_arguments={"command": exact_shell_command},
                     reason=recovered_tool_audit_bypass_reason,
                     rounds=round_number,
@@ -8107,6 +7837,11 @@ class OllamaCodeAgent:
                                 rejected_final_messages.add(rewrite_outcome.rejected_message)
                             if rewrite_outcome.retry_decision is not None:
                                 retry_decision = rewrite_outcome.retry_decision
+                        retry_decision = self._stabilize_retry_tool_constraints(
+                            retry_decision,
+                            sticky_required_tool_names=sticky_required_tool_names,
+                            sticky_forbidden_tool_names=sticky_forbidden_tool_names,
+                        )
                         required_tool_names.update(retry_decision["required_tools"])
                         forbidden_tool_names.update(retry_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)
@@ -8177,11 +7912,22 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                 if name in forbidden_tool_names:
+                    tool_error_counts[(name, self._tool_error_arg_key(name, arguments), "forbidden_tool")] = (
+                        tool_error_counts.get((name, self._tool_error_arg_key(name, arguments), "forbidden_tool"), 0) + 1
+                    )
+                    forbidden_count = tool_error_counts[(name, self._tool_error_arg_key(name, arguments), "forbidden_tool")]
                     self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": f"Do not use {name} in this turn. Choose a different allowed tool or answer from existing verified tool results. Respond with the next JSON object only.",
+                            "content": self._forbidden_tool_feedback_message(
+                                request_text=text,
+                                name=name,
+                                arguments=arguments,
+                                forbidden_count=forbidden_count,
+                                forbidden_tool_names=forbidden_tool_names,
+                                required_tool_names=required_tool_names,
+                            ),
                         }
                     )
                     continue
@@ -8447,6 +8193,11 @@ class OllamaCodeAgent:
                     arguments=arguments,
                     tool_error_counts=tool_error_counts,
                 )
+                repeated_mutating_failure = (
+                    name in RETRY_PRONE_MUTATING_TOOL_NAMES
+                    and (mutation_required or code_mutation_required)
+                    and mutating_failure_counts.get(self._mutating_failure_key(name, arguments), 0) >= 1
+                )
                 if repeated_error_class:
                     self._append_assistant_payload(payload)
                     self._record_event(
@@ -8458,6 +8209,29 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                     self.messages.append({"role": "user", "content": self._tool_error_guard_message(name, repeated_error_class)})
+                    continue
+                if repeated_mutating_failure:
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="repeated-mutating-failure-pivot",
+                        candidate_tool=name,
+                        target=self._mutating_failure_key(name, arguments)[1],
+                        forced_next_classes=["read", "implementation_edit", "validation"],
+                        rounds=round_number,
+                    )
+                    forbidden_tool_names.update({"edit_intent", "replace_in_file", "replace_symbol", "replace_symbols", "apply_structured_edit"})
+                    required_tool_names.difference_update(forbidden_tool_names)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._repeated_mutating_failure_escape_message(
+                                name=name,
+                                arguments=arguments,
+                                result={"summary": latest_run_test_failure_summary or "Earlier mutating edit already failed on this target."},
+                            ),
+                        }
+                    )
                     continue
                 if (
                     not context_planner_prompted
@@ -8593,6 +8367,11 @@ class OllamaCodeAgent:
                     )
                     if audit_decision["verdict"] == "retry":
                         assumption_audit_retries += 1
+                        audit_decision = self._stabilize_retry_tool_constraints(
+                            audit_decision,
+                            sticky_required_tool_names=sticky_required_tool_names,
+                            sticky_forbidden_tool_names=sticky_forbidden_tool_names,
+                        )
                         required_tool_names.update(audit_decision["required_tools"])
                         forbidden_tool_names.update(audit_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)
@@ -8634,9 +8413,11 @@ class OllamaCodeAgent:
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
-                    if name in MUTATING_TOOL_NAMES and latest_run_test_failed and (mutation_required or code_mutation_required):
+                    if name in RETRY_PRONE_MUTATING_TOOL_NAMES and (mutation_required or code_mutation_required):
                         failed_test_context_reads = 0
                         failed_test_mutation_version = mutation_version
+                        failure_key = self._mutating_failure_key(name, arguments)
+                        mutating_failure_counts[failure_key] = mutating_failure_counts.get(failure_key, 0) + 1
                     self._remember_tool_error(
                         name=name,
                         arguments=arguments,
@@ -8843,6 +8624,31 @@ class OllamaCodeAgent:
                     and self._spec_guided_repair_enabled()
                     and any(
                         token in str(result.get("summary") or result.get("output") or "").lower()
+                        for token in ("target text was not found", "target text not found", "not found.")
+                    )
+                ):
+                    spec_guided_repair_attempted = True
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result=result,
+                        run_test_arguments={},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
+                if (
+                    name in MUTATING_TOOL_NAMES
+                    and result.get("ok") is not True
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_enabled()
+                    and any(
+                        token in str(result.get("summary") or result.get("output") or "").lower()
                         for token in (
                             "syntax error",
                             "syntaxerror",
@@ -8866,6 +8672,29 @@ class OllamaCodeAgent:
                     )
                     if repair_result is not None:
                         return repair_result
+                if (
+                    name in MUTATING_TOOL_NAMES
+                    and result.get("ok") is not True
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._tool_error_class(result) == "syntax_error"
+                ):
+                    target_path = str(arguments.get("path") or arguments.get("cwd") or "").strip()
+                    target_text = (result.get("summary") or result.get("output") or "").strip()
+                    if target_path:
+                        prompt = (
+                            "This edit failed a syntax check. Do not retry low-level edits on this file.\n"
+                            f"Read {target_path} and rewrite the needed function(s) in a single, syntax-valid patch.\n"
+                            "Then rerun tests. Use full file edits only and keep the implementation minimal and correct."
+                        )
+                    else:
+                        prompt = "This mutating edit failed a syntax check. Replace malformed edits with a new syntactically valid implementation and rerun tests."
+                    if target_text:
+                        prompt += f"\nEvidence: {self._truncate_text(target_text, limit=360)}"
+                    self.messages.append({"role": "user", "content": prompt})
+                    self._record_event("assistant", content="syntax_error_recovery_prompt", rounds=round_number)
+                    continue
                 self._autosave()
                 if self._tool_result_needs_reconciliation(
                     request_text=text,
@@ -8890,6 +8719,11 @@ class OllamaCodeAgent:
                     )
                     if reconciliation_decision["verdict"] == "retry":
                         reconciliation_retries += 1
+                        reconciliation_decision = self._stabilize_retry_tool_constraints(
+                            reconciliation_decision,
+                            sticky_required_tool_names=sticky_required_tool_names,
+                            sticky_forbidden_tool_names=sticky_forbidden_tool_names,
+                        )
                         required_tool_names.update(reconciliation_decision["required_tools"])
                         forbidden_tool_names.update(reconciliation_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)

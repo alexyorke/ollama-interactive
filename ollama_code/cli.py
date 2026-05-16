@@ -319,6 +319,7 @@ def build_agent(
         input_func=input_func,
         test_command=test_command,
         default_tools_enabled=config.tools_default_enabled,
+        enabled_tools=config.enabled_tools,
         disabled_tools=config.disabled_tools,
         mcp_servers=config.mcp_servers,
         browser_enabled=config.browser_enabled,
