@@ -567,6 +567,12 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
             lines.append("verified functions: disabled/missing " + ", ".join(missing_verified))
         else:
             lines.append("verified functions: ok default-on Python cards; cache=.ollama-code/index/verified_functions.sqlite")
+        sdk_tools = {"python_sdk_search", "python_sdk_refresh"}
+        missing_sdk = sorted(sdk_tools - available_tools)
+        if missing_sdk:
+            lines.append("python sdk index: disabled/missing " + ", ".join(missing_sdk))
+        else:
+            lines.append("python sdk index: ok on-demand stdlib/API search; cache=.ollama-code/index/python_sdk.sqlite")
 
     optional_tools = {
         "rg": "fast text search",

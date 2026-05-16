@@ -144,6 +144,11 @@ def _suggest_targets(metrics: dict[str, Any], commands: list[dict[str, Any]]) ->
             first = slowest_probe[0]
             if isinstance(first, dict) and first.get("name"):
                 suggestions.append(f"Optimize no-LLM tool probe {first['name']} before model prompt changes.")
+    sdk = metrics.get("python_sdk_search")
+    if isinstance(sdk, dict):
+        summary = sdk.get("summary") if isinstance(sdk.get("summary"), dict) else {}
+        if int(summary.get("fail", 0) or 0):
+            suggestions.append("Improve Python SDK retrieval before relying on it for agent routing.")
     return list(dict.fromkeys(suggestions))[:6]
 
 
@@ -166,6 +171,27 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             output_path=tool_probe_path,
         )
     )
+
+    sdk_eval_path = run_dir / "python_sdk_search.json"
+    sdk_command = [
+        py,
+        "scripts/python_sdk_search_eval.py",
+        "--workspace",
+        str(repo_root),
+        "--index-limit",
+        str(args.sdk_index_limit),
+        "--limit",
+        "8",
+        "--output",
+        str(sdk_eval_path),
+    ]
+    if args.sdk_use_embeddings:
+        sdk_command.append("--use-embeddings")
+        if args.sdk_embedding_model:
+            sdk_command.extend(["--embedding-model", args.sdk_embedding_model])
+    if args.strict_accuracy:
+        sdk_command.append("--strict-accuracy")
+    commands.append(_run_command(repo_root, "python_sdk_search", sdk_command, timeout=args.tool_timeout, output_path=sdk_eval_path))
 
     token_path = run_dir / "token_efficiency.json"
     benchmark_path = run_dir / "coding_benchmark.json"
@@ -220,6 +246,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     token_payload = _load_json(token_path)
     benchmark_payload = _load_json(benchmark_path)
     probe_payload = _load_json(tool_probe_path)
+    sdk_payload = _load_json(sdk_eval_path)
     baseline = _load_json(args.compare) if args.compare else {}
     baseline_metrics = baseline.get("metrics") if isinstance(baseline.get("metrics"), dict) else {}
     baseline_token = baseline_metrics.get("token_efficiency") if isinstance(baseline_metrics.get("token_efficiency"), dict) else {}
@@ -229,6 +256,11 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "tool_speed_probe": {
             "generated_files": probe_payload.get("generated_files"),
             "slowest": _collect_probe_slowest(probe_payload)[:5],
+        },
+        "python_sdk_search": {
+            "summary": _summary(sdk_payload),
+            "refresh": sdk_payload.get("refresh", {}),
+            "mode": sdk_payload.get("mode"),
         },
         "token_efficiency": {
             "summary": _summary(token_payload),
@@ -276,6 +308,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--case-timeout", type=int, default=600, help="Per-case timeout passed to eval scripts.")
     parser.add_argument("--command-timeout", type=int, default=7200, help="Wall-clock timeout for each LLM eval command.")
     parser.add_argument("--tool-timeout", type=int, default=600, help="Wall-clock timeout for non-LLM tooling commands.")
+    parser.add_argument("--sdk-index-limit", type=int, default=5000, help="Python SDK API entries to index in the nightly retrieval eval.")
+    parser.add_argument("--sdk-use-embeddings", action="store_true", help="Use Ollama embeddings for the Python SDK retrieval eval.")
+    parser.add_argument("--sdk-embedding-model", default=None, help="Embedding model for --sdk-use-embeddings, e.g. nomic-embed-text.")
     parser.add_argument("--skip-llm", action="store_true", help="Run only no-LLM probes and anti-cheat.")
     parser.add_argument("--strict-accuracy", action="store_true", help="Propagate strict accuracy flags to eval scripts.")
     parser.add_argument("--strict-budget", action="store_true", help="Propagate strict budget checks to coding benchmarks.")

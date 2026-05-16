@@ -52,6 +52,7 @@ from ollama_code.agent_protocol import (
     PRIMARY_CONTEXT_CONTENT_LIMIT,
     PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT,
     PRIMARY_CURRENT_REQUEST_LIMIT,
+    PYTHON_SDK_TOOL_NAMES,
     QUESTION_PLANNER_EVIDENCE_LIMIT,
     QUESTION_PLANNER_MAX_QUESTIONS,
     READ_ONLY_CACHEABLE_TOOL_NAMES,
@@ -203,7 +204,9 @@ class OllamaCodeAgent:
             selected.update(GRAPH_TOOL_NAMES)
         if re.search(r"\b(?:verified|known utilit|reusable function|verified function|function card|compose|lego|legos|do not invent|don't invent|dont invent|pure function|purity)\b", lowered):
             selected.update(VERIFIED_FUNCTION_TOOL_NAMES)
-        if re.search(r"\b(?:library|package|site-packages|stdlib|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
+        if re.search(r"\b(?:python sdk|python api|stdlib|standard library|builtin|builtins|current python|python docs?|sdk search)\b", lowered):
+            selected.update(PYTHON_SDK_TOOL_NAMES)
+        if re.search(r"\b(?:library|package|site-packages|stdlib|standard library|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
             selected.add("inspect_library_source")
         if re.search(r"\b(?:ast|ast-grep|semgrep|structural|syntax-aware|codemod|pattern search|api misuse)\b", lowered):
             selected.update(STRUCTURAL_SEARCH_TOOL_NAMES)

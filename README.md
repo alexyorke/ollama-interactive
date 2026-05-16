@@ -277,6 +277,20 @@ python scripts/nightly_self_improvement_report.py --models gemma4:e4b --strict-a
 
 The report writes `scratch/nightly-self-improvement/<timestamp>/report.json` with pass/fail deltas, token totals, tool latency, slowest tools, and suggested implementation targets. It does not edit, merge, push, or run a background worker.
 
+### Python SDK Retrieval
+
+For Python API/stdlib questions, the CLI exposes an installed-SDK index instead of relying on model memory:
+
+```bash
+python scripts/python_sdk_search_eval.py --strict-accuracy
+```
+
+The `python_sdk_search` tool builds `.ollama-code/index/python_sdk.sqlite` from the current interpreter's stdlib signatures and docstrings. It uses SQLite FTS by default and can optionally cache/rerank with local Ollama embeddings:
+
+```bash
+python scripts/python_sdk_search_eval.py --use-embeddings --embedding-model nomic-embed-text
+```
+
 ## WSL + tmux
 
 From WSL in the repo root:

@@ -23,6 +23,8 @@ class DummyAgent:
                     "verify_function_contract",
                     "compose_verified_functions",
                     "promote_verified_function",
+                    "python_sdk_search",
+                    "python_sdk_refresh",
                 }
 
         self.model = DEFAULT_MODEL
@@ -191,6 +193,8 @@ class CliCommandTests(unittest.TestCase):
             "verify_function_contract",
             "compose_verified_functions",
             "promote_verified_function",
+            "python_sdk_search",
+            "python_sdk_refresh",
         ):
             self.assertIn(name, agent.tools.available_tool_names())
 

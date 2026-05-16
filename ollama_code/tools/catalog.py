@@ -70,6 +70,16 @@ TOOL_DESCRIPTIONS = [
         "description": "Inspect installed Python library source/signature/doc; falls back to bytecode or builtin diagnostics when source is unavailable.",
     },
     {
+        "name": "python_sdk_search",
+        "arguments": {"query": "natural language or API terms", "limit": "int, default 8", "refresh": "bool, default false", "use_embeddings": "bool, default false", "embedding_model": "optional Ollama embedding model"},
+        "description": "Search the installed Python stdlib/API index for current signatures, docstrings, and source locations; optionally rerank with local Ollama embeddings.",
+    },
+    {
+        "name": "python_sdk_refresh",
+        "arguments": {"limit": "int, default 5000", "embedding_model": "optional Ollama embedding model", "embedding_host": "optional Ollama host", "embedding_timeout": "seconds, default 120"},
+        "description": "Refresh the Python SDK API index from the currently installed Python stdlib and optionally cache local embedding vectors.",
+    },
+    {
         "name": "repo_index_search",
         "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
         "description": "Search code with compact ranked snippets instead of whole files.",
@@ -358,6 +368,8 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "code_outline": "code_outline(path,max_symbols=120)",
         "read_symbol": "read_symbol(path,symbol,context=2)",
         "inspect_library_source": "inspect_library_source(target,context=3,max_lines=160,include_disassembly=false)",
+        "python_sdk_search": "python_sdk_search(query,limit=8,refresh=false,use_embeddings=false,embedding_model?)",
+        "python_sdk_refresh": "python_sdk_refresh(limit=5000,embedding_model?,embedding_host?,embedding_timeout=120)",
         "repo_index_search": "repo_index_search(query,path='.',limit=10)",
         "fts_search": "fts_search(query,path='.',limit=20,refresh=false)",
         "fts_refresh": "fts_refresh(path='.',limit=2000)",

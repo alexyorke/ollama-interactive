@@ -19,9 +19,13 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import threading
 import textwrap
 import time
+import math
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -74,6 +78,51 @@ REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
 FTS_INDEX_VERSION = 1
 VERIFIED_FUNCTION_INDEX_VERSION = 1
+PYTHON_SDK_INDEX_VERSION = 1
+PYTHON_SDK_SAFE_IMPORT_MODULES = {
+    "array",
+    "base64",
+    "bisect",
+    "builtins",
+    "collections",
+    "csv",
+    "datetime",
+    "functools",
+    "glob",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "http.client",
+    "inspect",
+    "itertools",
+    "json",
+    "math",
+    "operator",
+    "os",
+    "pathlib",
+    "re",
+    "secrets",
+    "sqlite3",
+    "statistics",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "time",
+    "typing",
+    "urllib.parse",
+}
+PYTHON_SDK_SAFE_CLASS_METHOD_MODULES = {"collections", "datetime", "pathlib", "re", "subprocess", "tempfile"}
+PYTHON_SDK_PRIORITY_IMPORT_MODULES = (
+    "json",
+    "pathlib",
+    "tempfile",
+    "functools",
+    "collections",
+    "subprocess",
+    "itertools",
+    "math",
+    "re",
+)
 INDEX_MUTATING_TOOL_NAMES = {
     "write_file",
     "replace_symbol",
@@ -292,6 +341,8 @@ class ToolExecutor:
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
             "inspect_library_source": self.inspect_library_source,
+            "python_sdk_refresh": self.python_sdk_refresh,
+            "python_sdk_search": self.python_sdk_search,
             "repo_index_search": self.repo_index_search,
             "fts_search": self.fts_search,
             "fts_refresh": self.fts_refresh,
@@ -1652,6 +1703,673 @@ class ToolExecutor:
 
     def _fts_cache_path(self) -> Path:
         return self.workspace_root / ".ollama-code" / "index" / "repo_fts.sqlite"
+
+    def _python_sdk_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "python_sdk.sqlite"
+
+    def _initialize_python_sdk_connection(self, conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS python_sdk_entries("
+            "id TEXT PRIMARY KEY,"
+            "kind TEXT NOT NULL,"
+            "module TEXT NOT NULL,"
+            "qualname TEXT NOT NULL,"
+            "signature TEXT NOT NULL,"
+            "doc TEXT NOT NULL,"
+            "source_path TEXT NOT NULL,"
+            "line INTEGER NOT NULL,"
+            "text TEXT NOT NULL,"
+            "embedding_model TEXT,"
+            "embedding_json TEXT)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS python_sdk_fts USING fts5("
+            "id UNINDEXED, module, qualname, signature, doc, text)"
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version', ?)", (str(PYTHON_SDK_INDEX_VERSION),))
+        conn.commit()
+
+    def _connect_python_sdk(self) -> sqlite3.Connection:
+        cache_path = self._python_sdk_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(cache_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        self._initialize_python_sdk_connection(conn)
+        return conn
+
+    def _stdlib_root(self) -> Path:
+        return Path(sysconfig.get_path("stdlib") or Path(sys.executable).parent).resolve(strict=False)
+
+    def _stdlib_module_name(self, root: Path, path: Path) -> str | None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return None
+        parts = list(relative.with_suffix("").parts)
+        if not parts:
+            return None
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts:
+            return None
+        if any(part in {"test", "tests", "idle_test", "__pycache__", "site-packages", "dist-packages"} for part in parts):
+            return None
+        if any(part.startswith("_test") or part.endswith("_test") for part in parts):
+            return None
+        if not all(re.fullmatch(r"[A-Za-z_]\w*", part) for part in parts):
+            return None
+        return ".".join(parts)
+
+    def _iter_python_sdk_files(self, *, limit: int) -> list[Path]:
+        root = self._stdlib_root()
+        files: list[Path] = []
+        for file_path in sorted(root.rglob("*.py")):
+            self._check_interrupted()
+            if len(files) >= limit:
+                break
+            if self._stdlib_module_name(root, file_path) is None:
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 768_000:
+                continue
+            files.append(file_path)
+        return files
+
+    def _doc_summary(self, text: str | None, *, limit: int = 420) -> str:
+        doc = inspect.cleandoc(text or "")
+        if not doc:
+            return ""
+        paragraph = re.split(r"\n\s*\n", doc, maxsplit=1)[0].replace("\n", " ").strip()
+        return self._truncate_text(paragraph, limit=limit)
+
+    def _ast_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+        if isinstance(node, ast.ClassDef):
+            return f"class {node.name}"
+        args = node.args
+        parts: list[str] = []
+        positional = list(args.posonlyargs) + list(args.args)
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        for arg, default in zip(positional, defaults):
+            parts.append(arg.arg + ("=..." if default is not None else ""))
+        if args.vararg is not None:
+            parts.append("*" + args.vararg.arg)
+        elif args.kwonlyargs:
+            parts.append("*")
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+            parts.append(arg.arg + ("=..." if default is not None else ""))
+        if args.kwarg is not None:
+            parts.append("**" + args.kwarg.arg)
+        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        return f"{prefix} {node.name}({', '.join(parts)})"
+
+    def _python_sdk_entry(
+        self,
+        *,
+        kind: str,
+        module: str,
+        qualname: str,
+        signature: str,
+        doc: str,
+        source_path: str,
+        line: int,
+    ) -> dict[str, Any]:
+        text = f"{kind} {module} {qualname} {signature} {doc}".strip()
+        entry_id = hashlib.sha1(f"{kind}\0{module}\0{qualname}".encode("utf-8", errors="replace")).hexdigest()[:20]
+        return {
+            "id": entry_id,
+            "kind": kind,
+            "module": module,
+            "qualname": qualname,
+            "signature": signature,
+            "doc": doc,
+            "source_path": source_path,
+            "line": int(line or 1),
+            "text": text,
+        }
+
+    def _python_sdk_ast_entries(self, *, limit: int) -> list[dict[str, Any]]:
+        root = self._stdlib_root()
+        entries: list[dict[str, Any]] = []
+        for file_path in self._iter_python_sdk_files(limit=limit):
+            if len(entries) >= limit:
+                break
+            module = self._stdlib_module_name(root, file_path)
+            if module is None:
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(text, filename=str(file_path))
+            except (OSError, SyntaxError):
+                continue
+            doc = self._doc_summary(ast.get_docstring(tree))
+            source_path = str(file_path)
+            if doc:
+                entries.append(
+                    self._python_sdk_entry(
+                        kind="module",
+                        module=module,
+                        qualname=module,
+                        signature=f"module {module}",
+                        doc=doc,
+                        source_path=source_path,
+                        line=1,
+                    )
+                )
+            for node in tree.body:
+                self._check_interrupted()
+                if len(entries) >= limit:
+                    break
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name.startswith("_"):
+                        continue
+                    qualname = f"{module}.{node.name}"
+                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                    entries.append(
+                        self._python_sdk_entry(
+                            kind=kind,
+                            module=module,
+                            qualname=qualname,
+                            signature=self._ast_signature(node),
+                            doc=self._doc_summary(ast.get_docstring(node)),
+                            source_path=source_path,
+                            line=getattr(node, "lineno", 1),
+                        )
+                    )
+                    if isinstance(node, ast.ClassDef):
+                        for child in node.body:
+                            if len(entries) >= limit:
+                                break
+                            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                continue
+                            if child.name.startswith("_"):
+                                continue
+                            entries.append(
+                                self._python_sdk_entry(
+                                    kind="method",
+                                    module=module,
+                                    qualname=f"{module}.{node.name}.{child.name}",
+                                    signature=self._ast_signature(child),
+                                    doc=self._doc_summary(ast.get_docstring(child)),
+                                    source_path=source_path,
+                                    line=getattr(child, "lineno", 1),
+                                )
+                            )
+        return entries
+
+    def _python_sdk_imported_entries(self, *, remaining: int, existing_ids: set[str]) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        module_names = list(PYTHON_SDK_PRIORITY_IMPORT_MODULES)
+        module_names.extend(name for name in sorted(PYTHON_SDK_SAFE_IMPORT_MODULES) if name not in module_names)
+        for module_name in module_names:
+            if len(entries) >= remaining:
+                break
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            module_doc = self._doc_summary(inspect.getdoc(module))
+            module_entry = self._python_sdk_entry(
+                kind="module",
+                module=module_name,
+                qualname=module_name,
+                signature=f"module {module_name}",
+                doc=module_doc,
+                source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                line=1,
+            )
+            if module_entry["id"] not in existing_ids:
+                entries.append(module_entry)
+                existing_ids.add(module_entry["id"])
+            for name, value in inspect.getmembers(module):
+                if len(entries) >= remaining:
+                    break
+                if name.startswith("_"):
+                    continue
+                if inspect.isclass(value):
+                    kind = "class"
+                    signature = f"class {name}"
+                elif inspect.isbuiltin(value) or inspect.isfunction(value):
+                    kind = "function"
+                    try:
+                        signature = f"{name}{inspect.signature(value)}"
+                    except (TypeError, ValueError):
+                        signature = name
+                else:
+                    continue
+                qualname = f"{module_name}.{name}"
+                entry = self._python_sdk_entry(
+                    kind=kind,
+                    module=module_name,
+                    qualname=qualname,
+                    signature=signature,
+                    doc=self._doc_summary(inspect.getdoc(value)),
+                    source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                    line=1,
+                )
+                if entry["id"] in existing_ids:
+                    continue
+                entries.append(entry)
+                existing_ids.add(entry["id"])
+                if kind == "class" and module_name in PYTHON_SDK_SAFE_CLASS_METHOD_MODULES:
+                    for method_name, method_value in inspect.getmembers(value):
+                        if len(entries) >= remaining:
+                            break
+                        if method_name.startswith("_"):
+                            continue
+                        if not (inspect.isfunction(method_value) or inspect.ismethod(method_value) or inspect.isbuiltin(method_value) or inspect.ismethoddescriptor(method_value)):
+                            continue
+                        try:
+                            method_signature = f"{method_name}{inspect.signature(method_value)}"
+                        except (TypeError, ValueError):
+                            method_signature = method_name
+                        method_entry = self._python_sdk_entry(
+                            kind="method",
+                            module=module_name,
+                            qualname=f"{module_name}.{name}.{method_name}",
+                            signature=method_signature,
+                            doc=self._doc_summary(inspect.getdoc(method_value)),
+                            source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                            line=1,
+                        )
+                        if method_entry["id"] in existing_ids:
+                            continue
+                        entries.append(method_entry)
+                        existing_ids.add(method_entry["id"])
+        return entries
+
+    def _python_sdk_entries(self, *, limit: int) -> list[dict[str, Any]]:
+        entries = self._python_sdk_imported_entries(remaining=min(limit, 1200), existing_ids=set())
+        existing_ids = {str(entry["id"]) for entry in entries}
+        for entry in self._python_sdk_ast_entries(limit=limit):
+            if len(entries) >= limit:
+                break
+            if str(entry["id"]) in existing_ids:
+                continue
+            entries.append(entry)
+            existing_ids.add(str(entry["id"]))
+        if len(entries) < limit:
+            entries.extend(self._python_sdk_imported_entries(remaining=limit - len(entries), existing_ids=existing_ids))
+        return entries[:limit]
+
+    def _normalize_sdk_embedding_model(self, embedding_model: str | None) -> str | None:
+        raw = str(embedding_model or "").strip()
+        if not raw:
+            raw = os.environ.get("OLLAMA_CODE_SDK_EMBED_MODEL", "").strip()
+        if raw.lower() in {"", "0", "false", "none", "off"}:
+            return None
+        return raw
+
+    def _normalize_ollama_host(self, embedding_host: str | None) -> str:
+        raw = str(embedding_host or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+        if not re.match(r"^https?://", raw):
+            raw = "http://" + raw
+        return raw.rstrip("/")
+
+    def _ollama_embed_texts(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        host: str | None = None,
+        timeout: int = 120,
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        endpoint = self._normalize_ollama_host(host) + "/api/embed"
+        payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        raw_embeddings = data.get("embeddings")
+        if isinstance(raw_embeddings, list):
+            return [[float(value) for value in vector] for vector in raw_embeddings if isinstance(vector, list)]
+        raw_embedding = data.get("embedding")
+        if isinstance(raw_embedding, list) and len(texts) == 1:
+            return [[float(value) for value in raw_embedding]]
+        raise ValueError("Ollama embed response did not include embeddings.")
+
+    def _embed_python_sdk_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+    ) -> tuple[int, str | None]:
+        embedded = 0
+        batch_size = 16
+        for offset in range(0, len(entries), batch_size):
+            self._check_interrupted()
+            batch = entries[offset : offset + batch_size]
+            try:
+                vectors = self._ollama_embed_texts(
+                    [str(entry.get("text", ""))[:4000] for entry in batch],
+                    model=model,
+                    host=host,
+                    timeout=timeout,
+                )
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                return embedded, str(exc)
+            for entry, vector in zip(batch, vectors):
+                if not vector:
+                    continue
+                entry["embedding_model"] = model
+                entry["embedding_json"] = json.dumps(vector, separators=(",", ":"))
+                embedded += 1
+        return embedded, None
+
+    def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(a * a for a in left))
+        right_norm = math.sqrt(sum(b * b for b in right))
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    def python_sdk_refresh(
+        self,
+        limit: int = 5000,
+        embedding_model: str | None = None,
+        embedding_host: str | None = None,
+        embedding_timeout: int = 120,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        try:
+            conn = self._connect_python_sdk()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("python_sdk_refresh", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        limit_value = max(1, int(limit))
+        entries = self._python_sdk_entries(limit=limit_value)
+        model = self._normalize_sdk_embedding_model(embedding_model)
+        embedded = 0
+        embedding_error = None
+        if model:
+            embedded, embedding_error = self._embed_python_sdk_entries(
+                entries,
+                model=model,
+                host=embedding_host,
+                timeout=max(1, int(embedding_timeout)),
+            )
+        try:
+            conn.execute("DELETE FROM python_sdk_entries")
+            conn.execute("DELETE FROM python_sdk_fts")
+            for entry in entries:
+                conn.execute(
+                    "INSERT OR REPLACE INTO python_sdk_entries("
+                    "id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        entry["id"],
+                        entry["kind"],
+                        entry["module"],
+                        entry["qualname"],
+                        entry["signature"],
+                        entry["doc"],
+                        entry["source_path"],
+                        int(entry["line"]),
+                        entry["text"],
+                        entry.get("embedding_model"),
+                        entry.get("embedding_json"),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO python_sdk_fts(id,module,qualname,signature,doc,text) VALUES(?,?,?,?,?,?)",
+                    (entry["id"], entry["module"], entry["qualname"], entry["signature"], entry["doc"], entry["text"]),
+                )
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('stdlib_root', ?)", (str(self._stdlib_root()),))
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('python_version', ?)", (sys.version.split()[0],))
+            if model:
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('embedding_model', ?)", (model,))
+            conn.commit()
+        finally:
+            conn.close()
+        summary = f"Indexed {len(entries)} Python SDK item(s) from {self._stdlib_root()}."
+        if model:
+            summary += f" embeddings={embedded} model={model}."
+        if embedding_error:
+            summary += f" embedding_error={self._truncate_text(embedding_error, limit=160)}"
+        return {
+            "ok": True,
+            "tool": "python_sdk_refresh",
+            "items": len(entries),
+            "embedded": embedded,
+            "embedding_model": model,
+            "embedding_error": embedding_error,
+            "cache": self.relative_label(self._python_sdk_cache_path()),
+            "stdlib_root": str(self._stdlib_root()),
+            "output": summary,
+            "summary": summary,
+        }
+
+    def _python_sdk_lexical_rows(self, conn: sqlite3.Connection, query: str, *, limit: int) -> list[dict[str, Any]]:
+        fts_query = self._safe_fts_query(query)
+        if not fts_query:
+            return []
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        try:
+            records = conn.execute(
+                "SELECT e.id,e.kind,e.module,e.qualname,e.signature,e.doc,e.source_path,e.line,e.text,e.embedding_model,e.embedding_json,bm25(python_sdk_fts) AS rank "
+                "FROM python_sdk_fts JOIN python_sdk_entries e ON e.id=python_sdk_fts.id "
+                "WHERE python_sdk_fts MATCH ? ORDER BY rank LIMIT ?",
+                (fts_query, max(1, int(limit))),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            terms = self._extract_index_terms(query, limit=8)
+            if not terms:
+                return []
+            like = "%" + "%".join(terms) + "%"
+            records = conn.execute(
+                "SELECT id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json,0 AS rank "
+                "FROM python_sdk_entries WHERE text LIKE ? OR qualname LIKE ? ORDER BY qualname LIMIT ?",
+                (like, like, max(1, int(limit))),
+            ).fetchall()
+        rows = [
+            {
+                "id": row[0],
+                "kind": row[1],
+                "module": row[2],
+                "qualname": row[3],
+                "signature": row[4],
+                "doc": row[5],
+                "source_path": row[6],
+                "line": row[7],
+                "text": row[8],
+                "embedding_model": row[9],
+                "embedding_json": row[10],
+                "rank": float(row[11] or 0.0),
+                "source": "lexical",
+            }
+            for row in records
+        ]
+        for row in rows:
+            qualname = str(row.get("qualname") or "").lower()
+            module = str(row.get("module") or "").lower()
+            signature = str(row.get("signature") or "").lower()
+            doc = str(row.get("doc") or "").lower()
+            haystack = str(row.get("text") or "").lower()
+            score = 0.0
+            for term in terms:
+                if term == module or term in qualname:
+                    score += 10
+                if term in signature:
+                    score += 4
+                if term in doc:
+                    score += 2
+                elif term in haystack:
+                    score += 1
+            row["lexical_score"] = score
+        return sorted(rows, key=lambda item: (-float(item.get("lexical_score", 0.0)), float(item.get("rank", 0.0)), str(item.get("qualname", ""))))[: max(1, int(limit))]
+
+    def _python_sdk_expanded_query(self, query: str) -> str:
+        lowered = query.lower()
+        additions: list[str] = []
+        if "json" in lowered and re.search(r"\b(?:parse|deserialize|string|load|loads)\b", lowered):
+            additions.append("json loads load deserialize")
+        if re.search(r"\b(?:file|files|path|paths)\b", lowered) and re.search(r"\b(?:wildcard|glob|pattern|recursive|recursively)\b", lowered):
+            additions.append("pathlib Path glob rglob")
+        if "temporary" in lowered and "directory" in lowered:
+            additions.append("tempfile TemporaryDirectory")
+        if re.search(r"\b(?:memoize|memoise|cache|least recently used|lru)\b", lowered):
+            additions.append("functools lru_cache cache")
+        if re.search(r"\b(?:count|frequency|frequencies|tally)\b", lowered):
+            additions.append("collections Counter")
+        if "subprocess" in lowered or (re.search(r"\b(?:run|execute)\b", lowered) and "command" in lowered):
+            additions.append("subprocess run capture_output CompletedProcess")
+        if not additions:
+            return query
+        return query + " " + " ".join(additions)
+
+    def _python_sdk_embedding_rows(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        try:
+            query_vector = self._ollama_embed_texts([query], model=model, host=host, timeout=timeout)[0]
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError, IndexError) as exc:
+            return [], str(exc)
+        records = conn.execute(
+            "SELECT id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json "
+            "FROM python_sdk_entries WHERE embedding_model=? AND embedding_json IS NOT NULL",
+            (model,),
+        ).fetchall()
+        rows: list[dict[str, Any]] = []
+        for row in records:
+            try:
+                vector = [float(value) for value in json.loads(str(row[10] or "[]"))]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            if score <= 0:
+                continue
+            rows.append(
+                {
+                    "id": row[0],
+                    "kind": row[1],
+                    "module": row[2],
+                    "qualname": row[3],
+                    "signature": row[4],
+                    "doc": row[5],
+                    "source_path": row[6],
+                    "line": row[7],
+                    "text": row[8],
+                    "embedding_model": row[9],
+                    "embedding_json": row[10],
+                    "embedding_score": score,
+                    "source": "embedding",
+                }
+            )
+        return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
+
+    def _format_python_sdk_rows(self, rows: list[dict[str, Any]], *, limit: int) -> str:
+        lines: list[str] = []
+        for row in rows[: max(1, int(limit))]:
+            signature = str(row.get("signature") or "").strip()
+            doc = self._truncate_text(str(row.get("doc") or "").strip(), limit=220)
+            source = str(row.get("source_path") or "")
+            line = int(row.get("line") or 1)
+            score = ""
+            if "embedding_score" in row:
+                score = f" score={float(row['embedding_score']):.3f}"
+            lines.append(f"{row.get('qualname')} [{row.get('kind')}; module={row.get('module')}; source={row.get('source')}{score}]")
+            if signature:
+                lines.append(f"  signature: {signature}")
+            if doc:
+                lines.append(f"  doc: {doc}")
+            if source:
+                lines.append(f"  sdk_source: {source}:{line}")
+        return "\n".join(lines) if lines else "(no Python SDK matches)"
+
+    def python_sdk_search(
+        self,
+        query: str,
+        limit: int = 8,
+        refresh: bool = False,
+        use_embeddings: bool = False,
+        embedding_model: str | None = None,
+        embedding_host: str | None = None,
+        embedding_timeout: int = 30,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return {"ok": False, "tool": "python_sdk_search", "summary": "python_sdk_search requires a non-empty query."}
+        model = self._normalize_sdk_embedding_model(embedding_model) if use_embeddings or embedding_model else None
+        if refresh or not self._python_sdk_cache_path().exists():
+            refresh_result = self.python_sdk_refresh(limit=5000, embedding_model=model, embedding_host=embedding_host, embedding_timeout=max(1, int(embedding_timeout)))
+            if refresh_result.get("ok") is not True:
+                return refresh_result
+        try:
+            conn = self._connect_python_sdk()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("python_sdk_search", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        limit_value = max(1, int(limit))
+        embedding_error = None
+        try:
+            expanded_query = self._python_sdk_expanded_query(clean_query)
+            lexical_rows = self._python_sdk_lexical_rows(conn, expanded_query, limit=limit_value * 3)
+            embedding_rows: list[dict[str, Any]] = []
+            if model:
+                embedded_count = conn.execute("SELECT COUNT(*) FROM python_sdk_entries WHERE embedding_model=? AND embedding_json IS NOT NULL", (model,)).fetchone()[0]
+                if int(embedded_count or 0) > 0:
+                    embedding_rows, embedding_error = self._python_sdk_embedding_rows(
+                        conn,
+                        expanded_query,
+                        model=model,
+                        host=embedding_host,
+                        timeout=max(1, int(embedding_timeout)),
+                        limit=limit_value * 3,
+                    )
+                else:
+                    embedding_error = f"No cached embeddings for {model}; run python_sdk_refresh with embedding_model first."
+            merged: dict[str, dict[str, Any]] = {}
+            for rank, row in enumerate(lexical_rows):
+                item = dict(row)
+                item["combined_score"] = 1.0 / (rank + 1)
+                merged[str(item["id"])] = item
+            for rank, row in enumerate(embedding_rows):
+                item = merged.get(str(row["id"]), dict(row))
+                item["source"] = "hybrid" if str(row["id"]) in merged else "embedding"
+                item["embedding_score"] = row.get("embedding_score", 0.0)
+                item["combined_score"] = float(item.get("combined_score", 0.0)) + float(row.get("embedding_score", 0.0)) + (0.25 / (rank + 1))
+                merged[str(row["id"])] = item
+            rows = sorted(merged.values(), key=lambda item: (-float(item.get("combined_score", 0.0)), str(item.get("qualname", ""))))[:limit_value]
+        finally:
+            conn.close()
+        output = self._format_python_sdk_rows(rows, limit=limit_value)
+        summary = f"Python SDK search returned {len(rows)} item(s)."
+        if model:
+            summary += f" embedding_model={model}."
+        if embedding_error:
+            summary += f" embedding_error={self._truncate_text(embedding_error, limit=180)}"
+        return {
+            "ok": True,
+            "tool": "python_sdk_search",
+            "query": clean_query,
+            "expanded_query": self._python_sdk_expanded_query(clean_query),
+            "count": len(rows),
+            "embedding_model": model,
+            "embedding_error": embedding_error,
+            "cache": self.relative_label(self._python_sdk_cache_path()),
+            "results": [
+                {key: value for key, value in row.items() if key not in {"embedding_json", "text"}}
+                for row in rows
+            ],
+            "summary": summary,
+            "output": output,
+        }
 
     def _initialize_fts_connection(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA busy_timeout=2000")

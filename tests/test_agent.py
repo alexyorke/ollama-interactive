@@ -732,6 +732,26 @@ class AgentTests(unittest.TestCase):
         self.assertIn("ast_search", selected)
         self.assertIn("semgrep_scan", selected)
 
+    def test_primary_tools_add_python_sdk_search_by_intent(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        selected = agent._primary_tool_names_for_request(
+            "Find the current Python stdlib API for parsing JSON strings.",
+            requires_tools=True,
+            session_memory_request=False,
+            mutation_allowed=False,
+            mutation_required=False,
+            test_run_required=False,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+
+        self.assertIn("python_sdk_search", selected)
+        self.assertIn("inspect_library_source", selected)
+
     def test_primary_tools_add_verified_function_tools_by_intent(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient([])
