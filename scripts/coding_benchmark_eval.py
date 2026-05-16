@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+from urllib.parse import urlsplit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,8 @@ except ModuleNotFoundError:  # Imported as scripts.coding_benchmark_eval in unit
 _LOADED_MODELS: set[str] = set()
 Command = list[str] | str
 FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "trajectory-guards", "contract-guards", "all")
+BENCHMARK_CLASSES = ("agent", "controller")
+UNKNOWN_BENCHMARK_CLASS = "unknown"
 FAIL_CLOSED_MESSAGES = {
     "Stopped because grounded final verification could not accept a final answer.",
     "Stopped because assumption audit could not approve a next tool step.",
@@ -67,6 +70,17 @@ def _public_hard_slug_patterns() -> tuple[str, ...]:
     return slugs
 
 
+def _public_benchmark_patterns() -> tuple[str, ...]:
+    try:
+        try:
+            from scripts import public_benchmark_eval as public_bench
+        except ModuleNotFoundError:
+            import public_benchmark_eval as public_bench
+        return tuple(public_bench.public_task_set("expanded"))
+    except Exception:
+        return _public_hard_slug_patterns()
+
+
 def unload_model(model: str) -> None:
     subprocess.run(["ollama", "stop", model], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
 
@@ -101,13 +115,33 @@ class BenchmarkCase:
     requires_git: bool = False
 
 
+def benchmark_class_for_kind(kind: str | None) -> str:
+    if kind == "coding_accuracy":
+        return "agent"
+    if kind == "tool_contract":
+        return "controller"
+    return UNKNOWN_BENCHMARK_CLASS
+
+
+def benchmark_class_for_case(case: BenchmarkCase) -> str:
+    return benchmark_class_for_kind(case.benchmark_kind)
+
+
+def benchmark_class_for_outcome(outcome: dict[str, Any]) -> str:
+    value = outcome.get("benchmark_class")
+    if isinstance(value, str) and value in BENCHMARK_CLASSES:
+        return value
+    kind = outcome.get("benchmark_kind")
+    return benchmark_class_for_kind(kind if isinstance(kind, str) else None)
+
+
 def prompt_integrity_findings(case: BenchmarkCase) -> list[str]:
     if case.benchmark_kind != "coding_accuracy":
         return []
     text = "\n".join(case.turns)
-    slugs = [slug for slug in _public_hard_slug_patterns() if isinstance(slug, str)]
+    slugs = [slug for slug in _public_benchmark_patterns() if isinstance(slug, str)]
     slug_pattern = "|".join(re.escape(slug) for slug in sorted(set(slug.lower() for slug in slugs)))
-    module_names = sorted({slug.replace("-", "_") for slug in slugs})
+    module_names = sorted({slug for slug in slugs} | {slug.replace("-", "_") for slug in slugs})
     module_pattern = "|".join(re.escape(name) for name in module_names)
     checks = {
         "synthetic marker token": r"\b(?:BENCH|TOKEN|NEEDLE|EXACT)_[A-Z0-9_]+\b",
@@ -542,6 +576,28 @@ def validate_nested_package_import_fix(ctx: BenchmarkContext) -> str:
     return "pass" if _run_default_tests(ctx.workspace) else "fail"
 
 
+def prepare_bad_test_command_recovery(workspace: Path) -> None:
+    _write(workspace / "src" / "inventory.py", "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n")
+    _write(
+        workspace / "tests" / "test_inventory.py",
+        _standard_test_import("inventory")
+        + "import unittest\n\n\nclass InventoryTests(unittest.TestCase):\n"
+        + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
+        + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
+    )
+
+
+def validate_bad_test_command_recovery(ctx: BenchmarkContext) -> str:
+    hidden = "import sys; sys.path.insert(0, 'src'); from inventory import total_units; assert total_units([5, 0, 2]) == 7; assert total_units([1]) == 1"
+    recovered = any(
+        result.get("recovered") is True
+        and "pytesst -q" in str(result.get("original_command", ""))
+        and "unittest discover" in str(result.get("command", ""))
+        for result in tool_results(ctx.session, "run_test")
+    )
+    return "pass" if recovered and _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+
+
 def prepare_renamed_simple_expression_hidden(workspace: Path) -> None:
     _write(workspace / "src" / "scoreboard.py", "def score_delta(base: int, bonus: int) -> int:\n    pass\n")
     _write(
@@ -906,6 +962,16 @@ LOCAL_CASES: list[BenchmarkCase] = [
         budget_on=SMALL_BUDGET_ON,
     ),
     BenchmarkCase(
+        name="bad_test_command_recovery",
+        suite="local-full",
+        turns=("Run tests, fix src/inventory.py so total_units is correct, rerun tests, and summarize briefly.",),
+        prepare=prepare_bad_test_command_recovery,
+        validate=validate_bad_test_command_recovery,
+        test_cmd="pytesst -q",
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
         name="renamed_simple_expression_hidden",
         suite="local-full",
         turns=("Implement src/scoreboard.py from the tests. Read source and tests, replace stubs with complete code, run tests, and summarize briefly.",),
@@ -1096,7 +1162,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
 ]
 
 
-def selected_cases(suite: str, requested: set[str] | None = None) -> list[BenchmarkCase]:
+def selected_cases(suite: str, requested: set[str] | None = None, benchmark_classes: set[str] | None = None) -> list[BenchmarkCase]:
     if suite == "local-small":
         cases = [case for case in LOCAL_CASES if case.suite == "local-small"]
     elif suite == "local-full":
@@ -1105,6 +1171,8 @@ def selected_cases(suite: str, requested: set[str] | None = None) -> list[Benchm
         cases = []
     if requested:
         cases = [case for case in cases if case.name in requested]
+    if benchmark_classes:
+        cases = [case for case in cases if benchmark_class_for_case(case) in benchmark_classes]
     return cases
 
 
@@ -1135,7 +1203,17 @@ def default_benchmark_jobs() -> int:
             return max(1, int(configured))
         except ValueError:
             return 1
-    return 12 if os.environ.get("OLLAMA_HOST", "").strip() else 1
+    host = os.environ.get("OLLAMA_HOST", "").strip()
+    if not host:
+        return 1
+    normalized = host if host.startswith(("http://", "https://")) else f"http://{host}"
+    try:
+        parts = urlsplit(normalized)
+    except ValueError:
+        return 8
+    if parts.hostname in {"127.0.0.1", "localhost", "::1"} and parts.port == 11437:
+        return 12
+    return 8
 
 
 def evaluate_case(
@@ -1148,6 +1226,7 @@ def evaluate_case(
     reconcile: str = "auto",
     feature_profile: str = "baseline",
 ) -> dict[str, Any]:
+    benchmark_class = benchmark_class_for_case(case)
     workspace_parent = _benchmark_workspace_parent(repo_root, requires_git=case.requires_git)
     with workspace_temp_dir("ollama-code-bench-", workspace_parent) as tmp:
         workspace = Path(tmp)
@@ -1157,6 +1236,7 @@ def evaluate_case(
                 "case": case.name,
                 "suite": case.suite,
                 "benchmark_kind": case.benchmark_kind,
+                "benchmark_class": benchmark_class,
                 "model": model,
                 "verifier_model": verifier_model,
                 "debate": mode,
@@ -1211,6 +1291,7 @@ def evaluate_case(
                         "GIT_CEILING_DIRECTORIES": str(workspace.parent),
                         "OLLAMA_CODE_FEATURE_PROFILE": feature_profile,
                     },
+                    require_llm_for_turn=benchmark_class == "agent",
                 )
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.perf_counter() - started
@@ -1219,6 +1300,7 @@ def evaluate_case(
                     "case": case.name,
                     "suite": case.suite,
                     "benchmark_kind": case.benchmark_kind,
+                    "benchmark_class": benchmark_class,
                     "model": model,
                     "verifier_model": verifier_model,
                     "debate": mode,
@@ -1268,6 +1350,7 @@ def evaluate_case(
             "case": case.name,
             "suite": case.suite,
             "benchmark_kind": case.benchmark_kind,
+            "benchmark_class": benchmark_class,
             "model": model,
             "verifier_model": verifier_model,
             "debate": mode,
@@ -1397,16 +1480,40 @@ def budget_violations(outcome: dict[str, Any], case: BenchmarkCase) -> list[str]
     return violations
 
 
+def llm_bypass_failures(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    failures: list[dict[str, Any]] = []
+    for outcome in results:
+        if benchmark_class_for_outcome(outcome) != "agent":
+            continue
+        usage = outcome.get("usage") if isinstance(outcome.get("usage"), dict) else {}
+        if int(usage.get("llm_calls", 0)) != 0:
+            continue
+        failures.append({**outcome, "llm_bypass_reason": "agent benchmark completed with zero LLM calls"})
+    return failures
+
+
+def _summary_bucket(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total_tokens = [int(item["usage"]["total_tokens"]) for item in rows if isinstance(item.get("usage"), dict)]
+    return {
+        "runs": len(rows),
+        "pass": sum(1 for item in rows if item.get("status") == "pass"),
+        "fail_closed": sum(1 for item in rows if item.get("status") == "fail_closed"),
+        "fail": sum(1 for item in rows if item.get("status") == "fail"),
+        "skip": sum(1 for item in rows if item.get("status") == "skip"),
+        "total_llm_calls": sum(int(item["usage"]["llm_calls"]) for item in rows if isinstance(item.get("usage"), dict)),
+        "total_tokens": sum(total_tokens),
+        "median_total_tokens": median(total_tokens),
+    }
+
+
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total_tokens = [int(item["usage"]["total_tokens"]) for item in results if isinstance(item.get("usage"), dict)]
-    by_kind: dict[str, dict[str, int]] = {}
+    by_kind_rows: dict[str, list[dict[str, Any]]] = {}
+    by_class_rows: dict[str, list[dict[str, Any]]] = {}
     for item in results:
         kind = str(item.get("benchmark_kind") or "unknown")
-        bucket = by_kind.setdefault(kind, {"runs": 0, "pass": 0, "fail_closed": 0, "fail": 0, "skip": 0})
-        bucket["runs"] += 1
-        status = str(item.get("status"))
-        if status in {"pass", "fail_closed", "fail", "skip"}:
-            bucket[status] += 1
+        by_kind_rows.setdefault(kind, []).append(item)
+        by_class_rows.setdefault(benchmark_class_for_outcome(item), []).append(item)
     return {
         "runs": len(results),
         "pass": sum(1 for item in results if item.get("status") == "pass"),
@@ -1416,7 +1523,8 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_llm_calls": sum(int(item["usage"]["llm_calls"]) for item in results if isinstance(item.get("usage"), dict)),
         "total_tokens": sum(total_tokens),
         "median_total_tokens": median(total_tokens),
-        "by_benchmark_kind": dict(sorted(by_kind.items())),
+        "by_benchmark_kind": {name: _summary_bucket(rows) for name, rows in sorted(by_kind_rows.items())},
+        "by_benchmark_class": {name: _summary_bucket(rows) for name, rows in sorted(by_class_rows.items())},
     }
 
 
@@ -1434,13 +1542,31 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
     if baseline is None:
         return []
     index = {
-        (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("feature_profile", "baseline"), item.get("case")): item
+        (
+            item.get("suite"),
+            item.get("model"),
+            item.get("verifier_model"),
+            item.get("debate"),
+            item.get("reconcile"),
+            item.get("feature_profile", "baseline"),
+            benchmark_class_for_outcome(item),
+            item.get("case"),
+        ): item
         for item in baseline
         if isinstance(item, dict)
     }
     rows: list[dict[str, Any]] = []
     for item in current:
-        key = (item.get("suite"), item.get("model"), item.get("verifier_model"), item.get("debate"), item.get("reconcile"), item.get("feature_profile", "baseline"), item.get("case"))
+        key = (
+            item.get("suite"),
+            item.get("model"),
+            item.get("verifier_model"),
+            item.get("debate"),
+            item.get("reconcile"),
+            item.get("feature_profile", "baseline"),
+            benchmark_class_for_outcome(item),
+            item.get("case"),
+        )
         before = index.get(key)
         if before is None:
             continue
@@ -1457,6 +1583,7 @@ def comparison_rows(current: list[dict[str, Any]], baseline: list[dict[str, Any]
                 "debate": item.get("debate"),
                 "reconcile": item.get("reconcile"),
                 "feature_profile": item.get("feature_profile", "baseline"),
+                "benchmark_class": benchmark_class_for_outcome(item),
                 "case": item.get("case"),
                 "before_status": before.get("status"),
                 "after_status": item.get("status"),
@@ -1478,6 +1605,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
         print(
             "[coding-bench]"
             f" suite={item['suite']}"
+            f" class={benchmark_class_for_outcome(item)}"
             f" kind={item.get('benchmark_kind') or '-'}"
             f" model={item.get('model') or '-'}"
             f" verifier={item.get('verifier_model') or '-'}"
@@ -1499,6 +1627,7 @@ def print_table(results: list[dict[str, Any]], comparisons: list[dict[str, Any]]
             print(
                 "[coding-bench]"
                 f" suite={row['suite']}"
+                f" class={row.get('benchmark_class') or UNKNOWN_BENCHMARK_CLASS}"
                 f" model={row['model']}"
                 f" verifier={row['verifier_model'] or '-'}"
                 f" debate={row['debate']}"
@@ -1535,6 +1664,8 @@ def external_smoke_results() -> list[dict[str, Any]]:
             {
                 "case": name,
                 "suite": "external-smoke",
+                "benchmark_kind": "preflight",
+                "benchmark_class": UNKNOWN_BENCHMARK_CLASS,
                 "model": None,
                 "verifier_model": None,
                 "debate": None,
@@ -1577,6 +1708,7 @@ def write_results_payload(
     comparisons: list[dict[str, Any]] | None = None,
     accuracy_regressions: list[dict[str, Any]] | None = None,
     budget_failures: list[dict[str, Any]] | None = None,
+    llm_bypass_failures: list[dict[str, Any]] | None = None,
     partial: bool = False,
 ) -> None:
     payload = {
@@ -1584,11 +1716,13 @@ def write_results_payload(
         "git_commit": _git_commit(repo_root),
         "suite": suite,
         "partial": partial,
+        "benchmark_classes": list(BENCHMARK_CLASSES),
         "summary": summarize(results),
         "results": results,
         "comparisons": comparisons or [],
         "accuracy_regressions": accuracy_regressions or [],
         "budget_failures": budget_failures or [],
+        "llm_bypass_failures": llm_bypass_failures or [],
     }
     output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -1596,7 +1730,7 @@ def write_results_payload(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run serial coding accuracy + token-efficiency benchmarks.")
     parser.add_argument("--suite", choices=["local-small", "local-full", "external-smoke"], default="local-small")
-    parser.add_argument("--models", nargs="+", default=["gemma3:4b", "qwen3:8b", "granite4.1:8b"], help="Primary models for local suites.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "qwen3:8b", "granite4.1:8b"], help="Primary models for local suites.")
     parser.add_argument("--verifier-pairs", nargs="*", default=[], help="Optional primary=verifier entries, debate-on only.")
     parser.add_argument("--modes", nargs="+", choices=["off", "on"], default=["off", "on"])
     parser.add_argument("--reconcile-modes", nargs="+", choices=["off", "on", "auto"], default=["auto"], help="Artifact reconciliation modes to run.")
@@ -1604,10 +1738,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", default=None, help="Raw JSON output path. Defaults under scratch/coding-benchmark/.")
     parser.add_argument("--compare", default=None, help="Optional prior JSON path for token/accuracy deltas.")
     parser.add_argument("--feature-profiles", nargs="+", choices=FEATURE_PROFILES, default=["baseline"], help="A/B controller feature profiles.")
+    parser.add_argument("--benchmark-classes", nargs="+", choices=BENCHMARK_CLASSES, default=list(BENCHMARK_CLASSES), help="Benchmark classes to run.")
     parser.add_argument("--timeout", type=int, default=600, help="Per-turn timeout in seconds.")
     parser.add_argument("--jobs", type=int, default=default_benchmark_jobs(), help="Parallel benchmark cases per model/profile.")
     parser.add_argument("--strict-accuracy", action="store_true", help="Fail if any run status is not acceptable.")
     parser.add_argument("--strict-budget", action="store_true", help="Fail if a local case exceeds its token or LLM-call budget.")
+    parser.add_argument("--require-llm-for-agent-benchmarks", action="store_true", help="Fail if any agent benchmark completes with zero LLM calls.")
+    parser.add_argument("--require-llm-for-coding-accuracy", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
@@ -1619,10 +1756,12 @@ def main(argv: list[str] | None = None) -> int:
         comparisons: list[dict[str, Any]] = []
         accuracy_regressions: list[dict[str, Any]] = []
         budget_failures: list[dict[str, Any]] = []
+        llm_bypass_rows: list[dict[str, Any]] = []
         print_table(results, [])
     else:
         requested_cases = set(args.cases) if args.cases else None
-        cases = selected_cases(args.suite, requested_cases)
+        requested_classes = set(args.benchmark_classes)
+        cases = selected_cases(args.suite, requested_cases, requested_classes)
         if not cases:
             raise SystemExit("No benchmark cases selected.")
         integrity_violations = [
@@ -1685,6 +1824,8 @@ def main(argv: list[str] | None = None) -> int:
         comparisons = comparison_rows(results, baseline_results)
         accuracy_regressions = [row for row in comparisons if row.get("before_status") == "pass" and row.get("after_status") != "pass"]
         budget_failures = []
+        require_llm_for_agent = bool(args.require_llm_for_agent_benchmarks or args.require_llm_for_coding_accuracy)
+        llm_bypass_rows = llm_bypass_failures(results) if require_llm_for_agent else []
         if args.strict_budget:
             for outcome in results:
                 case = cases_by_name.get(str(outcome.get("case")))
@@ -1704,6 +1845,7 @@ def main(argv: list[str] | None = None) -> int:
         comparisons=comparisons,
         accuracy_regressions=accuracy_regressions,
         budget_failures=budget_failures,
+        llm_bypass_failures=llm_bypass_rows,
         partial=False,
     )
 
@@ -1713,6 +1855,8 @@ def main(argv: list[str] | None = None) -> int:
     failures.extend(accuracy_regressions)
     if args.strict_budget:
         failures.extend(budget_failures)
+    if args.require_llm_for_agent_benchmarks or args.require_llm_for_coding_accuracy:
+        failures.extend(llm_bypass_rows)
     if failures:
         print(f"[coding-bench] strict failures: {len(failures)}")
         return 1

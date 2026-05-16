@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import pyarrow.parquet as pq
+try:
+    import pyarrow.parquet as pq
+except ModuleNotFoundError:
+    pq = None
 
 
 DEFAULT_DATA_ROOT = Path("scratch") / "external" / "datasets"
@@ -279,6 +282,8 @@ def _extract_events(adapter: str, row: dict[str, Any]) -> list[Event]:
 
 
 def _iter_parquet_rows(paths: Iterable[Path], max_rows: int | None = None) -> Iterable[dict[str, Any]]:
+    if pq is None:
+        raise RuntimeError("trajectory profiling requires optional dependency pyarrow")
     emitted = 0
     for path in paths:
         parquet = pq.ParquetFile(path)

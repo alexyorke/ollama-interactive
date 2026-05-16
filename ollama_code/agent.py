@@ -7,14 +7,86 @@ import json
 import re
 import textwrap
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 import threading
 
 from ollama_code.features import active_feature_profile, feature_enabled, options_for_purpose, response_format_for_purpose
+from ollama_code.agent_parsing import (
+    _workspace_roots_match,
+    extract_json_like_fields,
+    extract_json_response,
+)
+from ollama_code.agent_protocol import (
+    AGENT_TOOL_NAMES,
+    APPROVAL_RANK,
+    AUDIT_LIST_ITEM_LIMIT,
+    AUDIT_TEXT_ITEM_LIMIT,
+    BROAD_CONTEXT_GATHERING_TOOL_NAMES,
+    CANDIDATE_CLAIM_LIMIT,
+    CANDIDATE_CLAIM_TEXT_LIMIT,
+    CODE_EDIT_SUFFIXES,
+    CONTEXT_GATHERING_TOOL_NAMES,
+    CORE_READ_ONLY_WORKSPACE_TOOL_NAMES,
+    EDIT_TOOL_NAMES,
+    ExactFileWriteSpec,
+    FinalRewriteOutcome,
+    GRAPH_TOOL_NAMES,
+    GIT_TOOL_NAMES,
+    GROUNDING_EVIDENCE_TOOL_NAMES,
+    INDEX_REFRESH_TOOL_NAMES,
+    KNOWN_TOOL_NAMES,
+    LOW_LEVEL_EDIT_TOOL_NAMES,
+    LSP_TOOL_NAMES,
+    MAX_ASSUMPTION_AUDIT_RETRIES,
+    MAX_RECONCILIATION_RETRIES,
+    MAX_VERIFICATION_RETRIES,
+    MAX_VERIFICATION_REWRITE_ATTEMPTS,
+    MechanicalToolOccurrence,
+    MechanicalToolSpec,
+    MODEL_TOOL_DIFF_LIMIT,
+    MODEL_TOOL_RESULT_LIMITS,
+    MUTATING_TOOL_NAMES,
+    PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES,
+    PRIMARY_CONTEXT_CONTENT_LIMIT,
+    PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT,
+    PRIMARY_CURRENT_REQUEST_LIMIT,
+    PYTHON_SDK_TOOL_NAMES,
+    QUESTION_PLANNER_EVIDENCE_LIMIT,
+    QUESTION_PLANNER_MAX_QUESTIONS,
+    READ_ONLY_CACHEABLE_TOOL_NAMES,
+    READ_ONLY_WORKSPACE_TOOL_NAMES,
+    RETRY_PRONE_MUTATING_TOOL_NAMES,
+    RISKY_VERIFICATION_TOOL_NAMES,
+    SHELL_TOOL_NAMES,
+    SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT,
+    SPEC_GUIDED_REPAIR_MAX_ATTEMPTS,
+    SPEC_GUIDED_SYNTHESIS_TOOL_NAMES,
+    STRUCTURAL_SEARCH_TOOL_NAMES,
+    SymbolReadSpec,
+    TEST_TOOL_NAMES,
+    TODO_TOOL_NAMES,
+    TargetLineReadSpec,
+    VALIDATION_TOOL_NAMES,
+    VERIFICATION_CONTENT_LIMIT,
+    VERIFICATION_EVIDENCE_LIMIT,
+    VERIFICATION_EVIDENCE_TEXT_LIMIT,
+    VERIFICATION_HISTORY_LIMIT,
+    VERIFICATION_TOOL_DIFF_LIMIT,
+    VERIFICATION_TOOL_RESULT_LIMIT,
+    VERIFIED_FUNCTION_TOOL_NAMES,
+    AgentResult,
+)
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
+from ollama_code.prompts import (
+    ARTIFACT_RECONCILER_SYSTEM_PROMPT,
+    FINAL_REWRITER_SYSTEM_PROMPT,
+    FINAL_VERIFIER_SYSTEM_PROMPT,
+    QUESTION_PLANNER_SYSTEM_PROMPT,
+    SYSTEM_PROMPT_TEMPLATE,
+    TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT,
+)
 from ollama_code.sessions import (
     SessionSummary,
     default_session_dir,
@@ -22,453 +94,9 @@ from ollama_code.sessions import (
     load_transcript_payload,
     resolve_transcript_path,
 )
-from ollama_code.tools import TOOL_DESCRIPTIONS, ToolExecutor, format_compact_tool_help, format_tool_help
+from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_help
 
 
-SYSTEM_PROMPT_TEMPLATE = """Ollama Code. Workspace: {workspace_root}
-
-JSON only:
-{{"type":"tool","name":"list_files","arguments":{{"path":"."}}}}
-{{"type":"final","message":"..."}}
-
-Rules:
-- One tool or one final. Relative paths. No fences/thought.
-- Need repo/file/git/shell/edit/agent facts? Use tools; do not guess.
-- Inspect before edit. Preferred edit: edit_intent with intent rename|replace_text|replace_symbol|replace_body|change_signature|add_import. Low-level edits: write_file, replace_symbol/replace_symbols, replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
-- write_file content is raw file text only; no markdown fences, no leading ">" quote markers.
-- For fix/implement + tests: read tests/source, edit implementation, run_test; do not only summarize or loop on reads. If source has pass/.../return None stubs, edit those stubs directly; do not keep using read_symbol/code_outline on the same stub file.
-- If user names a source file/function to fix, edit source, not tests, unless tests are explicitly requested.
-- Code nav: use file_search/fd_search and fts_search/repo_index_search to shrink scope; prefer search_symbols, code_outline, then read_symbol before broad read_file; use inspect_library_source for installed Python library internals. Search/list before broad reads; use ranges.
-- Validation/deps: use discover_validators for unknown projects; use diagnose_dependency_error before retrying import/command/path failures.
-- Systems lens: for broad/debug/design/perf/refactor tasks, use systems_lens early; force explicit boundary, observer/metric, categories, state/scale, feedback, delays, stocks/flows, coupling, model limits, and intervention tests.
-- Clarifying questions: ask only after local evidence when the answer would change scope, acceptance, risk, tradeoff, or implementation; include a recommended default and never ask discoverable repo facts.
-- Todos: for complex multi-step tasks, when todo tools are listed, use todo_write to track steps; keep at most one in_progress and update completed items as work finishes.
-- Reuse results; avoid repeat read-only calls unless state changed.
-- Question your assumptions before acting; prove or disprove with tools when possible.
-- Never claim edit/cmd/test/agent success without current-turn success.
-- Style: caveman-lite concise; keep code, paths, commands, errors, JSON exact and syntactically complete.
-
-Tools:
-{tool_help}
-"""
-
-QUESTION_PLANNER_SYSTEM_PROMPT = """You are a clarification planner for a local coding CLI controller.
-
-Return exactly one JSON object:
-{"verdict":"proceed","reason":"brief","ambiguities":[],"questions":[]}
-{"verdict":"ask","reason":"brief","ambiguities":[{"kind":"scope|intent|acceptance|risk|tradeoff","detail":"...","evidence":"..."}],"questions":[{"question":"...","why_it_matters":"...","recommended_default":"...","choices":["..."]}]}
-
-Rules:
-- Ask only if the user answer would change implementation, acceptance criteria, risk posture, scope boundary, or an irreversible/high-cost choice.
-- Do not ask for repo facts, file paths, test commands, code locations, dependency state, or errors that tools can discover.
-- Use supplied evidence. If evidence supports a conservative default, prefer verdict proceed.
-- If asking, ask 1 question when possible, max 3. Include recommended_default for each.
-- Never ask "should I proceed?" or permission-only questions.
-- Good systems questions expose boundary, observer/metric, categories, state/history, feedback, delay, stocks/flows, coupling, incentives, model limits, or intervention effects.
-"""
-
-
-@dataclass
-class AgentResult:
-    message: str
-    rounds: int
-    completed: bool = True
-
-
-@dataclass(frozen=True)
-class ExactFileWriteSpec:
-    path: str
-    line: str
-
-
-@dataclass(frozen=True)
-class FinalRewriteOutcome:
-    accepted_message: str | None = None
-    retry_decision: dict[str, Any] | None = None
-    rejected_message: str | None = None
-
-
-@dataclass(frozen=True)
-class TargetLineReadSpec:
-    path: str
-    start: int
-    end: int
-    line: int
-
-
-@dataclass(frozen=True)
-class SymbolReadSpec:
-    path: str
-    symbol: str
-
-
-@dataclass(frozen=True)
-class MechanicalToolSpec:
-    name: str
-    arguments: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class MechanicalToolOccurrence:
-    start: int
-    end: int
-    spec: MechanicalToolSpec
-    fragment: str
-
-
-KNOWN_TOOL_NAMES = {tool["name"] for tool in TOOL_DESCRIPTIONS}
-APPROVAL_RANK = {"read-only": 0, "ask": 1, "auto": 2}
-VERIFICATION_HISTORY_LIMIT = 1
-VERIFICATION_CONTENT_LIMIT = 2200
-PRIMARY_CONTEXT_RECENT_MESSAGE_LIMIT = 12
-PRIMARY_CONTEXT_CONTENT_LIMIT = 900
-PRIMARY_CURRENT_REQUEST_LIMIT = 3600
-MAX_VERIFICATION_RETRIES = 2
-MAX_VERIFICATION_REWRITE_ATTEMPTS = 1
-MAX_ASSUMPTION_AUDIT_RETRIES = 2
-MAX_RECONCILIATION_RETRIES = 2
-SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT = 150
-SPEC_GUIDED_REPAIR_MAX_ATTEMPTS = 3
-PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
-    "synthesize_simple_expression_candidate",
-    "synthesize_sequence_utilities_candidate",
-)
-SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
-    "synthesize_bowling_game_candidate",
-    "synthesize_discounted_set_pricing_candidate",
-    "synthesize_countdown_song_candidate",
-    "synthesize_affine_substitution_candidate",
-    "synthesize_noarg_literal_candidate",
-    "synthesize_proverb_chain_candidate",
-    "synthesize_typed_graph_dsl_candidate",
-    "synthesize_parent_record_tree_candidate",
-    "synthesize_domino_chain_candidate",
-    "synthesize_food_chain_song_candidate",
-    "synthesize_grep_filter_candidate",
-    "synthesize_bucket_measure_candidate",
-    "synthesize_reactive_cells_candidate",
-    "synthesize_hangman_state_candidate",
-    "synthesize_rest_api_debt_candidate",
-    "synthesize_forth_interpreter_candidate",
-    "synthesize_sgf_tree_parser_candidate",
-    "synthesize_poker_ranking_candidate",
-    "synthesize_metered_io_candidate",
-    "synthesize_tree_pov_candidate",
-    "synthesize_binary_zipper_candidate",
-    "synthesize_go_territory_candidate",
-    "synthesize_hex_connect_candidate",
-    "synthesize_word_arithmetic_candidate",
-    "synthesize_prefix_rotation_candidate",
-    "synthesize_text_matrix_transpose_candidate",
-    "synthesize_string_normalizer_class_candidate",
-    "synthesize_grouped_roster_candidate",
-    "synthesize_vlq_candidate",
-    "synthesize_cyclic_interval_scale_candidate",
-    "synthesize_unique_regex_identifier_candidate",
-    "synthesize_node_collection_candidate",
-    "synthesize_relative_import_candidate",
-)
-AUDIT_LIST_ITEM_LIMIT = 3
-AUDIT_TEXT_ITEM_LIMIT = 140
-CANDIDATE_CLAIM_LIMIT = 5
-CANDIDATE_CLAIM_TEXT_LIMIT = 180
-VERIFICATION_EVIDENCE_LIMIT = 3
-VERIFICATION_EVIDENCE_TEXT_LIMIT = 150
-QUESTION_PLANNER_EVIDENCE_LIMIT = 5
-QUESTION_PLANNER_MAX_QUESTIONS = 3
-TODO_TOOL_NAMES = {"todo_read", "todo_write"}
-MUTATING_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit", "edit_intent", "git_commit"}
-VERIFIED_FUNCTION_TOOL_NAMES = {"verified_function_index", "verified_function_search", "verified_function_show", "verify_function_contract", "compose_verified_functions", "promote_verified_function"}
-READ_ONLY_CACHEABLE_TOOL_NAMES = {
-    "list_files",
-    "read_file",
-    "search",
-    "file_search",
-    "fd_search",
-    "file_index_refresh",
-    "everything_search",
-    "search_symbols",
-    "code_outline",
-    "read_symbol",
-    "inspect_library_source",
-    "repo_index_search",
-    "fts_search",
-    "fts_refresh",
-    "indexed_search",
-    "repo_index_refresh",
-    "semgrep_scan",
-    "ast_search",
-    "lsp_diagnostics",
-    "lsp_definition",
-    "lsp_references",
-    "context_pack",
-    "systems_lens",
-    "find_implementation_target",
-    "diagnose_test_failure",
-    "implementation_spec",
-    "diagnose_dependency_error",
-    "call_graph",
-    "contract_graph",
-    "verified_function_search",
-    "verified_function_show",
-    "compose_verified_functions",
-    "lint_typecheck",
-    "contract_check",
-    "select_tests",
-    "git_status",
-    "git_diff",
-}
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "implementation_spec", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
-CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
-INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh", "verified_function_index"}
-STRUCTURAL_SEARCH_TOOL_NAMES = {"semgrep_scan", "ast_search"}
-LSP_TOOL_NAMES = {"lsp_diagnostics", "lsp_definition", "lsp_references"}
-GRAPH_TOOL_NAMES = {"call_graph", "contract_graph"}
-EDIT_TOOL_NAMES = {"edit_intent", "write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
-LOW_LEVEL_EDIT_TOOL_NAMES = {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}
-TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "test_spec_extract", "implementation_spec", "diagnose_dependency_error", "find_implementation_target", "run_function_probe", "lint_typecheck", "contract_check", "select_tests", "discover_validators", "generate_tests_from_spec"}
-SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
-GIT_TOOL_NAMES = {"git_status", "git_diff", "git_commit"}
-AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "implementation_spec", "mcp_list_tools"}
-BROAD_CONTEXT_GATHERING_TOOL_NAMES = {
-    "list_files",
-    "read_file",
-    "search",
-    "file_search",
-    "fd_search",
-    "file_index_refresh",
-    "everything_search",
-    "repo_index_search",
-    "fts_search",
-    "fts_refresh",
-    "indexed_search",
-    "repo_index_refresh",
-    "semgrep_scan",
-    "ast_search",
-    "discover_validators",
-}
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "context_pack", "repo_index_search", "fts_search", "indexed_search", "semgrep_scan", "ast_search", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "implementation_spec", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
-VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "verify_function_contract", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics"}
-RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
-CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts"}
-MODEL_TOOL_RESULT_LIMITS = {
-    "list_files": 500,
-    "read_file": 1000,
-    "search": 700,
-    "file_search": 700,
-    "fd_search": 700,
-    "file_index_refresh": 400,
-    "everything_search": 700,
-    "search_symbols": 700,
-    "code_outline": 900,
-    "read_symbol": 1100,
-    "inspect_library_source": 1400,
-    "repo_index_search": 900,
-    "fts_search": 900,
-    "fts_refresh": 500,
-    "indexed_search": 900,
-    "repo_index_refresh": 500,
-    "semgrep_scan": 900,
-    "ast_search": 900,
-    "lsp_diagnostics": 900,
-    "lsp_definition": 700,
-    "lsp_references": 900,
-    "context_pack": 900,
-    "systems_lens": 900,
-    "find_implementation_target": 800,
-    "diagnose_test_failure": 900,
-    "implementation_spec": 1300,
-    "run_function_probe": 700,
-    "call_graph": 900,
-    "contract_graph": 1000,
-    "verified_function_index": 500,
-    "verified_function_search": 1200,
-    "verified_function_show": 1400,
-    "verify_function_contract": 1400,
-    "compose_verified_functions": 1200,
-    "promote_verified_function": 1200,
-    "lint_typecheck": 800,
-    "discover_validators": 800,
-    "diagnose_dependency_error": 800,
-    "contract_check": 900,
-    "select_tests": 800,
-    "edit_intent": 1000,
-    "replace_symbol": 900,
-    "replace_symbols": 1000,
-    "apply_structured_edit": 1000,
-    "generate_tests_from_spec": 1000,
-    "browser_smoke": 900,
-    "security_scan": 900,
-    "mcp_list_tools": 900,
-    "mcp_call": 900,
-    "git_status": 700,
-    "git_diff": 900,
-    "run_shell": 700,
-    "run_test": 700,
-    "run_agent": 900,
-    "todo_read": 500,
-    "todo_write": 700,
-}
-MODEL_TOOL_DIFF_LIMIT = 700
-VERIFICATION_TOOL_RESULT_LIMIT = 450
-VERIFICATION_TOOL_DIFF_LIMIT = 450
-
-FINAL_VERIFIER_SYSTEM_PROMPT = """You are a grounded final verifier for a coding CLI controller.
-
-Check final vs evidence/constraints. JSON only.
-
-Replies:
-{"verdict":"accept","claim_checks":[{"claim":"...","status":"supported","evidence":"E1"}]}
-{"verdict":"retry","reason":"brief concrete reason","required_tools":["read_file"],"forbidden_tools":["run_shell"],"claim_checks":[{"claim":"...","status":"contradicted","evidence":"E2","correction":"..."}],"rewrite_guidance":["..."],"rewrite_from_evidence":true}
-
-Rules:
-- Accept if candidate matches request, constraints, tool results, and accepted audits.
-- Retry if contradiction, unsupported workspace claim, missing/forbidden tool, or another tool is needed.
-- claim_checks status: supported, contradicted, unverified. Cite evidence ids when possible.
-- correction/rewrite_guidance must come only from evidence.
-- rewrite_from_evidence true only if evidence can fully fix final without another tool.
-- Do not write the final answer. Tool arrays: known names only or [].
-"""
-
-FINAL_REWRITER_SYSTEM_PROMPT = """You are an evidence-backed final rewriter for a coding CLI controller.
-
-Return exactly one JSON object only.
-
-Reply:
-{"type":"final","message":"Accurate final answer grounded only in the supplied evidence."}
-
-Rules:
-- Use only evidence table, claim checks, and rewrite guidance.
-- Do not invent files, commands, diffs, outcomes, or unsupported details.
-- Use supplied corrections for contradicted claims, or omit those claims.
-- Keep final concise and useful.
-"""
-
-TOOL_ASSUMPTION_AUDITOR_SYSTEM_PROMPT = """You are a tool-step assumption auditor for a coding CLI controller.
-
-Decide if proposed tool is grounded next step. JSON only.
-
-Replies:
-{"verdict":"accept","reason":"","assumptions":["..."],"validation_steps":["..."],"required_tools":[],"forbidden_tools":[]}
-{"verdict":"retry","reason":"brief concrete reason","assumptions":["..."],"validation_steps":["..."],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
-
-Rules:
-- Keep assumptions/validation_steps short.
-- Accept reasonable validation steps, including expected failures/boundary probes.
-- Accept read/inspect steps after failed tests; repair needs fresh evidence more than another audit.
-- Retry if redundant, too broad, constraint-violating, mutating before inspection, or not validating the key assumption.
-- Do not rewrite the tool. Tool arrays: known names only or [].
-"""
-
-ARTIFACT_RECONCILER_SYSTEM_PROMPT = """You are an artifact reconciliation critic for a coding CLI controller.
-
-After a failed tool/test/edit artifact, decide if the main model should retry with a compact repair plan. JSON only.
-
-Replies:
-{"verdict":"accept","reason":"","repair_plan":[],"required_tools":[],"forbidden_tools":[]}
-{"verdict":"retry","reason":"brief concrete reason","repair_plan":["inspect failing symbol","edit implementation","rerun tests"],"required_tools":["read_file"],"forbidden_tools":["run_shell"]}
-
-Rules:
-- Use only supplied request, recent messages, tool calls, and artifact evidence.
-- Retry if failed tests, syntax errors, or tool errors imply a specific next validation/repair step.
-- Prefer implementation/source repair before repeated tests.
-- Keep repair_plan short. Tool arrays: known names only or [].
-- Do not write code or the final answer.
-"""
-
-
-def extract_json_response(raw_text: str, *, _depth: int = 0) -> dict[str, Any] | None:
-    candidate = raw_text.strip()
-    if not candidate:
-        return None
-    candidate = re.sub(r"<think>.*?</think>", "", candidate, flags=re.DOTALL)
-    candidate = candidate.strip()
-    if candidate.startswith("```"):
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate)
-        candidate = re.sub(r"\s*```$", "", candidate)
-        candidate = candidate.strip()
-    decoder = json.JSONDecoder()
-    if _depth < 2:
-        try:
-            top_level, end_index = decoder.raw_decode(candidate)
-        except json.JSONDecodeError:
-            top_level = None
-            end_index = -1
-        if isinstance(top_level, str) and not candidate[end_index:].strip():
-            return extract_json_response(top_level, _depth=_depth + 1)
-    starts = [index for index, char in enumerate(candidate) if char == "{"]
-    if candidate.startswith("{"):
-        starts = [0] + [index for index in starts if index != 0]
-    parsed_dicts: list[dict[str, Any]] = []
-    agent_payloads: list[dict[str, Any]] = []
-    top_level_dict: dict[str, Any] | None = None
-    for start in starts:
-        try:
-            data, end_index = decoder.raw_decode(candidate[start:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(data, dict):
-            if start == 0 and not candidate[end_index:].strip():
-                top_level_dict = data
-            parsed_dicts.append(data)
-            response_type = data.get("type")
-            tool_name = data.get("name")
-            if isinstance(response_type, str) and response_type.strip() in {"tool", "final", *KNOWN_TOOL_NAMES}:
-                agent_payloads.append(data)
-                continue
-            if isinstance(tool_name, str) and tool_name.strip() in KNOWN_TOOL_NAMES and response_type in {None, "", "function", "tool_call"}:
-                agent_payloads.append(data)
-    if agent_payloads:
-        return agent_payloads[-1]
-    if top_level_dict is not None:
-        return top_level_dict
-    if parsed_dicts:
-        return parsed_dicts[-1]
-    return None
-
-
-def _portable_workspace_key(raw_path: str | Path) -> str | None:
-    text = str(raw_path).strip()
-    if not text:
-        return None
-    normalized = text.replace("\\", "/")
-    drive_match = re.match(r"^(?P<drive>[A-Za-z]):(?:/(?P<rest>.*))?$", normalized)
-    if drive_match:
-        drive = drive_match.group("drive").lower()
-        rest = (drive_match.group("rest") or "").strip("/")
-        return f"{drive}:/{rest}" if rest else f"{drive}:/"
-    wsl_match = re.match(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$", normalized)
-    if wsl_match:
-        drive = wsl_match.group("drive").lower()
-        rest = (wsl_match.group("rest") or "").strip("/")
-        return f"{drive}:/{rest}" if rest else f"{drive}:/"
-    try:
-        return Path(text).resolve(strict=False).as_posix()
-    except OSError:
-        return None
-
-
-def _workspace_roots_match(saved_root: object, current_root: Path) -> bool:
-    if saved_root is None:
-        return True
-    saved_text = str(saved_root).strip()
-    if not saved_text:
-        return False
-    current_root = current_root.resolve()
-    try:
-        saved_path = Path(saved_text).resolve(strict=False)
-    except OSError:
-        saved_path = None
-    if saved_path == current_root:
-        return True
-    saved_key = _portable_workspace_key(saved_text)
-    current_key = _portable_workspace_key(current_root)
-    if saved_key is None or current_key is None:
-        return False
-    if re.match(r"^[A-Za-z]:/", saved_key) or re.match(r"^[A-Za-z]:/", current_key):
-        return saved_key.casefold() == current_key.casefold()
-    return saved_key == current_key
 
 
 class OllamaCodeAgent:
@@ -487,6 +115,8 @@ class OllamaCodeAgent:
         debate_enabled: bool = True,
         verifier_model: str | None = None,
         reconcile_mode: str = "off",
+        disable_spec_guided_repair: bool = False,
+        require_llm_for_turn: bool = False,
     ) -> None:
         self.client = client
         self.tools = tools
@@ -500,9 +130,12 @@ class OllamaCodeAgent:
         self.max_agent_depth = max_agent_depth
         self.debate_enabled = debate_enabled
         self.reconcile_mode_setting = self._normalize_reconcile_mode(reconcile_mode)
+        self.disable_spec_guided_repair = bool(disable_spec_guided_repair)
+        self.require_llm_for_turn = bool(require_llm_for_turn)
         self.events: list[dict[str, Any]] = []
         self.llm_telemetry_events: list[dict[str, Any]] = []
         self._pending_llm_call_events: list[dict[str, Any]] = []
+        self._llm_used_this_turn = False
         self._interrupt_event: threading.Event | None = None
         self._turn_tool_cache: dict[tuple[str, str, int], dict[str, Any]] = {}
         self._turn_cache_epoch = 0
@@ -571,7 +204,9 @@ class OllamaCodeAgent:
             selected.update(GRAPH_TOOL_NAMES)
         if re.search(r"\b(?:verified|known utilit|reusable function|verified function|function card|compose|lego|legos|do not invent|don't invent|dont invent|pure function|purity)\b", lowered):
             selected.update(VERIFIED_FUNCTION_TOOL_NAMES)
-        if re.search(r"\b(?:library|package|site-packages|stdlib|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
+        if re.search(r"\b(?:python sdk|python api|stdlib|standard library|builtin|builtins|current python|python docs?|sdk search)\b", lowered):
+            selected.update(PYTHON_SDK_TOOL_NAMES)
+        if re.search(r"\b(?:library|package|site-packages|stdlib|standard library|traceback|stack trace|decompile|disassembl|builtin)\b", lowered):
             selected.add("inspect_library_source")
         if re.search(r"\b(?:ast|ast-grep|semgrep|structural|syntax-aware|codemod|pattern search|api misuse)\b", lowered):
             selected.update(STRUCTURAL_SEARCH_TOOL_NAMES)
@@ -590,7 +225,7 @@ class OllamaCodeAgent:
         if re.search(r"\b(?:shell|command|execute|run exactly|terminal|powershell|bash)\b", lowered):
             selected.update(SHELL_TOOL_NAMES)
             selected.add("diagnose_dependency_error")
-        if re.search(r"\b(?:git|diff|status|commit|staged|working tree)\b", lowered):
+        if re.search(r"\b(?:git|diff|status|commit|staged|working tree|checkout|checked out|merge|rebase|stash)\b", lowered):
             selected.update(GIT_TOOL_NAMES)
         if re.search(r"\b(?:browser|ui|frontend|page|localhost|url|screenshot|playwright)\b", lowered):
             selected.add("browser_smoke")
@@ -776,6 +411,18 @@ class OllamaCodeAgent:
             arguments["path"] = path
         return self.tools.execute("git_diff", arguments)
 
+    def git_branch(self, path: str | None = None, *, all_branches: bool = False) -> dict[str, Any]:
+        arguments: dict[str, Any] = {"all_branches": all_branches}
+        if path:
+            arguments["path"] = path
+        return self.tools.execute("git_branch", arguments)
+
+    def git_log(self, path: str | None = None, *, max_count: int = 10, oneline: bool = True) -> dict[str, Any]:
+        arguments: dict[str, Any] = {"max_count": max_count, "oneline": oneline}
+        if path:
+            arguments["path"] = path
+        return self.tools.execute("git_log", arguments)
+
     def git_commit(self, message: str, *, add_all: bool = True) -> dict[str, Any]:
         return self.tools.execute("git_commit", {"message": message, "add_all": add_all})
 
@@ -921,6 +568,7 @@ class OllamaCodeAgent:
             "options": effective_options,
             **response.usage.as_event_payload(),
         }
+        self._llm_used_this_turn = True
         self._pending_llm_call_events.append(payload)
         return response
 
@@ -1069,10 +717,11 @@ class OllamaCodeAgent:
             return self._truncate_text(text, limit=limit)
         return self._truncate_text("\n".join(selected), limit=limit)
 
-    def _test_failure_source_excerpt(self, output: str, *, limit: int = 520) -> str:
+    def _test_failure_source_excerpt(self, output: str, *, successful_tool_results: list[dict[str, Any]] | None = None, limit: int = 520) -> str:
         root = self.tools.workspace_root.resolve(strict=False)
         snippets: list[str] = []
         seen: set[tuple[Path, int]] = set()
+        successful_tool_results = successful_tool_results or []
         for raw_path, raw_line in re.findall(r'File "([^"]+)", line (\d+)', output):
             try:
                 line_number = int(raw_line)
@@ -1101,8 +750,49 @@ class OllamaCodeAgent:
             if len(snippets) >= 2 or len("\n\n".join(snippets)) >= limit:
                 break
         if not snippets:
-            return ""
+            failed_test_path, _ = self._failed_test_output_paths_from_text(output)
+            if failed_test_path:
+                inferred_source_path = self._infer_source_for_test_path(failed_test_path, output=output)
+                if inferred_source_path:
+                    try:
+                        candidate = self.tools.resolve_path(inferred_source_path, allow_missing=False)
+                        candidate_lines = candidate.read_text(encoding="utf-8").splitlines()
+                    except Exception:
+                        return ""
+                    excerpt_lines = [f"{index}: {line}" for index, line in enumerate(candidate_lines[: min(18, len(candidate_lines))], start=1)]
+                    snippets.append(f"{inferred_source_path}:{1}\n" + "\n".join(excerpt_lines))
+            else:
+                for test_path, source_path in reversed(self._recent_source_paths_with_results(successful_tool_results)):
+                    if source_path:
+                        try:
+                            candidate = self.tools.resolve_path(source_path, allow_missing=False)
+                            lines = candidate.read_text(encoding="utf-8").splitlines()
+                        except Exception:
+                            continue
+                        excerpt_lines = [f"{index}: {line}" for index, line in enumerate(lines[: min(18, len(lines))], start=1)]
+                        snippets.append(f"{source_path}:{1}\n" + "\n".join(excerpt_lines))
+                        break
+            if not snippets:
+                return ""
         return "Failing source excerpt:\n" + self._truncate_text("\n\n".join(snippets), limit=limit)
+
+    def _recent_source_paths_with_results(self, successful_tool_results: list[dict[str, Any]]) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in reversed(successful_tool_results):
+            if item.get("name") not in {"read_file", "find_implementation_target", "implementation_spec", "diagnose_test_failure"}:
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            source_path = str(result.get("path") or "").strip().replace("\\", "/")
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            source_path = str(result.get("path") or arguments.get("source_path") or arguments.get("path") or "").strip().replace("\\", "/")
+            if not source_path or source_path in seen:
+                continue
+            seen.add(source_path)
+            if not source_path.endswith(".py") or self._path_looks_like_test_file(source_path):
+                continue
+            pairs.append((source_path, source_path))
+        return pairs
 
     def _normalize_audit_text_items(self, items: object) -> list[str]:
         if not isinstance(items, list):
@@ -1222,10 +912,15 @@ class OllamaCodeAgent:
         lowered = text.lower()
         fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", lowered)
         fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", lowered))
+        fragments.extend(re.findall(r"\bnot\s+(?:with|using|via)?\s*[^.?!\n]{0,80}", lowered))
         forbidden: set[str] = set()
         for fragment in fragments:
             forbidden.update(self._tool_names_in_fragment(fragment))
         return forbidden
+
+    def _intrinsic_forbidden_tool_names(self) -> set[str]:
+        available = self.tools.available_tool_names()
+        return {name for name in KNOWN_TOOL_NAMES if name not in available}
 
     def _requested_tool_names(self, text: str, *, forbidden_tool_names: set[str] | None = None) -> set[str]:
         lowered = text.lower()
@@ -1485,8 +1180,17 @@ class OllamaCodeAgent:
             "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
 
-    def _normalize_assumption_audit_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
-        decision = payload if isinstance(payload, dict) else {}
+    def _normalize_assumption_audit_payload(self, payload: dict[str, Any] | None, *, raw_text: str = "") -> dict[str, Any]:
+        decision = dict(payload) if isinstance(payload, dict) else {}
+        recovered = extract_json_like_fields(
+            raw_text,
+            scalar_keys=("verdict", "reason"),
+            array_keys=("assumptions", "validation_steps", "required_tools", "forbidden_tools"),
+        )
+        for key, value in recovered.items():
+            current = decision.get(key)
+            if key not in decision or current is None or current == "" or current == []:
+                decision[key] = value
         verdict = str(decision.get("verdict", "")).strip().lower()
         if verdict not in {"accept", "retry"}:
             verdict = "retry"
@@ -1539,7 +1243,7 @@ class OllamaCodeAgent:
             messages=self._assumption_audit_messages(context_payload),
             think=False,
         )
-        decision = self._normalize_assumption_audit_payload(extract_json_response(verdict_response.content))
+        decision = self._normalize_assumption_audit_payload(extract_json_response(verdict_response.content), raw_text=verdict_response.content)
         if decision["verdict"] == "retry" and not decision["reason"]:
             decision["reason"] = "Tool step assumptions were not validated."
         self._record_event(
@@ -1604,8 +1308,17 @@ class OllamaCodeAgent:
             "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
 
-    def _normalize_reconciliation_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
-        decision = payload if isinstance(payload, dict) else {}
+    def _normalize_reconciliation_payload(self, payload: dict[str, Any] | None, *, raw_text: str = "") -> dict[str, Any]:
+        decision = dict(payload) if isinstance(payload, dict) else {}
+        recovered = extract_json_like_fields(
+            raw_text,
+            scalar_keys=("verdict", "reason"),
+            array_keys=("repair_plan", "required_tools", "forbidden_tools"),
+        )
+        for key, value in recovered.items():
+            current = decision.get(key)
+            if key not in decision or current is None or current == "" or current == []:
+                decision[key] = value
         verdict = str(decision.get("verdict", "")).strip().lower()
         if verdict not in {"accept", "retry"}:
             verdict = "retry"
@@ -1653,7 +1366,7 @@ class OllamaCodeAgent:
             messages=self._reconciliation_messages(context_payload),
             think=False,
         )
-        decision = self._normalize_reconciliation_payload(extract_json_response(verdict_response.content))
+        decision = self._normalize_reconciliation_payload(extract_json_response(verdict_response.content), raw_text=verdict_response.content)
         if decision["verdict"] == "retry" and not decision["reason"]:
             decision["reason"] = "Failed artifact needs a grounded repair step."
         self._record_event(
@@ -1806,6 +1519,38 @@ class OllamaCodeAgent:
         parts.append("Choose a better next JSON object only.")
         return " ".join(parts)
 
+    def _stabilize_retry_tool_constraints(
+        self,
+        decision: dict[str, Any],
+        *,
+        sticky_required_tool_names: set[str],
+        sticky_forbidden_tool_names: set[str],
+    ) -> dict[str, Any]:
+        normalized = dict(decision)
+        available_tool_names = self.tools.available_tool_names()
+        required_tools = {
+            name
+            for name in normalized.get("required_tools", [])
+            if isinstance(name, str) and name in KNOWN_TOOL_NAMES
+        }
+        forbidden_tools = {
+            name
+            for name in normalized.get("forbidden_tools", [])
+            if isinstance(name, str) and name in KNOWN_TOOL_NAMES
+        }
+        if available_tool_names:
+            required_tools = {name for name in required_tools if name in available_tool_names}
+            sticky_required = {name for name in sticky_required_tool_names if name in available_tool_names}
+        else:
+            sticky_required = set(sticky_required_tool_names)
+        sticky_forbidden = {name for name in sticky_forbidden_tool_names if name in KNOWN_TOOL_NAMES}
+        required_tools.update(sticky_required)
+        forbidden_tools.update(sticky_forbidden)
+        required_tools.difference_update(forbidden_tools)
+        normalized["required_tools"] = sorted(required_tools)
+        normalized["forbidden_tools"] = sorted(forbidden_tools)
+        return normalized
+
     def _reset_turn_cache(self) -> None:
         self._turn_tool_cache = {}
         self._turn_cache_epoch = 0
@@ -1926,7 +1671,7 @@ class OllamaCodeAgent:
             flags=re.DOTALL,
         )
         if syntax_match:
-            path = Path(syntax_match.group("path")).name
+            path = self._display_path_basename(syntax_match.group("path"))
             line = syntax_match.group("line")
             error = syntax_match.group("error").strip()
             return (
@@ -1997,6 +1742,16 @@ class OllamaCodeAgent:
                 stubs = self._remaining_stub_targets(targets)
                 if stubs:
                     packet["remaining_stubs"] = self._remaining_stubs_text(stubs)
+        if not packet["diagnosis"]:
+            fallback = self._diagnose_assertion_output(output)
+            if fallback:
+                packet["diagnosis"] = f"Diagnosis: {fallback}"
+        if not packet["likely_targets"]:
+            failed_test_path, _ = self._failed_test_output_paths_from_text(output)
+            if failed_test_path:
+                inferred = self._infer_source_for_test_path(failed_test_path, output=output, limit=8)
+                if inferred:
+                    packet["likely_targets"] = f"Likely targets: {inferred}."
         context_paths = self._recent_source_paths(successful_tool_results or [])
         if context_paths:
             stubs = self._stub_targets_for_paths(context_paths)
@@ -2016,8 +1771,18 @@ class OllamaCodeAgent:
             if probe and probe.get("ok") is False:
                 packet["repair_matrix"] = "Repair matrix: " + self._truncate_text(str(probe.get("output") or probe.get("summary") or ""), limit=700)
                 break
-        packet["source_excerpt"] = self._test_failure_source_excerpt(output)
+        packet["source_excerpt"] = self._test_failure_source_excerpt(output, successful_tool_results=successful_tool_results or [])
         return packet
+
+    def _diagnose_assertion_output(self, output: str) -> str:
+        match = re.search(r"AssertionError:\s*([^\n]+)", output or "")
+        if not match:
+            return ""
+        message = match.group(1).strip()
+        equality = re.search(r"'([^']*)'\s*!=\s*'([^']*)'", message)
+        if equality:
+            return f"assertion mismatch: actual='{equality.group(1)}' expected='{equality.group(2)}'"
+        return f"assertion mismatch: {message}"
 
     def _format_run_test_repair_packet(self, packet: dict[str, str]) -> str:
         parts = [value for key, value in packet.items() if key != "source_excerpt" and value]
@@ -2332,6 +2097,11 @@ class OllamaCodeAgent:
             "pytest",
             "unittest",
             "git",
+            "checkout",
+            "checked out",
+            "merge",
+            "rebase",
+            "stash",
             "working tree",
             "staged",
             "unstaged",
@@ -2353,7 +2123,11 @@ class OllamaCodeAgent:
 
     def _request_prefers_structured_file_tools(self, text: str) -> bool:
         lowered = text.lower()
-        if "run_shell" in lowered or "shell" in lowered or "command" in lowered:
+        if "run_shell" in lowered and "not run_shell" not in lowered:
+            return False
+        if "shell" in lowered and "not shell" not in lowered:
+            return False
+        if "command" in lowered and "run_test" not in lowered:
             return False
         file_verbs = ["create ", "write ", "replace ", "edit ", "update ", "rewrite ", "append "]
         has_file_target = bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)) or "/" in text
@@ -2403,6 +2177,19 @@ class OllamaCodeAgent:
                 path = match.group("path").strip()
                 if path:
                     return ExactFileWriteSpec(path=path, line=line)
+        return None
+
+    def _requested_loose_file_create_path(self, text: str) -> str | None:
+        patterns = [
+            r"\b(?:create|write)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            path = match.group("path").strip().rstrip(".,;:")
+            if path:
+                return path
         return None
 
     def _requested_exact_reply_text(self, text: str) -> str | None:
@@ -2740,7 +2527,26 @@ class OllamaCodeAgent:
             "add ",
             "commit ",
         ]
-        return any(phrase in lowered for phrase in mutation_phrases)
+        return any(phrase in lowered for phrase in mutation_phrases) or self._request_looks_like_issue_report(text)
+
+    def _request_looks_like_issue_report(self, text: str) -> bool:
+        lowered = text.lower()
+        has_code_context = bool(
+            re.search(
+                r"`[^`]+`|(?:^|\s)[A-Za-z_][\w./-]*\.(?:py|js|ts|tsx|jsx|java|go|rs|c|cc|cpp)\b|array\(\[|traceback|from [A-Za-z0-9_. ]+ import ",
+                text,
+            )
+        )
+        if not has_code_context:
+            return False
+        issue_patterns = [
+            r"\b(?:bug|issue|regression)\b",
+            r"\bdoes not\b[^.?!\n]{0,120}\b(?:correctly|properly|compute|return|handle|pass|work)\b",
+            r"\breturns?\b[^.?!\n]{0,80}\bwrong\b",
+            r"\b(?:incorrect|incorrectly|unexpected(?:ly)?)\b",
+            r"\bfails?\b[^.?!\n]{0,120}\b(?:when|with|for|to|under|on)\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in issue_patterns)
 
     def _request_requires_mutation(self, text: str) -> bool:
         lowered = text.lower()
@@ -2763,6 +2569,8 @@ class OllamaCodeAgent:
             return False
         if re.search(r"\b(?:how|what|why)\s+(?:would|should|can)\b", lowered):
             return False
+        if self._request_looks_like_issue_report(text):
+            return True
         mutation_patterns = [
             r"\bimplement\b",
             r"\bfix\b",
@@ -2805,6 +2613,26 @@ class OllamaCodeAgent:
                 or re.search(r"\b(?:fix|patch|repair)\b.{0,120}\btests?\b", lowered)
             )
         )
+
+    def _request_explicitly_allows_test_mutation(self, text: str) -> bool:
+        lowered = text.lower()
+        if any(
+            phrase in lowered
+            for phrase in [
+                "update tests",
+                "edit tests",
+                "modify tests",
+                "change tests",
+                "rewrite tests",
+                "add tests",
+                "test file",
+                "test files",
+                "tests, and docs",
+                "tests and docs",
+            ]
+        ):
+            return True
+        return bool(re.search(r"\btests?/[^\s,;:]+", lowered))
 
     def _request_forbids_test_mutation(self, text: str) -> bool:
         lowered = text.lower()
@@ -2954,6 +2782,19 @@ class OllamaCodeAgent:
         response_type = normalized.get("type")
         tool_name = normalized.get("name")
         arguments = normalized.get("arguments")
+        if isinstance(tool_name, str) and tool_name == "final" and response_type in {"tool", None, "", "function", "tool_call"}:
+            message = normalized.get("message")
+            if not isinstance(message, str):
+                if isinstance(arguments, dict):
+                    arg_message = arguments.get("message")
+                    if isinstance(arg_message, str):
+                        message = arg_message
+                    else:
+                        arg_content = arguments.get("content")
+                        if isinstance(arg_content, str):
+                            message = arg_content
+            normalized = {"type": "final", "message": str(message or "").strip()}
+            return normalized
         if isinstance(response_type, str) and response_type in KNOWN_TOOL_NAMES:
             normalized["type"] = "tool"
             if not isinstance(tool_name, str) or not tool_name:
@@ -3082,6 +2923,9 @@ class OllamaCodeAgent:
         return None
 
     def _requested_exact_shell_command(self, text: str) -> str | None:
+        lowered = text.lower()
+        if re.search(r"\bnot\s+run_shell\b", lowered) or re.search(r"\bnot\s+shell\b", lowered):
+            return None
         patterns = [
             r"\b(?:execute|run)\s+exactly:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
             r"\b(?:execute|run)\s+the\s+exact\s+command:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
@@ -3151,10 +2995,11 @@ class OllamaCodeAgent:
 
     def _requested_list_files_path(self, text: str) -> str | None:
         lowered = text.lower().strip()
-        if lowered in {"ls", "dir", "list files", "list the files", "show files", "show the files"}:
+        if lowered in {"ls", "dir", "list files", "list the files", "show files", "show the files", "list_files", "use list_files"}:
             return "."
         patterns = [
             r"\b(?:list|show)\s+(?:the\s+)?files\s+(?:in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
+            r"\b(?:use\s+)?list_files\s+(?:on|in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
             r"\b(?:ls|dir)\s+(?P<path>[\w./\\:-]+)",
         ]
         for pattern in patterns:
@@ -3164,7 +3009,7 @@ class OllamaCodeAgent:
             path = match.group("path").strip().rstrip(".,;:")
             if path:
                 return "." if path.lower() in {"the", "workspace", "repo", "repository", "project", "directory", "folder"} else path
-        if re.search(r"\b(?:list|show)\s+(?:the\s+)?files\b", lowered):
+        if re.search(r"\b(?:list|show)\s+(?:the\s+)?files\b|\blist_files\b", lowered):
             return "."
         return None
 
@@ -3279,7 +3124,7 @@ class OllamaCodeAgent:
         ):
             command = None
             if "ruff check" in lowered:
-                command = "ruff check ."
+                command = "ruff check . --no-cache"
             elif re.search(r"\bmypy\b", lowered):
                 command = "mypy ."
             elif re.search(r"\bpyright\b", lowered):
@@ -3450,7 +3295,7 @@ class OllamaCodeAgent:
                 lowered_fragment = match.group(0).lower()
                 command = None
                 if "ruff check" in lowered_fragment:
-                    command = "ruff check ."
+                    command = "ruff check . --no-cache"
                 elif "mypy" in lowered_fragment:
                     command = "mypy ."
                 elif "pyright" in lowered_fragment:
@@ -3625,14 +3470,28 @@ class OllamaCodeAgent:
         request_text: str,
         exact_shell_command: str | None,
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "run_shell" or not self.tools.default_test_command:
+        if name != "run_shell":
             return name, arguments, None
         command = str(arguments.get("command", "")).strip()
-        if not command or not self._shell_command_looks_like_test_run(command):
+        if not command:
+            return name, arguments, None
+        request_forbidden = self._forbidden_tool_names(request_text)
+        explicit_run_shell = self._request_explicitly_requests_tool(request_text, "run_shell") and "run_shell" not in request_forbidden
+        explicit_run_test = self._request_explicitly_requests_tool(request_text, "run_test") and "run_test" not in request_forbidden
+        if explicit_run_shell:
+            return name, arguments, None
+        if explicit_run_test:
+            normalized = {"command": command}
+            if "cwd" in arguments:
+                normalized["cwd"] = arguments["cwd"]
+            if "timeout" in arguments:
+                normalized["timeout"] = arguments["timeout"]
+            return "run_test", normalized, "Normalized run_shell to run_test because the request explicitly requires run_test."
+        if not self.tools.default_test_command:
+            return name, arguments, None
+        if not self._shell_command_looks_like_test_run(command):
             return name, arguments, None
         if exact_shell_command and command == exact_shell_command:
-            return name, arguments, None
-        if self._request_explicitly_requests_tool(request_text, "run_shell"):
             return name, arguments, None
         normalized: dict[str, Any] = {"command": self.tools.default_test_command}
         if "cwd" in arguments:
@@ -3805,20 +3664,260 @@ class OllamaCodeAgent:
             count += 1
         return count
 
-    def _context_planner_message(self) -> str:
-        return (
-            "Pause broad inspection. Name the smallest missing fact and use a narrower next step: "
-            "search_symbols/read_symbol/code_outline for a concrete symbol, find_implementation_target for tests/traceback, "
-            "discover_validators/run_test for evidence, or answer/edit from current evidence. Next JSON only."
-        )
-
-    def _trajectory_loop_guard_message(self) -> str:
+    def _context_guard_retry_message(
+        self,
+        *,
+        mutation_required: bool,
+        code_mutation_required: bool,
+        test_run_required: bool,
+        required_mutation_paths: set[str],
+        mutated_paths_this_turn: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        broad: bool,
+    ) -> str:
+        if mutation_required or code_mutation_required:
+            pending_paths = sorted(required_mutation_paths - mutated_paths_this_turn)
+            if pending_paths:
+                target_list = ", ".join(pending_paths[:4])
+                next_step = "Make the grounded edit now"
+                if test_run_required:
+                    next_step += ", then run_test"
+                return (
+                    "You already have enough evidence to edit the named target path(s): "
+                    f"{target_list}. Do not gather more context. {next_step}. Next JSON only."
+                )
+            source_paths = self._recent_source_paths(successful_tool_results)
+            test_paths = self._recent_test_paths(successful_tool_results)
+            if source_paths:
+                evidence_parts = [f"source={', '.join(source_paths[:3])}"]
+                if test_paths:
+                    evidence_parts.append(f"tests={', '.join(test_paths[:2])}")
+                next_step = "Edit the grounded implementation now"
+                if test_run_required:
+                    next_step += ", then run_test"
+                return (
+                    "You already have grounding from "
+                    + "; ".join(evidence_parts)
+                    + f". Do not gather more context. {next_step}. Next JSON only."
+                )
+        if broad:
+            return (
+                "Pause broad inspection. Name the smallest missing fact and use a narrower next step: "
+                "search_symbols/read_symbol/code_outline for a concrete symbol, find_implementation_target for tests/traceback, "
+                "discover_validators/run_test for evidence, or answer/edit from current evidence. Next JSON only."
+            )
         return (
             "Too many context-only tool steps. Choose one narrower next step: read_symbol/code_outline for a specific symbol, "
             "find_implementation_target for tests/traceback, edit grounded target, run validation, or answer from current evidence. Next JSON only."
         )
 
+    def _test_to_source_bridge(self, successful_tool_results: list[dict[str, Any]]) -> tuple[str, str] | None:
+        recent_source_paths = self._recent_source_paths(successful_tool_results)
+        if not recent_source_paths:
+            for test_path in reversed(self._recent_test_paths(successful_tool_results)):
+                targets: list[dict[str, Any]] = []
+                try:
+                    result = self.tools.find_implementation_target(test_path=test_path, limit=6)
+                except Exception:
+                    result = {}
+                targets = result.get("targets") if isinstance(result, dict) and isinstance(result.get("targets"), list) else []
+                for item in targets:
+                    if not isinstance(item, dict):
+                        continue
+                    source_path = str(item.get("path") or "").strip().replace("\\", "/")
+                    if source_path.endswith(".py") and not self._path_looks_like_test_file(source_path):
+                        return test_path, source_path
+                for inferred in [self._infer_source_for_test_path(test_path)]:
+                    if inferred and inferred.endswith(".py") and not self._path_looks_like_test_file(inferred):
+                        return test_path, inferred
+            return None
+        bridge_candidates: list[tuple[str, str]] = []
+        for test_path in reversed(self._recent_test_paths(successful_tool_results)):
+            targets: list[dict[str, Any]] = []
+            try:
+                result = self.tools.find_implementation_target(test_path=test_path, limit=6)
+            except Exception:
+                result = {}
+            targets = result.get("targets") if isinstance(result, dict) and isinstance(result.get("targets"), list) else []
+            for item in targets:
+                if not isinstance(item, dict):
+                    continue
+                source_path = str(item.get("path") or "").strip().replace("\\", "/")
+                if source_path.endswith(".py") and not self._path_looks_like_test_file(source_path):
+                    candidate = (test_path, source_path)
+                    if candidate not in bridge_candidates:
+                        bridge_candidates.append(candidate)
+                        break
+            inferred = self._infer_source_for_test_path(test_path)
+            if inferred and inferred.endswith(".py") and not self._path_looks_like_test_file(inferred):
+                candidate = (test_path, inferred)
+                if candidate not in bridge_candidates:
+                    bridge_candidates.append(candidate)
+        if not bridge_candidates:
+            return None
+        test_path, source_path = bridge_candidates[0]
+        if source_path in recent_source_paths:
+            return test_path, source_path
+        if len(bridge_candidates) == 1:
+            return test_path, source_path
+        return None
+
+    def _failed_run_test_output_paths(self, output: str) -> tuple[str | None, str | None]:
+        raw = output.replace("\r", "\n").replace("\\", "/")
+        test_path: str | None = None
+        source_path: str | None = None
+        test_module_match = re.search(r"Failed to import test module:\s*([^\s]+)", raw, flags=re.IGNORECASE)
+        if test_module_match:
+            raw_candidate = test_module_match.group(1).strip().strip("`'\"")
+            if not raw_candidate.endswith(".py"):
+                raw_candidate = f"{raw_candidate}.py"
+            for candidate in (raw_candidate, f"tests/{raw_candidate}", f"src/{raw_candidate}", f"./{raw_candidate}"):
+                try:
+                    resolved = self.tools.resolve_path(candidate, allow_missing=False)
+                    if resolved.exists() and resolved.is_file():
+                        relative = self.tools.relative_label(resolved)
+                        if self._path_looks_like_test_file(relative):
+                            test_path = relative
+                        else:
+                            source_path = relative
+                        break
+                except Exception:
+                    continue
+        file_matches = re.findall(r"^\s*File \"([^\"]+\.py)\"(?:, line )?\d+,", raw, flags=re.MULTILINE)
+        for path in file_matches:
+            try:
+                resolved = self.tools.resolve_path(path.replace("\\", "/"), allow_missing=False)
+            except Exception:
+                continue
+            if not resolved.exists():
+                continue
+            relative = self.tools.relative_label(resolved)
+            if self._path_looks_like_test_file(relative):
+                if test_path is None:
+                    test_path = relative
+            else:
+                source_path = relative
+        return test_path, source_path
+
+    def _failed_test_output_paths(self, successful_tool_results: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+        return self._failed_test_output_paths_from_text(self._latest_failed_run_test_output(successful_tool_results))
+
+    def _failed_test_output_paths_from_text(self, output: str) -> tuple[str | None, str | None]:
+        return self._failed_run_test_output_paths(output)
+
+    def _infer_source_for_test_path(self, test_path: str, *, output: str = "", limit: int = 6) -> str | None:
+        if not test_path:
+            return None
+        for resolver in (
+            lambda: self._infer_source_for_test_path_from_output(test_path, output=output, limit=limit),
+            lambda: self._infer_source_for_test_path_from_imports(test_path),
+        ):
+            inferred = resolver()
+            if inferred:
+                return inferred
+        return None
+
+    def _resolve_candidate_source_paths(self, module_name: str) -> list[str]:
+        cleaned = module_name.replace("-", "_").strip(".")
+        if not cleaned:
+            return []
+        parts = tuple(part for part in cleaned.split(".") if part)
+        if not parts:
+            return []
+        candidates = [
+            Path(*parts).with_suffix(".py"),
+            Path(*parts).with_suffix(".py"),
+            Path("src", *parts).with_suffix(".py"),
+            Path(*parts[:-1]) / "__init__.py",
+            Path("src", *parts[:-1]) / "__init__.py",
+        ]
+        if len(parts) == 1:
+            candidates.extend([Path("src") / f"{parts[0]}.py", Path("src") / parts[0] / "__init__.py"])
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            try:
+                resolved = self.tools.relative_label(self.tools.resolve_path(str(candidate), allow_missing=False))
+            except Exception:
+                continue
+            rel = str(resolved).replace("\\", "/")
+            if not rel.endswith(".py") or self._path_looks_like_test_file(rel):
+                continue
+            if rel not in seen:
+                seen.add(rel)
+                normalized.append(rel)
+        return normalized
+
+    def _extract_imported_modules(self, text: str) -> list[str]:
+        modules: list[str] = []
+        try:
+            tree = ast.parse(text)
+        except Exception:
+            return modules
+        seen: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    module = (alias.name or "").strip()
+                    if module and module not in seen:
+                        seen.add(module)
+                        modules.append(module)
+            elif isinstance(node, ast.ImportFrom):
+                module = (node.module or "").strip()
+                if module and module not in seen:
+                    seen.add(module)
+                    modules.append(module)
+        return modules
+
+    def _infer_source_for_test_path_from_imports(self, test_path: str) -> str | None:
+        if not test_path:
+            return None
+        try:
+            path = self.tools.resolve_path(test_path, allow_missing=False)
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        for module in self._extract_imported_modules(text):
+            for candidate in self._resolve_candidate_source_paths(module):
+                if candidate:
+                    return candidate
+        stem = Path(test_path).stem
+        if stem.lower().startswith("test_"):
+            stem = stem[5:]
+        if stem.lower().endswith("_test"):
+            stem = stem[:-5]
+        for candidate in [f"src/{stem}.py", f"{stem}.py", f"src/{stem}/__init__.py"]:
+            try:
+                if self.tools.resolve_path(candidate, allow_missing=False).is_file():
+                    rel = self.tools.relative_label(self.tools.resolve_path(candidate, allow_missing=False))
+                    if not self._path_looks_like_test_file(rel):
+                        return str(rel).replace("\\", "/")
+            except Exception:
+                continue
+        return None
+
+    def _infer_source_for_test_path_from_output(self, test_path: str, *, output: str, limit: int) -> str | None:
+        if not output:
+            return self._infer_source_for_test_path_from_imports(test_path)
+        try:
+            result = self.tools.find_implementation_target(test_path=test_path, output=output, limit=limit)
+        except Exception:
+            result = None
+        if isinstance(result, dict):
+            for item in result.get("targets", []) if isinstance(result.get("targets"), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                source_path = str(item.get("path") or "").strip().replace("\\", "/")
+                if source_path.endswith(".py") and not self._path_looks_like_test_file(source_path):
+                    return source_path
+        return None
+
     def _failed_test_edit_target_hint(self, successful_tool_results: list[dict[str, Any]]) -> str:
+        failed_test_path, failed_source_path = self._failed_test_output_paths(successful_tool_results)
+        if failed_source_path:
+            return failed_source_path
+        if failed_test_path and failed_test_path not in {"", None}:
+            return failed_test_path
         stubs = self._stub_targets_for_paths(self._recent_source_paths(successful_tool_results))
         if stubs:
             return ", ".join(stubs[:8])
@@ -4016,6 +4115,35 @@ class OllamaCodeAgent:
                 return error_class
         return None
 
+    def _mutating_failure_key(self, name: str, arguments: dict[str, Any]) -> tuple[str, str]:
+        path = str(arguments.get("path") or arguments.get("cwd") or "").strip().replace("\\", "/").lstrip("./")
+        if path:
+            return ("path", path.lower())
+        return ("tool", name)
+
+    def _repeated_mutating_failure_escape_message(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        result: dict[str, Any],
+    ) -> str:
+        target_path = str(arguments.get("path") or arguments.get("cwd") or "").strip()
+        evidence = str(result.get("summary") or result.get("output") or "").strip()
+        if target_path:
+            message = (
+                f"Stop retrying narrow edit operations on {target_path} in this turn. "
+                f"Read {target_path}, then make one broader syntactically valid repair with write_file or a full-symbol replacement, and rerun tests."
+            )
+        else:
+            message = (
+                f"Stop retrying {name} with small mutations in this turn. "
+                "Switch to a broader direct repair, then rerun tests."
+            )
+        if evidence:
+            message += " Evidence: " + self._truncate_text(evidence, limit=320)
+        return message + " Next JSON only."
+
     def _remember_tool_error(
         self,
         *,
@@ -4054,6 +4182,53 @@ class OllamaCodeAgent:
             f"{name} already failed twice with {error_class}. Do not retry the same arguments. "
             "Use a different tool class, gather new evidence, edit the cause, or fail closed. Next JSON only."
         )
+
+    def _forbidden_tool_feedback_message(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        arguments: dict[str, Any],
+        forbidden_count: int,
+        forbidden_tool_names: set[str],
+        required_tool_names: set[str],
+    ) -> str:
+        command = str(arguments.get("command", "")).strip()
+        disabled = name in getattr(self.tools, "disabled_tools", set())
+        prefix = f"Do not use {name} in this turn."
+        if disabled:
+            prefix += f" {name} is disabled by config for this workspace."
+        if name == "run_shell":
+            if command and "run_test" in required_tool_names and "run_test" not in forbidden_tool_names:
+                return (
+                    prefix
+                    + f" Use run_test instead with command {command!r}. "
+                    + "If that fails, inspect the concrete failure and try a different repair before rerunning. Next JSON only."
+                )
+            if (
+                self.tools.default_test_command
+                and "run_test" not in forbidden_tool_names
+                and command
+                and self._shell_command_looks_like_test_run(command)
+            ):
+                return (
+                    prefix
+                    + f" Use run_test instead with command {command!r}. "
+                    + "If that still fails, inspect the concrete failure and try a different repair before rerunning tests. Next JSON only."
+                )
+            if self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+                return (
+                    prefix
+                    + " Use run_test or another structured allowed tool instead, not run_shell. "
+                    + "If tests already passed, answer from the successful run_test evidence. Next JSON only."
+                )
+        if forbidden_count >= 2:
+            return (
+                prefix
+                + " You already proposed this forbidden tool before. "
+                + "Choose a different allowed tool now or answer strictly from existing verified evidence. Next JSON only."
+            )
+        return prefix + " Choose a different allowed tool or answer from existing verified tool results. Respond with the next JSON object only."
 
     def _record_command_validation_event(self, *, name: str, result: dict[str, Any], round_number: int, cached: bool = False) -> None:
         validation = result.get("validation")
@@ -4146,6 +4321,15 @@ class OllamaCodeAgent:
     ) -> str | None:
         if self._request_expects_exact_tool_error(request_text) and self._failure_result_counts_for_request(request_text, name, result):
             return str(result.get("summary") or result.get("output") or "").strip() or None
+
+        if (
+            name in MUTATING_TOOL_NAMES
+            and result.get("ok") is not True
+            and self._failure_result_counts_for_request(request_text, name, result)
+        ):
+            denial = str(result.get("summary") or result.get("output") or "").strip()
+            if denial and "approval mode is read-only" in denial.lower():
+                return denial
 
         mechanical_tool = self._requested_mechanical_tool_call(request_text, forbidden_tool_names=set())
         mechanical_tool_name = mechanical_tool.name if mechanical_tool is not None else None
@@ -4512,18 +4696,6 @@ class OllamaCodeAgent:
                 "replace_in_file",
                 {"path": "src/formatter.py", "old": "return value.strip()", "new": "return value.strip().lower()"},
             )
-        elif "src/slug.py" in lowered and "slugify" in lowered and "spaces" in lowered and "hyphen" in lowered:
-            operation = (
-                "write_file",
-                {
-                    "path": "src/slug.py",
-                    "content": (
-                        "import re\n\n\n"
-                        "def slugify(value: str) -> str:\n"
-                        "    return re.sub(r'-+', '-', re.sub(r'\\s+', '-', value.strip().lower()))\n"
-                    ),
-                },
-            )
         else:
             constant_match = re.search(
                 r"\b(?:update|change|set)\s+the\s+(?P<name>[A-Z_][A-Z0-9_]*)\s+constant\s+in\s+(?P<path>[\w./-]+\.py)\s+to\s+['\"](?P<new>[^'\"]+)['\"]",
@@ -4886,6 +5058,30 @@ class OllamaCodeAgent:
             if message:
                 return self._record_synthesized_final(message, tool="run_shell", round_number=round_number)
             return None
+        if exact_shell_command and "run_test" in required_tool_names and "run_test" not in forbidden_tool_names:
+            round_number += 1
+            result = self._execute_controller_tool(
+                name="run_test",
+                arguments={"command": exact_shell_command},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            message = self._synthesize_final_from_tool_result(
+                request_text=request_text,
+                name="run_test",
+                arguments={"command": exact_shell_command},
+                result=result,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                required_tool_names=required_tool_names,
+                expected_exact_reply_text=expected_exact_reply_text,
+            )
+            if message:
+                return self._record_synthesized_final(message, tool="run_test", round_number=round_number)
+            return None
 
         if "run_test" in required_tool_names and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
             round_number += 1
@@ -5168,6 +5364,20 @@ class OllamaCodeAgent:
                 return self._record_synthesized_final(message, tool="read_file", round_number=round_number)
         return None
 
+    def _read_only_mutation_probe(self, request_text: str, exact_file_write: ExactFileWriteSpec | None) -> tuple[str, dict[str, Any]] | None:
+        if self.approval_mode() != "read-only":
+            return None
+        if not self._request_requires_mutation(request_text):
+            return None
+        if not self._failure_result_counts_for_request(request_text, "write_file", {"ok": False, "summary": "probe"}):
+            return None
+        if exact_file_write is not None:
+            return "write_file", {"path": exact_file_write.path, "content": exact_file_write.line + "\n"}
+        path = self._requested_loose_file_create_path(request_text)
+        if path is None:
+            return None
+        return "write_file", {"path": path, "content": "placeholder\n"}
+
     def _final_claims_file_mutation(self, message: str) -> bool:
         lowered = message.lower()
         patterns = [
@@ -5176,6 +5386,12 @@ class OllamaCodeAgent:
             r"\bwas\s+(?:updated|edited|changed|modified|created|written|rewritten|deleted|removed|renamed)\b",
         ]
         return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _display_path_basename(self, raw_path: str) -> str:
+        normalized = str(raw_path or "").replace("\\", "/").rstrip("/")
+        if not normalized:
+            return ""
+        return normalized.rsplit("/", 1)[-1]
 
     def _final_claims_test_success(self, message: str) -> bool:
         lowered = message.lower()
@@ -5551,6 +5767,278 @@ class OllamaCodeAgent:
         suffix = f" Available models include: {available_preview}." if available_preview else ""
         return requested_model, None, f"Sub-agent model is not installed: {requested_model}.{suffix}"
 
+    def _request_looks_like_python_test_driven_repair(
+        self,
+        *,
+        request_text: str,
+        session_memory_request: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+    ) -> bool:
+        if session_memory_request or not mutation_required or not test_run_required:
+            return False
+        if required_tool_names or forbidden_tool_names:
+            return False
+        if not self.tools.default_test_command:
+            return False
+        lowered = request_text.lower()
+        requested_paths = self._requested_mutation_paths(request_text)
+        source_paths = [path for path in requested_paths if path.endswith(".py") and not self._path_looks_like_test_file(path)]
+        doc_or_aux_paths = [
+            path
+            for path in requested_paths
+            if self._path_looks_like_test_file(path) or path.startswith("docs/") or path.endswith((".md", ".rst", ".txt"))
+        ]
+        if len(source_paths) > 1 or doc_or_aux_paths:
+            return False
+        if re.search(r"\b(?:refactor|rename|callsites?|docs?|public api|api)\b", lowered) and (
+            len(source_paths) == 1 or "docs" in lowered or "callsite" in lowered
+        ):
+            return False
+        if source_paths:
+            return True
+        return bool(
+            re.search(
+                r"\b(?:python exercise|from the tests?|read source and tests|read tests and source|implement .*tests?|fix .*tests?)\b",
+                lowered,
+            )
+        )
+
+    def _focused_python_repair_paths(self, request_text: str) -> tuple[str, str] | None:
+        requested_paths = sorted(
+            path for path in self._requested_mutation_paths(request_text) if path.endswith(".py") and not self._path_looks_like_test_file(path)
+        )
+        for source_path in requested_paths:
+            test_path = self._focused_python_repair_test_path(source_path)
+            if test_path is not None:
+                return source_path, test_path
+        return self._preemptive_spec_guided_repair_paths()
+
+    def _focused_python_repair_test_path(self, source_path: str) -> str | None:
+        try:
+            source_file = self.tools.resolve_path(source_path, allow_missing=False)
+        except Exception:
+            return None
+        rel_source = self.tools.relative_label(source_file)
+        source_stem = source_file.stem.lower()
+        candidates: list[tuple[int, str]] = []
+        try:
+            files = self.tools._iter_code_files(self.tools.workspace_root, limit=160)
+        except Exception:
+            files = []
+        for path in files:
+            rel_test = self.tools.relative_label(path)
+            if path.suffix.lower() != ".py" or not self._path_looks_like_test_file(rel_test):
+                continue
+            score = 0
+            name = path.name.lower()
+            if source_stem in name:
+                score += 20
+            try:
+                match = self.tools.find_implementation_target(test_path=rel_test, limit=8)
+            except Exception:
+                match = {}
+            targets = match.get("targets") if isinstance(match.get("targets"), list) else []
+            if any(isinstance(item, dict) and str(item.get("path") or "").strip() == rel_source for item in targets):
+                score += 100
+            if score:
+                candidates.append((score, rel_test))
+        if candidates:
+            candidates.sort(key=lambda item: (-item[0], item[1]))
+            return candidates[0][1]
+        return None
+
+    def _repair_strategy_messages(
+        self,
+        *,
+        request_text: str,
+        source_path: str,
+        test_path: str,
+        source_text: str,
+        spec_output: str,
+        quick_spec: dict[str, Any],
+    ) -> list[dict[str, str]]:
+        example_count = len(list(quick_spec.get("examples") or []))
+        stub_count = len(list(quick_spec.get("stubs") or []))
+        definition_count = len(list(quick_spec.get("definitions") or []))
+        payload = {
+            "request": self._truncate_text(request_text, limit=320),
+            "source_path": source_path,
+            "test_path": test_path,
+            "source_line_count": len(source_text.splitlines()),
+            "definition_count": definition_count,
+            "example_count": example_count,
+            "stub_count": stub_count,
+            "source_preview": self._truncate_text(source_text, limit=1200),
+            "implementation_spec": self._truncate_text(spec_output, limit=2200),
+        }
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "You are a repair strategy planner for a coding CLI controller. "
+                    "Choose spec_guided_repair when the task is a focused Python source repair with executable tests, "
+                    "small scope, and enough structured evidence to safely synthesize or validate a full replacement. "
+                    "Choose normal_loop when the task is broader, multi-file, or the spec is too weak."
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
+        ]
+
+    def _normalize_repair_strategy_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
+        decision = payload if isinstance(payload, dict) else {}
+        strategy = str(decision.get("strategy", "")).strip().lower()
+        if strategy not in {"spec_guided_repair", "normal_loop"}:
+            strategy = "normal_loop"
+        notes = [str(item).strip() for item in list(decision.get("notes") or []) if isinstance(item, str) and str(item).strip()]
+        return {
+            "strategy": strategy,
+            "reason": str(decision.get("reason", "")).strip(),
+            "notes": notes,
+        }
+
+    def _plan_repair_strategy(
+        self,
+        *,
+        request_text: str,
+        source_path: str,
+        test_path: str,
+        source_text: str,
+        spec_output: str,
+        quick_spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        self.status_printer("planning repair strategy")
+        response = self._chat(
+            purpose="repair_strategy",
+            model=self.model,
+            messages=self._repair_strategy_messages(
+                request_text=request_text,
+                source_path=source_path,
+                test_path=test_path,
+                source_text=source_text,
+                spec_output=spec_output,
+                quick_spec=quick_spec,
+            ),
+            think=False,
+        )
+        decision = self._normalize_repair_strategy_payload(extract_json_response(response.content))
+        self._record_event(
+            "repair_strategy",
+            strategy=decision["strategy"],
+            reason=decision["reason"],
+            notes=decision["notes"],
+            source_path=source_path,
+            test_path=test_path,
+            planner=response.content,
+        )
+        return decision
+
+    def _request_likely_import_repair(self, request_text: str, source_text: str) -> bool:
+        lowered = request_text.lower()
+        if "import" not in lowered:
+            return False
+        if not any(token in lowered for token in ("bug", "fix", "repair", "module", "package")):
+            return False
+        return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
+
+    def _try_structured_test_driven_repair(
+        self,
+        *,
+        request_text: str,
+        session_memory_request: bool,
+        mutation_required: bool,
+        test_run_required: bool,
+        required_tool_names: set[str],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        if self._explicit_guard_profile_selected():
+            return None
+        if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
+            return None
+        if not self._request_looks_like_python_test_driven_repair(
+            request_text=request_text,
+            session_memory_request=session_memory_request,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+        ):
+            return None
+        paths = self._focused_python_repair_paths(request_text)
+        if paths is None:
+            return None
+        source_path, test_path = paths
+        try:
+            source_text = self.tools.resolve_path(source_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        if self._request_likely_import_repair(request_text, source_text):
+            return None
+        source_result = self._execute_controller_tool(
+            name="read_file",
+            arguments={"path": source_path},
+            request_text=request_text,
+            round_number=0,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        test_result = self._execute_controller_tool(
+            name="read_file",
+            arguments={"path": test_path},
+            request_text=request_text,
+            round_number=0,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        spec_result = self._execute_controller_tool(
+            name="implementation_spec",
+            arguments={"source_path": source_path, "test_path": test_path, "limit": 60},
+            request_text=request_text,
+            round_number=0,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if source_result.get("ok") is not True or test_result.get("ok") is not True or spec_result.get("ok") is not True:
+            return None
+        if not self._spec_guided_repair_has_actionable_spec(
+            source_text=source_text,
+            quick_spec=spec_result,
+            failed_output="Focused Python test-driven repair requested.",
+        ):
+            return None
+        strategy = self._plan_repair_strategy(
+            request_text=request_text,
+            source_path=source_path,
+            test_path=test_path,
+            source_text=source_text,
+            spec_output=str(spec_result.get("output") or spec_result.get("summary") or ""),
+            quick_spec=spec_result,
+        )
+        if strategy["strategy"] != "spec_guided_repair":
+            return None
+        return self._try_spec_guided_repair(
+            request_text=request_text,
+            round_number=0,
+            failed_run_test_result={
+                "ok": False,
+                "tool": "structured_test_repair",
+                "summary": "Focused Python source+test repair selected by controller strategy planning.",
+                "output": "Focused Python source+test repair selected by controller strategy planning.",
+            },
+            run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
         prompt = arguments.get("prompt")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -5616,6 +6104,7 @@ class OllamaCodeAgent:
             debate_enabled=self.debate_enabled,
             verifier_model=self.verifier_model,
             reconcile_mode=self.reconcile_mode_setting,
+            require_llm_for_turn=self.require_llm_for_turn,
         )
         child.set_interrupt_event(self._interrupt_event)
         result = child.handle_user(prompt)
@@ -5639,6 +6128,20 @@ class OllamaCodeAgent:
         return response
 
     def _spec_guided_repair_paths(self, successful_tool_results: list[dict[str, Any]]) -> tuple[str, str] | None:
+        failed_test_path, failed_source_path = self._failed_test_output_paths(successful_tool_results)
+        if failed_source_path:
+            try:
+                source_file = self.tools.resolve_path(failed_source_path, allow_missing=False)
+                source_line_count = len(source_file.read_text(encoding="utf-8", errors="replace").splitlines())
+            except Exception:
+                failed_source_path = None
+            else:
+                if source_line_count <= 260:
+                    test_path = failed_test_path or (self._recent_test_paths(successful_tool_results)[-1] if self._recent_test_paths(successful_tool_results) else None)
+                    if test_path is None:
+                        return None
+                    return failed_source_path, test_path
+
         source_paths = self._recent_source_paths(successful_tool_results)
         test_paths = self._recent_test_paths(successful_tool_results)
         if not source_paths or not test_paths:
@@ -5671,11 +6174,39 @@ class OllamaCodeAgent:
         has_definition_risks = any(list(item.get("risks") or []) for item in quick_definitions)
         source_line_count = len(source_text.splitlines())
         small_module = source_line_count <= 220 and len(quick_definitions) <= 8
+        literal_example_count = 0
+        if small_module and len(quick_definitions) == 1:
+            target_names = {
+                str(quick_definitions[0].get("name") or "").strip(),
+                str(quick_definitions[0].get("symbol") or "").strip(),
+            } - {""}
+            for item in quick_examples:
+                if str(item.get("symbol") or "").strip() not in target_names:
+                    continue
+                kind, expr, expected = self.tools._split_test_example(str(item.get("example") or ""))
+                if kind != "value":
+                    continue
+                try:
+                    parsed = ast.parse(expr, mode="eval")
+                    ast.literal_eval(expected)
+                except (SyntaxError, ValueError):
+                    continue
+                call = parsed.body
+                if not isinstance(call, ast.Call) or call.keywords:
+                    continue
+                if self.tools._test_spec_call_name(call) not in target_names:
+                    continue
+                try:
+                    [ast.literal_eval(arg) for arg in call.args]
+                except (SyntaxError, ValueError):
+                    continue
+                literal_example_count += 1
+        has_small_literal_example_repair = small_module and len(quick_definitions) == 1 and literal_example_count >= 1
         if has_import_failure or has_structured_behavior_constraints or has_string_transform_hints or has_definition_risks:
             return True
         if quick_stubs:
             return True
-        return small_module and len(quick_examples) >= 4
+        return small_module and (len(quick_examples) >= 4 or has_small_literal_example_repair)
 
     def _extract_candidate_python_source(self, text: str) -> str:
         raw = text.strip()
@@ -5755,6 +6286,145 @@ class OllamaCodeAgent:
             models.append(self.model)
         return models
 
+    def _explicit_source_repair_candidates(
+        self,
+        requested_mutation_paths: set[str] | list[str] | None,
+    ) -> list[str]:
+        if not requested_mutation_paths:
+            return []
+        candidates: list[str] = []
+        for raw_path in requested_mutation_paths:
+            normalized = str(raw_path or "").strip().replace("\\", "/")
+            if not normalized:
+                continue
+            if not normalized.lower().endswith(".py"):
+                continue
+            if self._path_looks_like_test_file(normalized):
+                continue
+            try:
+                rel = self.tools.relative_label(self.tools.resolve_path(normalized, allow_missing=False))
+            except Exception:
+                continue
+            if rel in candidates:
+                continue
+            candidates.append(rel)
+        return candidates
+
+    def _related_tests_for_source(self, source_path: str) -> list[str]:
+        if not source_path:
+            return []
+        source = source_path.replace("\\", "/")
+        source_candidates = {source, source.rsplit("/", 1)[-1].rsplit(".", 1)[0]}
+        stem = Path(source).stem
+        parts = Path(source).with_suffix("").as_posix().split("/")
+        if len(parts) > 1:
+            source_candidates.add(".".join(parts[-2:]))
+            source_candidates.add(".".join(parts))
+        source_candidates.discard(".py")
+        source_candidates.discard("")
+        try:
+            test_paths = sorted((path for path in self.tools.workspace_root.rglob("test_*.py")), key=lambda p: p.name.lower())
+            test_paths.extend(sorted((path for path in self.tools.workspace_root.rglob("*_test.py")), key=lambda p: p.name.lower()))
+        except Exception:
+            return []
+        related: list[str] = []
+        for test_path in test_paths:
+            if self._path_looks_like_code_file(self.tools.relative_label(test_path)) is False:
+                continue
+            if not self._path_looks_like_test_file(self.tools.relative_label(test_path)):
+                continue
+            try:
+                raw = test_path.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(raw)
+            except Exception:
+                continue
+            imports: set[str] = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imports.add(alias.name)
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module:
+                        imports.add(node.module)
+            stem_name = Path(source).stem
+            candidates = {stem, stem_name, source.rsplit("/", 1)[-1], ".".join(parts[-2:]), ".".join(parts)}
+            if source_candidates.intersection(imports) or any(candidate in imports for candidate in candidates):
+                related.append(self.tools.relative_label(test_path))
+                continue
+            if not imports and stem_name.lower() in test_path.name.lower():
+                related.append(self.tools.relative_label(test_path))
+        if not related:
+            return []
+        if len(related) == 1:
+            return related
+        test_file_name = f"test_{stem}.py"
+        for item in related:
+            if Path(item).name == test_file_name:
+                return [item]
+        for item in related:
+            if stem.lower() in Path(item).name.lower():
+                return [item]
+        return related[:1]
+
+    def _package_relative_import_rewrite(self, source_path: str) -> str | None:
+        if not source_path:
+            return None
+        source_path = source_path.strip().replace("\\", "/")
+        source_file = self.tools.resolve_path(source_path, allow_missing=False) if source_path else None
+        if source_file is None or not source_file.is_file():
+            return None
+        if not source_file.parent.joinpath("__init__.py").is_file():
+            return None
+        try:
+            text = source_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        changed_lines: list[str] = []
+        changed = False
+        for line in text.splitlines():
+            if line.lstrip().startswith("from ") and " import " in line:
+                match = re.match(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\s+(.+?)\s*$", line)
+                if match:
+                    module = match.group(1).strip()
+                    rest = match.group(2).strip()
+                    candidate_module = source_file.parent / f"{module}.py"
+                    if candidate_module.is_file():
+                        changed_lines.append(f"from .{module} import {rest}")
+                        changed = True
+                        continue
+            if re.match(r"^\s*import\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:as\s+[\w_]+)?\s*$", line):
+                names = re.match(r"^\s*import\s+(.+?)\s*$", line)
+                if names:
+                    import_items = [item.strip() for item in names.group(1).split(",")]
+                    rewritten_items = []
+                    did_rewrite = False
+                    for item in import_items:
+                        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", item):
+                            rewritten_items.append(item)
+                            continue
+                        alias_match = re.match(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*)?$", item)
+                        if alias_match is None:
+                            rewritten_items.append(item)
+                            continue
+                        name = alias_match.group("name")
+                        alias = alias_match.group("alias")
+                        if source_file.parent.joinpath(f"{name}.py").is_file():
+                            rewritten_items.append(f".{name}" if not alias else f".{name} as {alias}")
+                            did_rewrite = True
+                        else:
+                            rewritten_items.append(item)
+                    if did_rewrite:
+                        changed_lines.append("import " + ", ".join(rewritten_items))
+                        changed = True
+                        continue
+            changed_lines.append(line)
+        if not changed:
+            return None
+        candidate = "\n".join(changed_lines)
+        if not candidate.endswith("\n"):
+            candidate += "\n"
+        return candidate
+
     def _preemptive_spec_guided_repair_paths(self) -> tuple[str, str] | None:
         try:
             files = self.tools._iter_code_files(self.tools.workspace_root, limit=80)
@@ -5827,12 +6497,17 @@ class OllamaCodeAgent:
         return source_rel, test_rel
 
     def _client_allows_preemptive_mechanical_repair(self) -> bool:
+        if self.disable_spec_guided_repair:
+            return False
         scripted_responses = getattr(self.client, "responses", None)
         return not isinstance(scripted_responses, list) or not scripted_responses
 
     def _explicit_guard_profile_selected(self) -> bool:
         profile = active_feature_profile()
         return profile in {"contract-guards", "trajectory-guards"}
+
+    def _spec_guided_repair_enabled(self) -> bool:
+        return not self.disable_spec_guided_repair
 
     def _try_preemptive_mechanical_spec_guided_repair(
         self,
@@ -5842,12 +6517,22 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]],
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
+        required_mutation_paths: set[str] | None = None,
     ) -> AgentResult | None:
         if not self.tools.default_test_command:
             return None
         if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
             return None
-        paths = self._preemptive_spec_guided_repair_paths()
+        explicit_source_paths = self._explicit_source_repair_candidates(required_mutation_paths)
+        paths = None
+        if len(explicit_source_paths) == 1:
+            source_path = explicit_source_paths[0]
+            related_tests = self._related_tests_for_source(source_path)
+            test_path = related_tests[0] if related_tests else None
+            if test_path:
+                paths = (source_path, test_path)
+        if paths is None:
+            paths = self._preemptive_spec_guided_repair_paths()
         if paths is None:
             return None
         source_path, test_path = paths
@@ -5859,6 +6544,56 @@ class OllamaCodeAgent:
             test_path=test_path,
             rounds=0,
         )
+        import_rewrite = self._package_relative_import_rewrite(source_path)
+        if import_rewrite is not None:
+            validation = self.tools.validate_implementation_candidate(
+                source_path,
+                import_rewrite,
+                test_path=test_path,
+                test_command=test_command,
+                probe_limit=24,
+                timeout=120,
+            )
+            if validation.get("ok") is True:
+                self._record_event(
+                    "spec_guided_repair",
+                    phase="mechanical_candidate_validation",
+                    preemptive=True,
+                    ok=True,
+                    stage=validation.get("stage"),
+                    source_path=source_path,
+                    test_path=test_path,
+                    summary=self._truncate_text(str(validation.get("summary") or validation.get("output") or ""), limit=700),
+                    synthesis_summary="synthetic package-relative import rewrite",
+                    rounds=0,
+                )
+                apply_result = self._execute_controller_tool(
+                    name="write_file",
+                    arguments={"path": source_path, "content": import_rewrite},
+                    request_text=request_text,
+                    round_number=0,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                if apply_result.get("ok") is True:
+                    final_result = self._execute_controller_tool(
+                        name="run_test",
+                        arguments={"command": test_command},
+                        request_text=request_text,
+                        round_number=0,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if final_result.get("ok") is True:
+                        message = "Spec-guided mechanical repair applied and tests passed."
+                        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=0, auto=True)
+                        self._record_event("assistant", content=message, rounds=0)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=message, rounds=0, completed=True)
+            else:
+                import_rewrite = None
         for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
                 synthesize = getattr(self.tools, synthesis_name)
@@ -6093,7 +6828,7 @@ class OllamaCodeAgent:
         spec_output = str(spec_result.get("output") or spec_result.get("summary") or "")
         test_command = str(run_test_arguments.get("command") or self.tools.default_test_command or "").strip()
         feedback = ""
-        for synthesis_name in SPEC_GUIDED_SYNTHESIS_TOOL_NAMES:
+        for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
                 synthesize = getattr(self.tools, synthesis_name)
                 synthesized = synthesize(source_path, test_path, limit=80)
@@ -6305,14 +7040,24 @@ class OllamaCodeAgent:
             return AgentResult(message=message, rounds=round_number, completed=False)
         return None
 
+    def _llm_turn_requirement_satisfied(self) -> bool:
+        if not self.require_llm_for_turn:
+            return True
+        return self._llm_used_this_turn
+
     def handle_user(self, text: str) -> AgentResult:
         self._reset_turn_cache()
         self._pending_llm_call_events = []
+        self._llm_used_this_turn = False
         self.messages.append({"role": "user", "content": text})
         self._record_event("user", content=text)
         requires_tools = self._request_requires_tools(text)
         forbidden_tool_names = self._forbidden_tool_names(text)
+        forbidden_tool_names.update(self._intrinsic_forbidden_tool_names())
+        forbidden_tool_names.update(getattr(self.tools, "disabled_tools", set()))
         required_tool_names = self._requested_tool_names(text, forbidden_tool_names=forbidden_tool_names)
+        sticky_forbidden_tool_names = set(forbidden_tool_names)
+        sticky_required_tool_names = set(required_tool_names)
         requested_git_diff_mode = self._requested_git_diff_mode(text)
         expected_exact_file_line = self._requested_exact_file_line(text)
         exact_file_write = self._requested_exact_single_line_file_write(text)
@@ -6346,20 +7091,21 @@ class OllamaCodeAgent:
             required_tool_names=required_tool_names,
             forbidden_tool_names=forbidden_tool_names,
         )
-        deterministic_result = self._try_handle_deterministic_turn(
-            request_text=text,
-            exact_file_write=exact_file_write,
-            target_line_read=target_line_read,
-            symbol_read=symbol_read,
-            exact_shell_command=exact_shell_command,
-            expected_exact_reply_text=expected_exact_reply_text,
-            required_tool_names=required_tool_names,
-            forbidden_tool_names=forbidden_tool_names,
-            session_memory_request=session_memory_request,
-            requested_git_diff_mode=requested_git_diff_mode,
-        )
-        if deterministic_result is not None:
-            return deterministic_result
+        if not self.require_llm_for_turn:
+            deterministic_result = self._try_handle_deterministic_turn(
+                request_text=text,
+                exact_file_write=exact_file_write,
+                target_line_read=target_line_read,
+                symbol_read=symbol_read,
+                exact_shell_command=exact_shell_command,
+                expected_exact_reply_text=expected_exact_reply_text,
+                required_tool_names=required_tool_names,
+                forbidden_tool_names=forbidden_tool_names,
+                session_memory_request=session_memory_request,
+                requested_git_diff_mode=requested_git_diff_mode,
+            )
+            if deterministic_result is not None:
+                return deterministic_result
         tool_used_this_turn = False
         satisfied_tool_names: set[str] = set()
         successful_tool_results: list[dict[str, Any]] = []
@@ -6389,12 +7135,13 @@ class OllamaCodeAgent:
         unresolved_static_diagnostics: dict[str, str] = {}
         unresolved_probe_diagnostics: dict[str, str] = {}
         tool_error_counts: dict[tuple[str, str, str], int] = {}
+        mutating_failure_counts: dict[tuple[str, str], int] = {}
         if (
             (mutation_required or code_mutation_required)
-            and test_run_required
             and not exact_request
             and not session_memory_request
             and not required_tool_names
+            and not self.require_llm_for_turn
             and not self._explicit_guard_profile_selected()
             and self._client_allows_preemptive_mechanical_repair()
         ):
@@ -6404,10 +7151,25 @@ class OllamaCodeAgent:
                 successful_tool_results=successful_tool_results,
                 satisfied_tool_names=satisfied_tool_names,
                 tool_calls_this_turn=tool_calls_this_turn,
+                required_mutation_paths=required_mutation_paths,
             )
             if preemptive_repair_result is not None:
                 return preemptive_repair_result
             tool_used_this_turn = tool_used_this_turn or bool(tool_calls_this_turn)
+        structured_repair_result = self._try_structured_test_driven_repair(
+            request_text=text,
+            session_memory_request=session_memory_request,
+            mutation_required=mutation_required or code_mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if structured_repair_result is not None:
+            return structured_repair_result
+        tool_used_this_turn = tool_used_this_turn or bool(tool_calls_this_turn)
         if self._should_preload_context_pack(
             request_text=text,
             session_memory_request=session_memory_request,
@@ -6475,6 +7237,21 @@ class OllamaCodeAgent:
                 if clarification_result is not None:
                     return clarification_result
         for round_number in range(1, self.max_tool_rounds + 1):
+            if self._llm_turn_requirement_satisfied():
+                deterministic_result = self._try_handle_deterministic_turn(
+                    request_text=text,
+                    exact_file_write=exact_file_write,
+                    target_line_read=target_line_read,
+                    symbol_read=symbol_read,
+                    exact_shell_command=exact_shell_command,
+                    expected_exact_reply_text=expected_exact_reply_text,
+                    required_tool_names=required_tool_names,
+                    forbidden_tool_names=forbidden_tool_names,
+                    session_memory_request=session_memory_request,
+                    requested_git_diff_mode=requested_git_diff_mode,
+                )
+                if deterministic_result is not None:
+                    return deterministic_result
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             try:
                 response = self._chat(
@@ -6498,17 +7275,36 @@ class OllamaCodeAgent:
                 )
             except OllamaError:
                 raise
+            recovered_tool_audit_bypass_reason: str | None = None
             payload = extract_json_response(response.content)
             if payload is None:
-                if exact_shell_command and not tool_used_this_turn:
+                if exact_shell_command and not tool_used_this_turn and "run_shell" not in forbidden_tool_names:
                     payload = {"type": "tool", "name": "run_shell", "arguments": {"command": exact_shell_command}}
+                    recovered_tool_audit_bypass_reason = "Recovered exact run_shell command after invalid model JSON."
                     self._record_event(
                         "tool_normalized",
                         original_name="",
                         original_arguments={},
                         normalized_name="run_shell",
                         normalized_arguments={"command": exact_shell_command},
-                        reason="Recovered exact run_shell command after invalid model JSON.",
+                        reason=recovered_tool_audit_bypass_reason,
+                        rounds=round_number,
+                    )
+                elif (
+                    exact_shell_command
+                    and not tool_used_this_turn
+                    and "run_test" in required_tool_names
+                    and "run_test" not in forbidden_tool_names
+                ):
+                    payload = {"type": "tool", "name": "run_test", "arguments": {"command": exact_shell_command}}
+                    recovered_tool_audit_bypass_reason = "Recovered exact run_test command after invalid model JSON."
+                    self._record_event(
+                        "tool_normalized",
+                        original_name="",
+                        original_arguments={},
+                        normalized_name="run_test",
+                        normalized_arguments={"command": exact_shell_command},
+                        reason=recovered_tool_audit_bypass_reason,
                         rounds=round_number,
                     )
                 else:
@@ -6526,18 +7322,40 @@ class OllamaCodeAgent:
                 continue
             payload = self._normalize_payload(payload)
             response_type = payload.get("type")
-            if response_type not in {"tool", "final"} and exact_shell_command and not tool_used_this_turn:
+            if response_type not in {"tool", "final"} and exact_shell_command and not tool_used_this_turn and "run_shell" not in forbidden_tool_names:
                 malformed_name = str(payload.get("name", ""))
                 malformed_arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
                 payload = {"type": "tool", "name": "run_shell", "arguments": {"command": exact_shell_command}}
                 response_type = "tool"
+                recovered_tool_audit_bypass_reason = "Recovered exact run_shell command from malformed model payload."
                 self._record_event(
                     "tool_normalized",
                     original_name=malformed_name,
                     original_arguments=malformed_arguments,
                     normalized_name="run_shell",
                     normalized_arguments={"command": exact_shell_command},
-                    reason="Recovered exact run_shell command from malformed model payload.",
+                    reason=recovered_tool_audit_bypass_reason,
+                    rounds=round_number,
+                )
+            elif (
+                response_type not in {"tool", "final"}
+                and exact_shell_command
+                and not tool_used_this_turn
+                and "run_test" in required_tool_names
+                and "run_test" not in forbidden_tool_names
+            ):
+                malformed_name = str(payload.get("name", ""))
+                malformed_arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+                payload = {"type": "tool", "name": "run_test", "arguments": {"command": exact_shell_command}}
+                response_type = "tool"
+                recovered_tool_audit_bypass_reason = "Recovered exact run_test command from malformed model payload."
+                self._record_event(
+                    "tool_normalized",
+                    original_name=malformed_name,
+                    original_arguments=malformed_arguments,
+                    normalized_name="run_test",
+                    normalized_arguments={"command": exact_shell_command},
+                    reason=recovered_tool_audit_bypass_reason,
                     rounds=round_number,
                 )
             if response_type is None:
@@ -6597,6 +7415,35 @@ class OllamaCodeAgent:
                     )
                     continue
                 if mutation_required and not mutation_verified_this_turn:
+                    read_only_probe = self._read_only_mutation_probe(text, exact_file_write)
+                    mutating_tool_attempted = any(call.get("name") in MUTATING_TOOL_NAMES for call in tool_calls_this_turn)
+                    if read_only_probe is not None and not mutating_tool_attempted:
+                        probe_name, probe_arguments = read_only_probe
+                        round_number += 1
+                        result = self._execute_controller_tool(
+                            name=probe_name,
+                            arguments=probe_arguments,
+                            request_text=text,
+                            round_number=round_number,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                        synthesized_final = self._synthesize_final_from_tool_result(
+                            request_text=text,
+                            name=probe_name,
+                            arguments=probe_arguments,
+                            result=result,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            required_tool_names=required_tool_names,
+                            expected_exact_reply_text=expected_exact_reply_text,
+                        )
+                        if synthesized_final:
+                            self._record_event("assistant_synthesized", content=synthesized_final, tool=probe_name, rounds=round_number, auto=True)
+                            self._record_event("assistant", content=synthesized_final, rounds=round_number)
+                            self._flush_llm_call_events()
+                            return AgentResult(message=synthesized_final, rounds=round_number, completed=True)
                     self._append_assistant_payload(payload)
                     self.messages.append(
                         {
@@ -6993,6 +7840,11 @@ class OllamaCodeAgent:
                                 rejected_final_messages.add(rewrite_outcome.rejected_message)
                             if rewrite_outcome.retry_decision is not None:
                                 retry_decision = rewrite_outcome.retry_decision
+                        retry_decision = self._stabilize_retry_tool_constraints(
+                            retry_decision,
+                            sticky_required_tool_names=sticky_required_tool_names,
+                            sticky_forbidden_tool_names=sticky_forbidden_tool_names,
+                        )
                         required_tool_names.update(retry_decision["required_tools"])
                         forbidden_tool_names.update(retry_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)
@@ -7063,11 +7915,22 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                 if name in forbidden_tool_names:
+                    tool_error_counts[(name, self._tool_error_arg_key(name, arguments), "forbidden_tool")] = (
+                        tool_error_counts.get((name, self._tool_error_arg_key(name, arguments), "forbidden_tool"), 0) + 1
+                    )
+                    forbidden_count = tool_error_counts[(name, self._tool_error_arg_key(name, arguments), "forbidden_tool")]
                     self._append_assistant_payload(payload)
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": f"Do not use {name} in this turn. Choose a different allowed tool or answer from existing verified tool results. Respond with the next JSON object only.",
+                            "content": self._forbidden_tool_feedback_message(
+                                request_text=text,
+                                name=name,
+                                arguments=arguments,
+                                forbidden_count=forbidden_count,
+                                forbidden_tool_names=forbidden_tool_names,
+                                required_tool_names=required_tool_names,
+                            ),
                         }
                     )
                     continue
@@ -7099,6 +7962,20 @@ class OllamaCodeAgent:
                         {
                             "role": "user",
                             "content": "Do not edit test files for this request. Edit only implementation files, then rerun run_test. Respond with the next JSON object only.",
+                        }
+                    )
+                    continue
+                if (
+                    mutation_required
+                    and name in {"write_file", "replace_symbol", "replace_symbols", "replace_in_file", "edit_intent"}
+                    and self._path_looks_like_test_file(str(arguments.get("path", "")))
+                    and not self._request_explicitly_allows_test_mutation(text)
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "This request looks like an implementation fix, not a test rewrite. Do not edit test files unless the user explicitly asks to update tests. Read or edit the relevant source file first, then rerun validation. Respond with the next JSON object only.",
                         }
                     )
                     continue
@@ -7319,6 +8196,11 @@ class OllamaCodeAgent:
                     arguments=arguments,
                     tool_error_counts=tool_error_counts,
                 )
+                repeated_mutating_failure = (
+                    name in RETRY_PRONE_MUTATING_TOOL_NAMES
+                    and (mutation_required or code_mutation_required)
+                    and mutating_failure_counts.get(self._mutating_failure_key(name, arguments), 0) >= 1
+                )
                 if repeated_error_class:
                     self._append_assistant_payload(payload)
                     self._record_event(
@@ -7331,6 +8213,29 @@ class OllamaCodeAgent:
                     )
                     self.messages.append({"role": "user", "content": self._tool_error_guard_message(name, repeated_error_class)})
                     continue
+                if repeated_mutating_failure:
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="repeated-mutating-failure-pivot",
+                        candidate_tool=name,
+                        target=self._mutating_failure_key(name, arguments)[1],
+                        forced_next_classes=["read", "implementation_edit", "validation"],
+                        rounds=round_number,
+                    )
+                    forbidden_tool_names.update({"edit_intent", "replace_in_file", "replace_symbol", "replace_symbols", "apply_structured_edit"})
+                    required_tool_names.difference_update(forbidden_tool_names)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._repeated_mutating_failure_escape_message(
+                                name=name,
+                                arguments=arguments,
+                                result={"summary": latest_run_test_failure_summary or "Earlier mutating edit already failed on this target."},
+                            ),
+                        }
+                    )
+                    continue
                 if (
                     not context_planner_prompted
                     and self._context_planner_blocks(
@@ -7339,7 +8244,6 @@ class OllamaCodeAgent:
                         latest_run_test_failed=latest_run_test_failed,
                     )
                 ):
-                    self._append_assistant_payload(payload)
                     prior_tools = [str(item.get("name", "")) for item in tool_calls_this_turn[-4:]]
                     self._record_event(
                         "controller_guard",
@@ -7349,8 +8253,22 @@ class OllamaCodeAgent:
                         forced_next_classes=["narrow_context", "implementation_target", "edit", "validation", "final"],
                         rounds=round_number,
                     )
+                    self._append_assistant_payload(payload)
                     context_planner_prompted = True
-                    self.messages.append({"role": "user", "content": self._context_planner_message()})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._context_guard_retry_message(
+                                mutation_required=mutation_required,
+                                code_mutation_required=code_mutation_required,
+                                test_run_required=test_run_required,
+                                required_mutation_paths=required_mutation_paths,
+                                mutated_paths_this_turn=mutated_paths_this_turn,
+                                successful_tool_results=successful_tool_results,
+                                broad=True,
+                            ),
+                        }
+                    )
                     continue
                 if self._trajectory_loop_guard_blocks(
                     name=name,
@@ -7358,7 +8276,6 @@ class OllamaCodeAgent:
                     tool_calls=tool_calls_this_turn,
                     cache_hit=cache_hit,
                 ):
-                    self._append_assistant_payload(payload)
                     prior_tools = [str(item.get("name", "")) for item in tool_calls_this_turn[-6:]]
                     self._record_event(
                         "controller_guard",
@@ -7368,7 +8285,21 @@ class OllamaCodeAgent:
                         forced_next_classes=["narrow_context", "implementation_target", "edit", "validation", "final"],
                         rounds=round_number,
                     )
-                    self.messages.append({"role": "user", "content": self._trajectory_loop_guard_message()})
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._context_guard_retry_message(
+                                mutation_required=mutation_required,
+                                code_mutation_required=code_mutation_required,
+                                test_run_required=test_run_required,
+                                required_mutation_paths=required_mutation_paths,
+                                mutated_paths_this_turn=mutated_paths_this_turn,
+                                successful_tool_results=successful_tool_results,
+                                broad=False,
+                            ),
+                        }
+                    )
                     continue
                 if self._trajectory_ground_guard_blocks(
                     request_text=text,
@@ -7416,7 +8347,7 @@ class OllamaCodeAgent:
                     request_text=text,
                     name=name,
                     arguments=arguments,
-                    normalization_reason=normalization_reason,
+                    normalization_reason=normalization_reason or recovered_tool_audit_bypass_reason,
                     cache_hit=cache_hit,
                     failed_tool_this_turn=failed_tool_this_turn,
                     session_memory_request=session_memory_request,
@@ -7439,6 +8370,11 @@ class OllamaCodeAgent:
                     )
                     if audit_decision["verdict"] == "retry":
                         assumption_audit_retries += 1
+                        audit_decision = self._stabilize_retry_tool_constraints(
+                            audit_decision,
+                            sticky_required_tool_names=sticky_required_tool_names,
+                            sticky_forbidden_tool_names=sticky_forbidden_tool_names,
+                        )
                         required_tool_names.update(audit_decision["required_tools"])
                         forbidden_tool_names.update(audit_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)
@@ -7480,9 +8416,11 @@ class OllamaCodeAgent:
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
-                    if name in MUTATING_TOOL_NAMES and latest_run_test_failed and (mutation_required or code_mutation_required):
+                    if name in RETRY_PRONE_MUTATING_TOOL_NAMES and (mutation_required or code_mutation_required):
                         failed_test_context_reads = 0
                         failed_test_mutation_version = mutation_version
+                        failure_key = self._mutating_failure_key(name, arguments)
+                        mutating_failure_counts[failure_key] = mutating_failure_counts.get(failure_key, 0) + 1
                     self._remember_tool_error(
                         name=name,
                         arguments=arguments,
@@ -7614,6 +8552,7 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                     and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_enabled()
                 ):
                     spec_guided_repair_attempted = True
                     feedback_text = "\n".join(post_tool_feedback)
@@ -7635,6 +8574,7 @@ class OllamaCodeAgent:
                     and failed_test_mutation_version == mutation_version
                     and failed_test_context_reads == 1
                     and name in CONTEXT_GATHERING_TOOL_NAMES
+                    and self._spec_guided_repair_enabled()
                 ):
                     self._record_event(
                         "controller_guard",
@@ -7652,6 +8592,7 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                     and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_enabled()
                 ):
                     import_repair = self._try_relative_import_repair(
                         request_text=text,
@@ -7683,6 +8624,32 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                     and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_enabled()
+                    and any(
+                        token in str(result.get("summary") or result.get("output") or "").lower()
+                        for token in ("target text was not found", "target text not found", "not found.")
+                    )
+                ):
+                    spec_guided_repair_attempted = True
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result=result,
+                        run_test_arguments={},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
+                if (
+                    name in MUTATING_TOOL_NAMES
+                    and result.get("ok") is not True
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_enabled()
                     and any(
                         token in str(result.get("summary") or result.get("output") or "").lower()
                         for token in (
@@ -7708,6 +8675,29 @@ class OllamaCodeAgent:
                     )
                     if repair_result is not None:
                         return repair_result
+                if (
+                    name in MUTATING_TOOL_NAMES
+                    and result.get("ok") is not True
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._tool_error_class(result) == "syntax_error"
+                ):
+                    target_path = str(arguments.get("path") or arguments.get("cwd") or "").strip()
+                    target_text = (result.get("summary") or result.get("output") or "").strip()
+                    if target_path:
+                        prompt = (
+                            "This edit failed a syntax check. Do not retry low-level edits on this file.\n"
+                            f"Read {target_path} and rewrite the needed function(s) in a single, syntax-valid patch.\n"
+                            "Then rerun tests. Use full file edits only and keep the implementation minimal and correct."
+                        )
+                    else:
+                        prompt = "This mutating edit failed a syntax check. Replace malformed edits with a new syntactically valid implementation and rerun tests."
+                    if target_text:
+                        prompt += f"\nEvidence: {self._truncate_text(target_text, limit=360)}"
+                    self.messages.append({"role": "user", "content": prompt})
+                    self._record_event("assistant", content="syntax_error_recovery_prompt", rounds=round_number)
+                    continue
                 self._autosave()
                 if self._tool_result_needs_reconciliation(
                     request_text=text,
@@ -7732,6 +8722,11 @@ class OllamaCodeAgent:
                     )
                     if reconciliation_decision["verdict"] == "retry":
                         reconciliation_retries += 1
+                        reconciliation_decision = self._stabilize_retry_tool_constraints(
+                            reconciliation_decision,
+                            sticky_required_tool_names=sticky_required_tool_names,
+                            sticky_forbidden_tool_names=sticky_forbidden_tool_names,
+                        )
                         required_tool_names.update(reconciliation_decision["required_tools"])
                         forbidden_tool_names.update(reconciliation_decision["forbidden_tools"])
                         required_tool_names.difference_update(forbidden_tool_names)
@@ -7973,6 +8968,28 @@ class OllamaCodeAgent:
                     self._record_event("assistant", content=message, rounds=self.max_tool_rounds)
                     self._flush_llm_call_events()
                     return AgentResult(message=message, rounds=self.max_tool_rounds, completed=True)
+                if (
+                    not spec_guided_repair_attempted
+                    and self._spec_guided_repair_enabled()
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_paths(successful_tool_results) is not None
+                ):
+                    spec_guided_repair_attempted = True
+                    failed_validation_result = dict(validation_result)
+                    failed_validation_result.setdefault("tool", validation_name)
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=self.max_tool_rounds,
+                        failed_run_test_result=failed_validation_result,
+                        run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        return repair_result
                 summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
                 failure = "Stopped because final-chance post-edit validation failed."
                 if summary:

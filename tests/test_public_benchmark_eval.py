@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -41,6 +42,15 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertIn("book-store", public_bench.public_task_set("expanded"))
         self.assertGreater(len(public_bench.public_task_set("expanded")), len(public_bench.HARD_POLYGLOT_TASKS))
         self.assertTrue(set(public_bench.HARD_POLYGLOT_TASKS).issubset(set(public_bench.public_task_set("expanded"))))
+        self.assertTrue(all(task in public_bench.public_task_set("all-python") for task in ("list-ops", "scale-generator")))
+
+    def test_public_task_set_all_python_discovers_practice(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "polyglot"
+            (root / "python" / "exercises" / "practice" / "task-one").mkdir(parents=True)
+            (root / "python" / "exercises" / "practice" / ".local").mkdir(parents=True)
+            tasks = public_bench.public_task_set("all-python", polyglot_root=root)
+        self.assertEqual(tasks, ("task-one",))
 
     def test_public_task_set_rejects_unknown(self) -> None:
         with self.assertRaises(ValueError):
@@ -216,6 +226,126 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
             self.assertTrue(payload["partial"])
             self.assertEqual(payload["summary"]["total_tokens"], 2)
             self.assertEqual(payload["comparisons"], [{"case": "wordy"}])
+
+    def test_mechanical_repair_summary_classifies_zero_llm_passes(self) -> None:
+        summary = public_bench._mech_repair_summary(
+            status="pass",
+            usage={"llm_calls": 0},
+            session_events=[{"type": "spec_guided_repair", "phase": "start"}],
+        )
+        self.assertTrue(summary["repair_used"])
+        self.assertFalse(summary["llm_used"])
+        self.assertTrue(summary["mechanical_only"])
+
+    def test_public_agent_runner_requires_llm_turn_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "project"
+            polyglot_root = root / "polyglot"
+            project_root.mkdir()
+            task_root = polyglot_root / "python" / "exercises" / "practice" / "hello-world"
+            task_root.mkdir(parents=True)
+            (task_root / "hello_world.py").write_text("def hello():\n    return 'hi'\n", encoding="utf-8")
+            (task_root / "hello_world_test.py").write_text("pass\n", encoding="utf-8")
+            cli_invocations: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                if "ollama_code.cli" in cmd:
+                    cli_invocations.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with (
+                patch.object(public_bench, "_run", side_effect=fake_run),
+                patch.object(public_bench, "warm_model", return_value={"ok": True, "latency_s": 0.1, "model": "fake"}),
+                patch.object(public_bench, "load_session", return_value={"events": [{"type": "llm_call"}], "llm_telemetry_events": []}),
+                patch.object(
+                    public_bench,
+                    "usage_totals",
+                    return_value={
+                        "llm_calls": 1,
+                        "prompt_tokens": 2,
+                        "output_tokens": 3,
+                        "total_tokens": 5,
+                        "total_duration_ns": 0,
+                        "prompt_chars": 0,
+                        "response_chars": 0,
+                        "purposes": {},
+                        "prompt_chars_by_role": {},
+                        "top_prompt_messages": [],
+                    },
+                ),
+                patch.object(public_bench, "tool_calls", return_value=["read_file", "run_test"]),
+                patch.object(public_bench, "failed_tools", return_value=[]),
+                patch.object(public_bench, "tests_run", return_value=[]),
+            ):
+                outcome = public_bench.evaluate_polyglot_python_task(
+                    project_root=project_root,
+                    polyglot_root=polyglot_root,
+                    task="hello-world",
+                    model="fake-model",
+                    debate="off",
+                    reconcile="auto",
+                    timeout=30,
+                )
+
+        self.assertEqual(outcome["status"], "pass")
+        self.assertEqual(len(cli_invocations), 1)
+        self.assertIn("--require-llm-for-turn", cli_invocations[0])
+
+    def test_public_agent_runner_can_explicitly_skip_llm_turn_requirement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_root = root / "project"
+            polyglot_root = root / "polyglot"
+            project_root.mkdir()
+            task_root = polyglot_root / "python" / "exercises" / "practice" / "hello-world"
+            task_root.mkdir(parents=True)
+            (task_root / "hello_world.py").write_text("def hello():\n    return 'hi'\n", encoding="utf-8")
+            (task_root / "hello_world_test.py").write_text("pass\n", encoding="utf-8")
+            cli_invocations: list[list[str]] = []
+
+            def fake_run(cmd: list[str], cwd: Path, timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+                if "ollama_code.cli" in cmd:
+                    cli_invocations.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with (
+                patch.object(public_bench, "_run", side_effect=fake_run),
+                patch.object(public_bench, "warm_model", return_value={"ok": True, "latency_s": 0.1, "model": "fake"}),
+                patch.object(public_bench, "load_session", return_value={"events": [], "llm_telemetry_events": []}),
+                patch.object(
+                    public_bench,
+                    "usage_totals",
+                    return_value={
+                        "llm_calls": 0,
+                        "prompt_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "total_duration_ns": 0,
+                        "prompt_chars": 0,
+                        "response_chars": 0,
+                        "purposes": {},
+                        "prompt_chars_by_role": {},
+                        "top_prompt_messages": [],
+                    },
+                ),
+                patch.object(public_bench, "tool_calls", return_value=["read_file", "run_test"]),
+                patch.object(public_bench, "failed_tools", return_value=[]),
+                patch.object(public_bench, "tests_run", return_value=[]),
+            ):
+                public_bench.evaluate_polyglot_python_task(
+                    project_root=project_root,
+                    polyglot_root=polyglot_root,
+                    task="hello-world",
+                    model="fake-model",
+                    debate="off",
+                    reconcile="auto",
+                    timeout=30,
+                    require_llm_for_turn=False,
+                )
+
+        self.assertEqual(len(cli_invocations), 1)
+        self.assertNotIn("--require-llm-for-turn", cli_invocations[0])
 
 
 if __name__ == "__main__":

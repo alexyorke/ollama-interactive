@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -43,9 +44,22 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(bench.default_benchmark_jobs(), 1)
         with patch.dict("os.environ", {"OLLAMA_HOST": "http://127.0.0.1:11434"}, clear=True):
+            self.assertEqual(bench.default_benchmark_jobs(), 8)
+        with patch.dict("os.environ", {"OLLAMA_HOST": "http://127.0.0.1:11437"}, clear=True):
+            self.assertEqual(bench.default_benchmark_jobs(), 12)
+        with patch.dict("os.environ", {"OLLAMA_HOST": "127.0.0.1:11437"}, clear=True):
             self.assertEqual(bench.default_benchmark_jobs(), 12)
         with patch.dict("os.environ", {"OLLAMA_HOST": "http://127.0.0.1:11434", "OLLAMA_CODE_BENCH_JOBS": "6"}, clear=True):
             self.assertEqual(bench.default_benchmark_jobs(), 6)
+
+    def test_selected_cases_can_filter_benchmark_class(self) -> None:
+        agent_cases = bench.selected_cases("local-full", benchmark_classes={"agent"})
+        controller_cases = bench.selected_cases("local-full", benchmark_classes={"controller"})
+
+        self.assertTrue(agent_cases)
+        self.assertTrue(controller_cases)
+        self.assertTrue(all(bench.benchmark_class_for_case(case) == "agent" for case in agent_cases))
+        self.assertTrue(all(bench.benchmark_class_for_case(case) == "controller" for case in controller_cases))
 
     def test_evaluate_case_batch_parallelizes_and_preserves_case_order(self) -> None:
         cases = [
@@ -124,6 +138,57 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(seen_jobs, [3])
 
+    def test_llm_bypass_failures_only_flag_zero_llm_coding_accuracy(self) -> None:
+        results = [
+            {"case": "coding-zero", "benchmark_kind": "coding_accuracy", "benchmark_class": "agent", "usage": {"llm_calls": 0}},
+            {"case": "coding-one", "benchmark_kind": "coding_accuracy", "benchmark_class": "agent", "usage": {"llm_calls": 1}},
+            {"case": "tool-zero", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 0}},
+        ]
+
+        failures = bench.llm_bypass_failures(results)
+
+        self.assertEqual([item["case"] for item in failures], ["coding-zero"])
+        self.assertIn("agent benchmark", failures[0]["llm_bypass_reason"])
+
+    def test_main_can_fail_when_coding_accuracy_uses_zero_llm_calls(self) -> None:
+        case = bench.BenchmarkCase(name="only", suite="local-small", turns=("prompt",), validate=lambda ctx: "pass")
+
+        def fake_batch(
+            repo_root: Path,
+            model: str,
+            verifier_model: str | None,
+            mode: str,
+            cases: list[bench.BenchmarkCase],
+            timeout: int,
+            *,
+            reconcile: str = "auto",
+            feature_profile: str = "baseline",
+            jobs: int = 1,
+        ) -> list[dict[str, object]]:
+            return [
+                {
+                    "case": case.name,
+                    "suite": case.suite,
+                    "benchmark_kind": "coding_accuracy",
+                    "status": "pass",
+                    "acceptable": ["pass"],
+                    "usage": {"llm_calls": 0, "total_tokens": 0},
+                    "latency_s": 0.0,
+                }
+            ]
+
+        with (
+            patch.object(bench, "selected_cases", return_value=[case]),
+            patch.object(bench, "installed_models", return_value=["gemma4:e4b"]),
+            patch.object(bench, "resolve_requested_model", side_effect=lambda requested, available: requested if requested in available else None),
+            patch.object(bench, "evaluate_case_batch", side_effect=fake_batch),
+            patch.object(bench, "print_table"),
+            patch.object(bench, "unload_model"),
+        ):
+            rc = bench.main(["--suite", "local-small", "--models", "gemma4:e4b", "--modes", "off", "--reconcile-modes", "off", "--require-llm-for-agent-benchmarks"])
+
+        self.assertEqual(rc, 1)
+
     def test_coding_accuracy_prompts_do_not_leak_synthetic_answers(self) -> None:
         cases = bench.selected_cases("local-full")
         violations = {case.name: bench.prompt_integrity_findings(case) for case in cases if bench.prompt_integrity_findings(case)}
@@ -141,6 +206,8 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
     def test_local_full_includes_generic_renamed_hidden_cases(self) -> None:
         cases = {case.name: case for case in bench.selected_cases("local-full")}
 
+        self.assertIn("bad_test_command_recovery", cases)
+        self.assertEqual(cases["bad_test_command_recovery"].benchmark_kind, "coding_accuracy")
         for name in (
             "renamed_simple_expression_hidden",
             "renamed_prefix_rotation_hidden",
@@ -270,6 +337,8 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(cases["list_files_and_git_status"].benchmark_kind, "tool_contract")
         self.assertEqual(cases["discover_validators_then_lint"].benchmark_kind, "tool_contract")
         self.assertEqual(cases["discover_validators_and_lint"].benchmark_kind, "tool_contract")
+        self.assertEqual(bench.benchmark_class_for_case(cases["large_repo_symbol_nav"]), "controller")
+        self.assertEqual(bench.benchmark_class_for_case(cases["single_file_literal_read"]), "controller")
         self.assertTrue(cases["forbidden_tool_efficiency"].requires_git)
         self.assertTrue(cases["staged_vs_worktree_diff"].requires_git)
 
@@ -287,6 +356,20 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertIn("public benchmark module name", findings)
         self.assertIn("exact git-diff answer", findings)
         self.assertIn("forced git tool path", findings)
+
+    def test_prompt_integrity_flags_expanded_task_slug_leaks(self) -> None:
+        case = bench.BenchmarkCase(
+            name="leaky",
+            suite="local-small",
+            turns=("Implement affine-cipher from the tests and keep the behavior exact.",),
+            benchmark_kind="coding_accuracy",
+            validate=lambda ctx: "pass",
+        )
+
+        findings = bench.prompt_integrity_findings(case)
+
+        self.assertIn("public benchmark task slug", findings)
+        self.assertIn("public benchmark module name", findings)
 
     def test_usage_totals_aggregates_prompt_profile(self) -> None:
         session = {
@@ -405,6 +488,56 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(bench.comparison_rows(current, baseline), [])
 
+    def test_comparison_rows_separate_benchmark_classes(self) -> None:
+        baseline = [
+            {
+                "suite": "local-small",
+                "model": "gemma4:e4b",
+                "verifier_model": None,
+                "debate": "off",
+                "reconcile": "auto",
+                "feature_profile": "all",
+                "benchmark_kind": "coding_accuracy",
+                "benchmark_class": "agent",
+                "case": "shared",
+                "status": "pass",
+                "usage": {"total_tokens": 100, "llm_calls": 4},
+                "latency_s": 1.0,
+            }
+        ]
+        current = [
+            {
+                "suite": "local-small",
+                "model": "gemma4:e4b",
+                "verifier_model": None,
+                "debate": "off",
+                "reconcile": "auto",
+                "feature_profile": "all",
+                "benchmark_kind": "tool_contract",
+                "benchmark_class": "controller",
+                "case": "shared",
+                "status": "pass",
+                "usage": {"total_tokens": 0, "llm_calls": 0},
+                "latency_s": 0.5,
+            }
+        ]
+
+        self.assertEqual(bench.comparison_rows(current, baseline), [])
+
+    def test_summarize_reports_agent_and_controller_classes_separately(self) -> None:
+        results = [
+            {"status": "pass", "benchmark_kind": "coding_accuracy", "benchmark_class": "agent", "usage": {"llm_calls": 2, "total_tokens": 10}},
+            {"status": "pass", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 0, "total_tokens": 0}},
+            {"status": "fail", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 1, "total_tokens": 3}},
+        ]
+
+        summary = bench.summarize(results)
+
+        self.assertEqual(summary["by_benchmark_class"]["agent"]["runs"], 1)
+        self.assertEqual(summary["by_benchmark_class"]["agent"]["total_tokens"], 10)
+        self.assertEqual(summary["by_benchmark_class"]["controller"]["runs"], 2)
+        self.assertEqual(summary["by_benchmark_class"]["controller"]["total_llm_calls"], 1)
+
     def test_issue_validator_passes_hidden_solution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -423,6 +556,30 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             (workspace / "docs" / "pricing.md").write_text("Call `cart_total(prices)` to compute a cart total.\n", encoding="utf-8")
 
             status = bench.validate_multi_file_refactor(self._context(workspace, {"events": []}))
+
+        self.assertEqual(status, "pass")
+
+    def test_bad_test_command_recovery_validator_requires_fallback_and_hidden_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            bench.prepare_bad_test_command_recovery(workspace)
+            (workspace / "src" / "inventory.py").write_text("def total_units(counts: list[int]) -> int:\n    return sum(counts)\n", encoding="utf-8")
+            session = {
+                "events": [
+                    {
+                        "type": "tool_result",
+                        "name": "run_test",
+                        "result": {
+                            "ok": True,
+                            "recovered": True,
+                            "original_command": "pytesst -q",
+                            "command": f"{sys.executable} -m unittest discover -s tests -v",
+                        },
+                    }
+                ]
+            }
+
+            status = bench.validate_bad_test_command_recovery(self._context(workspace, session))
 
         self.assertEqual(status, "pass")
 
@@ -486,10 +643,18 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             session_file: Path | None = None,
             extra_args: list[str] | None = None,
             extra_env: dict[str, str] | None = None,
+            require_llm_for_turn: bool = True,
             **_: object,
         ) -> subprocess.CompletedProcess[str]:
             self.assertIsNotNone(session_file)
-            calls.append({"prompt": prompt, "extra_args": list(extra_args or []), "extra_env": dict(extra_env or {})})
+            calls.append(
+                {
+                    "prompt": prompt,
+                    "extra_args": list(extra_args or []),
+                    "extra_env": dict(extra_env or {}),
+                    "require_llm_for_turn": require_llm_for_turn,
+                }
+            )
             session_file = Path(session_file or workspace / "scratch" / "session.json")
             session_file.parent.mkdir(parents=True, exist_ok=True)
             session_file.write_text(
@@ -533,6 +698,45 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertIn("GIT_CEILING_DIRECTORIES", calls[0]["extra_env"])
         self.assertNotIn("--resume", calls[0]["extra_args"])
         self.assertIn("--resume", calls[1]["extra_args"])
+        self.assertTrue(calls[0]["require_llm_for_turn"])
+
+    def test_evaluate_case_disables_require_llm_for_controller_benchmarks(self) -> None:
+        seen_require_llm: list[bool] = []
+
+        def fake_run_cli(
+            repo_root: Path,
+            workspace: Path,
+            model: str,
+            prompt: str,
+            *,
+            session_file: Path | None = None,
+            require_llm_for_turn: bool = True,
+            **_: object,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertIsNotNone(session_file)
+            seen_require_llm.append(require_llm_for_turn)
+            session_file = Path(session_file or workspace / "scratch" / "session.json")
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(json.dumps({"events": [{"type": "assistant", "content": "ok"}], "messages": []}), encoding="utf-8")
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+
+        case = bench.BenchmarkCase(
+            name="controller_case",
+            suite="local-small",
+            turns=("prompt",),
+            benchmark_kind="tool_contract",
+            validate=lambda ctx: "pass",
+        )
+
+        def fake_build_workspace(workspace: Path, *, init_git: bool = True) -> bool:
+            workspace.mkdir(parents=True, exist_ok=True)
+            return init_git
+
+        with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli", side_effect=fake_run_cli):
+            outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "off", case, timeout=30)
+
+        self.assertEqual(outcome["benchmark_class"], "controller")
+        self.assertEqual(seen_require_llm, [False])
 
     def test_evaluate_case_skips_git_required_case_when_nested_git_unavailable(self) -> None:
         case = bench.BenchmarkCase(

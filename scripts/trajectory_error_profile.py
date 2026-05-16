@@ -9,7 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-import pyarrow.parquet as pq
+try:
+    import pyarrow.parquet as pq
+except ModuleNotFoundError:
+    pq = None
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -268,6 +271,8 @@ def summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) -
 
 
 def _iter_projected_parquet_rows(paths: Iterable[Path], *, columns: list[str], max_rows: int | None = None) -> Iterable[dict[str, Any]]:
+    if pq is None:
+        raise RuntimeError("trajectory error profiling requires optional dependency pyarrow")
     emitted = 0
     for path in paths:
         parquet = pq.ParquetFile(path)

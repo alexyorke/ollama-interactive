@@ -4,8 +4,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ModuleNotFoundError:
+    pa = None
+    pq = None
 
 from scripts import trajectory_profile as profile
 
@@ -170,6 +174,8 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(portfolio[0]["seen_in_datasets"], 2)
 
     def test_iter_parquet_rows_honors_max_rows(self) -> None:
+        if pa is None or pq is None:
+            self.skipTest("pyarrow is not installed")
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sample.parquet"
             table = pa.table({"value": [1, 2, 3, 4]})

@@ -19,16 +19,33 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import threading
 import textwrap
 import time
-import tomllib
+import math
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from ollama_code.interrupts import OperationInterrupted
+from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_help
+
+try:
+    import tomllib  # type: ignore[attr-defined]
+    _TOMLDecodeError = tomllib.TOMLDecodeError
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+        _TOMLDecodeError = tomllib.TOMLDecodeError
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
+
+        class _TOMLDecodeError(ValueError):
+            pass
 
 ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
@@ -61,6 +78,51 @@ REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
 FTS_INDEX_VERSION = 1
 VERIFIED_FUNCTION_INDEX_VERSION = 1
+PYTHON_SDK_INDEX_VERSION = 1
+PYTHON_SDK_SAFE_IMPORT_MODULES = {
+    "array",
+    "base64",
+    "bisect",
+    "builtins",
+    "collections",
+    "csv",
+    "datetime",
+    "functools",
+    "glob",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "http.client",
+    "inspect",
+    "itertools",
+    "json",
+    "math",
+    "operator",
+    "os",
+    "pathlib",
+    "re",
+    "secrets",
+    "sqlite3",
+    "statistics",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "time",
+    "typing",
+    "urllib.parse",
+}
+PYTHON_SDK_SAFE_CLASS_METHOD_MODULES = {"collections", "datetime", "pathlib", "re", "subprocess", "tempfile"}
+PYTHON_SDK_PRIORITY_IMPORT_MODULES = (
+    "json",
+    "pathlib",
+    "tempfile",
+    "functools",
+    "collections",
+    "subprocess",
+    "itertools",
+    "math",
+    "re",
+)
 INDEX_MUTATING_TOOL_NAMES = {
     "write_file",
     "replace_symbol",
@@ -148,403 +210,6 @@ TODO_LIMIT = 20
 TODO_CONTENT_LIMIT = 180
 
 
-TOOL_DESCRIPTIONS = [
-    {
-        "name": "todo_read",
-        "arguments": {},
-        "description": "Read the in-session todo list for complex multi-step work.",
-    },
-    {
-        "name": "todo_write",
-        "arguments": {"items": "list of {content,status,id?}; status pending|in_progress|completed"},
-        "description": "Replace the in-session todo list. Keep at most one item in_progress.",
-    },
-    {
-        "name": "list_files",
-        "arguments": {"path": "relative path, default .", "max_depth": "int, default 4", "limit": "int, default 200"},
-        "description": "List files and directories under the workspace.",
-    },
-    {
-        "name": "read_file",
-        "arguments": {"path": "relative path", "start": "1-based start line, default 1", "end": "inclusive end line, default 200"},
-        "description": "Read a file with line numbers.",
-    },
-    {
-        "name": "search",
-        "arguments": {"query": "regex or plain text", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search text in the workspace.",
-    },
-    {
-        "name": "file_search",
-        "arguments": {"query": "filename/path terms", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search cached workspace file paths quickly without reading file contents.",
-    },
-    {
-        "name": "fd_search",
-        "arguments": {"query": "fd filename pattern", "path": "relative path, default .", "limit": "int, default 100", "kind": "any|file|dir, default any"},
-        "description": "Use fd/fdfind for fast repo-local file discovery when installed.",
-    },
-    {
-        "name": "file_index_refresh",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 50000"},
-        "description": "Refresh the persistent workspace file path index for fast future file searches.",
-    },
-    {
-        "name": "everything_search",
-        "arguments": {"query": "Everything search query", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Use the native Everything CLI es.exe when installed, constrained to the workspace path.",
-    },
-    {
-        "name": "search_symbols",
-        "arguments": {"query": "symbol name regex/text", "path": "relative path, default .", "limit": "int, default 50"},
-        "description": "Search code symbols by name without reading full files.",
-    },
-    {
-        "name": "code_outline",
-        "arguments": {"path": "file or directory, default .", "max_symbols": "int, default 120"},
-        "description": "Show compact code symbols and line ranges without function bodies.",
-    },
-    {
-        "name": "read_symbol",
-        "arguments": {"path": "code file", "symbol": "name or qualified name", "include_context": "lines around symbol, default 2"},
-        "description": "Read one code symbol body by AST/definition range.",
-    },
-    {
-        "name": "inspect_library_source",
-        "arguments": {"target": "Python import path like json.loads or json:loads", "context": "lines around source, default 3", "max_lines": "int, default 160", "include_disassembly": "bool, default false"},
-        "description": "Inspect installed Python library source/signature/doc; falls back to bytecode or builtin diagnostics when source is unavailable.",
-    },
-    {
-        "name": "repo_index_search",
-        "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
-        "description": "Search code with compact ranked snippets instead of whole files.",
-    },
-    {
-        "name": "fts_search",
-        "arguments": {"query": "terms or phrase", "path": "relative path, default .", "limit": "int, default 20", "refresh": "bool, default false"},
-        "description": "Search the local SQLite FTS5 cache across paths, symbols, headings, and snippets.",
-    },
-    {
-        "name": "fts_refresh",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 2000"},
-        "description": "Refresh the local SQLite FTS5 cache for fast lexical repository queries.",
-    },
-    {
-        "name": "indexed_search",
-        "arguments": {"query": "plain terms or regex-like text", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search cached line snippets from the persistent repo index without scanning every file.",
-    },
-    {
-        "name": "repo_index_refresh",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 1000"},
-        "description": "Refresh the persistent repo index for faster future symbol and text searches.",
-    },
-    {
-        "name": "semgrep_scan",
-        "arguments": {"pattern": "Semgrep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
-        "description": "Run Semgrep structurally when semgrep is installed; useful for syntax-aware code search.",
-    },
-    {
-        "name": "ast_search",
-        "arguments": {"pattern": "ast-grep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
-        "description": "Run ast-grep structural search when ast-grep/sg is installed.",
-    },
-    {
-        "name": "lsp_diagnostics",
-        "arguments": {"path": "file or directory, default .", "lang": "optional language", "timeout": "seconds, default 60"},
-        "description": "Run available language-server-style diagnostics without installing tools.",
-    },
-    {
-        "name": "lsp_definition",
-        "arguments": {"path": "file", "line": "1-based line", "column": "1-based column", "limit": "int, default 20"},
-        "description": "Find likely definitions for the symbol at a location using available local indexes.",
-    },
-    {
-        "name": "lsp_references",
-        "arguments": {"path": "file", "line": "1-based line", "column": "1-based column", "limit": "int, default 40"},
-        "description": "Find likely references for the symbol at a location using local search.",
-    },
-    {
-        "name": "context_pack",
-        "arguments": {"request": "user request or task text", "path": "relative path, default .", "limit": "int, default 8"},
-        "description": "Build compact ranked evidence from repo index, tests, imports, symbols, and git state.",
-    },
-    {
-        "name": "systems_lens",
-        "arguments": {"request": "user request or task text", "path": "relative path, default .", "evidence": "optional current evidence", "limit": "int, default 8"},
-        "description": "Frame complex work with boundary, state, scale, viewpoints, coupling, and validation checks.",
-    },
-    {
-        "name": "find_implementation_target",
-        "arguments": {"test_path": "optional test file", "path": "optional test/source path alias", "query": "optional symbol/query", "output": "optional failing test output/traceback", "limit": "int, default 12"},
-        "description": "Map tests or tracebacks to likely implementation files and symbols.",
-    },
-    {
-        "name": "diagnose_test_failure",
-        "arguments": {"output": "run_test output", "path": "relative path, default .", "limit": "int, default 12"},
-        "description": "Group failing tests by likely root cause with expected/actual and likely target files.",
-    },
-    {
-        "name": "test_spec_extract",
-        "arguments": {"test_path": "unittest file", "source_path": "optional source file", "limit": "int, default 20"},
-        "description": "Extract compact unittest examples from assertions and assertRaises for repair guidance.",
-    },
-    {
-        "name": "implementation_spec",
-        "arguments": {"source_path": "Python source file", "test_path": "optional unittest file", "limit": "int, default 40"},
-        "description": "Build a compact implementation spec from source signatures, stubs, static risks, and test examples.",
-    },
-    {
-        "name": "run_function_probe",
-        "arguments": {"module": "python module", "expressions": "list of Python expressions", "function": "optional function name", "timeout": "seconds, default 30"},
-        "description": "Run small Python expressions against a target module/function and return actual values/errors.",
-    },
-    {
-        "name": "call_graph",
-        "arguments": {"path": "file or directory", "symbol": "optional symbol", "limit": "int, default 40"},
-        "description": "Show static Python callers, callees, imports, and affected tests.",
-    },
-    {
-        "name": "contract_graph",
-        "arguments": {"path": "file or directory, default .", "symbol": "optional symbol", "limit": "int, default 40"},
-        "description": "Show compact function contracts, callers/callees, return-shape, and purity hints.",
-    },
-    {
-        "name": "verified_function_index",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 500"},
-        "description": "Build repo-local Python verified-function cards in the SQLite card index.",
-    },
-    {
-        "name": "verified_function_search",
-        "arguments": {"query": "behavior/function query", "signature": "optional signature terms", "examples": "optional examples text/list", "path": "relative path, default .", "limit": "int, default 10"},
-        "description": "Search repo-local verified/probable/unverified function cards; retrieval is not proof.",
-    },
-    {
-        "name": "verified_function_show",
-        "arguments": {"id": "card id or prefix"},
-        "description": "Show a verified-function card, evidence, source excerpt, and stale/fresh hash status.",
-    },
-    {
-        "name": "verify_function_contract",
-        "arguments": {"path": "Python source file", "symbol": "function/method symbol"},
-        "description": "Recheck one function card with purity, contract checks, doc probes, and focused tests.",
-    },
-    {
-        "name": "compose_verified_functions",
-        "arguments": {"goal": "desired behavior", "candidates": "list of card ids or search result ids"},
-        "description": "Plan glue-code composition from verified function cards without editing files.",
-    },
-    {
-        "name": "promote_verified_function",
-        "arguments": {"path": "Python source file", "symbol": "function/method symbol"},
-        "description": "Promote one Python function to verified only after static checks plus probes/tests pass.",
-    },
-    {
-        "name": "lint_typecheck",
-        "arguments": {"paths": "path or list of paths, default .", "command": "optional lint/type command", "timeout": "seconds, default 120"},
-        "description": "Run deterministic syntax/lint/type checks with exact file lines.",
-    },
-    {
-        "name": "discover_validators",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 12"},
-        "description": "Detect focused test/lint/typecheck commands for Python, JS/TS, Go, Rust, Java, and C/C++ projects.",
-    },
-    {
-        "name": "diagnose_dependency_error",
-        "arguments": {"output": "error output", "path": "relative path, default ."},
-        "description": "Classify missing dependency/import/command/path failures and suggest safe next steps.",
-    },
-    {
-        "name": "contract_check",
-        "arguments": {"changed_files": "list of changed source files", "changed_symbols": "optional list of symbols", "limit": "int, default 80"},
-        "description": "Check changed Python functions for arity, return-shape, async/yield, and annotation contract issues.",
-    },
-    {
-        "name": "select_tests",
-        "arguments": {"changed_files": "list of changed source files", "changed_symbols": "optional list of symbols", "limit": "int, default 8"},
-        "description": "Select focused test commands for changed files using imports, names, and symbols.",
-    },
-    {
-        "name": "replace_symbol",
-        "arguments": {"path": "code file", "symbol": "name or qualified name", "content": "replacement symbol source"},
-        "description": "Replace one function/class/method by symbol range. Python replacements must keep the full file syntactically valid.",
-    },
-    {
-        "name": "replace_symbols",
-        "arguments": {"path": "code file", "replacements": "list of {symbol, content} objects"},
-        "description": "Replace multiple functions/classes/methods in one syntactically checked edit.",
-    },
-    {
-        "name": "write_file",
-        "arguments": {"path": "relative path", "content": "full new file content"},
-        "description": "Create or fully replace a file.",
-    },
-    {
-        "name": "replace_in_file",
-        "arguments": {
-            "path": "relative path",
-            "old": "text to replace",
-            "new": "replacement text",
-            "replace_all": "bool, default false",
-            "match_whole_word": "bool, default false",
-        },
-        "description": "Replace text inside an existing file. Prefer unique snippets; use match_whole_word for standalone words.",
-    },
-    {
-        "name": "apply_structured_edit",
-        "arguments": {"operation": "JSON operation: rename_symbol, replace_symbol, add_import, move_symbol, delete_symbol"},
-        "description": "Apply a mechanical code edit from an intent JSON, then syntax-check and return diff.",
-    },
-    {
-        "name": "edit_intent",
-        "arguments": {"path": "relative path", "intent": "rename|replace_text|replace_symbol|replace_body|change_signature|add_import", "target": "old text/symbol", "replacement": "new text/source", "scope": "file|project, default file", "apply": "bool, default true"},
-        "description": "Route an edit intent to the safest low-level edit tool and avoid common symbol/text mixups.",
-    },
-    {
-        "name": "generate_tests_from_spec",
-        "arguments": {"target_symbol": "symbol under test", "behavior": "expected behavior", "test_path": "optional output test path", "apply": "bool, default false"},
-        "description": "Generate a compact pytest test patch from a spec; preview by default, apply only when requested.",
-    },
-    {
-        "name": "browser_smoke",
-        "arguments": {"url": "URL to open", "actions": "optional action list", "wait_for": "optional selector/text", "viewport": "desktop|mobile, default desktop", "screenshot": "bool, default false"},
-        "description": "Run a Playwright smoke check for browser/UI tasks when Playwright is installed.",
-    },
-    {
-        "name": "security_scan",
-        "arguments": {"path": "relative path, default .", "scanners": "auto or scanner list", "limit": "int, default 80", "timeout": "seconds, default 120"},
-        "description": "Run available local security/dependency scanners only when explicitly requested.",
-    },
-    {
-        "name": "mcp_list_tools",
-        "arguments": {"server": "optional configured MCP server name", "timeout": "seconds, default 15"},
-        "description": "List tools exposed by configured MCP servers.",
-    },
-    {
-        "name": "mcp_call",
-        "arguments": {"server": "configured MCP server name", "tool": "tool name", "arguments": "tool arguments object", "timeout": "seconds, default 30"},
-        "description": "Call a configured MCP server tool through a guarded stdio JSON-RPC request.",
-    },
-    {
-        "name": "run_shell",
-        "arguments": {"command": "shell command", "cwd": "relative path, default .", "timeout": "seconds, default 30"},
-        "description": "Run a shell command inside the workspace.",
-    },
-    {
-        "name": "run_test",
-        "arguments": {
-            "command": "optional test command override; defaults to the configured test command",
-            "cwd": "relative path, default .",
-            "timeout": "seconds, default 1200",
-        },
-        "description": "Run the project's test command inside the workspace.",
-    },
-    {
-        "name": "git_status",
-        "arguments": {"path": "optional relative path filter"},
-        "description": "Show git status for the workspace or a specific path.",
-    },
-    {
-        "name": "git_diff",
-        "arguments": {"path": "optional relative path filter", "cached": "bool, default false", "context": "int, default 3"},
-        "description": "Show a git diff for working tree or staged changes. Leave cached unset for working-tree changes; use cached=true only when the user explicitly asks for staged diff.",
-    },
-    {
-        "name": "git_commit",
-        "arguments": {"message": "commit message", "add_all": "bool, default true"},
-        "description": "Create a git commit for the current workspace changes.",
-    },
-    {
-        "name": "run_agent",
-        "arguments": {
-            "prompt": "subtask prompt for the child agent",
-            "model": "optional model override",
-            "approval_mode": "optional ask|auto|read-only",
-            "max_tool_rounds": "optional int, default inherited",
-        },
-        "description": "Start a nested agent for a scoped subtask and return its final answer.",
-    },
-]
-
-
-def format_tool_help(tool_names: Iterable[str] | None = None) -> str:
-    lines: list[str] = []
-    allowed = set(tool_names) if tool_names is not None else None
-    for tool in TOOL_DESCRIPTIONS:
-        if allowed is not None and tool["name"] not in allowed:
-            continue
-        arg_text = ", ".join(f"{key}: {value}" for key, value in tool["arguments"].items())
-        lines.append(f"- {tool['name']}({arg_text}) -> {tool['description']}")
-    return "\n".join(lines)
-
-
-def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
-    signatures = {
-        "todo_read": "todo_read()",
-        "todo_write": 'todo_write(items=[{"content":"inspect","status":"pending"}])',
-        "list_files": "list_files(path='.',depth=4,limit=200)",
-        "read_file": "read_file(path,start=1,end=200)",
-        "search": "search(query,path='.',limit=100)",
-        "file_search": "file_search(query,path='.',limit=100)",
-        "fd_search": "fd_search(query,path='.',limit=100,kind='any')",
-        "file_index_refresh": "file_index_refresh(path='.',limit=50000)",
-        "everything_search": "everything_search(query,path='.',limit=100)",
-        "search_symbols": "search_symbols(query,path='.',limit=50)",
-        "code_outline": "code_outline(path,max_symbols=120)",
-        "read_symbol": "read_symbol(path,symbol,context=2)",
-        "inspect_library_source": "inspect_library_source(target,context=3,max_lines=160,include_disassembly=false)",
-        "repo_index_search": "repo_index_search(query,path='.',limit=10)",
-        "fts_search": "fts_search(query,path='.',limit=20,refresh=false)",
-        "fts_refresh": "fts_refresh(path='.',limit=2000)",
-        "indexed_search": "indexed_search(query,path='.',limit=100)",
-        "repo_index_refresh": "repo_index_refresh(path='.',limit=1000)",
-        "semgrep_scan": "semgrep_scan(pattern,path='.',lang?,limit=50)",
-        "ast_search": "ast_search(pattern,path='.',lang?,limit=50)",
-        "lsp_diagnostics": "lsp_diagnostics(path='.',lang?,timeout=60)",
-        "lsp_definition": "lsp_definition(path,line,column,limit=20)",
-        "lsp_references": "lsp_references(path,line,column,limit=40)",
-        "context_pack": "context_pack(request,path='.',limit=8)",
-        "systems_lens": "systems_lens(request,path='.',evidence?,limit=8)",
-        "find_implementation_target": "find_implementation_target(test_path?/path?,query?,output?,limit=12)",
-        "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
-        "test_spec_extract": "test_spec_extract(test_path,source_path?,limit=20)",
-        "implementation_spec": "implementation_spec(source_path,test_path?,limit=40)",
-        "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
-        "call_graph": "call_graph(path,symbol?,limit=40)",
-        "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
-        "verified_function_index": "verified_function_index(path='.',limit=500)",
-        "verified_function_search": "verified_function_search(query,signature?,examples?,path='.',limit=10)",
-        "verified_function_show": "verified_function_show(id)",
-        "verify_function_contract": "verify_function_contract(path,symbol)",
-        "compose_verified_functions": "compose_verified_functions(goal,candidates)",
-        "promote_verified_function": "promote_verified_function(path,symbol)",
-        "lint_typecheck": "lint_typecheck(paths='.',command?,timeout=120)",
-        "discover_validators": "discover_validators(path='.',limit=12)",
-        "diagnose_dependency_error": "diagnose_dependency_error(output,path='.')",
-        "contract_check": "contract_check(changed_files,changed_symbols?,limit=80)",
-        "select_tests": "select_tests(changed_files,changed_symbols?,limit=8)",
-        "replace_symbol": "replace_symbol(path,symbol,content)",
-        "replace_symbols": 'replace_symbols(path,replacements=[{"symbol":"f","content":"def f():\\n    return ..."}])',
-        "write_file": "write_file(path,content)",
-        "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
-        "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol|replace_function_body|change_signature|...","path":"a.py"})',
-        "edit_intent": "edit_intent(path,intent=rename|replace_text|replace_symbol|replace_body|change_signature|add_import,target?,replacement?,scope='file',apply=true)",
-        "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
-        "browser_smoke": "browser_smoke(url,actions=[],wait_for?,viewport='desktop',screenshot=false)",
-        "security_scan": "security_scan(path='.',scanners='auto',limit=80)",
-        "mcp_list_tools": "mcp_list_tools(server?,timeout=15)",
-        "mcp_call": "mcp_call(server,tool,arguments={},timeout=30)",
-        "run_shell": "run_shell(command,cwd='.',timeout=30)",
-        "run_test": "run_test(command?,cwd='.',timeout=1200)",
-        "git_status": "git_status(path?)",
-        "git_diff": "git_diff(path?,cached=false,context=3)",
-        "git_commit": "git_commit(message,add_all=true)",
-        "run_agent": "run_agent(prompt,model?,approval?,rounds?)",
-    }
-    allowed = set(tool_names) if tool_names is not None else None
-    return "\n".join(signatures[tool["name"]] for tool in TOOL_DESCRIPTIONS if allowed is None or tool["name"] in allowed)
-
-
 class ToolExecutor:
     def __init__(
         self,
@@ -555,6 +220,7 @@ class ToolExecutor:
         agent_runner: AgentRunner | None = None,
         test_command: str | None = None,
         default_tools_enabled: bool = True,
+        enabled_tools: Iterable[str] | None = None,
         disabled_tools: Iterable[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         browser_enabled: bool = True,
@@ -567,6 +233,7 @@ class ToolExecutor:
         self.agent_runner = agent_runner
         self.default_test_command = test_command.strip() if isinstance(test_command, str) and test_command.strip() else None
         self.default_tools_enabled = bool(default_tools_enabled)
+        self.enabled_tools = {str(name).strip() for name in (enabled_tools or []) if str(name).strip()}
         self.disabled_tools = {str(name).strip() for name in (disabled_tools or []) if str(name).strip()}
         self.mcp_servers = dict(mcp_servers or {})
         self.browser_enabled = bool(browser_enabled)
@@ -628,6 +295,8 @@ class ToolExecutor:
         clean = str(name or "").strip()
         if not clean:
             return False
+        if self.enabled_tools and clean not in self.enabled_tools:
+            return False
         if clean in self.disabled_tools:
             return False
         if clean.startswith("mcp.") and ("mcp_call" in self.disabled_tools or "mcp" in self.disabled_tools):
@@ -672,6 +341,8 @@ class ToolExecutor:
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
             "inspect_library_source": self.inspect_library_source,
+            "python_sdk_refresh": self.python_sdk_refresh,
+            "python_sdk_search": self.python_sdk_search,
             "repo_index_search": self.repo_index_search,
             "fts_search": self.fts_search,
             "fts_refresh": self.fts_refresh,
@@ -717,6 +388,8 @@ class ToolExecutor:
             "run_test": self.run_test,
             "git_status": self.git_status,
             "git_diff": self.git_diff,
+            "git_branch": self.git_branch,
+            "git_log": self.git_log,
             "git_commit": self.git_commit,
         }
         handler = handlers.get(name)
@@ -877,7 +550,8 @@ class ToolExecutor:
         return candidate
 
     def relative_label(self, path: Path) -> str:
-        return path.resolve().relative_to(self.workspace_root).as_posix() or "."
+        candidate = path if path.is_absolute() else self.workspace_root / path
+        return candidate.resolve(strict=False).relative_to(self.workspace_root).as_posix() or "."
 
     def _confirm(self, prompt: str) -> bool:
         while True:
@@ -1012,12 +686,65 @@ class ToolExecutor:
                     raise OperationInterrupted("Interrupted by user.")
                 continue
 
-    def _run_git(self, args: list[str], *, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+    def _path_cwd(self, path: Path | None) -> Path:
+        if path is None:
+            return self.workspace_root
+        resolved = path.resolve(strict=False)
+        if resolved.exists() and resolved.is_file():
+            return resolved.parent
+        if resolved.exists() and resolved.is_dir():
+            return resolved
+        return resolved.parent if resolved.suffix else resolved
+
+    def _git_root_for_path(self, path: Path | None = None) -> Path | None:
+        starts: list[Path] = []
+        if path is not None:
+            starts.append(self._path_cwd(path))
+        starts.append(self.workspace_root)
+        seen: set[Path] = set()
+        for start in starts:
+            current = start.resolve(strict=False)
+            for candidate in (current, *current.parents):
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                if (candidate / ".git").exists():
+                    return candidate
+        if path is None:
+            nested = self._nested_git_roots()
+            if len(nested) == 1:
+                return nested[0]
+        return None
+
+    def _nested_git_roots(self, *, max_depth: int = 3, limit: int = 4) -> list[Path]:
+        roots: list[Path] = []
+        for root, dirs, files in os.walk(self.workspace_root):
+            root_path = Path(root)
+            try:
+                depth = len(root_path.relative_to(self.workspace_root).parts)
+            except ValueError:
+                depth = 0
+            if ".git" in dirs or ".git" in files:
+                roots.append(root_path.resolve(strict=False))
+                dirs[:] = []
+                if len(roots) >= limit:
+                    break
+                continue
+            dirs[:] = sorted(
+                directory
+                for directory in dirs
+                if directory == ".git" or (not directory.startswith(".") and not self._generated_dir_name(directory))
+            )
+            if depth >= max_depth:
+                dirs[:] = []
+        return roots
+
+    def _run_git(self, args: list[str], *, timeout: int = 30, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         if shutil.which("git") is None:
             raise RuntimeError("git is not installed.")
         return self._run_process(
             ["git", *args],
-            cwd=self.workspace_root,
+            cwd=self._path_cwd(cwd),
             timeout=timeout,
         )
 
@@ -1037,15 +764,9 @@ class ToolExecutor:
         return any(self._generated_dir_name(part) for part in parts)
 
     def _repo_files_from_git(self, base: Path, *, limit: int, suffixes: set[str] | None = None) -> list[Path] | None:
-        try:
-            top_level = self._run_git(["rev-parse", "--show-toplevel"], timeout=10)
-        except OperationInterrupted:
-            raise
-        except Exception:
+        git_root = self._git_root_for_path(base)
+        if git_root is None:
             return None
-        if top_level.returncode != 0 or not top_level.stdout.strip():
-            return None
-        git_root = Path(top_level.stdout.strip()).resolve(strict=False)
         try:
             pathspec = base.resolve(strict=False).relative_to(git_root).as_posix()
         except ValueError:
@@ -1053,7 +774,7 @@ class ToolExecutor:
         if not pathspec:
             pathspec = "."
         try:
-            completed = self._run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", pathspec], timeout=20)
+            completed = self._run_git(["ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", pathspec], timeout=20, cwd=git_root)
         except OperationInterrupted:
             raise
         except Exception:
@@ -1131,24 +852,35 @@ class ToolExecutor:
             return git_files
         return self._walk_repo_files(base, limit=limit, suffixes=suffixes)
 
-    def _ensure_git_repo(self) -> tuple[bool, str | None]:
-        probe = self._run_git(["rev-parse", "--is-inside-work-tree"])
+    def _ensure_git_repo(self, path: Path | None = None) -> tuple[bool, str | None]:
+        if self._git_root_for_path(path) is not None:
+            return True, None
+        try:
+            probe = self._run_git(["rev-parse", "--is-inside-work-tree"], cwd=path)
+        except RuntimeError as exc:
+            return False, str(exc)
         if probe.returncode == 0 and probe.stdout.strip() == "true":
             return True, None
         return False, self._collect_process_output(probe)
 
     def _git_dirty_paths(self) -> set[str]:
-        ok, _ = self._ensure_git_repo()
+        repo_root = self._git_root_for_path()
+        ok, _ = self._ensure_git_repo(repo_root)
         if not ok:
             return set()
         paths: set[str] = set()
         commands = [
-            ["diff", "--name-only", "-z"],
-            ["diff", "--cached", "--name-only", "-z"],
-            ["ls-files", "--others", "--exclude-standard", "-z"],
+            (["diff", "--name-only", "-z"], 120),
+            (["diff", "--cached", "--name-only", "-z"], 120),
+            (["ls-files", "--others", "--exclude-standard", "-z"], 60),
         ]
-        for args in commands:
-            completed = self._run_git(args)
+        for args, timeout in commands:
+            try:
+                completed = self._run_git(args, cwd=repo_root, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # repo-level dirty-path scans can be slow on large workspaces; skip
+                # this command on timeout so startup can still continue.
+                continue
             if completed.returncode != 0:
                 continue
             for raw_path in completed.stdout.split("\0"):
@@ -1303,6 +1035,7 @@ class ToolExecutor:
             "name": file_path.name,
             "suffix": file_path.suffix.lower(),
             "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
             "size": int(stat.st_size),
             "terms": self._extract_index_terms(rel.replace("/", " "), limit=80),
         }
@@ -1323,6 +1056,7 @@ class ToolExecutor:
             if not (
                 isinstance(cached, dict)
                 and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+                and cached.get("ctime_ns") == int(stat.st_ctime_ns)
                 and cached.get("size") == int(stat.st_size)
             ):
                 cached = self._file_index_record(file_path)
@@ -1532,6 +1266,13 @@ class ToolExecutor:
         signature = " ".join(collected)
         return signature[:180] + ("..." if len(signature) > 180 else "")
 
+    def _python_doc_summary(self, node: ast.AST) -> str:
+        doc = ast.get_docstring(node)
+        if not doc:
+            return ""
+        lines = [line.strip() for line in doc.splitlines() if line.strip()]
+        return lines[0][:120] if lines else ""
+
     def _python_symbols(self, target: Path, text: str) -> list[dict[str, Any]]:
         lines = text.splitlines()
         try:
@@ -1553,7 +1294,7 @@ class ToolExecutor:
                             "start": int(getattr(child, "lineno", 1)),
                             "end": int(getattr(child, "end_lineno", getattr(child, "lineno", 1))),
                             "signature": self._python_signature(lines, int(getattr(child, "lineno", 1))),
-                            "doc": (ast.get_docstring(child) or "").strip().splitlines()[0][:120] if ast.get_docstring(child) else "",
+                            "doc": self._python_doc_summary(child),
                         }
                     )
                     visit(child, [*stack, child.name])
@@ -1619,6 +1360,9 @@ class ToolExecutor:
         symbols = self._generic_symbols(target, text)
         return symbols, text, None
 
+    def _adaptive_index_record_limit(self, requested: int, *, minimum: int = 2000, multiplier: int = 250, maximum: int = 50_000) -> int:
+        return min(maximum, max(minimum, max(1, int(requested)) * multiplier))
+
     def search_symbols(self, query: str, path: str = ".", limit: int = 50) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
@@ -1634,22 +1378,50 @@ class ToolExecutor:
             def matcher(text: str) -> bool:
                 return lowered in text.lower()
 
-        matches: list[str] = []
-        for file_path in self._iter_code_files(base):
-            symbols, _, _ = self._code_symbols(file_path)
-            for symbol in symbols:
+        literal_query = str(query or "").strip().lower()
+        ranked: list[tuple[int, str, int, str]] = []
+        records = self._indexed_code_records(base, limit=self._adaptive_index_record_limit(limit))
+        for record in records:
+            rel = str(record.get("path") or "")
+            for symbol in record.get("symbols", []):
+                if not isinstance(symbol, dict):
+                    continue
                 haystack = " ".join(
                     str(symbol.get(key, ""))
                     for key in ("name", "qualname", "kind", "signature")
                 )
                 if not matcher(haystack):
                     continue
-                matches.append(
-                    f"{self.relative_label(file_path)}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']} {symbol['signature']}"
+                name = str(symbol.get("name", "")).lower()
+                qualname = str(symbol.get("qualname", "")).lower()
+                signature = str(symbol.get("signature", "")).lower()
+                score = 0
+                if literal_query:
+                    if literal_query == name or literal_query == qualname:
+                        score += 100
+                    if literal_query in name or literal_query in qualname:
+                        score += 60
+                    if literal_query in signature:
+                        score += 20
+                    if literal_query in rel.lower():
+                        score += 8
+                ranked.append(
+                    (
+                        score,
+                        rel,
+                        int(symbol.get("start") or 1),
+                        f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']} {symbol['signature']}",
+                    )
                 )
-                if len(matches) >= limit:
-                    return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches)}
-        return {"ok": True, "tool": "search_symbols", "path": self.relative_label(base), "count": len(matches), "output": "\n".join(matches) if matches else "(no symbols found)"}
+        ranked.sort(key=lambda item: (-item[0], item[1], item[2], item[3]))
+        matches = [line for _, _, _, line in ranked[: max(1, int(limit))]]
+        return {
+            "ok": True,
+            "tool": "search_symbols",
+            "path": self.relative_label(base),
+            "count": len(matches),
+            "output": "\n".join(matches) if matches else "(no symbols found)",
+        }
 
     def code_outline(self, path: str = ".", max_symbols: int = 120) -> dict[str, Any]:
         self._check_interrupted()
@@ -1932,6 +1704,771 @@ class ToolExecutor:
     def _fts_cache_path(self) -> Path:
         return self.workspace_root / ".ollama-code" / "index" / "repo_fts.sqlite"
 
+    def _python_sdk_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "python_sdk.sqlite"
+
+    def _initialize_python_sdk_connection(self, conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS python_sdk_entries("
+            "id TEXT PRIMARY KEY,"
+            "kind TEXT NOT NULL,"
+            "module TEXT NOT NULL,"
+            "qualname TEXT NOT NULL,"
+            "signature TEXT NOT NULL,"
+            "doc TEXT NOT NULL,"
+            "source_path TEXT NOT NULL,"
+            "line INTEGER NOT NULL,"
+            "text TEXT NOT NULL,"
+            "embedding_model TEXT,"
+            "embedding_json TEXT)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS python_sdk_fts USING fts5("
+            "id UNINDEXED, module, qualname, signature, doc, text)"
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version', ?)", (str(PYTHON_SDK_INDEX_VERSION),))
+        conn.commit()
+
+    def _connect_python_sdk(self) -> sqlite3.Connection:
+        cache_path = self._python_sdk_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(cache_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        self._initialize_python_sdk_connection(conn)
+        return conn
+
+    def _stdlib_root(self) -> Path:
+        return Path(sysconfig.get_path("stdlib") or Path(sys.executable).parent).resolve(strict=False)
+
+    def _stdlib_module_name(self, root: Path, path: Path) -> str | None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return None
+        parts = list(relative.with_suffix("").parts)
+        if not parts:
+            return None
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts:
+            return None
+        if any(part in {"test", "tests", "idle_test", "__pycache__", "site-packages", "dist-packages"} for part in parts):
+            return None
+        if any(part.startswith("_test") or part.endswith("_test") for part in parts):
+            return None
+        if not all(re.fullmatch(r"[A-Za-z_]\w*", part) for part in parts):
+            return None
+        return ".".join(parts)
+
+    def _iter_python_sdk_files(self, *, limit: int) -> list[Path]:
+        root = self._stdlib_root()
+        files: list[Path] = []
+        for file_path in sorted(root.rglob("*.py")):
+            self._check_interrupted()
+            if len(files) >= limit:
+                break
+            if self._stdlib_module_name(root, file_path) is None:
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 768_000:
+                continue
+            files.append(file_path)
+        return files
+
+    def _doc_summary(self, text: str | None, *, limit: int = 420) -> str:
+        doc = inspect.cleandoc(text or "")
+        if not doc:
+            return ""
+        paragraph = re.split(r"\n\s*\n", doc, maxsplit=1)[0].replace("\n", " ").strip()
+        return self._truncate_text(paragraph, limit=limit)
+
+    def _ast_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+        if isinstance(node, ast.ClassDef):
+            return f"class {node.name}"
+        args = node.args
+        parts: list[str] = []
+        positional = list(args.posonlyargs) + list(args.args)
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        for arg, default in zip(positional, defaults):
+            parts.append(arg.arg + ("=..." if default is not None else ""))
+        if args.vararg is not None:
+            parts.append("*" + args.vararg.arg)
+        elif args.kwonlyargs:
+            parts.append("*")
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+            parts.append(arg.arg + ("=..." if default is not None else ""))
+        if args.kwarg is not None:
+            parts.append("**" + args.kwarg.arg)
+        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        return f"{prefix} {node.name}({', '.join(parts)})"
+
+    def _python_sdk_entry(
+        self,
+        *,
+        kind: str,
+        module: str,
+        qualname: str,
+        signature: str,
+        doc: str,
+        source_path: str,
+        line: int,
+    ) -> dict[str, Any]:
+        text = f"{kind} {module} {qualname} {signature} {doc}".strip()
+        entry_id = hashlib.sha1(f"{kind}\0{module}\0{qualname}".encode("utf-8", errors="replace")).hexdigest()[:20]
+        return {
+            "id": entry_id,
+            "kind": kind,
+            "module": module,
+            "qualname": qualname,
+            "signature": signature,
+            "doc": doc,
+            "source_path": source_path,
+            "line": int(line or 1),
+            "text": text,
+        }
+
+    def _python_sdk_ast_entries(self, *, limit: int) -> list[dict[str, Any]]:
+        root = self._stdlib_root()
+        entries: list[dict[str, Any]] = []
+        for file_path in self._iter_python_sdk_files(limit=limit):
+            if len(entries) >= limit:
+                break
+            module = self._stdlib_module_name(root, file_path)
+            if module is None:
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(text, filename=str(file_path))
+            except (OSError, SyntaxError):
+                continue
+            doc = self._doc_summary(ast.get_docstring(tree))
+            source_path = str(file_path)
+            if doc:
+                entries.append(
+                    self._python_sdk_entry(
+                        kind="module",
+                        module=module,
+                        qualname=module,
+                        signature=f"module {module}",
+                        doc=doc,
+                        source_path=source_path,
+                        line=1,
+                    )
+                )
+            for node in tree.body:
+                self._check_interrupted()
+                if len(entries) >= limit:
+                    break
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name.startswith("_"):
+                        continue
+                    qualname = f"{module}.{node.name}"
+                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                    entries.append(
+                        self._python_sdk_entry(
+                            kind=kind,
+                            module=module,
+                            qualname=qualname,
+                            signature=self._ast_signature(node),
+                            doc=self._doc_summary(ast.get_docstring(node)),
+                            source_path=source_path,
+                            line=getattr(node, "lineno", 1),
+                        )
+                    )
+                    if isinstance(node, ast.ClassDef):
+                        for child in node.body:
+                            if len(entries) >= limit:
+                                break
+                            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                continue
+                            if child.name.startswith("_"):
+                                continue
+                            entries.append(
+                                self._python_sdk_entry(
+                                    kind="method",
+                                    module=module,
+                                    qualname=f"{module}.{node.name}.{child.name}",
+                                    signature=self._ast_signature(child),
+                                    doc=self._doc_summary(ast.get_docstring(child)),
+                                    source_path=source_path,
+                                    line=getattr(child, "lineno", 1),
+                                )
+                            )
+        return entries
+
+    def _python_sdk_imported_entries(self, *, remaining: int, existing_ids: set[str]) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        module_names = list(PYTHON_SDK_PRIORITY_IMPORT_MODULES)
+        module_names.extend(name for name in sorted(PYTHON_SDK_SAFE_IMPORT_MODULES) if name not in module_names)
+        for module_name in module_names:
+            if len(entries) >= remaining:
+                break
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            module_doc = self._doc_summary(inspect.getdoc(module))
+            module_entry = self._python_sdk_entry(
+                kind="module",
+                module=module_name,
+                qualname=module_name,
+                signature=f"module {module_name}",
+                doc=module_doc,
+                source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                line=1,
+            )
+            if module_entry["id"] not in existing_ids:
+                entries.append(module_entry)
+                existing_ids.add(module_entry["id"])
+            for name, value in inspect.getmembers(module):
+                if len(entries) >= remaining:
+                    break
+                if name.startswith("_"):
+                    continue
+                if inspect.isclass(value):
+                    kind = "class"
+                    signature = f"class {name}"
+                elif inspect.isbuiltin(value) or inspect.isfunction(value):
+                    kind = "function"
+                    try:
+                        signature = f"{name}{inspect.signature(value)}"
+                    except (TypeError, ValueError):
+                        signature = name
+                else:
+                    continue
+                qualname = f"{module_name}.{name}"
+                entry = self._python_sdk_entry(
+                    kind=kind,
+                    module=module_name,
+                    qualname=qualname,
+                    signature=signature,
+                    doc=self._doc_summary(inspect.getdoc(value)),
+                    source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                    line=1,
+                )
+                if entry["id"] in existing_ids:
+                    continue
+                entries.append(entry)
+                existing_ids.add(entry["id"])
+                if kind == "class" and module_name in PYTHON_SDK_SAFE_CLASS_METHOD_MODULES:
+                    for method_name, method_value in inspect.getmembers(value):
+                        if len(entries) >= remaining:
+                            break
+                        if method_name.startswith("_"):
+                            continue
+                        if not (inspect.isfunction(method_value) or inspect.ismethod(method_value) or inspect.isbuiltin(method_value) or inspect.ismethoddescriptor(method_value)):
+                            continue
+                        try:
+                            method_signature = f"{method_name}{inspect.signature(method_value)}"
+                        except (TypeError, ValueError):
+                            method_signature = method_name
+                        method_entry = self._python_sdk_entry(
+                            kind="method",
+                            module=module_name,
+                            qualname=f"{module_name}.{name}.{method_name}",
+                            signature=method_signature,
+                            doc=self._doc_summary(inspect.getdoc(method_value)),
+                            source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                            line=1,
+                        )
+                        if method_entry["id"] in existing_ids:
+                            continue
+                        entries.append(method_entry)
+                        existing_ids.add(method_entry["id"])
+        return entries
+
+    def _python_sdk_entries(self, *, limit: int) -> list[dict[str, Any]]:
+        entries = self._python_sdk_imported_entries(remaining=min(limit, 1200), existing_ids=set())
+        existing_ids = {str(entry["id"]) for entry in entries}
+        for entry in self._python_sdk_ast_entries(limit=limit):
+            if len(entries) >= limit:
+                break
+            if str(entry["id"]) in existing_ids:
+                continue
+            entries.append(entry)
+            existing_ids.add(str(entry["id"]))
+        if len(entries) < limit:
+            entries.extend(self._python_sdk_imported_entries(remaining=limit - len(entries), existing_ids=existing_ids))
+        return entries[:limit]
+
+    def _normalize_sdk_embedding_model(self, embedding_model: str | None) -> str | None:
+        raw = str(embedding_model or "").strip()
+        if not raw:
+            raw = os.environ.get("OLLAMA_CODE_SDK_EMBED_MODEL", "").strip()
+        if raw.lower() in {"", "0", "false", "none", "off"}:
+            return None
+        return raw
+
+    def _normalize_ollama_host(self, embedding_host: str | None) -> str:
+        raw = str(embedding_host or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+        if not re.match(r"^https?://", raw):
+            raw = "http://" + raw
+        return raw.rstrip("/")
+
+    def _ollama_embed_texts(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        host: str | None = None,
+        timeout: int = 120,
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        endpoint = self._normalize_ollama_host(host) + "/api/embed"
+        payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        raw_embeddings = data.get("embeddings")
+        if isinstance(raw_embeddings, list):
+            return [[float(value) for value in vector] for vector in raw_embeddings if isinstance(vector, list)]
+        raw_embedding = data.get("embedding")
+        if isinstance(raw_embedding, list) and len(texts) == 1:
+            return [[float(value) for value in raw_embedding]]
+        raise ValueError("Ollama embed response did not include embeddings.")
+
+    def _embed_python_sdk_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+    ) -> tuple[int, str | None]:
+        embedded = 0
+        batch_size = 16
+        for offset in range(0, len(entries), batch_size):
+            self._check_interrupted()
+            batch = entries[offset : offset + batch_size]
+            try:
+                vectors = self._ollama_embed_texts(
+                    [str(entry.get("text", ""))[:4000] for entry in batch],
+                    model=model,
+                    host=host,
+                    timeout=timeout,
+                )
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                return embedded, str(exc)
+            for entry, vector in zip(batch, vectors):
+                if not vector:
+                    continue
+                entry["embedding_model"] = model
+                entry["embedding_json"] = json.dumps(vector, separators=(",", ":"))
+                embedded += 1
+        return embedded, None
+
+    def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(a * a for a in left))
+        right_norm = math.sqrt(sum(b * b for b in right))
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    def python_sdk_refresh(
+        self,
+        limit: int = 5000,
+        embedding_model: str | None = None,
+        embedding_host: str | None = None,
+        embedding_timeout: int = 120,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        try:
+            conn = self._connect_python_sdk()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("python_sdk_refresh", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        limit_value = max(1, int(limit))
+        existing_embeddings: dict[str, tuple[str, str]] = {}
+        try:
+            for row in conn.execute(
+                "SELECT id,embedding_model,embedding_json FROM python_sdk_entries "
+                "WHERE embedding_model IS NOT NULL AND embedding_json IS NOT NULL"
+            ).fetchall():
+                existing_embeddings[str(row[0])] = (str(row[1] or ""), str(row[2] or ""))
+        except sqlite3.Error:
+            existing_embeddings = {}
+        entries = self._python_sdk_entries(limit=limit_value)
+        model = self._normalize_sdk_embedding_model(embedding_model)
+        cached_embeddings = 0
+        if not model and existing_embeddings:
+            for entry in entries:
+                cached = existing_embeddings.get(str(entry.get("id") or ""))
+                if not cached:
+                    continue
+                cached_model, cached_json = cached
+                if cached_model and cached_json:
+                    entry["embedding_model"] = cached_model
+                    entry["embedding_json"] = cached_json
+                    cached_embeddings += 1
+        embedded = 0
+        embedding_error = None
+        if model:
+            embedded, embedding_error = self._embed_python_sdk_entries(
+                entries,
+                model=model,
+                host=embedding_host,
+                timeout=max(1, int(embedding_timeout)),
+            )
+        try:
+            conn.execute("DELETE FROM python_sdk_entries")
+            conn.execute("DELETE FROM python_sdk_fts")
+            for entry in entries:
+                conn.execute(
+                    "INSERT OR REPLACE INTO python_sdk_entries("
+                    "id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        entry["id"],
+                        entry["kind"],
+                        entry["module"],
+                        entry["qualname"],
+                        entry["signature"],
+                        entry["doc"],
+                        entry["source_path"],
+                        int(entry["line"]),
+                        entry["text"],
+                        entry.get("embedding_model"),
+                        entry.get("embedding_json"),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO python_sdk_fts(id,module,qualname,signature,doc,text) VALUES(?,?,?,?,?,?)",
+                    (entry["id"], entry["module"], entry["qualname"], entry["signature"], entry["doc"], entry["text"]),
+                )
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('stdlib_root', ?)", (str(self._stdlib_root()),))
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('python_version', ?)", (sys.version.split()[0],))
+            if model:
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('embedding_model', ?)", (model,))
+            conn.commit()
+        finally:
+            conn.close()
+        summary = f"Indexed {len(entries)} Python SDK item(s) from {self._stdlib_root()}."
+        if cached_embeddings:
+            summary += f" cached_embeddings={cached_embeddings}."
+        if model:
+            summary += f" embeddings={embedded} model={model}."
+        if embedding_error:
+            summary += f" embedding_error={self._truncate_text(embedding_error, limit=160)}"
+        return {
+            "ok": True,
+            "tool": "python_sdk_refresh",
+            "items": len(entries),
+            "embedded": embedded,
+            "cached_embeddings": cached_embeddings,
+            "embedding_model": model,
+            "embedding_error": embedding_error,
+            "cache": self.relative_label(self._python_sdk_cache_path()),
+            "stdlib_root": str(self._stdlib_root()),
+            "output": summary,
+            "summary": summary,
+        }
+
+    def _python_sdk_lexical_rows(self, conn: sqlite3.Connection, query: str, *, limit: int) -> list[dict[str, Any]]:
+        fts_query = self._safe_fts_query(query)
+        if not fts_query:
+            return []
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        try:
+            records = conn.execute(
+                "SELECT e.id,e.kind,e.module,e.qualname,e.signature,e.doc,e.source_path,e.line,e.text,e.embedding_model,e.embedding_json,bm25(python_sdk_fts) AS rank "
+                "FROM python_sdk_fts JOIN python_sdk_entries e ON e.id=python_sdk_fts.id "
+                "WHERE python_sdk_fts MATCH ? ORDER BY rank LIMIT ?",
+                (fts_query, max(1, int(limit))),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            terms = self._extract_index_terms(query, limit=8)
+            if not terms:
+                return []
+            like = "%" + "%".join(terms) + "%"
+            records = conn.execute(
+                "SELECT id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json,0 AS rank "
+                "FROM python_sdk_entries WHERE text LIKE ? OR qualname LIKE ? ORDER BY qualname LIMIT ?",
+                (like, like, max(1, int(limit))),
+            ).fetchall()
+        rows = [
+            {
+                "id": row[0],
+                "kind": row[1],
+                "module": row[2],
+                "qualname": row[3],
+                "signature": row[4],
+                "doc": row[5],
+                "source_path": row[6],
+                "line": row[7],
+                "text": row[8],
+                "embedding_model": row[9],
+                "embedding_json": row[10],
+                "rank": float(row[11] or 0.0),
+                "source": "lexical",
+            }
+            for row in records
+        ]
+        for row in rows:
+            qualname = str(row.get("qualname") or "").lower()
+            module = str(row.get("module") or "").lower()
+            signature = str(row.get("signature") or "").lower()
+            doc = str(row.get("doc") or "").lower()
+            haystack = str(row.get("text") or "").lower()
+            score = 0.0
+            for term in terms:
+                if term == module or term in qualname:
+                    score += 10
+                if term in signature:
+                    score += 4
+                if term in doc:
+                    score += 2
+                elif term in haystack:
+                    score += 1
+            row["lexical_score"] = score
+        return sorted(rows, key=lambda item: (-float(item.get("lexical_score", 0.0)), float(item.get("rank", 0.0)), str(item.get("qualname", ""))))[: max(1, int(limit))]
+
+    def _python_sdk_expanded_query(self, query: str) -> str:
+        lowered = query.lower()
+        additions: list[str] = []
+        if "json" in lowered and re.search(r"\b(?:parse|deserialize|string|load|loads)\b", lowered):
+            additions.append("json loads load deserialize")
+        if re.search(r"\b(?:file|files|path|paths)\b", lowered) and re.search(r"\b(?:wildcard|glob|pattern|recursive|recursively)\b", lowered):
+            additions.append("pathlib Path glob rglob")
+        if "temporary" in lowered and "directory" in lowered:
+            additions.append("tempfile TemporaryDirectory")
+        if re.search(r"\b(?:memoize|memoise|cache|least recently used|lru)\b", lowered):
+            additions.append("functools lru_cache cache")
+        if re.search(r"\b(?:count|frequency|frequencies|tally)\b", lowered):
+            additions.append("collections Counter")
+        if "subprocess" in lowered or (re.search(r"\b(?:run|execute)\b", lowered) and "command" in lowered):
+            additions.append("subprocess run capture_output CompletedProcess")
+        if not additions:
+            return query
+        return query + " " + " ".join(additions)
+
+    def _python_sdk_embedding_rows(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        try:
+            query_vector = self._ollama_embed_texts([query], model=model, host=host, timeout=timeout)[0]
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError, IndexError) as exc:
+            return [], str(exc)
+        records = conn.execute(
+            "SELECT id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json "
+            "FROM python_sdk_entries WHERE embedding_model=? AND embedding_json IS NOT NULL",
+            (model,),
+        ).fetchall()
+        rows: list[dict[str, Any]] = []
+        for row in records:
+            try:
+                vector = [float(value) for value in json.loads(str(row[10] or "[]"))]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            if score <= 0:
+                continue
+            rows.append(
+                {
+                    "id": row[0],
+                    "kind": row[1],
+                    "module": row[2],
+                    "qualname": row[3],
+                    "signature": row[4],
+                    "doc": row[5],
+                    "source_path": row[6],
+                    "line": row[7],
+                    "text": row[8],
+                    "embedding_model": row[9],
+                    "embedding_json": row[10],
+                    "embedding_score": score,
+                    "source": "embedding",
+                }
+            )
+        return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
+
+    def _python_sdk_candidate_embedding_rows(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        candidates: list[dict[str, Any]],
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if not candidates:
+            return [], None
+        try:
+            query_vector = self._ollama_embed_texts([query], model=model, host=host, timeout=timeout)[0]
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError, IndexError) as exc:
+            return [], str(exc)
+
+        vectors_by_id: dict[str, list[float]] = {}
+        missing_rows: list[dict[str, Any]] = []
+        for row in candidates:
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                continue
+            cached_model = str(row.get("embedding_model") or "")
+            cached_json = str(row.get("embedding_json") or "")
+            if cached_model == model and cached_json:
+                try:
+                    vector = [float(value) for value in json.loads(cached_json)]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    vector = []
+                if vector:
+                    vectors_by_id[row_id] = vector
+                    continue
+            missing_rows.append(row)
+
+        if missing_rows:
+            try:
+                vectors = self._ollama_embed_texts(
+                    [str(row.get("text", ""))[:4000] for row in missing_rows],
+                    model=model,
+                    host=host,
+                    timeout=timeout,
+                )
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                return [], str(exc)
+            for row, vector in zip(missing_rows, vectors):
+                row_id = str(row.get("id") or "")
+                if not row_id or not vector:
+                    continue
+                vectors_by_id[row_id] = vector
+                row["embedding_model"] = model
+                row["embedding_json"] = json.dumps(vector, separators=(",", ":"))
+                conn.execute(
+                    "UPDATE python_sdk_entries SET embedding_model=?, embedding_json=? WHERE id=?",
+                    (model, row["embedding_json"], row_id),
+                )
+            conn.commit()
+
+        rows: list[dict[str, Any]] = []
+        for row in candidates:
+            vector = vectors_by_id.get(str(row.get("id") or ""))
+            if not vector:
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            if score <= 0:
+                continue
+            item = dict(row)
+            item["embedding_model"] = model
+            item["embedding_score"] = score
+            item["source"] = "embedding"
+            rows.append(item)
+        return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
+
+    def _format_python_sdk_rows(self, rows: list[dict[str, Any]], *, limit: int) -> str:
+        lines: list[str] = []
+        for row in rows[: max(1, int(limit))]:
+            signature = str(row.get("signature") or "").strip()
+            doc = self._truncate_text(str(row.get("doc") or "").strip(), limit=220)
+            source = str(row.get("source_path") or "")
+            line = int(row.get("line") or 1)
+            score = ""
+            if "embedding_score" in row:
+                score = f" score={float(row['embedding_score']):.3f}"
+            lines.append(f"{row.get('qualname')} [{row.get('kind')}; module={row.get('module')}; source={row.get('source')}{score}]")
+            if signature:
+                lines.append(f"  signature: {signature}")
+            if doc:
+                lines.append(f"  doc: {doc}")
+            if source:
+                lines.append(f"  sdk_source: {source}:{line}")
+        return "\n".join(lines) if lines else "(no Python SDK matches)"
+
+    def python_sdk_search(
+        self,
+        query: str,
+        limit: int = 8,
+        refresh: bool = False,
+        use_embeddings: bool = False,
+        embedding_model: str | None = None,
+        embedding_host: str | None = None,
+        embedding_timeout: int = 30,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return {"ok": False, "tool": "python_sdk_search", "summary": "python_sdk_search requires a non-empty query."}
+        model = self._normalize_sdk_embedding_model(embedding_model)
+        if refresh or not self._python_sdk_cache_path().exists():
+            refresh_result = self.python_sdk_refresh(limit=5000, embedding_model="off")
+            if refresh_result.get("ok") is not True:
+                return refresh_result
+        try:
+            conn = self._connect_python_sdk()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("python_sdk_search", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        limit_value = max(1, int(limit))
+        embedding_error = None
+        embedding_candidates = 0
+        try:
+            expanded_query = self._python_sdk_expanded_query(clean_query)
+            lexical_rows = self._python_sdk_lexical_rows(conn, expanded_query, limit=limit_value * 3)
+            embedding_rows: list[dict[str, Any]] = []
+            if model:
+                candidate_limit = min(len(lexical_rows), max(limit_value, min(limit_value * 2, 12)))
+                embedding_candidates = candidate_limit
+                embedding_rows, embedding_error = self._python_sdk_candidate_embedding_rows(
+                    conn,
+                    expanded_query,
+                    lexical_rows[:candidate_limit],
+                    model=model,
+                    host=embedding_host,
+                    timeout=max(1, int(embedding_timeout)),
+                    limit=limit_value * 3,
+                )
+            merged: dict[str, dict[str, Any]] = {}
+            for rank, row in enumerate(lexical_rows):
+                item = dict(row)
+                item["combined_score"] = 1.0 / (rank + 1)
+                merged[str(item["id"])] = item
+            for rank, row in enumerate(embedding_rows):
+                item = merged.get(str(row["id"]), dict(row))
+                item["source"] = "hybrid" if str(row["id"]) in merged else "embedding"
+                item["embedding_score"] = row.get("embedding_score", 0.0)
+                item["combined_score"] = float(item.get("combined_score", 0.0)) + float(row.get("embedding_score", 0.0)) + (0.25 / (rank + 1))
+                merged[str(row["id"])] = item
+            rows = sorted(merged.values(), key=lambda item: (-float(item.get("combined_score", 0.0)), str(item.get("qualname", ""))))[:limit_value]
+        finally:
+            conn.close()
+        output = self._format_python_sdk_rows(rows, limit=limit_value)
+        summary = f"Python SDK search returned {len(rows)} item(s)."
+        if model:
+            summary += f" embedding_model={model}."
+        if embedding_error:
+            summary += f" embedding_error={self._truncate_text(embedding_error, limit=180)}"
+        return {
+            "ok": True,
+            "tool": "python_sdk_search",
+            "query": clean_query,
+            "expanded_query": self._python_sdk_expanded_query(clean_query),
+            "count": len(rows),
+            "embedding_model": model,
+            "embedding_error": embedding_error,
+            "embedding_candidates": embedding_candidates,
+            "cache": self.relative_label(self._python_sdk_cache_path()),
+            "results": [
+                {key: value for key, value in row.items() if key not in {"embedding_json", "text"}}
+                for row in rows
+            ],
+            "summary": summary,
+            "output": output,
+        }
+
     def _initialize_fts_connection(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA busy_timeout=2000")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -2159,6 +2696,7 @@ class ToolExecutor:
         return {
             "path": self.relative_label(file_path),
             "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
             "size": int(stat.st_size),
             "sha1": hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest(),
             "symbols": symbols[:300],
@@ -2204,6 +2742,7 @@ class ToolExecutor:
             if not (
                 isinstance(cached, dict)
                 and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+                and cached.get("ctime_ns") == int(stat.st_ctime_ns)
                 and cached.get("size") == int(stat.st_size)
                 and isinstance(cached.get("line_index"), list)
             ):
@@ -2291,7 +2830,7 @@ class ToolExecutor:
         terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
         if not terms:
             return {"ok": False, "tool": "repo_index_search", "summary": "repo_index_search requires a non-empty query."}
-        records = self._indexed_code_records(base, limit=1000)
+        records = self._indexed_code_records(base, limit=self._adaptive_index_record_limit(limit, minimum=2500, multiplier=300))
         return self._repo_index_search_records(terms, base, limit=max(1, int(limit)), records=records)
 
     def indexed_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
@@ -2855,6 +3394,62 @@ class ToolExecutor:
                         )
         return targets
 
+    def _python_import_targets_from_text(self, text: str, *, label: str) -> list[dict[str, Any]]:
+        snippets: list[str] = []
+        for match in re.finditer(r"```(?:python|py)?\s*(?P<body>.*?)```", text, flags=re.DOTALL | re.IGNORECASE):
+            body = str(match.group("body") or "").strip()
+            if body:
+                snippets.append(body)
+        import_lines = [
+            line.strip()
+            for line in text.splitlines()
+            if re.match(r"^\s*(?:from\s+[A-Za-z_][\w.]*\s+import\s+.+|import\s+[A-Za-z_][\w.]*(?:\s+as\s+\w+)?(?:\s*,\s*\w+)*)\s*$", line)
+        ]
+        if import_lines:
+            snippets.append("\n".join(import_lines))
+        targets: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for snippet in snippets:
+            try:
+                tree = ast.parse(self._python_parse_text(snippet), filename=label)
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    module_file = self._resolve_python_module_file(node.module)
+                    for alias in node.names:
+                        if module_file is None:
+                            continue
+                        key = (self.relative_label(module_file), alias.name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        targets.append(
+                            {
+                                "path": self.relative_label(module_file),
+                                "symbol": alias.name,
+                                "reason": f"{label} imports {alias.name} from {node.module}",
+                            }
+                        )
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        module_file = self._resolve_python_module_file(alias.name)
+                        if module_file is None:
+                            continue
+                        symbol = alias.asname or alias.name.split(".")[-1]
+                        key = (self.relative_label(module_file), symbol)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        targets.append(
+                            {
+                                "path": self.relative_label(module_file),
+                                "symbol": symbol,
+                                "reason": f"{label} imports {alias.name}",
+                            }
+                        )
+        return targets
+
     def _traceback_targets(self, output: str) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []
         for match in re.finditer(r'File "([^"]+)", line (\d+), in ([A-Za-z_<>][\w<>]*)', output):
@@ -2886,6 +3481,34 @@ class ToolExecutor:
             seen_files.add(path)
             targets.extend(self._python_import_targets(path))
         return targets
+
+    def _implementation_target_score(self, item: dict[str, Any], query_text: str) -> int:
+        rel = str(item.get("path") or "").strip().replace("\\", "/")
+        symbol = str(item.get("symbol") or "").strip()
+        reason = str(item.get("reason") or "")
+        lowered_query = query_text.lower()
+        score = 0
+        if "line" in item:
+            score += 80
+        if rel:
+            path_obj = Path(rel)
+            if self._path_looks_like_test(path_obj):
+                score -= 25
+            else:
+                score += 20
+            stem = path_obj.stem.lower()
+            if stem and re.search(rf"(?<![\w.]){re.escape(stem)}(?![\w.])", lowered_query):
+                score += 8
+            module_name = rel[:-3].replace("/", ".").replace("\\", ".").lower() if rel.endswith(".py") else rel.lower()
+            if module_name and module_name in lowered_query:
+                score += 14
+        if symbol and re.search(rf"(?<![\w.]){re.escape(symbol.lower())}(?![\w.])", lowered_query):
+            score += 30
+        if reason.startswith("request text imports"):
+            score += 18
+        elif "imports" in reason:
+            score += 6
+        return score
 
     def find_implementation_target(
         self,
@@ -2929,9 +3552,19 @@ class ToolExecutor:
             target = self.resolve_path(test_path, allow_missing=False)
             if target.suffix.lower() == ".py":
                 targets.extend(self._python_import_targets(target))
+        if query:
+            targets.extend(self._python_import_targets_from_text(str(query), label="request text"))
+        ranked = sorted(
+            targets,
+            key=lambda item: (
+                -self._implementation_target_score(item, str(query or output or traceback or "")),
+                str(item.get("path", "")),
+                str(item.get("symbol", "")),
+            ),
+        )
         deduped: list[dict[str, Any]] = []
         seen: set[tuple[str, str]] = set()
-        for item in targets:
+        for item in ranked:
             key = (str(item.get("path", "")), str(item.get("symbol", "")))
             if key in seen:
                 continue
@@ -3598,6 +4231,21 @@ class ToolExecutor:
                             aliases=aliases,
                         )
                         continue
+                    if method_name in {"assertTrue", "assertFalse"} and node.args:
+                        actual_node = node.args[0]
+                        expr = self._test_spec_behavior_expr(actual_node, local_exprs, object_history) if isinstance(actual_node, ast.Call) else self._node_expr(actual_node, local_exprs)
+                        self._test_spec_add_raw_example(
+                            examples,
+                            expr=expr,
+                            expected="True" if method_name == "assertTrue" else "False",
+                            line=int(getattr(node, "lineno", 1)),
+                            test_name=function.name,
+                            source_symbols=source_symbols,
+                            aliases=aliases,
+                        )
+                        if isinstance(actual_node, ast.Call) and self._test_spec_call_may_mutate_state(actual_node):
+                            self._test_spec_record_side_effect_call(actual_node, local_exprs, object_history)
+                        continue
                     if method_name in {"assertRegex", "assertRegexpMatches"} and len(node.args) >= 2:
                         expr = self._node_expr(node.args[0], local_exprs)
                         pattern = self._node_expr(node.args[1], local_exprs)
@@ -3908,8 +4556,131 @@ class ToolExecutor:
         def all_numbers(values: list[Any]) -> bool:
             return all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in values)
 
+        def values_match(value: Any, expected: Any) -> bool:
+            if isinstance(expected, bool):
+                return isinstance(value, bool) and value is expected
+            if isinstance(value, float) and isinstance(expected, int) and not isinstance(expected, bool) and value.is_integer():
+                value = int(value)
+            return value == expected
+
+        def numeric_constants(index: int) -> list[int | float]:
+            raw_values: list[int | float] = []
+            for args, _expected in examples:
+                if index >= len(args):
+                    continue
+                value = args[index]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                raw_values.append(value)
+            ordered: list[int | float] = []
+            seen: set[int | float] = set()
+            for value in raw_values:
+                variants: list[int | float] = [value]
+                if isinstance(value, int) and not isinstance(value, bool):
+                    variants.extend([value - 1, value + 1])
+                for variant in variants:
+                    if variant in seen:
+                        continue
+                    seen.add(variant)
+                    ordered.append(variant)
+            return ordered[:12]
+
+        def comparison_expressions(param: str, constants: list[int | float]) -> list[str]:
+            expressions: list[str] = []
+            for constant in constants:
+                literal = repr(constant)
+                expressions.extend(
+                    [
+                        f"{param} < {literal}",
+                        f"{param} <= {literal}",
+                        f"{param} > {literal}",
+                        f"{param} >= {literal}",
+                        f"{param} == {literal}",
+                        f"{param} != {literal}",
+                    ]
+                )
+            return expressions
+
+        def range_expressions(param: str, constants: list[int | float]) -> list[str]:
+            expressions: list[str] = []
+            sorted_constants = sorted(set(constants))
+            for low_index, low in enumerate(sorted_constants):
+                for high in sorted_constants[low_index + 1 :]:
+                    expressions.extend(
+                        [
+                            f"{repr(low)} <= {param} <= {repr(high)}",
+                            f"{repr(low)} < {param} <= {repr(high)}",
+                            f"{repr(low)} <= {param} < {repr(high)}",
+                            f"{repr(low)} < {param} < {repr(high)}",
+                        ]
+                    )
+            return expressions
+
+        def heuristic_boolean_expressions(param: str, index: int) -> list[str]:
+            positives: list[int | float] = []
+            negatives: list[int | float] = []
+            for args, expected in examples:
+                if index >= len(args):
+                    continue
+                value = args[index]
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    continue
+                if expected is True:
+                    positives.append(value)
+                elif expected is False:
+                    negatives.append(value)
+            if not positives:
+                return []
+            expressions: list[str] = []
+            pos_min = min(positives)
+            pos_max = max(positives)
+            if negatives:
+                neg_max = max(negatives)
+                neg_min = min(negatives)
+                if neg_max < pos_min:
+                    if all(isinstance(value, int) and not isinstance(value, bool) for value in [neg_max, pos_min]):
+                        expressions.append(f"{param} >= {int(neg_max) + 1}")
+                    expressions.append(f"{param} > {repr(neg_max)}")
+                    expressions.append(f"{param} >= {repr(pos_min)}")
+                if neg_min > pos_max:
+                    expressions.append(f"{param} <= {repr(pos_max)}")
+                    expressions.append(f"{param} < {repr(neg_min)}")
+            expressions.append(f"{param} <= {repr(pos_max)}")
+            expressions.append(f"{param} >= {repr(pos_min)}")
+            if pos_min != pos_max:
+                expressions.append(f"{repr(pos_min)} <= {param} <= {repr(pos_max)}")
+            return list(dict.fromkeys(expressions))
+
         candidate_exprs: list[str] = []
-        if len(params) == 1:
+        bool_outputs = all(isinstance(expected, bool) for _args, expected in examples)
+        if bool_outputs:
+            atomic_by_param: list[list[str]] = []
+            for index, param in enumerate(params):
+                constants = numeric_constants(index)
+                atomic = heuristic_boolean_expressions(param, index)
+                atomic.extend(comparison_expressions(param, constants))
+                atomic.extend(range_expressions(param, constants))
+                atomic_by_param.append(list(dict.fromkeys(atomic)))
+            if len(params) == 1:
+                candidate_exprs.extend(atomic_by_param[0])
+            elif len(params) == 2:
+                left, right = params
+                for left_expr in atomic_by_param[0]:
+                    for right_expr in atomic_by_param[1]:
+                        candidate_exprs.append(f"({left_expr}) and ({right_expr})")
+                candidate_exprs.extend(atomic_by_param[0])
+                candidate_exprs.extend(atomic_by_param[1])
+                candidate_exprs.extend([f"{left} < {right}", f"{left} <= {right}", f"{left} > {right}", f"{left} >= {right}", f"{left} == {right}", f"{left} != {right}"])
+                for left_expr in atomic_by_param[0]:
+                    for right_expr in atomic_by_param[1]:
+                        candidate_exprs.append(f"({left_expr}) or ({right_expr})")
+            elif len(params) == 3:
+                for first_expr in atomic_by_param[0]:
+                    for second_expr in atomic_by_param[1]:
+                        for third_expr in atomic_by_param[2]:
+                            candidate_exprs.append(f"({first_expr}) and ({second_expr}) and ({third_expr})")
+                candidate_exprs.extend(expr for atomic in atomic_by_param for expr in atomic)
+        elif len(params) == 1:
             a = params[0]
             candidate_exprs.extend([a, f"-{a}", f"{a} * 2", f"{a} + 1", f"{a} - 1", f"{a} * {a}", f"abs({a})", f"len({a})", f"sum({a})"])
         elif len(params) == 2:
@@ -3942,9 +4713,7 @@ class ToolExecutor:
                 except Exception:
                     matched = False
                     break
-                if isinstance(value, float) and isinstance(expected, int) and value.is_integer():
-                    value = int(value)
-                if value != expected:
+                if not values_match(value, expected):
                     matched = False
                     break
             if matched:
@@ -3973,6 +4742,110 @@ class ToolExecutor:
             "expression": selected_expr,
             "examples": len(examples),
             "summary": f"Synthesized simple expression {function.name}(...) -> {selected_expr}.",
+        }
+
+    def synthesize_string_normalizer_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+        if len(functions) != 1:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis requires exactly one top-level function."}
+        function = functions[0]
+        if function.args.vararg or function.args.kwarg or function.args.kwonlyargs:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis supports positional parameters only."}
+        params = [arg.arg for arg in [*function.args.posonlyargs, *function.args.args]]
+        if len(params) != 1:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis supports exactly one parameter."}
+        extracted = self.test_spec_extract(test_path, source_path=rel_source, limit=limit)
+        if extracted.get("ok") is not True:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": str(extracted.get("summary") or "Could not extract examples.")}
+        examples: list[tuple[str, str]] = []
+        for item in extracted.get("examples", []) if isinstance(extracted.get("examples"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            parsed = self._literal_string_call_example(str(item.get("example") or ""))
+            if parsed is None:
+                continue
+            symbol, source, expected = parsed
+            if symbol != function.name:
+                continue
+            examples.append((source, expected))
+        if not examples:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "No literal string examples found."}
+
+        param = params[0]
+        wants_lower = any(any(char.isupper() for char in source) for source, _expected in examples) and all(expected == expected.lower() for _source, expected in examples)
+        wants_trim = any(source != source.strip() for source, _expected in examples)
+        has_whitespace = any(bool(re.search(r"\s", source)) for source, _expected in examples)
+        wants_hyphen = any("-" in expected for _source, expected in examples)
+
+        preferred_base = param
+        if wants_trim:
+            preferred_base += ".strip()"
+        if wants_lower:
+            preferred_base += ".lower()"
+        base_variants = [preferred_base]
+        for candidate in (param, f"{param}.strip()", f"{param}.lower()", f"{param}.strip().lower()"):
+            if candidate not in base_variants:
+                base_variants.append(candidate)
+
+        candidate_exprs: list[str] = []
+        for base in base_variants:
+            if wants_hyphen and has_whitespace:
+                candidate_exprs.append(f"'-'.join({base}.split())")
+            if has_whitespace:
+                candidate_exprs.append(f"' '.join({base}.split())")
+                candidate_exprs.append(f"''.join({base}.split())")
+            candidate_exprs.append(base)
+            if wants_hyphen:
+                candidate_exprs.append(f"{base}.replace(' ', '-')")
+                candidate_exprs.append(f"{base}.replace('_', '-')")
+                candidate_exprs.append(f"{base}.replace('_', '-').replace(' ', '-')")
+
+        selected_expr = ""
+        for expr in dict.fromkeys(candidate_exprs):
+            matched = True
+            for source, expected in examples:
+                try:
+                    value = eval(expr, {"__builtins__": {}}, {param: source})  # noqa: S307 - fixed internal expression templates.
+                except Exception:
+                    matched = False
+                    break
+                if value != expected:
+                    matched = False
+                    break
+            if matched:
+                selected_expr = expr
+                break
+        if not selected_expr:
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "No string-normalizer expression matched the examples."}
+
+        lines = source_text.splitlines()
+        start = int(getattr(function, "lineno", 1)) - 1
+        end = int(getattr(function, "end_lineno", getattr(function, "lineno", 1)))
+        if start < 0 or start >= len(lines):
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "Could not locate function source."}
+        signature = lines[start].rstrip()
+        if not signature.lstrip().startswith(("def ", "async def ")) or not signature.rstrip().endswith(":"):
+            return {"ok": False, "tool": "synthesize_string_normalizer_candidate", "path": rel_source, "summary": "String-normalizer synthesis supports single-line signatures only."}
+        indent = re.match(r"^\s*", signature).group(0) + "    "  # type: ignore[union-attr]
+        candidate_lines = [*lines[:start], signature, f"{indent}return {selected_expr}", *lines[end:]]
+        return {
+            "ok": True,
+            "tool": "synthesize_string_normalizer_candidate",
+            "path": rel_source,
+            "candidate_source": "\n".join(candidate_lines).rstrip() + "\n",
+            "expression": selected_expr,
+            "examples": len(examples),
+            "summary": f"Synthesized string normalizer {function.name}(...) -> {selected_expr}.",
         }
 
     def synthesize_sequence_utilities_candidate(self, source_path: str, test_path: str, limit: int = 80) -> dict[str, Any]:
@@ -7678,13 +8551,50 @@ import string
             shape = self._annotation_expected_shape(str(arg.get("annotation", "")))
             if name and shape:
                 arg_shapes[name] = shape
+        local_shapes = dict(arg_shapes)
         has_return = False
-        for child in ast.walk(node):
-            if isinstance(child, ast.Return):
+
+        class ReturnShapeVisitor(ast.NodeVisitor):
+            def visit_FunctionDef(self, nested: ast.FunctionDef) -> Any:
+                if nested is not node:
+                    return None
+                self.generic_visit(nested)
+                return None
+
+            def visit_AsyncFunctionDef(self, nested: ast.AsyncFunctionDef) -> Any:
+                if nested is not node:
+                    return None
+                self.generic_visit(nested)
+                return None
+
+            def visit_Assign(self, assign: ast.Assign) -> Any:
+                shape = self_outer._value_shape_hint(assign.value, local_shapes)
+                if shape:
+                    for target in assign.targets:
+                        if isinstance(target, ast.Name):
+                            local_shapes[target.id] = shape
+                self.generic_visit(assign)
+
+            def visit_AnnAssign(self, assign: ast.AnnAssign) -> Any:
+                shape = self_outer._annotation_expected_shape(self_outer._annotation_text(assign.annotation))
+                if not shape and assign.value is not None:
+                    shape = self_outer._value_shape_hint(assign.value, local_shapes)
+                if shape and isinstance(assign.target, ast.Name):
+                    local_shapes[assign.target.id] = shape
+                self.generic_visit(assign)
+
+            def visit_Return(self, child: ast.Return) -> Any:
+                nonlocal has_return
                 has_return = True
                 value = child.value
+                inferred = self_outer._value_shape_hint(value, local_shapes) if value is not None else None
                 if value is None or isinstance(value, ast.Constant) and value.value is None:
                     shapes.add("none")
+                elif inferred:
+                    if inferred == "tuple" and isinstance(value, ast.Tuple):
+                        shapes.add(f"tuple[{len(value.elts)}]")
+                    else:
+                        shapes.add(inferred)
                 elif isinstance(value, ast.Tuple):
                     shapes.add(f"tuple[{len(value.elts)}]")
                 elif isinstance(value, ast.List):
@@ -7696,11 +8606,14 @@ import string
                 elif isinstance(value, ast.Constant):
                     shapes.add(type(value.value).__name__)
                 elif isinstance(value, ast.Call):
-                    shapes.add(f"call:{self._call_name(value.func) or 'unknown'}")
+                    shapes.add(f"call:{self_outer._call_name(value.func) or 'unknown'}")
                 elif isinstance(value, ast.Name):
                     shapes.add(arg_shapes.get(value.id, f"name:{value.id}"))
                 else:
                     shapes.add(type(value).__name__.lower())
+
+        self_outer = self
+        ReturnShapeVisitor().visit(node)
         if not has_return:
             shapes.add("implicit_none")
         return shapes
@@ -8025,7 +8938,47 @@ import string
             names.add(node.args.kwarg.arg)
         return names
 
-    def _python_module_defined_names(self, tree: ast.AST) -> set[str]:
+    def _python_string_sequence_literal(self, node: ast.AST | None) -> list[str] | None:
+        if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return None
+        values: list[str] = []
+        for child in node.elts:
+            if not isinstance(child, ast.Constant) or not isinstance(child.value, str):
+                return None
+            values.append(child.value)
+        return values
+
+    def _python_explicit_module_exports(self, tree: ast.AST) -> set[str] | None:
+        for node in getattr(tree, "body", []):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = list(node.targets) if isinstance(node, ast.Assign) else [node.target]
+            if not any(isinstance(target, ast.Name) and target.id == "__all__" for target in targets):
+                continue
+            values = self._python_string_sequence_literal(getattr(node, "value", None))
+            if values is not None:
+                return {value for value in values if value}
+        return None
+
+    def _python_star_import_names(self, module_name: str, seen_modules: set[str] | None = None) -> set[str]:
+        seen = set(seen_modules or ())
+        if module_name in seen:
+            return set()
+        seen.add(module_name)
+        module_file = self._resolve_python_module_file(module_name)
+        if module_file is None:
+            return set()
+        try:
+            text = module_file.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(self._python_parse_text(text), filename=self.relative_label(module_file))
+        except SyntaxError:
+            return set()
+        explicit = self._python_explicit_module_exports(tree)
+        if explicit is not None:
+            return explicit
+        return {name for name in self._python_module_defined_names(tree, seen_modules=seen) if name and not name.startswith("_")}
+
+    def _python_module_defined_names(self, tree: ast.AST, seen_modules: set[str] | None = None) -> set[str]:
         names = {"__name__", "__file__", "__package__"}
         for node in getattr(tree, "body", []):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -8036,7 +8989,14 @@ import string
                     for child in ast.walk(target):
                         if isinstance(child, ast.Name):
                             names.add(child.id)
-            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            elif isinstance(node, ast.ImportFrom):
+                if node.module and any(alias.name == "*" for alias in node.names):
+                    names.update(self._python_star_import_names(node.module, seen_modules=seen_modules))
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    names.add((alias.asname or alias.name).split(".", 1)[0])
+            elif isinstance(node, ast.Import):
                 for alias in node.names:
                     names.add((alias.asname or alias.name).split(".", 1)[0])
         return names
@@ -8941,8 +9901,19 @@ import string
         if not path.exists():
             return {}
         try:
-            return tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError):
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        if tomllib is None:
+            tool_sections: dict[str, Any] = {}
+            for match in re.finditer(r"(?m)^\s*\[tool\.([A-Za-z0-9_.-]+)\]\s*$", text):
+                cursor = tool_sections
+                for part in match.group(1).split("."):
+                    cursor = cursor.setdefault(part, {})
+            return {"tool": tool_sections} if tool_sections else {}
+        try:
+            return tomllib.loads(text)
+        except (OSError, _TOMLDecodeError):
             return {}
 
     def _toml_tool_section(self, payload: dict[str, Any], name: str) -> bool:
@@ -8986,6 +9957,7 @@ import string
         )
         if python_files or pyproject or pytest_config:
             add("syntax", "python", f"{sys.executable} -m py_compile", "Python files found; lint_typecheck does exact syntax checks internally.")
+            add("lint", "python", f"{sys.executable} -m py_compile", "Python files found; lint_typecheck does exact syntax checks internally.")
             if pytest_config:
                 add("collect", "python", f"{sys.executable} -m pytest --collect-only -q", "pytest config found.")
                 add("test", "python", f"{sys.executable} -m pytest", "pytest config found.")
@@ -8997,7 +9969,7 @@ import string
                 or self._toml_tool_section(pyproject, "ruff")
                 or shutil.which("ruff")
             ):
-                add("lint", "python", "ruff check .", "ruff config or executable found.")
+                add("lint", "python", "ruff check . --no-cache", "ruff config or executable found.")
             if (
                 (root / "mypy.ini").exists()
                 or (root / ".mypy.ini").exists()
@@ -9396,7 +10368,7 @@ import string
         approved, reason = self._approve_mutation(f"Replace symbol {found['qualname']} in {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "replace_symbol", "path": relative_path, "symbol": found["qualname"], "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         result = {
             "ok": True,
             "tool": "replace_symbol",
@@ -9529,7 +10501,7 @@ import string
         approved, reason = self._approve_mutation(f"Replace {len(prepared)} symbols in {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "replace_symbols", "path": relative_path, "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         result = {
             "ok": True,
             "tool": "replace_symbols",
@@ -9638,8 +10610,26 @@ import string
         approved, reason = self._approve_mutation(prompt, preview)
         if not approved:
             return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "syntax_ok": True if target.suffix.lower() == ".py" else None, "summary": f"Applied {op} to {relative_path}.", "diff": preview}
+
+    def _invalidate_python_bytecode_cache(self, target: Path) -> None:
+        if target.suffix.lower() != ".py":
+            return
+        cache_dir = target.parent / "__pycache__"
+        if not cache_dir.is_dir():
+            return
+        for pattern in (f"{target.stem}.*.pyc", f"{target.stem}.*.pyo"):
+            for cached in cache_dir.glob(pattern):
+                try:
+                    cached.unlink()
+                except OSError:
+                    continue
+
+    def _write_text_and_invalidate_python_cache(self, target: Path, content: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        self._invalidate_python_bytecode_cache(target)
 
     def _single_full_python_function_name(self, source: str) -> str | None:
         stripped = textwrap.dedent(source or "").strip()
@@ -9824,26 +10814,120 @@ import string
             return ""
         existing_params = self._python_parameter_sequence(node)
         replacement_params = self._python_parameter_sequence(candidate)
+        existing_names = [entry for entry in existing_params if not entry.startswith("*")]
+        replacement_names = [entry for entry in replacement_params if not entry.startswith("*")]
+
+        if not existing_names or not replacement_names:
+            return ""
+        if len(existing_names) != len(replacement_names):
+            return ""
+
+        # Reorder-only correction for same-name permutations.
+        if sorted(existing_names) == sorted(replacement_names):
+            if (
+                replacement_names == existing_names
+                or node.args.defaults
+                or candidate.args.defaults
+                or node.args.kw_defaults
+                or candidate.args.kw_defaults
+                or node.args.vararg
+                or candidate.args.vararg
+                or node.args.kwarg
+                or candidate.args.kwarg
+                or node.args.kwonlyargs
+                or candidate.args.kwonlyargs
+            ):
+                return ""
+            lines = replacement.splitlines()
+            header_index = int(getattr(candidate, "lineno", 1)) - 1
+            if header_index < 0 or header_index >= len(lines):
+                return ""
+            header = lines[header_index]
+            match = re.match(rf"^(\s*(?:async\s+)?def\s+{re.escape(candidate.name)}\s*)\([^)]*\)(\s*(?:->\s*[^:]+)?\s*:\s*)$", header)
+            if not match:
+                return ""
+            lines[header_index] = f"{match.group(1)}({', '.join(existing_names)}){match.group(2)}"
+            return "\n".join(lines) + ("\n" if replacement.endswith(("\n", "\r")) else "")
+
+        # Name-only correction for same arity, same parameter shape.
         if (
-            replacement_params == existing_params
-            or sorted(replacement_params) != sorted(existing_params)
-            or any(param.startswith("*") for param in [*existing_params, *replacement_params])
+            len(existing_params) != len(replacement_params)
             or node.args.defaults
             or candidate.args.defaults
             or node.args.kw_defaults
             or candidate.args.kw_defaults
+            or node.args.vararg
+            or candidate.args.vararg
+            or node.args.kwarg
+            or candidate.args.kwarg
+            or node.args.kwonlyargs
+            or candidate.args.kwonlyargs
+            or any(name.startswith("*") for name in existing_params + replacement_params)
         ):
             return ""
-        lines = replacement.splitlines()
-        header_index = int(getattr(candidate, "lineno", 1)) - 1
-        if header_index < 0 or header_index >= len(lines):
+
+        # Avoid rewriting when a candidate parameter name is rebound in function body.
+        for child in ast.walk(candidate):
+            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)) and child.id in replacement_names:
+                return ""
+
+        class _CanonicalBodyRenamer(ast.NodeTransformer):
+            def __init__(self, mapping: dict[str, str]):
+                self._mapping = mapping
+                self._depth = 0
+
+            def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
+                if self._depth == 0:
+                    self._depth = 1
+                    node.body = [self.visit(child) for child in node.body]
+                    self._depth = 0
+                    return node
+                return node
+
+            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
+                if self._depth == 0:
+                    self._depth = 1
+                    node.body = [self.visit(child) for child in node.body]
+                    self._depth = 0
+                    return node
+                return node
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
+                return node
+
+            def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
+                return node
+
+            def visit_Name(self, node: ast.Name) -> ast.Name:
+                if self._depth == 1 and isinstance(node.ctx, ast.Load):
+                    mapped = self._mapping.get(node.id)
+                    if mapped is not None:
+                        node = ast.copy_location(ast.Name(id=mapped, ctx=node.ctx), node)
+                return node
+
+        mapping = {replacement_name: existing_name for replacement_name, existing_name in zip(replacement_names, existing_names)}
+        candidate_rebuilt = deepcopy(candidate)
+        posonly_count = len(candidate.args.posonlyargs)
+
+        # Keep the argument shape and defaults; only normalize parameter identifiers.
+        for index, param_name in enumerate(existing_names):
+            if index < posonly_count:
+                if index >= len(candidate_rebuilt.args.posonlyargs):
+                    return ""
+                candidate_rebuilt.args.posonlyargs[index].arg = param_name
+            else:
+                arg_index = index - posonly_count
+                if arg_index >= len(candidate_rebuilt.args.args):
+                    return ""
+                candidate_rebuilt.args.args[arg_index].arg = param_name
+
+        candidate_rebuilt = _CanonicalBodyRenamer(mapping).visit(candidate_rebuilt)
+        ast.fix_missing_locations(candidate_rebuilt)
+        try:
+            normalized = ast.unparse(candidate_rebuilt)
+        except (SyntaxError, ValueError):
             return ""
-        header = lines[header_index]
-        match = re.match(rf"^(\s*(?:async\s+)?def\s+{re.escape(candidate.name)}\s*)\([^)]*\)(\s*(?:->\s*[^:]+)?\s*:\s*)$", header)
-        if not match:
-            return ""
-        lines[header_index] = f"{match.group(1)}({', '.join(existing_params)}){match.group(2)}"
-        return "\n".join(lines) + ("\n" if replacement.endswith(("\n", "\r")) else "")
+        return normalized + "\n"
 
     def _canonical_foldr_replacement_if_safe(self, target: Path, symbol: str, diagnostic: str) -> str:
         if "foldr reducer arguments look reversed" not in diagnostic:
@@ -9964,7 +11048,14 @@ import string
                 clean = " ".join(collected)
         if not clean.startswith(("def ", "async def ")):
             name = expected_name or symbol.split(".")[-1]
-            clean = f"def {name}{clean if clean.startswith('(') else '(' + clean + ')'}"
+            bare_name = re.match(r"^(?P<prefix>async\s+)?(?P<name>[A-Za-z_]\w*)\s*\(", clean)
+            if bare_name:
+                prefix = "async def " if bare_name.group("prefix") else "def "
+                clean = prefix + clean
+            elif clean.startswith("("):
+                clean = f"def {name}{clean}"
+            else:
+                clean = f"def {name}({clean})"
         if not clean.rstrip().endswith(":"):
             clean = clean.rstrip() + ":"
         try:
@@ -10113,7 +11204,7 @@ import string
             approved, reason = self._approve_mutation(f"Rename {old} to {new} in {relative_path}?", preview)
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
-            target.write_text(updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(target, updated)
             return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "count": count, "summary": f"Renamed {count} occurrence(s) of {old} to {new}.", "diff": preview}
         if op == "add_import":
             target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
@@ -10134,7 +11225,7 @@ import string
             approved, reason = self._approve_mutation(f"Add import to {relative_path}?", preview)
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
-            target.write_text(updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(target, updated)
             return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": f"Added import to {relative_path}.", "diff": preview}
         if op == "delete_symbol":
             target = self.resolve_path(str(payload.get("path") or ""), allow_missing=False)
@@ -10154,7 +11245,7 @@ import string
             approved, reason = self._approve_mutation(f"Delete {symbol} from {relative_path}?", preview)
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": reason}
-            target.write_text(updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(target, updated)
             return {"ok": True, "tool": "apply_structured_edit", "path": relative_path, "op": op, "summary": f"Deleted {symbol} from {relative_path}.", "diff": preview}
         if op == "move_symbol":
             source = self.resolve_path(str(payload.get("from_path") or payload.get("path") or ""), allow_missing=False)
@@ -10184,8 +11275,8 @@ import string
             if not approved:
                 return {"ok": False, "tool": "apply_structured_edit", "summary": reason}
             destination.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text(source_updated, encoding="utf-8")
-            destination.write_text(dest_updated, encoding="utf-8")
+            self._write_text_and_invalidate_python_cache(source, source_updated)
+            self._write_text_and_invalidate_python_cache(destination, dest_updated)
             return {"ok": True, "tool": "apply_structured_edit", "op": op, "path": source_rel, "to_path": dest_rel, "summary": f"Moved {symbol} to {dest_rel}.", "diff": preview}
         return {"ok": False, "tool": "apply_structured_edit", "summary": f"Unsupported structured edit op: {op or '(missing)'}"}
 
@@ -10194,6 +11285,9 @@ import string
         wrapped["tool"] = "edit_intent"
         wrapped["routed_tool"] = routed_tool
         wrapped["route"] = route
+        if wrapped.get("syntax_ok") is False:
+            wrapped["ok"] = False
+            wrapped.setdefault("error_class", "syntax_error")
         summary = str(wrapped.get("summary") or wrapped.get("output") or "").strip()
         wrapped["summary"] = f"{route}: {summary}" if summary else route
         return wrapped
@@ -10323,7 +11417,17 @@ import string
         elif clean_intent in {"replace_symbol", "replace_function", "replace_class", "symbol"}:
             replacement_name = self._single_python_replacement_symbol_name(new) if target_path.suffix.lower() == ".py" and self._looks_like_full_symbol_source(target_path, new) else ""
             old_leaf = old.rsplit(".", 1)[-1]
-            if replacement_name and replacement_name != old_leaf and self._looks_like_symbol_name(old_leaf):
+            new_leaf = new.rsplit(".", 1)[-1]
+            if self._looks_like_symbol_name(old_leaf) and self._looks_like_symbol_name(new_leaf):
+                if clean_scope in {"project", "repo", "repository", "all"}:
+                    route = "project symbol rename"
+                    routed_tool = "apply_structured_edit"
+                    operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": new_leaf}
+                else:
+                    route = "file symbol rename"
+                    routed_tool = "apply_structured_edit"
+                    operation = {"op": "rename_symbol", "path": relative_path, "old": old_leaf, "new": new_leaf}
+            elif replacement_name and replacement_name != old_leaf and self._looks_like_symbol_name(old_leaf):
                 route = "project symbol rename from replacement source"
                 routed_tool = "apply_structured_edit"
                 operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name}
@@ -10413,19 +11517,21 @@ import string
         if not approved:
             return {"ok": False, "tool": "generate_tests_from_spec", "path": self.relative_label(target), "summary": reason}
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         return {"ok": True, "tool": "generate_tests_from_spec", "path": self.relative_label(target), "applied": True, "summary": f"Wrote generated test scaffold to {self.relative_label(target)}.", "diff": preview}
 
     def git_status(self, path: str | None = None) -> dict[str, Any]:
-        ok, error = self._ensure_git_repo()
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
         if not ok:
             return {"ok": False, "tool": "git_status", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
         command = ["status", "--short", "--branch", "--untracked-files=all"]
         relative_path = None
-        if path:
-            relative_path = self.relative_label(self.resolve_path(path, allow_missing=False))
+        if path and target_path is not None and repo_root is not None:
+            relative_path = target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
             command.extend(["--", relative_path])
-        result = self._run_git(command)
+        result = self._run_git(command, cwd=repo_root)
         output = result.stdout.strip() or "(clean)"
         if result.stderr.strip():
             output = f"{output}\n{result.stderr.strip()}"
@@ -10437,17 +11543,19 @@ import string
         }
 
     def git_diff(self, path: str | None = None, cached: bool = False, context: int = 3) -> dict[str, Any]:
-        ok, error = self._ensure_git_repo()
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
         if not ok:
             return {"ok": False, "tool": "git_diff", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
         command = ["diff", "--no-ext-diff", f"--unified={max(0, context)}"]
         if cached:
             command.append("--cached")
         relative_path = None
-        if path:
-            relative_path = self.relative_label(self.resolve_path(path, allow_missing=False))
+        if path and target_path is not None and repo_root is not None:
+            relative_path = target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
             command.extend(["--", relative_path])
-        result = self._run_git(command)
+        result = self._run_git(command, cwd=repo_root)
         output = self._collect_process_output(result)
         if output == "(no output)":
             output = "(no diff)"
@@ -10456,6 +11564,49 @@ import string
             "tool": "git_diff",
             "path": relative_path or ".",
             "cached": cached,
+            "output": output,
+        }
+
+    def git_branch(self, path: str | None = None, all_branches: bool = False) -> dict[str, Any]:
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
+        if not ok:
+            return {"ok": False, "tool": "git_branch", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
+        command = ["branch", "--list"]
+        if all_branches:
+            command.append("--all")
+        result = self._run_git(command, cwd=repo_root)
+        output = self._collect_process_output(result)
+        return {
+            "ok": result.returncode == 0,
+            "tool": "git_branch",
+            "path": path or ".",
+            "all_branches": all_branches,
+            "output": output,
+        }
+
+    def git_log(self, path: str | None = None, max_count: int = 10, oneline: bool = True) -> dict[str, Any]:
+        target_path = self.resolve_path(path, allow_missing=False) if path else None
+        ok, error = self._ensure_git_repo(target_path)
+        if not ok:
+            return {"ok": False, "tool": "git_log", "summary": error or "Not inside a git repository."}
+        repo_root = self._git_root_for_path(target_path)
+        safe_count = self._coerce_int(max_count, default=10, minimum=1)
+        command = ["log", f"--max-count={safe_count}", "--decorate"]
+        if oneline:
+            command.append("--oneline")
+        if path and target_path is not None and repo_root is not None:
+            relative_path = target_path.resolve(strict=False).relative_to(repo_root).as_posix() or "."
+            command.extend(["--", relative_path])
+        result = self._run_git(command, cwd=repo_root)
+        output = self._collect_process_output(result)
+        return {
+            "ok": result.returncode == 0,
+            "tool": "git_log",
+            "path": path or ".",
+            "max_count": safe_count,
+            "oneline": oneline,
             "output": output,
         }
 
@@ -10536,8 +11687,7 @@ import string
         approved, reason = self._approve_mutation(f"Write {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "write_file", "path": relative_path, "summary": reason}
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, content)
         result = {
             "ok": True,
             "tool": "write_file",
@@ -10790,7 +11940,7 @@ import string
         approved, reason = self._approve_mutation(f"Replace text in {relative_path}?", preview)
         if not approved:
             return {"ok": False, "tool": "replace_in_file", "path": relative_path, "summary": reason}
-        target.write_text(updated, encoding="utf-8")
+        self._write_text_and_invalidate_python_cache(target, updated)
         replaced_count = count if replace_all else 1
         result = {
             "ok": True,
@@ -11068,6 +12218,16 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return next((group for group in match.groups() if group), None)
 
     def _split_command_for_validation(self, command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
+        python_inline = re.match(
+            r"^\s*(?P<exe>(?:[A-Za-z]:)?[^\s]+(?:python|python3|py)(?:\.exe)?)\s+-c\s+(?P<code>.+?)\s*$",
+            command,
+            flags=re.IGNORECASE,
+        )
+        if python_inline:
+            code = python_inline.group("code").strip()
+            if len(code) >= 2 and code[0] == code[-1] and code[0] in {"'", '"'}:
+                code = code[1:-1]
+            return [python_inline.group("exe"), "-c", code], None
         try:
             argv = shlex.split(command, posix=os.name != "nt")
         except ValueError as exc:
@@ -11200,6 +12360,21 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             result["reason"] = reason
         return result
 
+    def _normalize_python_exec_argv(self, argv: list[str]) -> list[str]:
+        if len(argv) < 3:
+            return argv
+        normalized = list(argv)
+        try:
+            code_index = normalized.index("-c") + 1
+        except ValueError:
+            return normalized
+        if code_index >= len(normalized):
+            return normalized
+        code = str(normalized[code_index]).strip()
+        if len(code) >= 2 and code[0] == code[-1] and code[0] in {"'", '"'}:
+            normalized[code_index] = code[1:-1]
+        return normalized
+
     def _needs_bash_syntax_check(self, command: str, family: str | None) -> bool:
         if family is not None:
             return False
@@ -11242,13 +12417,9 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             return None, split_error
         assert argv is not None
         argv = [str(argv[0]).strip().strip("'\""), *argv[1:]]
-        if "-c" in argv:
-            try:
-                code_index = argv.index("-c") + 1
-                argv[code_index] = str(argv[code_index]).strip().strip("'\"")
-            except IndexError:
-                pass
         family = self._command_family(argv)
+        if family == "python_exec":
+            argv = self._normalize_python_exec_argv(argv)
         if self._needs_bash_syntax_check(command, family):
             syntax_error = self._bash_syntax_validation(command)
             if syntax_error is not None:
@@ -11385,15 +12556,9 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         discovered = None
         if not selected_command:
             validators = self.discover_validators(cwd)
-            candidates = [
-                item
-                for item in validators.get("validators", [])
-                if isinstance(item, dict) and item.get("kind") == "test" and item.get("command") and item.get("available") is True
-            ]
-            preferred = [item for item in candidates if "unittest discover" in str(item.get("command", ""))]
-            selected = (preferred or candidates)[:1]
-            if selected:
-                selected_command = str(selected[0]["command"])
+            discovered_command = self._preferred_test_validator_command(validators)
+            if discovered_command:
+                selected_command = discovered_command
                 discovered = validators
             else:
                 return {
@@ -11410,8 +12575,38 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
                 raise
             result = self.run_shell(selected_command, cwd=".", timeout=timeout_value)
             normalized = f"Ignored run_test cwd outside workspace: {cwd}"
+        selected_from_default = bool(
+            self.default_test_command
+            and selected_command == self.default_test_command
+            and (
+                command is None
+                or (isinstance(command, str) and command.strip() == self.default_test_command)
+            )
+        )
+        recovery_validators = None
+        if selected_from_default and result.get("ok") is not True and self._run_test_needs_command_recovery(result):
+            recovery_validators = self.discover_validators(cwd)
+            fallback_command = self._preferred_test_validator_command(
+                recovery_validators,
+                exclude_commands={selected_command},
+            )
+            if fallback_command:
+                recovered = self.run_shell(fallback_command, cwd=cwd, timeout=timeout_value)
+                recovered["tool"] = "run_test"
+                recovered["command"] = fallback_command
+                recovered["original_command"] = selected_command
+                recovered["recovered"] = True
+                recovered["validators"] = recovery_validators.get("validators", [])
+                recovered["normalized"] = (
+                    "Recovered run_test from configured command "
+                    f"{selected_command} to discovered test command {fallback_command}"
+                )
+                self.set_test_command(fallback_command)
+                selected_command = fallback_command
+                result = recovered
+                normalized = str(recovered["normalized"])
         result["tool"] = "run_test"
-        result["command"] = selected_command
+        result["command"] = str(result.get("command") or selected_command)
         if discovered is not None:
             result["discovered"] = True
             result["validators"] = discovered.get("validators", [])
@@ -11424,3 +12619,45 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             result["normalized"] = normalized
             result["summary"] = normalized if result.get("ok") else f"{normalized}. {result.get('output', '')[:180]}"
         return result
+
+    def _run_test_needs_command_recovery(self, result: dict[str, Any]) -> bool:
+        validation = result.get("validation")
+        if isinstance(validation, dict) and validation.get("valid") is False:
+            return True
+        error_class = str(result.get("error_class") or "").strip().lower()
+        if error_class in {"command_not_found", "invalid_args", "missing_dependency", "path_missing", "cwd_missing"}:
+            return True
+        output = str(result.get("output") or result.get("summary") or "").lower()
+        return any(
+            marker in output
+            for marker in (
+                "no tests ran",
+                "ran 0 tests",
+                "collected 0 items",
+                "no tests collected",
+            )
+        )
+
+    def _preferred_test_validator_command(
+        self,
+        validators: dict[str, Any],
+        *,
+        exclude_commands: set[str] | None = None,
+    ) -> str | None:
+        excluded = {str(item).strip() for item in (exclude_commands or set()) if str(item).strip()}
+        candidates = [
+            item
+            for item in validators.get("validators", [])
+            if (
+                isinstance(item, dict)
+                and item.get("kind") == "test"
+                and item.get("command")
+                and item.get("available") is True
+                and str(item.get("command")).strip() not in excluded
+            )
+        ]
+        preferred = [item for item in candidates if "unittest discover" in str(item.get("command", ""))]
+        selected = (preferred or candidates)[:1]
+        if not selected:
+            return None
+        return str(selected[0]["command"])

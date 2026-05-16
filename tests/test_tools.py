@@ -59,6 +59,57 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("alpha.txt", listed["output"])
         self.assertEqual(read["output"], "   2 | line2")
 
+    def test_non_git_tasks_work_when_git_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "alpha.txt").write_text("line1\n", encoding="utf-8")
+            with patch("ollama_code.tools.shutil.which", return_value=None):
+                tools = ToolExecutor(root, approval_mode="auto")
+                listed = tools.list_files()
+                git_status = tools.git_status()
+
+        self.assertTrue(listed["ok"])
+        self.assertIn("alpha.txt", listed["output"])
+        self.assertFalse(git_status["ok"])
+        self.assertIn("git is not installed", git_status["summary"])
+
+    def test_read_toml_extracts_tool_sections_when_no_toml_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "pyproject.toml"
+            config.write_text("[tool.example]\nname='demo'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.tomllib", None):
+                payload = tools._read_toml(config)
+
+        self.assertEqual(payload, {"tool": {"example": {}}})
+
+    def test_git_tools_can_target_nested_repo_path(self) -> None:
+        root = self._workspace_scratch()
+        repo = root / "nested-repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        self.init_git_repo(repo)
+        (repo / "note.txt").write_text("hello\n", encoding="utf-8")
+
+        tools = ToolExecutor(root, approval_mode="auto")
+        status = tools.git_status("nested-repo")
+
+        self.assertTrue(status["ok"])
+        self.assertIn("##", status["output"])
+
+    def test_git_status_defaults_to_single_nested_repo(self) -> None:
+        root = self._workspace_scratch()
+        repo = root / "only-repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        self.init_git_repo(repo)
+        (repo / "note.txt").write_text("hello\n", encoding="utf-8")
+
+        tools = ToolExecutor(root, approval_mode="auto")
+        status = tools.git_status()
+
+        self.assertTrue(status["ok"])
+        self.assertIn("##", status["output"])
+
     def test_write_and_replace_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -444,6 +495,57 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("src/app.py", result["output"])
         self.assertNotIn("node_modules", result["output"])
 
+    def test_symbol_tools_tolerate_whitespace_only_python_docstrings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg").mkdir()
+            (root / "pkg" / "mod.py").write_text(
+                "def outer():\n"
+                "    \"\"\"   \n"
+                "    \"\"\"\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            search = tools.search_symbols("outer")
+            repo = tools.repo_index_search("outer")
+            outline = tools.code_outline("pkg/mod.py")
+
+        self.assertTrue(search["ok"], search)
+        self.assertIn("pkg/mod.py", search["output"])
+        self.assertTrue(repo["ok"], repo)
+        self.assertIn("outer", repo["output"])
+        self.assertTrue(outline["ok"], outline)
+        self.assertIn("outer", outline["output"])
+
+    def test_symbol_tools_scan_beyond_first_two_hundred_code_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            for index in range(260):
+                name = f"filler_{index:03d}"
+                (src / f"{name}.py").write_text(
+                    f"def {name}():\n"
+                    f"    return {index}\n",
+                    encoding="utf-8",
+                )
+            (src / "zz_target.py").write_text(
+                "def separability_matrix():\n"
+                "    return 'needle_symbol'\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            search = tools.search_symbols("separability_matrix")
+            repo = tools.repo_index_search("separability_matrix")
+
+        self.assertTrue(search["ok"], search)
+        self.assertIn("src/zz_target.py", search["output"])
+        self.assertTrue(repo["ok"], repo)
+        self.assertIn("src/zz_target.py", repo["output"])
+
     def test_read_symbol_reports_ambiguous_names(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -511,6 +613,24 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn("    def value(self):\n        return 2\n", final_text)
+
+    def test_replace_symbol_normalizes_parameter_names(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbol(
+            "ops.py",
+            "append",
+            "def append(list, function):\n    return list + [function]\n",
+        )
+
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized replacement signature", result["summary"])
+        self.assertIn("def append(list1, list2):", final_text)
+        self.assertIn("return list1 + [list2]", final_text)
 
     def test_replace_symbol_rejects_python_syntax_error_without_writing(self) -> None:
         root = self._workspace_scratch()
@@ -608,6 +728,22 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Normalized replacement signature", result["summary"])
         self.assertIn("def foldl(function, list, initial):", final_text)
         self.assertIn("for item in list:", final_text)
+
+    def test_replace_symbols_normalizes_parameter_names(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.replace_symbols(
+            "ops.py",
+            [{"symbol": "append", "content": "def append(list, function):\n    return list + [function]\n"}],
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("Normalized replacement signature", result["summary"])
+        self.assertIn("def append(list1, list2):", final_text)
+        self.assertIn("return list1 + [list2]", final_text)
 
     def test_replace_symbols_rejects_python_syntax_error_without_writing(self) -> None:
         root = self._workspace_scratch()
@@ -1090,6 +1226,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("disabled", result["summary"])
 
+    def test_enabled_tools_allowlist_hides_other_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto", enabled_tools=["run_test", "read_file"])
+
+            self.assertEqual(tools.available_tool_names(), {"run_test", "read_file"})
+            blocked = tools.execute("run_shell", {"command": "echo hi"})
+
+        self.assertFalse(blocked["ok"])
+        self.assertIn("disabled", blocked["summary"])
+
     def test_systems_lens_frames_complex_task_without_grounding_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1152,6 +1298,148 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["missing_dependency"], missing_name)
         self.assertEqual(result["error_class"], "missing_dependency")
+
+    def test_python_sdk_search_finds_current_stdlib_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            refresh = tools.python_sdk_refresh(limit=5000)
+            result = tools.python_sdk_search("parse json string loads", limit=5)
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("json.loads", result["output"])
+        self.assertIn("Deserialize", result["output"])
+
+    def test_python_sdk_search_can_rerank_with_cached_embeddings(self) -> None:
+        entries = [
+            {
+                "id": "json",
+                "kind": "function",
+                "module": "json",
+                "qualname": "json.dumps",
+                "signature": "dumps(obj)",
+                "doc": "Serialize an object to JSON text.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "json dumps serialize object",
+            },
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            },
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            vectors: list[list[float]] = []
+            for text in texts:
+                lowered = text.lower()
+                vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
+            return vectors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed):
+                    refresh = tools.python_sdk_refresh(limit=10, embedding_model="fake-embed")
+                    result = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertEqual(refresh["embedded"], 2)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["results"][0]["qualname"], "pathlib.Path.glob")
+        self.assertIn("source=hybrid", result["output"])
+
+    def test_python_sdk_search_reranks_candidates_with_on_demand_embeddings(self) -> None:
+        entries = [
+            {
+                "id": "json",
+                "kind": "function",
+                "module": "json",
+                "qualname": "json.dumps",
+                "signature": "dumps(obj)",
+                "doc": "Serialize an object to JSON text.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "json dumps serialize object",
+            },
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            },
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            vectors: list[list[float]] = []
+            for text in texts:
+                lowered = text.lower()
+                vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
+            return vectors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
+                    refresh = tools.python_sdk_refresh(limit=10)
+                    result = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+                    refresh_again = tools.python_sdk_refresh(limit=10)
+                    second = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertEqual(refresh["embedded"], 0)
+        self.assertEqual(refresh_again["cached_embeddings"], 1)
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["embedding_error"])
+        self.assertEqual(result["results"][0]["qualname"], "pathlib.Path.glob")
+        self.assertIn("source=hybrid", result["output"])
+        self.assertTrue(second["ok"], second)
+        self.assertLessEqual(embed.call_count, 4)
+
+    def test_python_sdk_search_uses_env_embedding_model(self) -> None:
+        entries = [
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            }
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            self.assertEqual(model, "fake-env-embed")
+            return [[0.0, 1.0] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.dict("os.environ", {"OLLAMA_CODE_SDK_EMBED_MODEL": "fake-env-embed"}):
+                with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                    with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
+                        result = tools.python_sdk_search("find files by wildcard", limit=1)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["embedding_model"], "fake-env-embed")
+        self.assertIsNone(result["embedding_error"])
+        self.assertEqual(result["embedding_candidates"], 1)
+        self.assertEqual(result["results"][0]["source"], "hybrid")
+        self.assertEqual(embed.call_count, 2)
 
     def test_ast_search_reports_missing_ast_grep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1483,7 +1771,7 @@ class ToolExecutorTests(unittest.TestCase):
                 "ops.py",
                 "foldl",
                 (
-                    "def foldl(function, values, initial):\n"
+                    "def foldl(function, values, initial, mode):\n"
                     "    accumulator = initial\n"
                     "    for item in values:\n"
                     "        accumulator = function(accumulator, item)\n"
@@ -1517,6 +1805,46 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "replace_symbol")
         self.assertIn("return left + right", final_text)
         self.assertNotIn("def def", final_text)
+
+    def test_edit_intent_surfacing_syntax_errors_as_failed_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "billing.py"
+            sample.write_text('def invoice_label(user_id: int) -> str:\n    return f"{user_id}"\n', encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "billing.py",
+                "replace_text",
+                'def invoice_label(user_id: int) -> str:\n    return f"{user_id}"',
+                'def invoice_label(user_id: int) -> str\n    return f"{user_id}"',
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "syntax_error")
+        self.assertIn("Python syntax error", result["summary"])
+
+    def test_edit_intent_routes_symbol_name_replacement_to_file_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "pricing.py"
+            sample.write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "pricing.py",
+                "replace_symbol",
+                "total",
+                "cart_total",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "apply_structured_edit")
+        self.assertEqual(result["op"], "rename_symbol")
+        self.assertIn("def cart_total(prices):", final_text)
+        self.assertNotIn("def total(", final_text)
 
     def test_test_spec_extract_parses_unittest_examples_and_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1599,6 +1927,26 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertIn("school = School(); school.add_student(name='Aimee', grade=2); school.roster() -> ['Aimee']", result["output"])
+
+    def test_test_spec_extract_captures_assert_true_and_false_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "retry.py").write_text("def should_retry(status_code, attempt):\n    pass\n", encoding="utf-8")
+            (root / "retry_test.py").write_text(
+                "import unittest\nfrom retry import should_retry\n\n"
+                "class RetryPolicyTest(unittest.TestCase):\n"
+                "    def test_retries_initial_attempts(self):\n"
+                "        self.assertTrue(should_retry(503, 0))\n"
+                "    def test_does_not_retry_non_server_error(self):\n"
+                "        self.assertFalse(should_retry(404, 0))\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.test_spec_extract("retry_test.py", source_path="retry.py", limit=10)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("should_retry(503, 0) -> True", result["output"])
+        self.assertIn("should_retry(404, 0) -> False", result["output"])
 
     def test_test_spec_extract_keeps_constructor_attribute_and_receiver_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1959,6 +2307,79 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(synthesized["ok"], synthesized)
         self.assertEqual(synthesized["expression"], "left + right")
+        self.assertTrue(validation["ok"], validation)
+
+    def test_synthesize_simple_expression_candidate_handles_boolean_ranges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "retry.py").write_text(
+                "def should_retry(status_code: int, attempt: int) -> bool:\n    return status_code >= 500 and attempt > 2\n",
+                encoding="utf-8",
+            )
+            (root / "client.py").write_text(
+                "from retry import should_retry\n\n"
+                "def next_action(status_code: int, attempt: int) -> str:\n"
+                "    return 'retry' if should_retry(status_code, attempt) else 'stop'\n",
+                encoding="utf-8",
+            )
+            (root / "tests").mkdir()
+            (root / "tests" / "test_retry_policy.py").write_text(
+                "import unittest\nfrom retry import should_retry\nfrom client import next_action\n\n"
+                "class RetryPolicyTests(unittest.TestCase):\n"
+                "    def test_retries_initial_attempts(self):\n"
+                "        self.assertTrue(should_retry(503, 0))\n"
+                "    def test_does_not_retry_non_server_error(self):\n"
+                "        self.assertFalse(should_retry(404, 0))\n"
+                "    def test_retries_upper_server_range(self):\n"
+                "        self.assertTrue(should_retry(599, 2))\n"
+                "    def test_does_not_retry_client_error_boundary(self):\n"
+                "        self.assertFalse(should_retry(499, 0))\n"
+                "    def test_client_retry_action(self):\n"
+                "        self.assertEqual(next_action(503, 1), 'retry')\n"
+                "    def test_client_stop_after_budget(self):\n"
+                "        self.assertEqual(next_action(503, 3), 'stop')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_simple_expression_candidate("retry.py", "tests/test_retry_policy.py")
+            validation = tools.validate_implementation_candidate(
+                "retry.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="tests/test_retry_policy.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertTrue(validation["ok"], validation)
+        self.assertIn("attempt", synthesized["expression"])
+        self.assertIn("status_code", synthesized["expression"])
+
+    def test_synthesize_string_normalizer_candidate_from_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "slug.py").write_text("def slugify(value: str) -> str:\n    pass\n", encoding="utf-8")
+            (root / "slug_test.py").write_text(
+                "import unittest\nfrom slug import slugify\n\n"
+                "class SlugTest(unittest.TestCase):\n"
+                "    def test_spaces(self):\n"
+                "        self.assertEqual(slugify('Hello Local Model'), 'hello-local-model')\n"
+                "    def test_edges(self):\n"
+                "        self.assertEqual(slugify('  Mixed Case  '), 'mixed-case')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            synthesized = tools.synthesize_string_normalizer_candidate("slug.py", "slug_test.py")
+            validation = tools.validate_implementation_candidate(
+                "slug.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="slug_test.py",
+                test_command=command,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("split()", synthesized["expression"])
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_sequence_utilities_candidate_from_standard_signatures(self) -> None:
@@ -3636,6 +4057,32 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
 
+    def test_contract_check_resolves_workspace_star_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "pricing.py").write_text(
+                "__all__ = ['cart_total']\n\n"
+                "def cart_total(prices):\n"
+                "    return sum(prices)\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_pricing.py").write_text(
+                "import sys\n"
+                "from pathlib import Path\n"
+                "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
+                "from pricing import *\n\n"
+                "def test_cart_total():\n"
+                "    assert cart_total([2, 3, 4]) == 9\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["src/pricing.py", "tests/test_pricing.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("undefined local/global name 'cart_total'", result["output"])
+
     def test_broad_scans_skip_public_benchmark_meta(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3774,6 +4221,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("pyright", output)
         self.assertIn("tox", output)
         self.assertIn("nox", output)
+
+    def test_discover_validators_reads_pyproject_tool_sections_without_toml_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.tomllib", None):
+                result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("pytest --collect-only", output)
+        self.assertIn("ruff check", output)
 
     def test_select_tests_returns_language_level_validator_for_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4119,6 +4583,21 @@ def double(value: int) -> int:
         self.assertIn("returns shape dict", result["output"])
         self.assertIn("may return None", result["output"])
 
+    def test_contract_check_allows_returning_local_dict_variable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def fetch_user(user_id: str) -> dict[str, str]:\n"
+                "    user_data = {'id': user_id}\n"
+                "    return user_data\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.contract_check(["app.py"])
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertNotIn("returns shape name:user_data", result["output"])
+
     def test_contract_check_flags_caller_return_shape_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4269,6 +4748,26 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"])
         self.assertIn("def fetch_user(user_id, include_orders=False):", sample.read_text(encoding="utf-8"))
 
+    def test_apply_structured_edit_changes_signature_from_bare_callable_signature(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "ops.py"
+        sample.write_text("def fetch_user(user_id: str) -> dict[str, str]:\n    return {'id': user_id}\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit(
+            {
+                "op": "change_signature",
+                "path": "ops.py",
+                "symbol": "fetch_user",
+                "signature": "fetch_user(user_id: str, include_orders: bool = False) -> dict[str, str]:",
+            }
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn(
+            "def fetch_user(user_id: str, include_orders: bool = False) -> dict[str, str]:",
+            sample.read_text(encoding="utf-8"),
+        )
+
     def test_apply_structured_edit_changes_signature_from_full_function_input(self) -> None:
         root = self._workspace_scratch()
         sample = root / "ops.py"
@@ -4352,10 +4851,9 @@ def double(value: int) -> int:
     def test_run_shell_ignores_posix_shell_env_override(self) -> None:
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
         completed = subprocess.CompletedProcess(args=["echo", "ok"], returncode=0, stdout="ok\n", stderr="")
-        with patch("ollama_code.tools.os.name", "posix"):
-            with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
-                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
-                    result = tools.run_shell("echo ok")
+        with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
+            with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                result = tools.run_shell("echo ok")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "ok")
@@ -4523,6 +5021,17 @@ def double(value: int) -> int:
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
 
+    def test_run_test_reports_inline_python_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: None != 3'); sys.exit(1)"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("AssertionError: None != 3", result["output"])
+
     def test_run_test_allows_unittest_discover_dot_start_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4567,6 +5076,89 @@ def double(value: int) -> int:
         self.assertTrue(result["discovered"])
         self.assertIn("unittest discover", result["command"])
 
+    def test_run_test_recovers_from_broken_configured_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto", test_command="pytesst -q")
+            result = tools.run_test()
+
+        self.assertTrue(result["ok"], result.get("output"))
+        self.assertTrue(result["recovered"])
+        self.assertEqual(result["original_command"], "pytesst -q")
+        self.assertIn("unittest discover", result["command"])
+        self.assertEqual(tools.default_test_command, result["command"])
+
+    def test_run_test_does_not_recover_from_normal_test_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add\n\n"
+                "class SampleTests(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("recovered", result)
+        self.assertEqual(result["command"], command)
+        self.assertIn("AssertionError", result["output"])
+        self.assertEqual(tools.default_test_command, command)
+
+    def test_run_test_sees_immediate_same_size_python_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "balance.py").write_text(
+                "def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_balance_credit.py").write_text(
+                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom balance import *\nimport unittest\n\n"
+                "class BalanceTests(unittest.TestCase):\n"
+                "    def test_apply_credit(self):\n"
+                "        self.assertEqual(apply_credit(10, 3), 13)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+
+            first = tools.run_test()
+            write_result = tools.write_file(
+                "src/balance.py",
+                "def apply_credit(amount: int, credit: int) -> int:\n    return amount + credit\n",
+            )
+            second = tools.run_test()
+
+        self.assertFalse(first["ok"])
+        self.assertTrue(write_result["ok"])
+        self.assertTrue(second["ok"], second.get("output"))
+
+    def test_run_test_does_not_override_explicit_bad_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.run_test("pytesst -q")
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("recovered", result)
+        self.assertEqual(result["command"], "pytesst -q")
+
     def test_diagnose_test_failure_classifies_common_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
@@ -4605,6 +5197,27 @@ def double(value: int) -> int:
         self.assertIn("tracked.txt", status["output"])
         self.assertTrue(diff["ok"])
         self.assertIn("+after", diff["output"])
+
+    def test_git_branch_and_log(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.init_git_repo(root)
+            tracked = root / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "checkout", "-b", "feature"], cwd=root, check=True, capture_output=True, text=True)
+            tracked.write_text("after\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "feature update"], cwd=root, check=True, capture_output=True, text=True)
+            tools = ToolExecutor(root, approval_mode="auto")
+            branches = tools.git_branch(all_branches=True)
+            history = tools.git_log(max_count=5)
+
+        self.assertTrue(branches["ok"])
+        self.assertIn("feature", branches["output"])
+        self.assertIn("master", branches["output"])
+        self.assertTrue(history["ok"])
+        self.assertIn("feature update", history["output"])
 
     def test_git_commit_creates_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

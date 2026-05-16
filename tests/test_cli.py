@@ -23,6 +23,8 @@ class DummyAgent:
                     "verify_function_contract",
                     "compose_verified_functions",
                     "promote_verified_function",
+                    "python_sdk_search",
+                    "python_sdk_refresh",
                 }
 
         self.model = DEFAULT_MODEL
@@ -168,6 +170,8 @@ class CliCommandTests(unittest.TestCase):
     def test_parser_defaults_max_tool_rounds_to_100(self) -> None:
         args = build_parser().parse_args([])
         self.assertIsNone(args.max_tool_rounds)
+        self.assertFalse(args.disable_spec_guided_repair)
+        self.assertFalse(args.require_llm_for_turn)
 
     def test_build_agent_uses_config_default_model(self) -> None:
         root = self._workspace_scratch()
@@ -189,6 +193,8 @@ class CliCommandTests(unittest.TestCase):
             "verify_function_contract",
             "compose_verified_functions",
             "promote_verified_function",
+            "python_sdk_search",
+            "python_sdk_refresh",
         ):
             self.assertIn(name, agent.tools.available_tool_names())
 
@@ -206,6 +212,26 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("\x1b[90mfour\x1b[0m", output)
         self.assertIn("\x1b[1A", output)
         self.assertIn("[status] tool read_file {}", output)
+
+    def test_build_agent_respects_disable_spec_guided_repair_env(self) -> None:
+        root = self._workspace_scratch()
+        with patch.dict("os.environ", {"OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR": "1"}):
+            args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+            agent = build_agent(args)
+        self.assertTrue(agent.disable_spec_guided_repair)
+
+    def test_build_agent_respects_require_llm_for_turn_flag(self) -> None:
+        root = self._workspace_scratch()
+        args = build_parser().parse_args(["--cwd", str(root), "--quiet", "--require-llm-for-turn"])
+        agent = build_agent(args)
+        self.assertTrue(agent.require_llm_for_turn)
+
+    def test_build_agent_respects_require_llm_for_turn_env(self) -> None:
+        root = self._workspace_scratch()
+        with patch.dict("os.environ", {"OLLAMA_CODE_REQUIRE_LLM_FOR_TURN": "1"}):
+            args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
+            agent = build_agent(args)
+        self.assertTrue(agent.require_llm_for_turn)
 
     def test_runtime_default_fallback_prints_default_pull_hint(self) -> None:
         root = self._workspace_scratch()
@@ -325,7 +351,18 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn(f"model: ok {DEFAULT_MODEL}", report)
         self.assertIn("indexer: ok enabled", report)
         self.assertIn("verified functions: ok default-on", report)
+        self.assertIn("python sdk embeddings:", report)
         self.assertIn("console script: not on PATH", report)
+
+    def test_doctor_report_shows_configured_sdk_embedding_model(self) -> None:
+        agent = DummyAgent()
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            with patch.dict("os.environ", {"OLLAMA_CODE_SDK_EMBED_MODEL": "qwen3-embedding:8b"}):
+                report, ok = doctor_report(agent)
+
+        self.assertTrue(ok)
+        self.assertIn("python sdk embeddings: ok on-demand candidate rerank via qwen3-embedding:8b", report)
 
     def test_doctor_command_prints_report(self) -> None:
         agent = DummyAgent()

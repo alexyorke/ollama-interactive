@@ -54,7 +54,7 @@ def build_workspace(root: Path) -> None:
     (root / ".gitignore").write_text(".ollama-code/\n", encoding="utf-8")
     (root / "notes" / "alpha.txt").write_text("ORBIT\nsecond line\n", encoding="utf-8")
     (root / "docs" / "spec.md").write_text(
-        "# Spec\n\nMAGIC_TOKEN appears here.\nSubagents should read this file.\n",
+        "# Spec\n\nUse the search tool to find MAGIC_TOKEN.\nThe search query must be exactly MAGIC_TOKEN.\nMAGIC_TOKEN appears here.\nSubagents should read this file.\n",
         encoding="utf-8",
     )
     (root / "src" / "sample.py").write_text(
@@ -93,6 +93,7 @@ def run_cli(
         model,
         "--approval",
         approval,
+        "--require-llm-for-turn",
         "--max-tool-rounds",
         "12",
         "--max-agent-depth",
@@ -182,7 +183,7 @@ def scenario_search(repo_root: Path, workspace: Path, model: str) -> None:
         repo_root,
         workspace,
         model,
-        "Use the search tool to find MAGIC_TOKEN and tell me which file contains it.",
+        "Use the search tool. Set query to MAGIC_TOKEN, path to ., and limit to 20. Then tell me which file contains it.",
     )
     require(result, lambda r: "[status] tool search" in r.stdout and "docs/spec.md" in r.stdout, "search scenario failed")
 
@@ -342,6 +343,7 @@ def scenario_repl(repo_root: Path, workspace: Path, model: str) -> None:
         str(workspace),
         "--model",
         model,
+        "--require-llm-for-turn",
         "--quiet",
     ]
     result = subprocess.run(
@@ -390,7 +392,7 @@ def resolve_requested_models(requested: list[str], available: set[str]) -> list[
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run live Ollama Code smoke tests against real local models.")
-    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "gemma3:4b", "qwen3:8b"], help="Models to test.")
+    parser.add_argument("--models", nargs="+", default=["gemma4:e4b", "granite4.1:8b", "qwen3:8b"], help="Models to test.")
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent

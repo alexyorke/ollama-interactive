@@ -12,12 +12,13 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY ollama_code ./ollama_code
+COPY scripts ./scripts
 COPY tests ./tests
 COPY docker/entrypoint.sh /usr/local/bin/ollama-code-docker
 
 RUN chmod +x /usr/local/bin/ollama-code-docker \
     && python -m pip install --upgrade pip \
-    && python -m pip install -e .
+    && python -m pip install -e . pytest
 
 RUN mkdir -p /workspace
 

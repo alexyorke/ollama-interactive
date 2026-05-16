@@ -23,6 +23,8 @@ ENV_OLLAMA_CODE_TEST_CMD = "OLLAMA_CODE_TEST_CMD"
 ENV_OLLAMA_CODE_DEBATE = "OLLAMA_CODE_DEBATE"
 ENV_OLLAMA_CODE_RECONCILE = "OLLAMA_CODE_RECONCILE"
 ENV_OLLAMA_CODE_NUM_CTX = "OLLAMA_CODE_NUM_CTX"
+ENV_OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR = "OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR"
+ENV_OLLAMA_CODE_REQUIRE_LLM_FOR_TURN = "OLLAMA_CODE_REQUIRE_LLM_FOR_TURN"
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class CliConfig:
     debate: bool | None = None
     reconcile: str | None = None
     tools_default_enabled: bool = True
+    enabled_tools: tuple[str, ...] = ()
     disabled_tools: tuple[str, ...] = ()
     mcp_servers: dict[str, Any] | None = None
     browser_enabled: bool = True
@@ -168,6 +171,7 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
         debate=_bool_config_value(data, "debate", path),
         reconcile=_reconcile_config_value(data, path),
         tools_default_enabled=True if tools_default_enabled is None else tools_default_enabled,
+        enabled_tools=_string_list_config_value(tools_payload, "enabled", path),
         disabled_tools=_string_list_config_value(tools_payload, "disabled", path),
         mcp_servers=dict(mcp_servers) if mcp_servers is not None else None,
         browser_enabled=True if browser_enabled is None else browser_enabled,

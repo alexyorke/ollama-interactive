@@ -24,6 +24,8 @@ from ollama_code.config import (
     ENV_OLLAMA_CODE_MODEL,
     ENV_OLLAMA_CODE_RECONCILE,
     ENV_OLLAMA_CODE_TEST_CMD,
+    ENV_OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR,
+    ENV_OLLAMA_CODE_REQUIRE_LLM_FOR_TURN,
     ENV_OLLAMA_CODE_VERIFIER_MODEL,
     ENV_OLLAMA_HOST,
     OFFICIAL_GRANITE_8B_MODEL,
@@ -160,6 +162,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verifier-model", default=None, help="Optional model override for grounded final verification and evidence-backed rewrite.")
     parser.add_argument("--session-file", default=None, help="Optional JSON transcript path. Defaults to a local auto-saved session file.")
     parser.add_argument("--no-indexer", action="store_true", help="Disable the background repo indexer for this run.")
+    parser.add_argument("--disable-spec-guided-repair", action="store_true", help="Disable spec-guided mechanical repair.")
+    parser.add_argument("--require-llm-for-turn", action="store_true", help="Require at least one real model call for each prompt turn.")
     parser.add_argument("--doctor", action="store_true", help="Check Ollama, model, workspace, and optional local tool availability, then exit.")
     parser.add_argument("--quiet", action="store_true", help="Suppress banner and status lines.")
     return parser
@@ -188,6 +192,10 @@ def _reconcile_from_text(value: str | None) -> str | None:
         return None
     lowered = value.strip().lower()
     return lowered if lowered in {"off", "on", "auto"} else None
+
+
+def _llm_call_count(agent: OllamaCodeAgent) -> int:
+    return sum(1 for event in agent.events if isinstance(event, dict) and event.get("type") == "llm_call")
 
 
 def build_agent(
@@ -297,12 +305,21 @@ def build_agent(
         poll_interval_ms=config.indexer_poll_interval_ms,
         status_printer=resolved_status_printer,
     )
+    disable_spec_guided_repair = bool(
+        _bool_from_text(_non_empty_string(os.environ.get(ENV_OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR)))
+        or args.disable_spec_guided_repair
+    )
+    require_llm_for_turn = bool(
+        _bool_from_text(_non_empty_string(os.environ.get(ENV_OLLAMA_CODE_REQUIRE_LLM_FOR_TURN)))
+        or args.require_llm_for_turn
+    )
     tools = ToolExecutor(
         workspace_root,
         approval_mode=approval,
         input_func=input_func,
         test_command=test_command,
         default_tools_enabled=config.tools_default_enabled,
+        enabled_tools=config.enabled_tools,
         disabled_tools=config.disabled_tools,
         mcp_servers=config.mcp_servers,
         browser_enabled=config.browser_enabled,
@@ -321,6 +338,8 @@ def build_agent(
         debate_enabled=debate_enabled,
         verifier_model=verifier_model,
         reconcile_mode=reconcile_mode,
+        disable_spec_guided_repair=disable_spec_guided_repair,
+        require_llm_for_turn=require_llm_for_turn,
     )
     if restored_payload is not None:
         agent.restore_transcript(restored_payload)
@@ -548,6 +567,17 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
             lines.append("verified functions: disabled/missing " + ", ".join(missing_verified))
         else:
             lines.append("verified functions: ok default-on Python cards; cache=.ollama-code/index/verified_functions.sqlite")
+        sdk_tools = {"python_sdk_search", "python_sdk_refresh"}
+        missing_sdk = sorted(sdk_tools - available_tools)
+        if missing_sdk:
+            lines.append("python sdk index: disabled/missing " + ", ".join(missing_sdk))
+        else:
+            lines.append("python sdk index: ok on-demand stdlib/API search; cache=.ollama-code/index/python_sdk.sqlite")
+            sdk_embed_model = os.environ.get("OLLAMA_CODE_SDK_EMBED_MODEL", "").strip()
+            if sdk_embed_model and sdk_embed_model.lower() not in {"0", "false", "none", "off"}:
+                lines.append(f"python sdk embeddings: ok on-demand candidate rerank via {sdk_embed_model}")
+            else:
+                lines.append("python sdk embeddings: disabled; set OLLAMA_CODE_SDK_EMBED_MODEL to enable")
 
     optional_tools = {
         "rg": "fast text search",
@@ -779,7 +809,12 @@ def run_repl(agent: OllamaCodeAgent, *, quiet: bool = False, renderer: CliStatus
                         return 0
                     if handled is True:
                         continue
+                    llm_calls_before = _llm_call_count(agent)
                     result = agent.handle_user(raw)
+                    if agent.require_llm_for_turn and _llm_call_count(agent) == llm_calls_before:
+                        renderer.clear_thinking()
+                        print("error: require-llm-for-turn completed without any llm_call event", file=sys.stderr)
+                        return 1
             except OllamaError as exc:
                 renderer.clear_thinking()
                 print(f"error: {exc}", file=sys.stderr)
@@ -826,7 +861,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with InterruptController(lambda _: None).watch() as interrupt_event:
                 agent.set_interrupt_event(interrupt_event)
+                llm_calls_before = _llm_call_count(agent)
                 result = agent.handle_user(" ".join(args.prompt))
+                if agent.require_llm_for_turn and _llm_call_count(agent) == llm_calls_before:
+                    renderer.clear_thinking()
+                    print("error: require-llm-for-turn completed without any llm_call event", file=sys.stderr)
+                    return 1
         except OllamaError as exc:
             renderer.clear_thinking()
             print(f"error: {exc}", file=sys.stderr)

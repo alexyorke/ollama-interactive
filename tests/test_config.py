@@ -132,7 +132,7 @@ class ConfigTests(unittest.TestCase):
             (root / ".ollama-code" / "config.json").write_text(
                 json.dumps(
                     {
-                        "tools": {"default_enabled": True, "disabled": ["browser_smoke"]},
+                        "tools": {"default_enabled": True, "enabled": ["run_test", "read_file"], "disabled": ["browser_smoke"]},
                         "mcp": {"servers": {"demo": {"command": "demo-mcp"}}},
                         "browser": {"enabled": False},
                         "security": {"enabled": False},
@@ -146,6 +146,7 @@ class ConfigTests(unittest.TestCase):
             agent = build_agent(args)
 
         self.assertNotIn("browser_smoke", agent.tools.available_tool_names())
+        self.assertEqual(agent.tools.enabled_tools, {"run_test", "read_file"})
         self.assertEqual(agent.tools.mcp_servers["demo"]["command"], "demo-mcp")
         self.assertFalse(agent.tools.browser_enabled)
         self.assertFalse(agent.tools.security_enabled)
