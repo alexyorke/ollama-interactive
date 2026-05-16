@@ -73,7 +73,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(git_status["ok"])
         self.assertIn("git is not installed", git_status["summary"])
 
-    def test_read_toml_gracefully_skips_when_no_toml_module(self) -> None:
+    def test_read_toml_extracts_tool_sections_when_no_toml_module(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "pyproject.toml"
@@ -82,7 +82,7 @@ class ToolExecutorTests(unittest.TestCase):
             with patch("ollama_code.tools.tomllib", None):
                 payload = tools._read_toml(config)
 
-        self.assertEqual(payload, {})
+        self.assertEqual(payload, {"tool": {"example": {}}})
 
     def test_git_tools_can_target_nested_repo_path(self) -> None:
         root = self._workspace_scratch()
@@ -4221,6 +4221,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("pyright", output)
         self.assertIn("tox", output)
         self.assertIn("nox", output)
+
+    def test_discover_validators_reads_pyproject_tool_sections_without_toml_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.tomllib", None):
+                result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("pytest --collect-only", output)
+        self.assertIn("ruff check", output)
 
     def test_select_tests_returns_language_level_validator_for_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -9900,10 +9900,19 @@ import string
     def _read_toml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
-        if tomllib is None:
-            return {}
         try:
-            return tomllib.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        if tomllib is None:
+            tool_sections: dict[str, Any] = {}
+            for match in re.finditer(r"(?m)^\s*\[tool\.([A-Za-z0-9_.-]+)\]\s*$", text):
+                cursor = tool_sections
+                for part in match.group(1).split("."):
+                    cursor = cursor.setdefault(part, {})
+            return {"tool": tool_sections} if tool_sections else {}
+        try:
+            return tomllib.loads(text)
         except (OSError, _TOMLDecodeError):
             return {}
 
