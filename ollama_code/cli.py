@@ -319,6 +319,7 @@ def build_agent(
         input_func=input_func,
         test_command=test_command,
         default_tools_enabled=config.tools_default_enabled,
+        enabled_tools=config.enabled_tools,
         disabled_tools=config.disabled_tools,
         mcp_servers=config.mcp_servers,
         browser_enabled=config.browser_enabled,
@@ -566,6 +567,17 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
             lines.append("verified functions: disabled/missing " + ", ".join(missing_verified))
         else:
             lines.append("verified functions: ok default-on Python cards; cache=.ollama-code/index/verified_functions.sqlite")
+        sdk_tools = {"python_sdk_search", "python_sdk_refresh"}
+        missing_sdk = sorted(sdk_tools - available_tools)
+        if missing_sdk:
+            lines.append("python sdk index: disabled/missing " + ", ".join(missing_sdk))
+        else:
+            lines.append("python sdk index: ok on-demand stdlib/API search; cache=.ollama-code/index/python_sdk.sqlite")
+            sdk_embed_model = os.environ.get("OLLAMA_CODE_SDK_EMBED_MODEL", "").strip()
+            if sdk_embed_model and sdk_embed_model.lower() not in {"0", "false", "none", "off"}:
+                lines.append(f"python sdk embeddings: ok on-demand candidate rerank via {sdk_embed_model}")
+            else:
+                lines.append("python sdk embeddings: disabled; set OLLAMA_CODE_SDK_EMBED_MODEL to enable")
 
     optional_tools = {
         "rg": "fast text search",

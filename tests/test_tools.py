@@ -73,7 +73,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(git_status["ok"])
         self.assertIn("git is not installed", git_status["summary"])
 
-    def test_read_toml_gracefully_skips_when_no_toml_module(self) -> None:
+    def test_read_toml_extracts_tool_sections_when_no_toml_module(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             config = root / "pyproject.toml"
@@ -82,7 +82,7 @@ class ToolExecutorTests(unittest.TestCase):
             with patch("ollama_code.tools.tomllib", None):
                 payload = tools._read_toml(config)
 
-        self.assertEqual(payload, {})
+        self.assertEqual(payload, {"tool": {"example": {}}})
 
     def test_git_tools_can_target_nested_repo_path(self) -> None:
         root = self._workspace_scratch()
@@ -1226,6 +1226,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("disabled", result["summary"])
 
+    def test_enabled_tools_allowlist_hides_other_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto", enabled_tools=["run_test", "read_file"])
+
+            self.assertEqual(tools.available_tool_names(), {"run_test", "read_file"})
+            blocked = tools.execute("run_shell", {"command": "echo hi"})
+
+        self.assertFalse(blocked["ok"])
+        self.assertIn("disabled", blocked["summary"])
+
     def test_systems_lens_frames_complex_task_without_grounding_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1288,6 +1298,148 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["missing_dependency"], missing_name)
         self.assertEqual(result["error_class"], "missing_dependency")
+
+    def test_python_sdk_search_finds_current_stdlib_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            refresh = tools.python_sdk_refresh(limit=5000)
+            result = tools.python_sdk_search("parse json string loads", limit=5)
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertTrue(result["ok"], result)
+        self.assertIn("json.loads", result["output"])
+        self.assertIn("Deserialize", result["output"])
+
+    def test_python_sdk_search_can_rerank_with_cached_embeddings(self) -> None:
+        entries = [
+            {
+                "id": "json",
+                "kind": "function",
+                "module": "json",
+                "qualname": "json.dumps",
+                "signature": "dumps(obj)",
+                "doc": "Serialize an object to JSON text.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "json dumps serialize object",
+            },
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            },
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            vectors: list[list[float]] = []
+            for text in texts:
+                lowered = text.lower()
+                vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
+            return vectors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed):
+                    refresh = tools.python_sdk_refresh(limit=10, embedding_model="fake-embed")
+                    result = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertEqual(refresh["embedded"], 2)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["results"][0]["qualname"], "pathlib.Path.glob")
+        self.assertIn("source=hybrid", result["output"])
+
+    def test_python_sdk_search_reranks_candidates_with_on_demand_embeddings(self) -> None:
+        entries = [
+            {
+                "id": "json",
+                "kind": "function",
+                "module": "json",
+                "qualname": "json.dumps",
+                "signature": "dumps(obj)",
+                "doc": "Serialize an object to JSON text.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "json dumps serialize object",
+            },
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            },
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            vectors: list[list[float]] = []
+            for text in texts:
+                lowered = text.lower()
+                vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
+            return vectors
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
+                    refresh = tools.python_sdk_refresh(limit=10)
+                    result = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+                    refresh_again = tools.python_sdk_refresh(limit=10)
+                    second = tools.python_sdk_search("find files by wildcard", limit=2, use_embeddings=True, embedding_model="fake-embed")
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertEqual(refresh["embedded"], 0)
+        self.assertEqual(refresh_again["cached_embeddings"], 1)
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["embedding_error"])
+        self.assertEqual(result["results"][0]["qualname"], "pathlib.Path.glob")
+        self.assertIn("source=hybrid", result["output"])
+        self.assertTrue(second["ok"], second)
+        self.assertLessEqual(embed.call_count, 4)
+
+    def test_python_sdk_search_uses_env_embedding_model(self) -> None:
+        entries = [
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            }
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            self.assertEqual(model, "fake-env-embed")
+            return [[0.0, 1.0] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.dict("os.environ", {"OLLAMA_CODE_SDK_EMBED_MODEL": "fake-env-embed"}):
+                with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                    with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
+                        result = tools.python_sdk_search("find files by wildcard", limit=1)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["embedding_model"], "fake-env-embed")
+        self.assertIsNone(result["embedding_error"])
+        self.assertEqual(result["embedding_candidates"], 1)
+        self.assertEqual(result["results"][0]["source"], "hybrid")
+        self.assertEqual(embed.call_count, 2)
 
     def test_ast_search_reports_missing_ast_grep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1653,6 +1805,25 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["routed_tool"], "replace_symbol")
         self.assertIn("return left + right", final_text)
         self.assertNotIn("def def", final_text)
+
+    def test_edit_intent_surfacing_syntax_errors_as_failed_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "billing.py"
+            sample.write_text('def invoice_label(user_id: int) -> str:\n    return f"{user_id}"\n', encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.edit_intent(
+                "billing.py",
+                "replace_text",
+                'def invoice_label(user_id: int) -> str:\n    return f"{user_id}"',
+                'def invoice_label(user_id: int) -> str\n    return f"{user_id}"',
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "syntax_error")
+        self.assertIn("Python syntax error", result["summary"])
 
     def test_edit_intent_routes_symbol_name_replacement_to_file_rename(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4051,6 +4222,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("tox", output)
         self.assertIn("nox", output)
 
+    def test_discover_validators_reads_pyproject_tool_sections_without_toml_parser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.tomllib", None):
+                result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("pytest --collect-only", output)
+        self.assertIn("ruff check", output)
+
     def test_select_tests_returns_language_level_validator_for_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4663,10 +4851,9 @@ def double(value: int) -> int:
     def test_run_shell_ignores_posix_shell_env_override(self) -> None:
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
         completed = subprocess.CompletedProcess(args=["echo", "ok"], returncode=0, stdout="ok\n", stderr="")
-        with patch("ollama_code.tools.os.name", "posix"):
-            with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
-                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
-                    result = tools.run_shell("echo ok")
+        with patch.dict(os.environ, {"SHELL": "/usr/bin/fish"}, clear=False):
+            with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                result = tools.run_shell("echo ok")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "ok")
@@ -4833,6 +5020,17 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"])
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
+
+    def test_run_test_reports_inline_python_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: None != 3'); sys.exit(1)"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("AssertionError: None != 3", result["output"])
 
     def test_run_test_allows_unittest_discover_dot_start_dir(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

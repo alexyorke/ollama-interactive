@@ -12,6 +12,7 @@ WORKDIR /app
 
 COPY pyproject.toml README.md ./
 COPY ollama_code ./ollama_code
+COPY scripts ./scripts
 COPY tests ./tests
 COPY docker/entrypoint.sh /usr/local/bin/ollama-code-docker
 

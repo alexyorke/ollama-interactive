@@ -19,15 +19,20 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import sysconfig
 import threading
 import textwrap
 import time
+import math
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from ollama_code.interrupts import OperationInterrupted
+from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_help
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -73,6 +78,51 @@ REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
 FTS_INDEX_VERSION = 1
 VERIFIED_FUNCTION_INDEX_VERSION = 1
+PYTHON_SDK_INDEX_VERSION = 1
+PYTHON_SDK_SAFE_IMPORT_MODULES = {
+    "array",
+    "base64",
+    "bisect",
+    "builtins",
+    "collections",
+    "csv",
+    "datetime",
+    "functools",
+    "glob",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "http.client",
+    "inspect",
+    "itertools",
+    "json",
+    "math",
+    "operator",
+    "os",
+    "pathlib",
+    "re",
+    "secrets",
+    "sqlite3",
+    "statistics",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "time",
+    "typing",
+    "urllib.parse",
+}
+PYTHON_SDK_SAFE_CLASS_METHOD_MODULES = {"collections", "datetime", "pathlib", "re", "subprocess", "tempfile"}
+PYTHON_SDK_PRIORITY_IMPORT_MODULES = (
+    "json",
+    "pathlib",
+    "tempfile",
+    "functools",
+    "collections",
+    "subprocess",
+    "itertools",
+    "math",
+    "re",
+)
 INDEX_MUTATING_TOOL_NAMES = {
     "write_file",
     "replace_symbol",
@@ -160,415 +210,6 @@ TODO_LIMIT = 20
 TODO_CONTENT_LIMIT = 180
 
 
-TOOL_DESCRIPTIONS = [
-    {
-        "name": "todo_read",
-        "arguments": {},
-        "description": "Read the in-session todo list for complex multi-step work.",
-    },
-    {
-        "name": "todo_write",
-        "arguments": {"items": "list of {content,status,id?}; status pending|in_progress|completed"},
-        "description": "Replace the in-session todo list. Keep at most one item in_progress.",
-    },
-    {
-        "name": "list_files",
-        "arguments": {"path": "relative path, default .", "max_depth": "int, default 4", "limit": "int, default 200"},
-        "description": "List files and directories under the workspace.",
-    },
-    {
-        "name": "read_file",
-        "arguments": {"path": "relative path", "start": "1-based start line, default 1", "end": "inclusive end line, default 200"},
-        "description": "Read a file with line numbers.",
-    },
-    {
-        "name": "search",
-        "arguments": {"query": "regex or plain text", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search text in the workspace.",
-    },
-    {
-        "name": "file_search",
-        "arguments": {"query": "filename/path terms", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search cached workspace file paths quickly without reading file contents.",
-    },
-    {
-        "name": "fd_search",
-        "arguments": {"query": "fd filename pattern", "path": "relative path, default .", "limit": "int, default 100", "kind": "any|file|dir, default any"},
-        "description": "Use fd/fdfind for fast repo-local file discovery when installed.",
-    },
-    {
-        "name": "file_index_refresh",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 50000"},
-        "description": "Refresh the persistent workspace file path index for fast future file searches.",
-    },
-    {
-        "name": "everything_search",
-        "arguments": {"query": "Everything search query", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Use the native Everything CLI es.exe when installed, constrained to the workspace path.",
-    },
-    {
-        "name": "search_symbols",
-        "arguments": {"query": "symbol name regex/text", "path": "relative path, default .", "limit": "int, default 50"},
-        "description": "Search code symbols by name without reading full files.",
-    },
-    {
-        "name": "code_outline",
-        "arguments": {"path": "file or directory, default .", "max_symbols": "int, default 120"},
-        "description": "Show compact code symbols and line ranges without function bodies.",
-    },
-    {
-        "name": "read_symbol",
-        "arguments": {"path": "code file", "symbol": "name or qualified name", "include_context": "lines around symbol, default 2"},
-        "description": "Read one code symbol body by AST/definition range.",
-    },
-    {
-        "name": "inspect_library_source",
-        "arguments": {"target": "Python import path like json.loads or json:loads", "context": "lines around source, default 3", "max_lines": "int, default 160", "include_disassembly": "bool, default false"},
-        "description": "Inspect installed Python library source/signature/doc; falls back to bytecode or builtin diagnostics when source is unavailable.",
-    },
-    {
-        "name": "repo_index_search",
-        "arguments": {"query": "natural query or symbol", "path": "relative path, default .", "limit": "int, default 10"},
-        "description": "Search code with compact ranked snippets instead of whole files.",
-    },
-    {
-        "name": "fts_search",
-        "arguments": {"query": "terms or phrase", "path": "relative path, default .", "limit": "int, default 20", "refresh": "bool, default false"},
-        "description": "Search the local SQLite FTS5 cache across paths, symbols, headings, and snippets.",
-    },
-    {
-        "name": "fts_refresh",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 2000"},
-        "description": "Refresh the local SQLite FTS5 cache for fast lexical repository queries.",
-    },
-    {
-        "name": "indexed_search",
-        "arguments": {"query": "plain terms or regex-like text", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search cached line snippets from the persistent repo index without scanning every file.",
-    },
-    {
-        "name": "repo_index_refresh",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 1000"},
-        "description": "Refresh the persistent repo index for faster future symbol and text searches.",
-    },
-    {
-        "name": "semgrep_scan",
-        "arguments": {"pattern": "Semgrep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
-        "description": "Run Semgrep structurally when semgrep is installed; useful for syntax-aware code search.",
-    },
-    {
-        "name": "ast_search",
-        "arguments": {"pattern": "ast-grep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
-        "description": "Run ast-grep structural search when ast-grep/sg is installed.",
-    },
-    {
-        "name": "lsp_diagnostics",
-        "arguments": {"path": "file or directory, default .", "lang": "optional language", "timeout": "seconds, default 60"},
-        "description": "Run available language-server-style diagnostics without installing tools.",
-    },
-    {
-        "name": "lsp_definition",
-        "arguments": {"path": "file", "line": "1-based line", "column": "1-based column", "limit": "int, default 20"},
-        "description": "Find likely definitions for the symbol at a location using available local indexes.",
-    },
-    {
-        "name": "lsp_references",
-        "arguments": {"path": "file", "line": "1-based line", "column": "1-based column", "limit": "int, default 40"},
-        "description": "Find likely references for the symbol at a location using local search.",
-    },
-    {
-        "name": "context_pack",
-        "arguments": {"request": "user request or task text", "path": "relative path, default .", "limit": "int, default 8"},
-        "description": "Build compact ranked evidence from repo index, tests, imports, symbols, and git state.",
-    },
-    {
-        "name": "systems_lens",
-        "arguments": {"request": "user request or task text", "path": "relative path, default .", "evidence": "optional current evidence", "limit": "int, default 8"},
-        "description": "Frame complex work with boundary, state, scale, viewpoints, coupling, and validation checks.",
-    },
-    {
-        "name": "find_implementation_target",
-        "arguments": {"test_path": "optional test file", "path": "optional test/source path alias", "query": "optional symbol/query", "output": "optional failing test output/traceback", "limit": "int, default 12"},
-        "description": "Map tests or tracebacks to likely implementation files and symbols.",
-    },
-    {
-        "name": "diagnose_test_failure",
-        "arguments": {"output": "run_test output", "path": "relative path, default .", "limit": "int, default 12"},
-        "description": "Group failing tests by likely root cause with expected/actual and likely target files.",
-    },
-    {
-        "name": "test_spec_extract",
-        "arguments": {"test_path": "unittest file", "source_path": "optional source file", "limit": "int, default 20"},
-        "description": "Extract compact unittest examples from assertions and assertRaises for repair guidance.",
-    },
-    {
-        "name": "implementation_spec",
-        "arguments": {"source_path": "Python source file", "test_path": "optional unittest file", "limit": "int, default 40"},
-        "description": "Build a compact implementation spec from source signatures, stubs, static risks, and test examples.",
-    },
-    {
-        "name": "run_function_probe",
-        "arguments": {"module": "python module", "expressions": "list of Python expressions", "function": "optional function name", "timeout": "seconds, default 30"},
-        "description": "Run small Python expressions against a target module/function and return actual values/errors.",
-    },
-    {
-        "name": "call_graph",
-        "arguments": {"path": "file or directory", "symbol": "optional symbol", "limit": "int, default 40"},
-        "description": "Show static Python callers, callees, imports, and affected tests.",
-    },
-    {
-        "name": "contract_graph",
-        "arguments": {"path": "file or directory, default .", "symbol": "optional symbol", "limit": "int, default 40"},
-        "description": "Show compact function contracts, callers/callees, return-shape, and purity hints.",
-    },
-    {
-        "name": "verified_function_index",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 500"},
-        "description": "Build repo-local Python verified-function cards in the SQLite card index.",
-    },
-    {
-        "name": "verified_function_search",
-        "arguments": {"query": "behavior/function query", "signature": "optional signature terms", "examples": "optional examples text/list", "path": "relative path, default .", "limit": "int, default 10"},
-        "description": "Search repo-local verified/probable/unverified function cards; retrieval is not proof.",
-    },
-    {
-        "name": "verified_function_show",
-        "arguments": {"id": "card id or prefix"},
-        "description": "Show a verified-function card, evidence, source excerpt, and stale/fresh hash status.",
-    },
-    {
-        "name": "verify_function_contract",
-        "arguments": {"path": "Python source file", "symbol": "function/method symbol"},
-        "description": "Recheck one function card with purity, contract checks, doc probes, and focused tests.",
-    },
-    {
-        "name": "compose_verified_functions",
-        "arguments": {"goal": "desired behavior", "candidates": "list of card ids or search result ids"},
-        "description": "Plan glue-code composition from verified function cards without editing files.",
-    },
-    {
-        "name": "promote_verified_function",
-        "arguments": {"path": "Python source file", "symbol": "function/method symbol"},
-        "description": "Promote one Python function to verified only after static checks plus probes/tests pass.",
-    },
-    {
-        "name": "lint_typecheck",
-        "arguments": {"paths": "path or list of paths, default .", "command": "optional lint/type command", "timeout": "seconds, default 120"},
-        "description": "Run deterministic syntax/lint/type checks with exact file lines.",
-    },
-    {
-        "name": "discover_validators",
-        "arguments": {"path": "relative path, default .", "limit": "int, default 12"},
-        "description": "Detect focused test/lint/typecheck commands for Python, JS/TS, Go, Rust, Java, and C/C++ projects.",
-    },
-    {
-        "name": "diagnose_dependency_error",
-        "arguments": {"output": "error output", "path": "relative path, default ."},
-        "description": "Classify missing dependency/import/command/path failures and suggest safe next steps.",
-    },
-    {
-        "name": "contract_check",
-        "arguments": {"changed_files": "list of changed source files", "changed_symbols": "optional list of symbols", "limit": "int, default 80"},
-        "description": "Check changed Python functions for arity, return-shape, async/yield, and annotation contract issues.",
-    },
-    {
-        "name": "select_tests",
-        "arguments": {"changed_files": "list of changed source files", "changed_symbols": "optional list of symbols", "limit": "int, default 8"},
-        "description": "Select focused test commands for changed files using imports, names, and symbols.",
-    },
-    {
-        "name": "replace_symbol",
-        "arguments": {"path": "code file", "symbol": "name or qualified name", "content": "replacement symbol source"},
-        "description": "Replace one function/class/method by symbol range. Python replacements must keep the full file syntactically valid.",
-    },
-    {
-        "name": "replace_symbols",
-        "arguments": {"path": "code file", "replacements": "list of {symbol, content} objects"},
-        "description": "Replace multiple functions/classes/methods in one syntactically checked edit.",
-    },
-    {
-        "name": "write_file",
-        "arguments": {"path": "relative path", "content": "full new file content"},
-        "description": "Create or fully replace a file.",
-    },
-    {
-        "name": "replace_in_file",
-        "arguments": {
-            "path": "relative path",
-            "old": "text to replace",
-            "new": "replacement text",
-            "replace_all": "bool, default false",
-            "match_whole_word": "bool, default false",
-        },
-        "description": "Replace text inside an existing file. Prefer unique snippets; use match_whole_word for standalone words.",
-    },
-    {
-        "name": "apply_structured_edit",
-        "arguments": {"operation": "JSON operation: rename_symbol, replace_symbol, add_import, move_symbol, delete_symbol"},
-        "description": "Apply a mechanical code edit from an intent JSON, then syntax-check and return diff.",
-    },
-    {
-        "name": "edit_intent",
-        "arguments": {"path": "relative path", "intent": "rename|replace_text|replace_symbol|replace_body|change_signature|add_import", "target": "old text/symbol", "replacement": "new text/source", "scope": "file|project, default file", "apply": "bool, default true"},
-        "description": "Route an edit intent to the safest low-level edit tool and avoid common symbol/text mixups.",
-    },
-    {
-        "name": "generate_tests_from_spec",
-        "arguments": {"target_symbol": "symbol under test", "behavior": "expected behavior", "test_path": "optional output test path", "apply": "bool, default false"},
-        "description": "Generate a compact pytest test patch from a spec; preview by default, apply only when requested.",
-    },
-    {
-        "name": "browser_smoke",
-        "arguments": {"url": "URL to open", "actions": "optional action list", "wait_for": "optional selector/text", "viewport": "desktop|mobile, default desktop", "screenshot": "bool, default false"},
-        "description": "Run a Playwright smoke check for browser/UI tasks when Playwright is installed.",
-    },
-    {
-        "name": "security_scan",
-        "arguments": {"path": "relative path, default .", "scanners": "auto or scanner list", "limit": "int, default 80", "timeout": "seconds, default 120"},
-        "description": "Run available local security/dependency scanners only when explicitly requested.",
-    },
-    {
-        "name": "mcp_list_tools",
-        "arguments": {"server": "optional configured MCP server name", "timeout": "seconds, default 15"},
-        "description": "List tools exposed by configured MCP servers.",
-    },
-    {
-        "name": "mcp_call",
-        "arguments": {"server": "configured MCP server name", "tool": "tool name", "arguments": "tool arguments object", "timeout": "seconds, default 30"},
-        "description": "Call a configured MCP server tool through a guarded stdio JSON-RPC request.",
-    },
-    {
-        "name": "run_shell",
-        "arguments": {"command": "shell command", "cwd": "relative path, default .", "timeout": "seconds, default 30"},
-        "description": "Run a shell command inside the workspace.",
-    },
-    {
-        "name": "run_test",
-        "arguments": {
-            "command": "optional test command override; defaults to the configured test command",
-            "cwd": "relative path, default .",
-            "timeout": "seconds, default 1200",
-        },
-        "description": "Run the project's test command inside the workspace.",
-    },
-    {
-        "name": "git_status",
-        "arguments": {"path": "optional relative path filter"},
-        "description": "Show git status for the workspace or a specific path.",
-    },
-    {
-        "name": "git_diff",
-        "arguments": {"path": "optional relative path filter", "cached": "bool, default false", "context": "int, default 3"},
-        "description": "Show a git diff for working tree or staged changes. Leave cached unset for working-tree changes; use cached=true only when the user explicitly asks for staged diff.",
-    },
-    {
-        "name": "git_branch",
-        "arguments": {"path": "optional relative path inside the repo", "all_branches": "bool, default false"},
-        "description": "List git branches for the active repo, optionally including remotes.",
-    },
-    {
-        "name": "git_log",
-        "arguments": {"path": "optional relative path inside the repo", "max_count": "int, default 10", "oneline": "bool, default true"},
-        "description": "Show recent git commits for the active repo or path.",
-    },
-    {
-        "name": "git_commit",
-        "arguments": {"message": "commit message", "add_all": "bool, default true"},
-        "description": "Create a git commit for the current workspace changes.",
-    },
-    {
-        "name": "run_agent",
-        "arguments": {
-            "prompt": "subtask prompt for the child agent",
-            "model": "optional model override",
-            "approval_mode": "optional ask|auto|read-only",
-            "max_tool_rounds": "optional int, default inherited",
-        },
-        "description": "Start a nested agent for a scoped subtask and return its final answer.",
-    },
-]
-
-
-def format_tool_help(tool_names: Iterable[str] | None = None) -> str:
-    lines: list[str] = []
-    allowed = set(tool_names) if tool_names is not None else None
-    for tool in TOOL_DESCRIPTIONS:
-        if allowed is not None and tool["name"] not in allowed:
-            continue
-        arg_text = ", ".join(f"{key}: {value}" for key, value in tool["arguments"].items())
-        lines.append(f"- {tool['name']}({arg_text}) -> {tool['description']}")
-    return "\n".join(lines)
-
-
-def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
-    signatures = {
-        "todo_read": "todo_read()",
-        "todo_write": 'todo_write(items=[{"content":"inspect","status":"pending"}])',
-        "list_files": "list_files(path='.',depth=4,limit=200)",
-        "read_file": "read_file(path,start=1,end=200)",
-        "search": "search(query,path='.',limit=100)",
-        "file_search": "file_search(query,path='.',limit=100)",
-        "fd_search": "fd_search(query,path='.',limit=100,kind='any')",
-        "file_index_refresh": "file_index_refresh(path='.',limit=50000)",
-        "everything_search": "everything_search(query,path='.',limit=100)",
-        "search_symbols": "search_symbols(query,path='.',limit=50)",
-        "code_outline": "code_outline(path,max_symbols=120)",
-        "read_symbol": "read_symbol(path,symbol,context=2)",
-        "inspect_library_source": "inspect_library_source(target,context=3,max_lines=160,include_disassembly=false)",
-        "repo_index_search": "repo_index_search(query,path='.',limit=10)",
-        "fts_search": "fts_search(query,path='.',limit=20,refresh=false)",
-        "fts_refresh": "fts_refresh(path='.',limit=2000)",
-        "indexed_search": "indexed_search(query,path='.',limit=100)",
-        "repo_index_refresh": "repo_index_refresh(path='.',limit=1000)",
-        "semgrep_scan": "semgrep_scan(pattern,path='.',lang?,limit=50)",
-        "ast_search": "ast_search(pattern,path='.',lang?,limit=50)",
-        "lsp_diagnostics": "lsp_diagnostics(path='.',lang?,timeout=60)",
-        "lsp_definition": "lsp_definition(path,line,column,limit=20)",
-        "lsp_references": "lsp_references(path,line,column,limit=40)",
-        "context_pack": "context_pack(request,path='.',limit=8)",
-        "systems_lens": "systems_lens(request,path='.',evidence?,limit=8)",
-        "find_implementation_target": "find_implementation_target(test_path?/path?,query?,output?,limit=12)",
-        "diagnose_test_failure": "diagnose_test_failure(output,path='.',limit=12)",
-        "test_spec_extract": "test_spec_extract(test_path,source_path?,limit=20)",
-        "implementation_spec": "implementation_spec(source_path,test_path?,limit=40)",
-        "run_function_probe": "run_function_probe(module,expressions,function?,timeout=30)",
-        "call_graph": "call_graph(path,symbol?,limit=40)",
-        "contract_graph": "contract_graph(path='.',symbol?,limit=40)",
-        "verified_function_index": "verified_function_index(path='.',limit=500)",
-        "verified_function_search": "verified_function_search(query,signature?,examples?,path='.',limit=10)",
-        "verified_function_show": "verified_function_show(id)",
-        "verify_function_contract": "verify_function_contract(path,symbol)",
-        "compose_verified_functions": "compose_verified_functions(goal,candidates)",
-        "promote_verified_function": "promote_verified_function(path,symbol)",
-        "lint_typecheck": "lint_typecheck(paths='.',command?,timeout=120)",
-        "discover_validators": "discover_validators(path='.',limit=12)",
-        "diagnose_dependency_error": "diagnose_dependency_error(output,path='.')",
-        "contract_check": "contract_check(changed_files,changed_symbols?,limit=80)",
-        "select_tests": "select_tests(changed_files,changed_symbols?,limit=8)",
-        "replace_symbol": "replace_symbol(path,symbol,content)",
-        "replace_symbols": 'replace_symbols(path,replacements=[{"symbol":"f","content":"def f():\\n    return ..."}])',
-        "write_file": "write_file(path,content)",
-        "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
-        "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol|replace_function_body|change_signature|...","path":"a.py"})',
-        "edit_intent": "edit_intent(path,intent=rename|replace_text|replace_symbol|replace_body|change_signature|add_import,target?,replacement?,scope='file',apply=true)",
-        "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
-        "browser_smoke": "browser_smoke(url,actions=[],wait_for?,viewport='desktop',screenshot=false)",
-        "security_scan": "security_scan(path='.',scanners='auto',limit=80)",
-        "mcp_list_tools": "mcp_list_tools(server?,timeout=15)",
-        "mcp_call": "mcp_call(server,tool,arguments={},timeout=30)",
-        "run_shell": "run_shell(command,cwd='.',timeout=30)",
-        "run_test": "run_test(command?,cwd='.',timeout=1200)",
-        "git_status": "git_status(path?)",
-        "git_diff": "git_diff(path?,cached=false,context=3)",
-        "git_branch": "git_branch(path?,all_branches=false)",
-        "git_log": "git_log(path?,max_count=10,oneline=true)",
-        "git_commit": "git_commit(message,add_all=true)",
-        "run_agent": "run_agent(prompt,model?,approval?,rounds?)",
-    }
-    allowed = set(tool_names) if tool_names is not None else None
-    return "\n".join(signatures[tool["name"]] for tool in TOOL_DESCRIPTIONS if allowed is None or tool["name"] in allowed)
-
-
 class ToolExecutor:
     def __init__(
         self,
@@ -579,6 +220,7 @@ class ToolExecutor:
         agent_runner: AgentRunner | None = None,
         test_command: str | None = None,
         default_tools_enabled: bool = True,
+        enabled_tools: Iterable[str] | None = None,
         disabled_tools: Iterable[str] | None = None,
         mcp_servers: dict[str, Any] | None = None,
         browser_enabled: bool = True,
@@ -591,6 +233,7 @@ class ToolExecutor:
         self.agent_runner = agent_runner
         self.default_test_command = test_command.strip() if isinstance(test_command, str) and test_command.strip() else None
         self.default_tools_enabled = bool(default_tools_enabled)
+        self.enabled_tools = {str(name).strip() for name in (enabled_tools or []) if str(name).strip()}
         self.disabled_tools = {str(name).strip() for name in (disabled_tools or []) if str(name).strip()}
         self.mcp_servers = dict(mcp_servers or {})
         self.browser_enabled = bool(browser_enabled)
@@ -652,6 +295,8 @@ class ToolExecutor:
         clean = str(name or "").strip()
         if not clean:
             return False
+        if self.enabled_tools and clean not in self.enabled_tools:
+            return False
         if clean in self.disabled_tools:
             return False
         if clean.startswith("mcp.") and ("mcp_call" in self.disabled_tools or "mcp" in self.disabled_tools):
@@ -696,6 +341,8 @@ class ToolExecutor:
             "code_outline": self.code_outline,
             "read_symbol": self.read_symbol,
             "inspect_library_source": self.inspect_library_source,
+            "python_sdk_refresh": self.python_sdk_refresh,
+            "python_sdk_search": self.python_sdk_search,
             "repo_index_search": self.repo_index_search,
             "fts_search": self.fts_search,
             "fts_refresh": self.fts_refresh,
@@ -1388,6 +1035,7 @@ class ToolExecutor:
             "name": file_path.name,
             "suffix": file_path.suffix.lower(),
             "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
             "size": int(stat.st_size),
             "terms": self._extract_index_terms(rel.replace("/", " "), limit=80),
         }
@@ -1408,6 +1056,7 @@ class ToolExecutor:
             if not (
                 isinstance(cached, dict)
                 and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+                and cached.get("ctime_ns") == int(stat.st_ctime_ns)
                 and cached.get("size") == int(stat.st_size)
             ):
                 cached = self._file_index_record(file_path)
@@ -2055,6 +1704,771 @@ class ToolExecutor:
     def _fts_cache_path(self) -> Path:
         return self.workspace_root / ".ollama-code" / "index" / "repo_fts.sqlite"
 
+    def _python_sdk_cache_path(self) -> Path:
+        return self.workspace_root / ".ollama-code" / "index" / "python_sdk.sqlite"
+
+    def _initialize_python_sdk_connection(self, conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA busy_timeout=2000")
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS python_sdk_entries("
+            "id TEXT PRIMARY KEY,"
+            "kind TEXT NOT NULL,"
+            "module TEXT NOT NULL,"
+            "qualname TEXT NOT NULL,"
+            "signature TEXT NOT NULL,"
+            "doc TEXT NOT NULL,"
+            "source_path TEXT NOT NULL,"
+            "line INTEGER NOT NULL,"
+            "text TEXT NOT NULL,"
+            "embedding_model TEXT,"
+            "embedding_json TEXT)"
+        )
+        conn.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS python_sdk_fts USING fts5("
+            "id UNINDEXED, module, qualname, signature, doc, text)"
+        )
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('version', ?)", (str(PYTHON_SDK_INDEX_VERSION),))
+        conn.commit()
+
+    def _connect_python_sdk(self) -> sqlite3.Connection:
+        cache_path = self._python_sdk_cache_path()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(cache_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        self._initialize_python_sdk_connection(conn)
+        return conn
+
+    def _stdlib_root(self) -> Path:
+        return Path(sysconfig.get_path("stdlib") or Path(sys.executable).parent).resolve(strict=False)
+
+    def _stdlib_module_name(self, root: Path, path: Path) -> str | None:
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return None
+        parts = list(relative.with_suffix("").parts)
+        if not parts:
+            return None
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        if not parts:
+            return None
+        if any(part in {"test", "tests", "idle_test", "__pycache__", "site-packages", "dist-packages"} for part in parts):
+            return None
+        if any(part.startswith("_test") or part.endswith("_test") for part in parts):
+            return None
+        if not all(re.fullmatch(r"[A-Za-z_]\w*", part) for part in parts):
+            return None
+        return ".".join(parts)
+
+    def _iter_python_sdk_files(self, *, limit: int) -> list[Path]:
+        root = self._stdlib_root()
+        files: list[Path] = []
+        for file_path in sorted(root.rglob("*.py")):
+            self._check_interrupted()
+            if len(files) >= limit:
+                break
+            if self._stdlib_module_name(root, file_path) is None:
+                continue
+            try:
+                stat = file_path.stat()
+            except OSError:
+                continue
+            if stat.st_size > 768_000:
+                continue
+            files.append(file_path)
+        return files
+
+    def _doc_summary(self, text: str | None, *, limit: int = 420) -> str:
+        doc = inspect.cleandoc(text or "")
+        if not doc:
+            return ""
+        paragraph = re.split(r"\n\s*\n", doc, maxsplit=1)[0].replace("\n", " ").strip()
+        return self._truncate_text(paragraph, limit=limit)
+
+    def _ast_signature(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> str:
+        if isinstance(node, ast.ClassDef):
+            return f"class {node.name}"
+        args = node.args
+        parts: list[str] = []
+        positional = list(args.posonlyargs) + list(args.args)
+        defaults = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        for arg, default in zip(positional, defaults):
+            parts.append(arg.arg + ("=..." if default is not None else ""))
+        if args.vararg is not None:
+            parts.append("*" + args.vararg.arg)
+        elif args.kwonlyargs:
+            parts.append("*")
+        for arg, default in zip(args.kwonlyargs, args.kw_defaults):
+            parts.append(arg.arg + ("=..." if default is not None else ""))
+        if args.kwarg is not None:
+            parts.append("**" + args.kwarg.arg)
+        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        return f"{prefix} {node.name}({', '.join(parts)})"
+
+    def _python_sdk_entry(
+        self,
+        *,
+        kind: str,
+        module: str,
+        qualname: str,
+        signature: str,
+        doc: str,
+        source_path: str,
+        line: int,
+    ) -> dict[str, Any]:
+        text = f"{kind} {module} {qualname} {signature} {doc}".strip()
+        entry_id = hashlib.sha1(f"{kind}\0{module}\0{qualname}".encode("utf-8", errors="replace")).hexdigest()[:20]
+        return {
+            "id": entry_id,
+            "kind": kind,
+            "module": module,
+            "qualname": qualname,
+            "signature": signature,
+            "doc": doc,
+            "source_path": source_path,
+            "line": int(line or 1),
+            "text": text,
+        }
+
+    def _python_sdk_ast_entries(self, *, limit: int) -> list[dict[str, Any]]:
+        root = self._stdlib_root()
+        entries: list[dict[str, Any]] = []
+        for file_path in self._iter_python_sdk_files(limit=limit):
+            if len(entries) >= limit:
+                break
+            module = self._stdlib_module_name(root, file_path)
+            if module is None:
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(text, filename=str(file_path))
+            except (OSError, SyntaxError):
+                continue
+            doc = self._doc_summary(ast.get_docstring(tree))
+            source_path = str(file_path)
+            if doc:
+                entries.append(
+                    self._python_sdk_entry(
+                        kind="module",
+                        module=module,
+                        qualname=module,
+                        signature=f"module {module}",
+                        doc=doc,
+                        source_path=source_path,
+                        line=1,
+                    )
+                )
+            for node in tree.body:
+                self._check_interrupted()
+                if len(entries) >= limit:
+                    break
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    if node.name.startswith("_"):
+                        continue
+                    qualname = f"{module}.{node.name}"
+                    kind = "class" if isinstance(node, ast.ClassDef) else "function"
+                    entries.append(
+                        self._python_sdk_entry(
+                            kind=kind,
+                            module=module,
+                            qualname=qualname,
+                            signature=self._ast_signature(node),
+                            doc=self._doc_summary(ast.get_docstring(node)),
+                            source_path=source_path,
+                            line=getattr(node, "lineno", 1),
+                        )
+                    )
+                    if isinstance(node, ast.ClassDef):
+                        for child in node.body:
+                            if len(entries) >= limit:
+                                break
+                            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                                continue
+                            if child.name.startswith("_"):
+                                continue
+                            entries.append(
+                                self._python_sdk_entry(
+                                    kind="method",
+                                    module=module,
+                                    qualname=f"{module}.{node.name}.{child.name}",
+                                    signature=self._ast_signature(child),
+                                    doc=self._doc_summary(ast.get_docstring(child)),
+                                    source_path=source_path,
+                                    line=getattr(child, "lineno", 1),
+                                )
+                            )
+        return entries
+
+    def _python_sdk_imported_entries(self, *, remaining: int, existing_ids: set[str]) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        module_names = list(PYTHON_SDK_PRIORITY_IMPORT_MODULES)
+        module_names.extend(name for name in sorted(PYTHON_SDK_SAFE_IMPORT_MODULES) if name not in module_names)
+        for module_name in module_names:
+            if len(entries) >= remaining:
+                break
+            try:
+                module = importlib.import_module(module_name)
+            except Exception:
+                continue
+            module_doc = self._doc_summary(inspect.getdoc(module))
+            module_entry = self._python_sdk_entry(
+                kind="module",
+                module=module_name,
+                qualname=module_name,
+                signature=f"module {module_name}",
+                doc=module_doc,
+                source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                line=1,
+            )
+            if module_entry["id"] not in existing_ids:
+                entries.append(module_entry)
+                existing_ids.add(module_entry["id"])
+            for name, value in inspect.getmembers(module):
+                if len(entries) >= remaining:
+                    break
+                if name.startswith("_"):
+                    continue
+                if inspect.isclass(value):
+                    kind = "class"
+                    signature = f"class {name}"
+                elif inspect.isbuiltin(value) or inspect.isfunction(value):
+                    kind = "function"
+                    try:
+                        signature = f"{name}{inspect.signature(value)}"
+                    except (TypeError, ValueError):
+                        signature = name
+                else:
+                    continue
+                qualname = f"{module_name}.{name}"
+                entry = self._python_sdk_entry(
+                    kind=kind,
+                    module=module_name,
+                    qualname=qualname,
+                    signature=signature,
+                    doc=self._doc_summary(inspect.getdoc(value)),
+                    source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                    line=1,
+                )
+                if entry["id"] in existing_ids:
+                    continue
+                entries.append(entry)
+                existing_ids.add(entry["id"])
+                if kind == "class" and module_name in PYTHON_SDK_SAFE_CLASS_METHOD_MODULES:
+                    for method_name, method_value in inspect.getmembers(value):
+                        if len(entries) >= remaining:
+                            break
+                        if method_name.startswith("_"):
+                            continue
+                        if not (inspect.isfunction(method_value) or inspect.ismethod(method_value) or inspect.isbuiltin(method_value) or inspect.ismethoddescriptor(method_value)):
+                            continue
+                        try:
+                            method_signature = f"{method_name}{inspect.signature(method_value)}"
+                        except (TypeError, ValueError):
+                            method_signature = method_name
+                        method_entry = self._python_sdk_entry(
+                            kind="method",
+                            module=module_name,
+                            qualname=f"{module_name}.{name}.{method_name}",
+                            signature=method_signature,
+                            doc=self._doc_summary(inspect.getdoc(method_value)),
+                            source_path=str(getattr(module, "__file__", "") or "(built-in)"),
+                            line=1,
+                        )
+                        if method_entry["id"] in existing_ids:
+                            continue
+                        entries.append(method_entry)
+                        existing_ids.add(method_entry["id"])
+        return entries
+
+    def _python_sdk_entries(self, *, limit: int) -> list[dict[str, Any]]:
+        entries = self._python_sdk_imported_entries(remaining=min(limit, 1200), existing_ids=set())
+        existing_ids = {str(entry["id"]) for entry in entries}
+        for entry in self._python_sdk_ast_entries(limit=limit):
+            if len(entries) >= limit:
+                break
+            if str(entry["id"]) in existing_ids:
+                continue
+            entries.append(entry)
+            existing_ids.add(str(entry["id"]))
+        if len(entries) < limit:
+            entries.extend(self._python_sdk_imported_entries(remaining=limit - len(entries), existing_ids=existing_ids))
+        return entries[:limit]
+
+    def _normalize_sdk_embedding_model(self, embedding_model: str | None) -> str | None:
+        raw = str(embedding_model or "").strip()
+        if not raw:
+            raw = os.environ.get("OLLAMA_CODE_SDK_EMBED_MODEL", "").strip()
+        if raw.lower() in {"", "0", "false", "none", "off"}:
+            return None
+        return raw
+
+    def _normalize_ollama_host(self, embedding_host: str | None) -> str:
+        raw = str(embedding_host or os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").strip()
+        if not re.match(r"^https?://", raw):
+            raw = "http://" + raw
+        return raw.rstrip("/")
+
+    def _ollama_embed_texts(
+        self,
+        texts: list[str],
+        *,
+        model: str,
+        host: str | None = None,
+        timeout: int = 120,
+    ) -> list[list[float]]:
+        if not texts:
+            return []
+        endpoint = self._normalize_ollama_host(host) + "/api/embed"
+        payload = json.dumps({"model": model, "input": texts}).encode("utf-8")
+        request = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(request, timeout=max(1, int(timeout))) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        raw_embeddings = data.get("embeddings")
+        if isinstance(raw_embeddings, list):
+            return [[float(value) for value in vector] for vector in raw_embeddings if isinstance(vector, list)]
+        raw_embedding = data.get("embedding")
+        if isinstance(raw_embedding, list) and len(texts) == 1:
+            return [[float(value) for value in raw_embedding]]
+        raise ValueError("Ollama embed response did not include embeddings.")
+
+    def _embed_python_sdk_entries(
+        self,
+        entries: list[dict[str, Any]],
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+    ) -> tuple[int, str | None]:
+        embedded = 0
+        batch_size = 16
+        for offset in range(0, len(entries), batch_size):
+            self._check_interrupted()
+            batch = entries[offset : offset + batch_size]
+            try:
+                vectors = self._ollama_embed_texts(
+                    [str(entry.get("text", ""))[:4000] for entry in batch],
+                    model=model,
+                    host=host,
+                    timeout=timeout,
+                )
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                return embedded, str(exc)
+            for entry, vector in zip(batch, vectors):
+                if not vector:
+                    continue
+                entry["embedding_model"] = model
+                entry["embedding_json"] = json.dumps(vector, separators=(",", ":"))
+                embedded += 1
+        return embedded, None
+
+    def _cosine_similarity(self, left: list[float], right: list[float]) -> float:
+        if not left or not right or len(left) != len(right):
+            return 0.0
+        dot = sum(a * b for a, b in zip(left, right))
+        left_norm = math.sqrt(sum(a * a for a in left))
+        right_norm = math.sqrt(sum(b * b for b in right))
+        if not left_norm or not right_norm:
+            return 0.0
+        return dot / (left_norm * right_norm)
+
+    def python_sdk_refresh(
+        self,
+        limit: int = 5000,
+        embedding_model: str | None = None,
+        embedding_host: str | None = None,
+        embedding_timeout: int = 120,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        try:
+            conn = self._connect_python_sdk()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("python_sdk_refresh", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        limit_value = max(1, int(limit))
+        existing_embeddings: dict[str, tuple[str, str]] = {}
+        try:
+            for row in conn.execute(
+                "SELECT id,embedding_model,embedding_json FROM python_sdk_entries "
+                "WHERE embedding_model IS NOT NULL AND embedding_json IS NOT NULL"
+            ).fetchall():
+                existing_embeddings[str(row[0])] = (str(row[1] or ""), str(row[2] or ""))
+        except sqlite3.Error:
+            existing_embeddings = {}
+        entries = self._python_sdk_entries(limit=limit_value)
+        model = self._normalize_sdk_embedding_model(embedding_model)
+        cached_embeddings = 0
+        if not model and existing_embeddings:
+            for entry in entries:
+                cached = existing_embeddings.get(str(entry.get("id") or ""))
+                if not cached:
+                    continue
+                cached_model, cached_json = cached
+                if cached_model and cached_json:
+                    entry["embedding_model"] = cached_model
+                    entry["embedding_json"] = cached_json
+                    cached_embeddings += 1
+        embedded = 0
+        embedding_error = None
+        if model:
+            embedded, embedding_error = self._embed_python_sdk_entries(
+                entries,
+                model=model,
+                host=embedding_host,
+                timeout=max(1, int(embedding_timeout)),
+            )
+        try:
+            conn.execute("DELETE FROM python_sdk_entries")
+            conn.execute("DELETE FROM python_sdk_fts")
+            for entry in entries:
+                conn.execute(
+                    "INSERT OR REPLACE INTO python_sdk_entries("
+                    "id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json"
+                    ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        entry["id"],
+                        entry["kind"],
+                        entry["module"],
+                        entry["qualname"],
+                        entry["signature"],
+                        entry["doc"],
+                        entry["source_path"],
+                        int(entry["line"]),
+                        entry["text"],
+                        entry.get("embedding_model"),
+                        entry.get("embedding_json"),
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO python_sdk_fts(id,module,qualname,signature,doc,text) VALUES(?,?,?,?,?,?)",
+                    (entry["id"], entry["module"], entry["qualname"], entry["signature"], entry["doc"], entry["text"]),
+                )
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('stdlib_root', ?)", (str(self._stdlib_root()),))
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('python_version', ?)", (sys.version.split()[0],))
+            if model:
+                conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('embedding_model', ?)", (model,))
+            conn.commit()
+        finally:
+            conn.close()
+        summary = f"Indexed {len(entries)} Python SDK item(s) from {self._stdlib_root()}."
+        if cached_embeddings:
+            summary += f" cached_embeddings={cached_embeddings}."
+        if model:
+            summary += f" embeddings={embedded} model={model}."
+        if embedding_error:
+            summary += f" embedding_error={self._truncate_text(embedding_error, limit=160)}"
+        return {
+            "ok": True,
+            "tool": "python_sdk_refresh",
+            "items": len(entries),
+            "embedded": embedded,
+            "cached_embeddings": cached_embeddings,
+            "embedding_model": model,
+            "embedding_error": embedding_error,
+            "cache": self.relative_label(self._python_sdk_cache_path()),
+            "stdlib_root": str(self._stdlib_root()),
+            "output": summary,
+            "summary": summary,
+        }
+
+    def _python_sdk_lexical_rows(self, conn: sqlite3.Connection, query: str, *, limit: int) -> list[dict[str, Any]]:
+        fts_query = self._safe_fts_query(query)
+        if not fts_query:
+            return []
+        terms = [term.lower() for term in re.findall(r"[A-Za-z_][\w.:-]*|\d+", query)]
+        try:
+            records = conn.execute(
+                "SELECT e.id,e.kind,e.module,e.qualname,e.signature,e.doc,e.source_path,e.line,e.text,e.embedding_model,e.embedding_json,bm25(python_sdk_fts) AS rank "
+                "FROM python_sdk_fts JOIN python_sdk_entries e ON e.id=python_sdk_fts.id "
+                "WHERE python_sdk_fts MATCH ? ORDER BY rank LIMIT ?",
+                (fts_query, max(1, int(limit))),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            terms = self._extract_index_terms(query, limit=8)
+            if not terms:
+                return []
+            like = "%" + "%".join(terms) + "%"
+            records = conn.execute(
+                "SELECT id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json,0 AS rank "
+                "FROM python_sdk_entries WHERE text LIKE ? OR qualname LIKE ? ORDER BY qualname LIMIT ?",
+                (like, like, max(1, int(limit))),
+            ).fetchall()
+        rows = [
+            {
+                "id": row[0],
+                "kind": row[1],
+                "module": row[2],
+                "qualname": row[3],
+                "signature": row[4],
+                "doc": row[5],
+                "source_path": row[6],
+                "line": row[7],
+                "text": row[8],
+                "embedding_model": row[9],
+                "embedding_json": row[10],
+                "rank": float(row[11] or 0.0),
+                "source": "lexical",
+            }
+            for row in records
+        ]
+        for row in rows:
+            qualname = str(row.get("qualname") or "").lower()
+            module = str(row.get("module") or "").lower()
+            signature = str(row.get("signature") or "").lower()
+            doc = str(row.get("doc") or "").lower()
+            haystack = str(row.get("text") or "").lower()
+            score = 0.0
+            for term in terms:
+                if term == module or term in qualname:
+                    score += 10
+                if term in signature:
+                    score += 4
+                if term in doc:
+                    score += 2
+                elif term in haystack:
+                    score += 1
+            row["lexical_score"] = score
+        return sorted(rows, key=lambda item: (-float(item.get("lexical_score", 0.0)), float(item.get("rank", 0.0)), str(item.get("qualname", ""))))[: max(1, int(limit))]
+
+    def _python_sdk_expanded_query(self, query: str) -> str:
+        lowered = query.lower()
+        additions: list[str] = []
+        if "json" in lowered and re.search(r"\b(?:parse|deserialize|string|load|loads)\b", lowered):
+            additions.append("json loads load deserialize")
+        if re.search(r"\b(?:file|files|path|paths)\b", lowered) and re.search(r"\b(?:wildcard|glob|pattern|recursive|recursively)\b", lowered):
+            additions.append("pathlib Path glob rglob")
+        if "temporary" in lowered and "directory" in lowered:
+            additions.append("tempfile TemporaryDirectory")
+        if re.search(r"\b(?:memoize|memoise|cache|least recently used|lru)\b", lowered):
+            additions.append("functools lru_cache cache")
+        if re.search(r"\b(?:count|frequency|frequencies|tally)\b", lowered):
+            additions.append("collections Counter")
+        if "subprocess" in lowered or (re.search(r"\b(?:run|execute)\b", lowered) and "command" in lowered):
+            additions.append("subprocess run capture_output CompletedProcess")
+        if not additions:
+            return query
+        return query + " " + " ".join(additions)
+
+    def _python_sdk_embedding_rows(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        try:
+            query_vector = self._ollama_embed_texts([query], model=model, host=host, timeout=timeout)[0]
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError, IndexError) as exc:
+            return [], str(exc)
+        records = conn.execute(
+            "SELECT id,kind,module,qualname,signature,doc,source_path,line,text,embedding_model,embedding_json "
+            "FROM python_sdk_entries WHERE embedding_model=? AND embedding_json IS NOT NULL",
+            (model,),
+        ).fetchall()
+        rows: list[dict[str, Any]] = []
+        for row in records:
+            try:
+                vector = [float(value) for value in json.loads(str(row[10] or "[]"))]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            if score <= 0:
+                continue
+            rows.append(
+                {
+                    "id": row[0],
+                    "kind": row[1],
+                    "module": row[2],
+                    "qualname": row[3],
+                    "signature": row[4],
+                    "doc": row[5],
+                    "source_path": row[6],
+                    "line": row[7],
+                    "text": row[8],
+                    "embedding_model": row[9],
+                    "embedding_json": row[10],
+                    "embedding_score": score,
+                    "source": "embedding",
+                }
+            )
+        return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
+
+    def _python_sdk_candidate_embedding_rows(
+        self,
+        conn: sqlite3.Connection,
+        query: str,
+        candidates: list[dict[str, Any]],
+        *,
+        model: str,
+        host: str | None,
+        timeout: int,
+        limit: int,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if not candidates:
+            return [], None
+        try:
+            query_vector = self._ollama_embed_texts([query], model=model, host=host, timeout=timeout)[0]
+        except (OSError, ValueError, urllib.error.URLError, TimeoutError, IndexError) as exc:
+            return [], str(exc)
+
+        vectors_by_id: dict[str, list[float]] = {}
+        missing_rows: list[dict[str, Any]] = []
+        for row in candidates:
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                continue
+            cached_model = str(row.get("embedding_model") or "")
+            cached_json = str(row.get("embedding_json") or "")
+            if cached_model == model and cached_json:
+                try:
+                    vector = [float(value) for value in json.loads(cached_json)]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    vector = []
+                if vector:
+                    vectors_by_id[row_id] = vector
+                    continue
+            missing_rows.append(row)
+
+        if missing_rows:
+            try:
+                vectors = self._ollama_embed_texts(
+                    [str(row.get("text", ""))[:4000] for row in missing_rows],
+                    model=model,
+                    host=host,
+                    timeout=timeout,
+                )
+            except (OSError, ValueError, urllib.error.URLError, TimeoutError) as exc:
+                return [], str(exc)
+            for row, vector in zip(missing_rows, vectors):
+                row_id = str(row.get("id") or "")
+                if not row_id or not vector:
+                    continue
+                vectors_by_id[row_id] = vector
+                row["embedding_model"] = model
+                row["embedding_json"] = json.dumps(vector, separators=(",", ":"))
+                conn.execute(
+                    "UPDATE python_sdk_entries SET embedding_model=?, embedding_json=? WHERE id=?",
+                    (model, row["embedding_json"], row_id),
+                )
+            conn.commit()
+
+        rows: list[dict[str, Any]] = []
+        for row in candidates:
+            vector = vectors_by_id.get(str(row.get("id") or ""))
+            if not vector:
+                continue
+            score = self._cosine_similarity(query_vector, vector)
+            if score <= 0:
+                continue
+            item = dict(row)
+            item["embedding_model"] = model
+            item["embedding_score"] = score
+            item["source"] = "embedding"
+            rows.append(item)
+        return sorted(rows, key=lambda item: (-float(item["embedding_score"]), str(item["qualname"])))[: max(1, int(limit))], None
+
+    def _format_python_sdk_rows(self, rows: list[dict[str, Any]], *, limit: int) -> str:
+        lines: list[str] = []
+        for row in rows[: max(1, int(limit))]:
+            signature = str(row.get("signature") or "").strip()
+            doc = self._truncate_text(str(row.get("doc") or "").strip(), limit=220)
+            source = str(row.get("source_path") or "")
+            line = int(row.get("line") or 1)
+            score = ""
+            if "embedding_score" in row:
+                score = f" score={float(row['embedding_score']):.3f}"
+            lines.append(f"{row.get('qualname')} [{row.get('kind')}; module={row.get('module')}; source={row.get('source')}{score}]")
+            if signature:
+                lines.append(f"  signature: {signature}")
+            if doc:
+                lines.append(f"  doc: {doc}")
+            if source:
+                lines.append(f"  sdk_source: {source}:{line}")
+        return "\n".join(lines) if lines else "(no Python SDK matches)"
+
+    def python_sdk_search(
+        self,
+        query: str,
+        limit: int = 8,
+        refresh: bool = False,
+        use_embeddings: bool = False,
+        embedding_model: str | None = None,
+        embedding_host: str | None = None,
+        embedding_timeout: int = 30,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return {"ok": False, "tool": "python_sdk_search", "summary": "python_sdk_search requires a non-empty query."}
+        model = self._normalize_sdk_embedding_model(embedding_model)
+        if refresh or not self._python_sdk_cache_path().exists():
+            refresh_result = self.python_sdk_refresh(limit=5000, embedding_model="off")
+            if refresh_result.get("ok") is not True:
+                return refresh_result
+        try:
+            conn = self._connect_python_sdk()
+        except sqlite3.OperationalError as exc:
+            return self._missing_dependency_result("python_sdk_search", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
+        limit_value = max(1, int(limit))
+        embedding_error = None
+        embedding_candidates = 0
+        try:
+            expanded_query = self._python_sdk_expanded_query(clean_query)
+            lexical_rows = self._python_sdk_lexical_rows(conn, expanded_query, limit=limit_value * 3)
+            embedding_rows: list[dict[str, Any]] = []
+            if model:
+                candidate_limit = min(len(lexical_rows), max(limit_value, min(limit_value * 2, 12)))
+                embedding_candidates = candidate_limit
+                embedding_rows, embedding_error = self._python_sdk_candidate_embedding_rows(
+                    conn,
+                    expanded_query,
+                    lexical_rows[:candidate_limit],
+                    model=model,
+                    host=embedding_host,
+                    timeout=max(1, int(embedding_timeout)),
+                    limit=limit_value * 3,
+                )
+            merged: dict[str, dict[str, Any]] = {}
+            for rank, row in enumerate(lexical_rows):
+                item = dict(row)
+                item["combined_score"] = 1.0 / (rank + 1)
+                merged[str(item["id"])] = item
+            for rank, row in enumerate(embedding_rows):
+                item = merged.get(str(row["id"]), dict(row))
+                item["source"] = "hybrid" if str(row["id"]) in merged else "embedding"
+                item["embedding_score"] = row.get("embedding_score", 0.0)
+                item["combined_score"] = float(item.get("combined_score", 0.0)) + float(row.get("embedding_score", 0.0)) + (0.25 / (rank + 1))
+                merged[str(row["id"])] = item
+            rows = sorted(merged.values(), key=lambda item: (-float(item.get("combined_score", 0.0)), str(item.get("qualname", ""))))[:limit_value]
+        finally:
+            conn.close()
+        output = self._format_python_sdk_rows(rows, limit=limit_value)
+        summary = f"Python SDK search returned {len(rows)} item(s)."
+        if model:
+            summary += f" embedding_model={model}."
+        if embedding_error:
+            summary += f" embedding_error={self._truncate_text(embedding_error, limit=180)}"
+        return {
+            "ok": True,
+            "tool": "python_sdk_search",
+            "query": clean_query,
+            "expanded_query": self._python_sdk_expanded_query(clean_query),
+            "count": len(rows),
+            "embedding_model": model,
+            "embedding_error": embedding_error,
+            "embedding_candidates": embedding_candidates,
+            "cache": self.relative_label(self._python_sdk_cache_path()),
+            "results": [
+                {key: value for key, value in row.items() if key not in {"embedding_json", "text"}}
+                for row in rows
+            ],
+            "summary": summary,
+            "output": output,
+        }
+
     def _initialize_fts_connection(self, conn: sqlite3.Connection) -> None:
         conn.execute("PRAGMA busy_timeout=2000")
         conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -2282,6 +2696,7 @@ class ToolExecutor:
         return {
             "path": self.relative_label(file_path),
             "mtime_ns": int(stat.st_mtime_ns),
+            "ctime_ns": int(stat.st_ctime_ns),
             "size": int(stat.st_size),
             "sha1": hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest(),
             "symbols": symbols[:300],
@@ -2327,6 +2742,7 @@ class ToolExecutor:
             if not (
                 isinstance(cached, dict)
                 and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+                and cached.get("ctime_ns") == int(stat.st_ctime_ns)
                 and cached.get("size") == int(stat.st_size)
                 and isinstance(cached.get("line_index"), list)
             ):
@@ -9484,10 +9900,19 @@ import string
     def _read_toml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
-        if tomllib is None:
-            return {}
         try:
-            return tomllib.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return {}
+        if tomllib is None:
+            tool_sections: dict[str, Any] = {}
+            for match in re.finditer(r"(?m)^\s*\[tool\.([A-Za-z0-9_.-]+)\]\s*$", text):
+                cursor = tool_sections
+                for part in match.group(1).split("."):
+                    cursor = cursor.setdefault(part, {})
+            return {"tool": tool_sections} if tool_sections else {}
+        try:
+            return tomllib.loads(text)
         except (OSError, _TOMLDecodeError):
             return {}
 
@@ -9532,6 +9957,7 @@ import string
         )
         if python_files or pyproject or pytest_config:
             add("syntax", "python", f"{sys.executable} -m py_compile", "Python files found; lint_typecheck does exact syntax checks internally.")
+            add("lint", "python", f"{sys.executable} -m py_compile", "Python files found; lint_typecheck does exact syntax checks internally.")
             if pytest_config:
                 add("collect", "python", f"{sys.executable} -m pytest --collect-only -q", "pytest config found.")
                 add("test", "python", f"{sys.executable} -m pytest", "pytest config found.")
@@ -10859,6 +11285,9 @@ import string
         wrapped["tool"] = "edit_intent"
         wrapped["routed_tool"] = routed_tool
         wrapped["route"] = route
+        if wrapped.get("syntax_ok") is False:
+            wrapped["ok"] = False
+            wrapped.setdefault("error_class", "syntax_error")
         summary = str(wrapped.get("summary") or wrapped.get("output") or "").strip()
         wrapped["summary"] = f"{route}: {summary}" if summary else route
         return wrapped
@@ -11789,6 +12218,16 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return next((group for group in match.groups() if group), None)
 
     def _split_command_for_validation(self, command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
+        python_inline = re.match(
+            r"^\s*(?P<exe>(?:[A-Za-z]:)?[^\s]+(?:python|python3|py)(?:\.exe)?)\s+-c\s+(?P<code>.+?)\s*$",
+            command,
+            flags=re.IGNORECASE,
+        )
+        if python_inline:
+            code = python_inline.group("code").strip()
+            if len(code) >= 2 and code[0] == code[-1] and code[0] in {"'", '"'}:
+                code = code[1:-1]
+            return [python_inline.group("exe"), "-c", code], None
         try:
             argv = shlex.split(command, posix=os.name != "nt")
         except ValueError as exc:
@@ -11921,6 +12360,21 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             result["reason"] = reason
         return result
 
+    def _normalize_python_exec_argv(self, argv: list[str]) -> list[str]:
+        if len(argv) < 3:
+            return argv
+        normalized = list(argv)
+        try:
+            code_index = normalized.index("-c") + 1
+        except ValueError:
+            return normalized
+        if code_index >= len(normalized):
+            return normalized
+        code = str(normalized[code_index]).strip()
+        if len(code) >= 2 and code[0] == code[-1] and code[0] in {"'", '"'}:
+            normalized[code_index] = code[1:-1]
+        return normalized
+
     def _needs_bash_syntax_check(self, command: str, family: str | None) -> bool:
         if family is not None:
             return False
@@ -11963,13 +12417,9 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             return None, split_error
         assert argv is not None
         argv = [str(argv[0]).strip().strip("'\""), *argv[1:]]
-        if "-c" in argv:
-            try:
-                code_index = argv.index("-c") + 1
-                argv[code_index] = str(argv[code_index]).strip().strip("'\"")
-            except IndexError:
-                pass
         family = self._command_family(argv)
+        if family == "python_exec":
+            argv = self._normalize_python_exec_argv(argv)
         if self._needs_bash_syntax_check(command, family):
             syntax_error = self._bash_syntax_validation(command)
             if syntax_error is not None:

@@ -23,6 +23,8 @@ class DummyAgent:
                     "verify_function_contract",
                     "compose_verified_functions",
                     "promote_verified_function",
+                    "python_sdk_search",
+                    "python_sdk_refresh",
                 }
 
         self.model = DEFAULT_MODEL
@@ -191,6 +193,8 @@ class CliCommandTests(unittest.TestCase):
             "verify_function_contract",
             "compose_verified_functions",
             "promote_verified_function",
+            "python_sdk_search",
+            "python_sdk_refresh",
         ):
             self.assertIn(name, agent.tools.available_tool_names())
 
@@ -347,7 +351,18 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn(f"model: ok {DEFAULT_MODEL}", report)
         self.assertIn("indexer: ok enabled", report)
         self.assertIn("verified functions: ok default-on", report)
+        self.assertIn("python sdk embeddings:", report)
         self.assertIn("console script: not on PATH", report)
+
+    def test_doctor_report_shows_configured_sdk_embedding_model(self) -> None:
+        agent = DummyAgent()
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            with patch.dict("os.environ", {"OLLAMA_CODE_SDK_EMBED_MODEL": "qwen3-embedding:8b"}):
+                report, ok = doctor_report(agent)
+
+        self.assertTrue(ok)
+        self.assertIn("python sdk embeddings: ok on-demand candidate rerank via qwen3-embedding:8b", report)
 
     def test_doctor_command_prints_report(self) -> None:
         agent = DummyAgent()
