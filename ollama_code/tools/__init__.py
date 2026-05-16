@@ -2403,9 +2403,9 @@ class ToolExecutor:
         clean_query = str(query or "").strip()
         if not clean_query:
             return {"ok": False, "tool": "python_sdk_search", "summary": "python_sdk_search requires a non-empty query."}
-        model = self._normalize_sdk_embedding_model(embedding_model) if use_embeddings or embedding_model else None
+        model = self._normalize_sdk_embedding_model(embedding_model)
         if refresh or not self._python_sdk_cache_path().exists():
-            refresh_result = self.python_sdk_refresh(limit=5000)
+            refresh_result = self.python_sdk_refresh(limit=5000, embedding_model="off")
             if refresh_result.get("ok") is not True:
                 return refresh_result
         try:
@@ -2414,15 +2414,18 @@ class ToolExecutor:
             return self._missing_dependency_result("python_sdk_search", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
         limit_value = max(1, int(limit))
         embedding_error = None
+        embedding_candidates = 0
         try:
             expanded_query = self._python_sdk_expanded_query(clean_query)
             lexical_rows = self._python_sdk_lexical_rows(conn, expanded_query, limit=limit_value * 3)
             embedding_rows: list[dict[str, Any]] = []
             if model:
+                candidate_limit = min(len(lexical_rows), max(limit_value, min(limit_value * 2, 12)))
+                embedding_candidates = candidate_limit
                 embedding_rows, embedding_error = self._python_sdk_candidate_embedding_rows(
                     conn,
                     expanded_query,
-                    lexical_rows,
+                    lexical_rows[:candidate_limit],
                     model=model,
                     host=embedding_host,
                     timeout=max(1, int(embedding_timeout)),
@@ -2456,6 +2459,7 @@ class ToolExecutor:
             "count": len(rows),
             "embedding_model": model,
             "embedding_error": embedding_error,
+            "embedding_candidates": embedding_candidates,
             "cache": self.relative_label(self._python_sdk_cache_path()),
             "results": [
                 {key: value for key, value in row.items() if key not in {"embedding_json", "text"}}

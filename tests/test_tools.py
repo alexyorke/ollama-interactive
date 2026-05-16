@@ -1408,6 +1408,39 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(second["ok"], second)
         self.assertLessEqual(embed.call_count, 4)
 
+    def test_python_sdk_search_uses_env_embedding_model(self) -> None:
+        entries = [
+            {
+                "id": "pathlib",
+                "kind": "method",
+                "module": "pathlib",
+                "qualname": "pathlib.Path.glob",
+                "signature": "glob(pattern)",
+                "doc": "Find files by wildcard pattern.",
+                "source_path": "(built-in)",
+                "line": 1,
+                "text": "pathlib Path glob find files wildcard",
+            }
+        ]
+
+        def fake_embed(texts: list[str], *, model: str, host: str | None = None, timeout: int = 120) -> list[list[float]]:
+            self.assertEqual(model, "fake-env-embed")
+            return [[0.0, 1.0] for _ in texts]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch.dict("os.environ", {"OLLAMA_CODE_SDK_EMBED_MODEL": "fake-env-embed"}):
+                with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
+                    with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
+                        result = tools.python_sdk_search("find files by wildcard", limit=1)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["embedding_model"], "fake-env-embed")
+        self.assertIsNone(result["embedding_error"])
+        self.assertEqual(result["embedding_candidates"], 1)
+        self.assertEqual(result["results"][0]["source"], "hybrid")
+        self.assertEqual(embed.call_count, 2)
+
     def test_ast_search_reports_missing_ast_grep(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

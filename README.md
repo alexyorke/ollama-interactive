@@ -291,6 +291,12 @@ The `python_sdk_search` tool builds `.ollama-code/index/python_sdk.sqlite` from 
 python scripts/python_sdk_search_eval.py --use-embeddings --embedding-model qwen3-embedding:8b
 ```
 
+To make CLI tool calls use SDK embeddings automatically, set:
+
+```bash
+OLLAMA_CODE_SDK_EMBED_MODEL=qwen3-embedding:8b
+```
+
 ## WSL + tmux
 
 From WSL in the repo root:

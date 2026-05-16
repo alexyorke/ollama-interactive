@@ -13,7 +13,7 @@ Rules:
 - write_file content is raw file text only; no markdown fences, no leading ">" quote markers.
 - For fix/implement + tests: read tests/source, edit implementation, run_test; do not only summarize or loop on reads. If source has pass/.../return None stubs, edit those stubs directly; do not keep using read_symbol/code_outline on the same stub file.
 - If user names a source file/function to fix, edit source, not tests, unless tests are explicitly requested.
-- Code nav: use file_search/fd_search and fts_search/repo_index_search to shrink scope; prefer search_symbols, code_outline, then read_symbol before broad read_file. Python API/stdlib facts: use python_sdk_search before memory, then inspect_library_source for exact source/signature. Search/list before broad reads; use ranges.
+- Code nav: use file_search/fd_search and fts_search/repo_index_search to shrink scope; prefer search_symbols, code_outline, then read_symbol before broad read_file. Python API/stdlib facts: use python_sdk_search before memory; it uses configured SDK embeddings automatically when available. Then inspect_library_source for exact source/signature. Search/list before broad reads; use ranges.
 - Validation/deps: use discover_validators for unknown projects; use diagnose_dependency_error before retrying import/command/path failures.
 - Systems lens: for broad/debug/design/perf/refactor tasks, use systems_lens early; force explicit boundary, observer/metric, categories, state/scale, feedback, delays, stocks/flows, coupling, model limits, and intervention tests.
 - Clarifying questions: ask only after local evidence when the answer would change scope, acceptance, risk, tradeoff, or implementation; include a recommended default and never ask discoverable repo facts.

@@ -42,6 +42,7 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     refresh = tools.python_sdk_refresh(
         limit=args.index_limit,
+        embedding_model="off",
     )
     refresh_elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
     rows: list[dict[str, Any]] = []
@@ -51,7 +52,7 @@ def run_eval(args: argparse.Namespace) -> dict[str, Any]:
             case.query,
             limit=args.limit,
             use_embeddings=args.use_embeddings,
-            embedding_model=args.embedding_model,
+            embedding_model=args.embedding_model if args.use_embeddings else "off",
             embedding_host=args.embedding_host,
             embedding_timeout=args.embedding_timeout,
         )

@@ -573,6 +573,11 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
             lines.append("python sdk index: disabled/missing " + ", ".join(missing_sdk))
         else:
             lines.append("python sdk index: ok on-demand stdlib/API search; cache=.ollama-code/index/python_sdk.sqlite")
+            sdk_embed_model = os.environ.get("OLLAMA_CODE_SDK_EMBED_MODEL", "").strip()
+            if sdk_embed_model and sdk_embed_model.lower() not in {"0", "false", "none", "off"}:
+                lines.append(f"python sdk embeddings: ok on-demand candidate rerank via {sdk_embed_model}")
+            else:
+                lines.append("python sdk embeddings: disabled; set OLLAMA_CODE_SDK_EMBED_MODEL to enable")
 
     optional_tools = {
         "rg": "fast text search",
