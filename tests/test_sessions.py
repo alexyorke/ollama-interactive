@@ -71,6 +71,16 @@ class SessionPathTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Transcript file not found"):
             load_transcript_payload(missing)
 
+    def test_load_transcript_payload_reports_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session = root / ".ollama-code" / "sessions" / "invalid-utf8.json"
+            session.parent.mkdir(parents=True, exist_ok=True)
+            session.write_bytes(b"\xff\xfe\x80")
+
+            with self.assertRaisesRegex(ValueError, "Invalid transcript encoding"):
+                load_transcript_payload(session)
+
     def test_latest_session_path_ignores_symlink_that_resolves_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

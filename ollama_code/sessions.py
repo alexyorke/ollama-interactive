@@ -77,6 +77,8 @@ def load_transcript_payload(path: Path) -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ValueError(f"Transcript file not found: {path}") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Invalid transcript encoding in {path}; expected UTF-8") from exc
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid transcript JSON in {path}") from exc
     if not isinstance(payload, dict):

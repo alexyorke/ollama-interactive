@@ -652,6 +652,17 @@ class CliCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Transcript file not found"):
             build_agent(args)
 
+    def test_build_agent_resume_invalid_utf8_session_raises_value_error(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "invalid-utf8.json"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_bytes(b"\xff\xfe\x80")
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--resume", str(session), "--quiet"])
+
+        with self.assertRaisesRegex(ValueError, "Invalid transcript encoding"):
+            build_agent(args)
+
     def test_build_agent_resume_does_not_rewrite_saved_transcript_on_startup(self) -> None:
         root = self._workspace_scratch()
         session = root / ".ollama-code" / "sessions" / "saved.json"
