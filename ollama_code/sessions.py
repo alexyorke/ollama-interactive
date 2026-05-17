@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ollama_code.agent_parsing import _workspace_roots_match
+
 
 SESSION_SUBDIR = Path(".ollama-code") / "sessions"
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
@@ -90,6 +92,22 @@ def load_transcript_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
+def payload_can_restore_session(payload: dict[str, Any], workspace_root: Path) -> bool:
+    if not _workspace_roots_match(payload.get("workspace_root"), workspace_root):
+        return False
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return False
+    for message in messages:
+        if not isinstance(message, dict):
+            return False
+        role = message.get("role")
+        content = message.get("content")
+        if not isinstance(role, str) or not isinstance(content, str):
+            return False
+    return True
+
+
 def write_transcript_payload(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, raw_tmp_path = tempfile.mkstemp(
@@ -132,10 +150,11 @@ def _safe_session_paths(workspace_root: Path) -> list[Path]:
 def latest_session_path(workspace_root: Path) -> Path | None:
     for candidate in _safe_session_paths(workspace_root):
         try:
-            load_transcript_payload(candidate)
+            payload = load_transcript_payload(candidate)
         except ValueError:
             continue
-        return candidate
+        if payload_can_restore_session(payload, workspace_root):
+            return candidate
     return None
 
 
@@ -165,6 +184,8 @@ def list_sessions(workspace_root: Path, limit: int = 20) -> list[SessionSummary]
         try:
             payload = load_transcript_payload(path)
         except ValueError:
+            continue
+        if not payload_can_restore_session(payload, workspace_root):
             continue
         messages = payload.get("messages")
         message_count = len(messages) if isinstance(messages, list) else 0

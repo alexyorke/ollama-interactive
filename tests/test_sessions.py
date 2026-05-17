@@ -166,6 +166,27 @@ class SessionPathTests(unittest.TestCase):
 
         self.assertEqual(latest, older.resolve())
 
+    def test_latest_session_path_skips_newer_session_missing_message_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            older = session_dir / "older.json"
+            newer = session_dir / "newer.json"
+            self._write_session(older, "resume me")
+            newer.parent.mkdir(parents=True, exist_ok=True)
+            newer.write_text(
+                '{"model":"bad-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[],"events":[]}',
+                encoding="utf-8",
+            )
+            older_ts = newer.stat().st_mtime - 10
+            os.utime(older, (older_ts, older_ts))
+
+            latest = latest_session_path(root)
+
+        self.assertEqual(latest, older.resolve())
+
     def test_list_sessions_ignores_symlink_that_resolves_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -201,6 +222,26 @@ class SessionPathTests(unittest.TestCase):
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].path, kept.resolve())
+
+    def test_list_sessions_skips_session_missing_message_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            kept = session_dir / "kept.json"
+            invalid = session_dir / "invalid.json"
+            self._write_session(kept, "keep me")
+            invalid.write_text(
+                '{"model":"bad-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[],"events":[]}',
+                encoding="utf-8",
+            )
+
+            sessions = list_sessions(root)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].path, kept.resolve())
+        self.assertEqual(sessions[0].summary, "keep me")
 
     def test_list_sessions_limit_counts_valid_sessions_after_skipping_newer_invalid_ones(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
