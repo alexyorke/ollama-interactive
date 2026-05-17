@@ -34,7 +34,7 @@ from ollama_code.config import (
 from ollama_code.indexer import BackgroundIndexer
 from ollama_code.interrupts import InterruptController, OperationInterrupted
 from ollama_code.ollama_client import OllamaClient, OllamaError
-from ollama_code.sessions import latest_session_path, load_transcript_payload, new_session_path, resolve_transcript_path
+from ollama_code.sessions import latest_restorable_session, load_transcript_payload, new_session_path, resolve_transcript_path
 from ollama_code.tool_dependencies import dependency_statuses
 from ollama_code.tools import ToolExecutor
 
@@ -214,10 +214,10 @@ def build_agent(
         resume_path = resolve_transcript_path(workspace_root, args.resume)
         restored_payload = load_transcript_payload(resume_path)
     elif args.continue_session:
-        resume_path = latest_session_path(workspace_root)
-        if resume_path is None:
+        latest_session = latest_restorable_session(workspace_root)
+        if latest_session is None:
             raise ValueError(f"No saved sessions found in {workspace_root.as_posix()}/.ollama-code/sessions")
-        restored_payload = load_transcript_payload(resume_path)
+        resume_path, restored_payload = latest_session
 
     explicit_model = _non_empty_string(args.model)
     session_model: str | None = None

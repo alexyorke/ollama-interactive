@@ -148,13 +148,20 @@ def _safe_session_paths(workspace_root: Path) -> list[Path]:
 
 
 def latest_session_path(workspace_root: Path) -> Path | None:
+    latest = latest_restorable_session(workspace_root)
+    if latest is None:
+        return None
+    return latest[0]
+
+
+def latest_restorable_session(workspace_root: Path) -> tuple[Path, dict[str, Any]] | None:
     for candidate in _safe_session_paths(workspace_root):
         try:
             payload = load_transcript_payload(candidate)
         except ValueError:
             continue
         if payload_can_restore_session(payload, workspace_root):
-            return candidate
+            return candidate, payload
     return None
 
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.sessions import list_sessions, latest_session_path, load_transcript_payload, resolve_transcript_path
+from ollama_code.sessions import latest_restorable_session, list_sessions, latest_session_path, load_transcript_payload, resolve_transcript_path
 
 
 class SessionPathTests(unittest.TestCase):
@@ -294,3 +294,21 @@ class SessionPathTests(unittest.TestCase):
                     latest = latest_session_path(root)
 
         self.assertEqual(latest, kept.resolve())
+
+    def test_latest_restorable_session_returns_payload_for_newest_valid_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            older = session_dir / "older.json"
+            newer = session_dir / "newer.json"
+            self._write_session(older, "older message")
+            self._write_session(newer, "newer message")
+            older_ts = newer.stat().st_mtime - 10
+            os.utime(older, (older_ts, older_ts))
+
+            latest = latest_restorable_session(root)
+
+        assert latest is not None
+        path, payload = latest
+        self.assertEqual(path, newer.resolve())
+        self.assertEqual(payload["messages"][0]["content"], "newer message")
