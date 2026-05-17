@@ -74,7 +74,7 @@ def new_session_path(workspace_root: Path) -> Path:
 
 def load_transcript_payload(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError as exc:
         raise ValueError(f"Transcript file not found: {path}") from exc
     except UnicodeDecodeError as exc:

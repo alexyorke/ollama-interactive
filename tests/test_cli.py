@@ -663,6 +663,24 @@ class CliCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid transcript encoding"):
             build_agent(args)
 
+    def test_build_agent_resume_accepts_utf8_bom_session(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "bom.json"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_bytes(
+            b"\xef\xbb\xbf"
+            + b'{"model":"bom-model","approval_mode":"auto","workspace_root":"'
+            + root.as_posix().encode("utf-8")
+            + b'","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--resume", str(session), "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.model, "bom-model")
+        self.assertEqual(agent.messages[1]["content"], "remember me")
+
     def test_build_agent_resume_does_not_rewrite_saved_transcript_on_startup(self) -> None:
         root = self._workspace_scratch()
         session = root / ".ollama-code" / "sessions" / "saved.json"

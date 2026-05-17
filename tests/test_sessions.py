@@ -81,6 +81,22 @@ class SessionPathTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Invalid transcript encoding"):
                 load_transcript_payload(session)
 
+    def test_load_transcript_payload_accepts_utf8_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session = root / ".ollama-code" / "sessions" / "bom.json"
+            session.parent.mkdir(parents=True, exist_ok=True)
+            session.write_bytes(
+                b"\xef\xbb\xbf"
+                + b'{"model":"fake-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix().encode("utf-8")
+                + b'","messages":[{"role":"system","content":"sys"}],"events":[]}',
+            )
+
+            payload = load_transcript_payload(session)
+
+        self.assertEqual(payload["model"], "fake-model")
+
     def test_latest_session_path_ignores_symlink_that_resolves_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
