@@ -217,6 +217,8 @@ class OllamaClient:
             raise OllamaError(f"Could not reach Ollama at {self.host}: {exc}") from exc
         except TimeoutError as exc:
             raise OllamaError(f"Ollama timed out after {self.timeout} seconds.") from exc
+        except UnicodeDecodeError as exc:
+            raise OllamaError("Ollama returned invalid UTF-8 from /api/chat.") from exc
         except json.JSONDecodeError as exc:
             raise OllamaError("Ollama returned invalid JSON from /api/chat.") from exc
         message = raw.get("message") or {}
@@ -317,6 +319,8 @@ class OllamaClient:
             raise OllamaError(f"Could not reach Ollama at {self.host}: {exc}") from exc
         except TimeoutError as exc:
             raise OllamaError(f"Ollama timed out after {self.timeout} seconds.") from exc
+        except UnicodeDecodeError as exc:
+            raise OllamaError("Ollama returned invalid UTF-8 from /api/tags.") from exc
         except json.JSONDecodeError as exc:
             raise OllamaError("Ollama returned invalid JSON from /api/tags.") from exc
         models = raw.get("models") if isinstance(raw, dict) else None

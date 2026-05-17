@@ -92,6 +92,36 @@ class OllamaClientTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=5)
 
+    def test_chat_reports_invalid_utf8_response(self) -> None:
+        client, server, thread = self._with_server(b"\x80")
+        try:
+            with self.assertRaisesRegex(OllamaError, r"invalid UTF-8 from /api/chat"):
+                client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_chat_stream_reports_invalid_utf8_response(self) -> None:
+        client, server, thread = self._with_server(b"\x80")
+        try:
+            with self.assertRaisesRegex(OllamaError, r"invalid UTF-8 from /api/chat"):
+                client.chat(model="fake-model", messages=[{"role": "user", "content": "hi"}], on_thinking=lambda _: None)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    def test_list_models_reports_invalid_utf8_response(self) -> None:
+        client, server, thread = self._with_server(b"\x80")
+        try:
+            with self.assertRaisesRegex(OllamaError, r"invalid UTF-8 from /api/tags"):
+                client.list_models()
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
     def test_chat_can_be_interrupted(self) -> None:
         client, server, thread = self._with_server(b'{"message":{"content":"ok"}}', delay=1.0)
         interrupted = threading.Event()
