@@ -93,6 +93,7 @@ from ollama_code.sessions import (
     list_sessions as collect_sessions,
     load_transcript_payload,
     resolve_transcript_path,
+    write_transcript_payload,
 )
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
 
@@ -465,8 +466,7 @@ class OllamaCodeAgent:
             "events": self.events,
             "llm_telemetry_events": self.llm_telemetry_events,
         }
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        write_transcript_payload(target, payload)
         if self.session_file is not None and target.resolve(strict=False) == self.session_file.resolve(strict=False):
             self._transcript_dirty = False
         return target

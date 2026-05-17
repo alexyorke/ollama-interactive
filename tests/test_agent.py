@@ -2771,6 +2771,23 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(any(event.get("type") == "tool_result" and event.get("name") == "read_file" for event in payload["events"]))
         self.assertTrue(any(event.get("type") == "assistant" and event.get("content") == "done" for event in payload["events"]))
 
+    def test_save_transcript_preserves_existing_file_when_atomic_replace_fails(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        original = '{"keep":"original"}'
+        session.write_text(original, encoding="utf-8")
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file=session, debate_enabled=False)
+
+        with patch("ollama_code.sessions.os.replace", side_effect=OSError("replace failed")):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                agent.save_transcript()
+
+        self.assertEqual(session.read_text(encoding="utf-8"), original)
+        self.assertEqual(list(session.parent.glob(f".{session.name}.*.tmp")), [])
+
     def test_agent_can_load_saved_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
