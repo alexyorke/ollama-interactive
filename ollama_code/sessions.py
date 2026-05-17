@@ -116,16 +116,17 @@ def _safe_session_paths(workspace_root: Path) -> list[Path]:
     session_dir = default_session_dir(workspace_root)
     if not session_dir.exists():
         return []
-    candidates: list[Path] = []
+    candidates: list[tuple[Path, float]] = []
     for path in session_dir.glob("*.json"):
-        if not path.is_file():
-            continue
         try:
+            if not path.is_file():
+                continue
             resolved = resolve_transcript_path(workspace_root, path)
-        except ValueError:
+            modified_at = resolved.stat().st_mtime
+        except (OSError, ValueError):
             continue
-        candidates.append(resolved)
-    return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)
+        candidates.append((resolved, modified_at))
+    return [path for path, _ in sorted(candidates, key=lambda item: item[1], reverse=True)]
 
 
 def latest_session_path(workspace_root: Path) -> Path | None:
@@ -160,21 +161,27 @@ def _payload_summary(payload: dict[str, Any]) -> str:
 
 def list_sessions(workspace_root: Path, limit: int = 20) -> list[SessionSummary]:
     summaries: list[SessionSummary] = []
-    for path in _safe_session_paths(workspace_root)[:limit]:
+    for path in _safe_session_paths(workspace_root):
         try:
             payload = load_transcript_payload(path)
         except ValueError:
             continue
         messages = payload.get("messages")
         message_count = len(messages) if isinstance(messages, list) else 0
+        try:
+            updated_at = datetime.fromtimestamp(path.stat().st_mtime)
+        except OSError:
+            continue
         summaries.append(
             SessionSummary(
                 path=path.resolve(),
-                updated_at=datetime.fromtimestamp(path.stat().st_mtime),
+                updated_at=updated_at,
                 model=str(payload.get("model", "")),
                 approval_mode=str(payload.get("approval_mode", "")),
                 message_count=message_count,
                 summary=_payload_summary(payload),
             )
         )
+        if len(summaries) >= limit:
+            break
     return summaries

@@ -201,3 +201,55 @@ class SessionPathTests(unittest.TestCase):
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].path, kept.resolve())
+
+    def test_list_sessions_limit_counts_valid_sessions_after_skipping_newer_invalid_ones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            valid = session_dir / "valid.json"
+            newer_invalid = session_dir / "newer-invalid.json"
+            newest_invalid = session_dir / "newest-invalid.json"
+            self._write_session(valid, "keep me")
+            newer_invalid.parent.mkdir(parents=True, exist_ok=True)
+            newer_invalid.write_text("{not json", encoding="utf-8")
+            newest_invalid.write_text("{still not json", encoding="utf-8")
+            valid_ts = newer_invalid.stat().st_mtime - 10
+            os.utime(valid, (valid_ts, valid_ts))
+            newer_invalid_ts = newest_invalid.stat().st_mtime - 5
+            os.utime(newer_invalid, (newer_invalid_ts, newer_invalid_ts))
+
+            sessions = list_sessions(root, limit=1)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].path, valid.resolve())
+        self.assertEqual(sessions[0].summary, "keep me")
+
+    def test_latest_session_path_skips_session_that_disappears_during_discovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            kept = session_dir / "kept.json"
+            vanished = session_dir / "vanished.json"
+            self._write_session(kept, "keep me")
+            self._write_session(vanished, "gone soon")
+            older_ts = vanished.stat().st_mtime - 10
+            os.utime(kept, (older_ts, older_ts))
+            original_is_file = Path.is_file
+            original_stat = Path.stat
+            vanished_key = str(vanished).lower()
+
+            def patched_is_file(target: Path) -> bool:
+                if str(target).lower() == vanished_key:
+                    return True
+                return original_is_file(target)
+
+            def patched_stat(target: Path, *args: object, **kwargs: object) -> os.stat_result:
+                if str(target).lower() == vanished_key:
+                    raise FileNotFoundError("vanished")
+                return original_stat(target, *args, **kwargs)
+
+            with patch.object(Path, "is_file", autospec=True, side_effect=patched_is_file):
+                with patch.object(Path, "stat", autospec=True, side_effect=patched_stat):
+                    latest = latest_session_path(root)
+
+        self.assertEqual(latest, kept.resolve())
