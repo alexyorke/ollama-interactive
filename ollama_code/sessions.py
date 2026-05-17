@@ -74,11 +74,15 @@ def new_session_path(workspace_root: Path) -> Path:
 
 def load_transcript_payload(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw = path.read_text(encoding="utf-8-sig")
     except FileNotFoundError as exc:
         raise ValueError(f"Transcript file not found: {path}") from exc
     except UnicodeDecodeError as exc:
         raise ValueError(f"Invalid transcript encoding in {path}; expected UTF-8") from exc
+    except OSError as exc:
+        raise ValueError(f"Unable to read transcript file: {path} ({exc})") from exc
+    try:
+        payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid transcript JSON in {path}") from exc
     if not isinstance(payload, dict):

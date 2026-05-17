@@ -669,6 +669,42 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.approval_mode(), "auto")
         self.assertEqual(agent.messages[1]["content"], "remember me")
 
+    def test_build_agent_continue_skips_newer_unreadable_session(self) -> None:
+        root = self._workspace_scratch()
+        session_dir = root / ".ollama-code" / "sessions"
+        session_dir.mkdir(parents=True)
+        older = session_dir / "older.json"
+        newer = session_dir / "newer.json"
+        older.write_text(
+            '{"model":"gemma4:latest","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
+            encoding="utf-8",
+        )
+        newer.write_text(
+            '{"model":"ignored","approval_mode":"ask","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"blocked"}],"events":[{"type":"user","content":"blocked"}]}',
+            encoding="utf-8",
+        )
+        older_ts = newer.stat().st_mtime - 10
+        os.utime(older, (older_ts, older_ts))
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
+        original_read_text = Path.read_text
+
+        def denied_read_text(target: Path, *args: object, **kwargs: object) -> str:
+            if target.resolve(strict=False) == newer.resolve(strict=False):
+                raise PermissionError("denied")
+            return original_read_text(target, *args, **kwargs)
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=denied_read_text):
+            agent = build_agent(args)
+
+        self.assertEqual(agent.model, "gemma4:latest")
+        self.assertEqual(agent.approval_mode(), "auto")
+        self.assertEqual(agent.messages[1]["content"], "remember me")
+
     def test_build_agent_resume_missing_session_raises_value_error(self) -> None:
         missing = f"missing-{uuid4().hex}.json"
         parser = build_parser()
@@ -705,6 +741,29 @@ class CliCommandTests(unittest.TestCase):
 
         self.assertEqual(agent.model, "bom-model")
         self.assertEqual(agent.messages[1]["content"], "remember me")
+
+    def test_build_agent_resume_unreadable_session_raises_value_error(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "denied.json"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_text(
+            '{"model":"fake-model","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--resume", str(session), "--quiet"])
+        original_read_text = Path.read_text
+
+        def denied_read_text(target: Path, *args: object, **kwargs: object) -> str:
+            if target.resolve(strict=False) == session.resolve(strict=False):
+                raise PermissionError("denied")
+            return original_read_text(target, *args, **kwargs)
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=denied_read_text):
+            with self.assertRaisesRegex(ValueError, "Unable to read transcript file"):
+                build_agent(args)
 
     def test_build_agent_resume_does_not_rewrite_saved_transcript_on_startup(self) -> None:
         root = self._workspace_scratch()
