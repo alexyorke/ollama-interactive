@@ -121,6 +121,16 @@ class DummyAgent:
     def tool_help(self, *, compact: bool = False) -> str:
         return "list_files()\nread_file(path)" if compact else "list_files\nread_file"
 
+    def tool_group_help(self) -> str:
+        return "navigation: tools=list_files, read_file"
+
+    def tool_dependency_status(self, scope: str = "all", tool_id: str | None = None) -> dict[str, object]:
+        return {"ok": True, "output": f"tool dependency status scope={scope} tool_id={tool_id or '-'}"}
+
+    def tool_dependency_install(self, tool_id: str | None = None, *, all_recommended: bool = False, confirm: bool = False) -> dict[str, object]:
+        target = "--recommended" if all_recommended else tool_id
+        return {"ok": True, "output": f"install target={target} confirm={confirm}"}
+
     def todo_read(self) -> dict[str, object]:
         return {"ok": True, "output": self._todos}
 
@@ -405,11 +415,29 @@ class CliCommandTests(unittest.TestCase):
 
         compact = handle_meta_command("/tools", agent, output.append)
         full = handle_meta_command("/tools full", agent, output.append)
+        groups = handle_meta_command("/tools groups", agent, output.append)
 
         self.assertTrue(compact)
         self.assertTrue(full)
+        self.assertTrue(groups)
         self.assertEqual(output[0], "list_files()\nread_file(path)")
         self.assertEqual(output[1], "list_files\nread_file")
+        self.assertEqual(output[2], "navigation: tools=list_files, read_file")
+
+    def test_tools_command_reports_and_installs_optional_dependencies(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        missing = handle_meta_command("/tools missing", agent, output.append)
+        install = handle_meta_command("/tools install ruff", agent, output.append)
+        recommended = handle_meta_command("/tools install --recommended", agent, output.append)
+
+        self.assertTrue(missing)
+        self.assertTrue(install)
+        self.assertTrue(recommended)
+        self.assertIn("scope=missing", output[0])
+        self.assertIn("install target=ruff confirm=True", output[1])
+        self.assertIn("install target=--recommended confirm=True", output[2])
 
     def test_todos_command_shows_and_clears_todo_list(self) -> None:
         agent = DummyAgent()

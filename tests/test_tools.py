@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.tools import ToolExecutor
+from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -58,6 +58,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(listed["ok"])
         self.assertIn("alpha.txt", listed["output"])
         self.assertEqual(read["output"], "   2 | line2")
+
+    def test_tool_catalog_groups_model_facing_tools(self) -> None:
+        compact = format_compact_tool_help({"read_file", "ast_search", "run_test"}, grouped=True)
+        groups = format_tool_group_help({"read_file", "ast_search", "run_test"})
+
+        self.assertIn("[navigation]", compact)
+        self.assertIn("[structural]", compact)
+        self.assertIn("[validation]", compact)
+        self.assertIn("read_file(path,start=1,end=200)", compact)
+        self.assertIn("navigation:", groups)
+        self.assertIn("ast_search", groups)
 
     def test_non_git_tasks_work_when_git_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1135,6 +1146,43 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("--json", command)
         self.assertIn("--lang", command)
         self.assertFalse(run_process.call_args.kwargs["shell"])
+
+    def test_semgrep_scan_can_run_through_remote_docker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            payload = {
+                "results": [
+                    {
+                        "path": "/src/target",
+                        "start": {"line": 1},
+                        "extra": {"lines": "eval('1')"},
+                    }
+                ]
+            }
+            responses = [
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="container123\n", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="1\n", stderr=""),
+                subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr=""),
+            ]
+            with patch.object(tools, "_semgrep_executable", return_value=None):
+                with patch.object(tools, "_docker_command", return_value="docker"):
+                    with patch.object(tools, "_run_process", side_effect=responses) as run_process:
+                        with patch.dict(os.environ, {"OLLAMA_CODE_DOCKER_HOST": "ssh://car-detection-server"}):
+                            result = tools.semgrep_scan("eval(...)", lang="python")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["backend"], "docker")
+        self.assertEqual(result["docker_host"], "ssh://car-detection-server")
+        self.assertIn("/src/target:1", result["output"])
+        create_call = run_process.call_args_list[0]
+        copy_call = run_process.call_args_list[1]
+        self.assertIn("create", create_call.args[0])
+        self.assertIn("cp", copy_call.args[0])
+        self.assertEqual(create_call.kwargs["env"]["DOCKER_HOST"], "ssh://car-detection-server")
 
     def test_semgrep_scan_reports_cli_error_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4239,6 +4287,54 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("pytest --collect-only", output)
         self.assertIn("ruff check", output)
 
+    def test_discover_validators_detects_optional_oss_validators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            (workflows / "ci.yml").write_text("name: ci\non: push\n", encoding="utf-8")
+            (root / "script.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+            (root / "Dockerfile").write_text("FROM python:3.12\n", encoding="utf-8")
+            (root / "requirements.txt").write_text("requests==2.32.3\n", encoding="utf-8")
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
+            (root / "package.json").write_text(json.dumps({"scripts": {"test": "vitest"}}), encoding="utf-8")
+            (root / "tsconfig.json").write_text("{}\n", encoding="utf-8")
+            (root / ".eslintrc.json").write_text("{}\n", encoding="utf-8")
+            (root / ".prettierrc").write_text("{}\n", encoding="utf-8")
+            (root / "biome.json").write_text("{}\n", encoding="utf-8")
+            (root / ".pre-commit-config.yaml").write_text("repos: []\n", encoding="utf-8")
+            (root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            (root / "query.sql").write_text("select 1;\n", encoding="utf-8")
+            (root / "schema.schema.json").write_text('{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n', encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.discover_validators(limit=40)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("basedpyright", output)
+        self.assertIn("actionlint", output)
+        self.assertIn("bash -n script.sh", output)
+        self.assertIn("shellcheck script.sh", output)
+        self.assertIn("hadolint Dockerfile", output)
+        self.assertIn("osv-scanner scan .", output)
+        self.assertIn("tsc --noEmit", output)
+        self.assertIn("eslint .", output)
+        self.assertIn("prettier --check .", output)
+        self.assertIn("biome check .", output)
+        self.assertIn("run --all-files", output)
+        self.assertIn("vendor.github-workflows", output)
+        self.assertIn("--check-metaschema", output)
+        self.assertIn("yamllint", output)
+        self.assertIn("shfmt -d script.sh", output)
+        self.assertIn("markdownlint-cli2", output)
+        self.assertIn("codespell .", output)
+        self.assertIn("sqlfluff lint .", output)
+        self.assertIn("pip", output)
+        self.assertIn("audit", output)
+        self.assertIn("trivy fs", output)
+        self.assertIn("grype dir:.", output)
+
     def test_select_tests_returns_language_level_validator_for_go(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4671,6 +4767,26 @@ def double(value: int) -> int:
 
         self.assertFalse(result["ok"])
         self.assertIn("bad.py:1", result["output"])
+
+    def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "script.sh").write_text("if true; then\n  echo ok\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=2,
+                stdout="",
+                stderr="script.sh: line 3: syntax error: unexpected end of file",
+            )
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "bash" if name == "bash" else None):
+                with patch.object(tools, "_run_process", return_value=completed) as run_process:
+                    result = tools.lint_typecheck("script.sh")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("bash -n script.sh", result["validator_commands"])
+        self.assertIn("unexpected end of file", result["output"])
+        self.assertIn("-n", run_process.call_args.args[0])
 
     def test_select_tests_maps_python_source_to_importing_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

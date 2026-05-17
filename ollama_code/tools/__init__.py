@@ -32,7 +32,17 @@ from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from ollama_code.interrupts import OperationInterrupted
-from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_help
+from ollama_code.tool_dependencies import (
+    TOOL_DEPENDENCIES,
+    command_to_text,
+    current_platform,
+    dependency_status,
+    dependency_statuses,
+    first_install_hint,
+    resolve_dependency,
+    resolve_tool_executable,
+)
+from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_group_help, format_tool_help
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -53,6 +63,7 @@ _MEMORY_FTS_CONNECTIONS: dict[str, sqlite3.Connection] = {}
 _MEMORY_VERIFIED_FUNCTION_CONNECTIONS: dict[str, sqlite3.Connection] = {}
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
 WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
+SHELL_SCRIPT_SUFFIXES = {".sh", ".bash"}
 CODE_FILE_SUFFIXES = {
     ".py",
     ".js",
@@ -73,7 +84,7 @@ CODE_FILE_SUFFIXES = {
     ".swift",
     ".kt",
     ".kts",
-}
+} | SHELL_SCRIPT_SUFFIXES
 REPO_INDEX_VERSION = 2
 FILE_INDEX_VERSION = 1
 FTS_INDEX_VERSION = 1
@@ -242,6 +253,7 @@ class ToolExecutor:
         self._interrupt_event: threading.Event | None = None
         self._initial_dirty_paths = self._git_dirty_paths()
         self._todos: list[dict[str, str]] = []
+        self._tree_sitter_parsers: dict[str, Any] = {}
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
@@ -348,8 +360,12 @@ class ToolExecutor:
             "fts_refresh": self.fts_refresh,
             "indexed_search": self.indexed_search,
             "repo_index_refresh": self.repo_index_refresh,
+            "tool_status": self.tool_status,
+            "tool_install": self.tool_install,
             "semgrep_scan": self.semgrep_scan,
             "ast_search": self.ast_search,
+            "structural_rewrite": self.structural_rewrite,
+            "tree_sitter_syntax": self.tree_sitter_syntax,
             "lsp_diagnostics": self.lsp_diagnostics,
             "lsp_definition": self.lsp_definition,
             "lsp_references": self.lsp_references,
@@ -2902,24 +2918,21 @@ class ToolExecutor:
             return "java"
         return None
 
-    def semgrep_scan(self, pattern: str, path: str = ".", lang: str | None = None, limit: int = 50) -> dict[str, Any]:
-        self._check_interrupted()
-        semgrep = shutil.which("semgrep")
-        if not semgrep:
-            return self._missing_dependency_result("semgrep_scan", "semgrep", "semgrep is not installed. Install semgrep to use structural search.")
-        base = self.resolve_path(path, allow_missing=False)
-        clean_pattern = str(pattern or "").strip()
-        if not clean_pattern:
-            return {"ok": False, "tool": "semgrep_scan", "summary": "semgrep_scan requires a pattern."}
-        clean_lang = (lang or self._semgrep_lang_for_path(base) or "python").strip().lower()
-        allowed_langs = {"python", "javascript", "typescript", "go", "rust", "java", "c", "cpp", "csharp", "ruby", "php"}
-        if clean_lang not in allowed_langs:
-            return {"ok": False, "tool": "semgrep_scan", "summary": f"Unsupported semgrep language: {clean_lang}"}
-        command = [semgrep, "--json", "--quiet", "-e", clean_pattern, "--lang", clean_lang, str(base)]
-        completed = self._run_process(command, cwd=self.workspace_root, timeout=60, shell=False)
-        output = self._collect_process_output(completed)
+    def _format_semgrep_result(
+        self,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+        base: Path,
+        lang: str,
+        limit: int,
+        *,
+        backend: str,
+        docker_host: str | None = None,
+    ) -> dict[str, Any]:
+        output = (stdout or "") + (("\n" + stderr) if stderr else "")
         try:
-            payload = json.loads(completed.stdout or "{}")
+            payload = json.loads(stdout or "{}")
         except json.JSONDecodeError:
             payload = {}
         results = payload.get("results") if isinstance(payload, dict) else None
@@ -2936,28 +2949,303 @@ class ToolExecutor:
                     rel = self.relative_label(Path(item_path))
                 except Exception:
                     pass
-                rows.append(f"{rel}:{start.get('line', '?')}: {str(extra.get('lines', '')).strip()[:220]}")
+                text = str(extra.get("lines") or extra.get("message") or "").strip().replace("\n", " ")
+                rows.append(f"{rel}:{start.get('line', '?')}: {text[:220]}")
         return {
-            "ok": completed.returncode in {0, 1},
+            "ok": returncode in {0, 1},
             "tool": "semgrep_scan",
             "path": self.relative_label(base),
-            "lang": clean_lang,
+            "lang": lang,
+            "backend": backend,
+            "docker_host": docker_host,
             "count": len(rows),
-            "output": "\n".join(rows) if rows else ("(no semgrep matches)" if completed.returncode in {0, 1} else output),
+            "output": "\n".join(rows) if rows else ("(no semgrep matches)" if returncode in {0, 1} else output),
         }
 
+    def semgrep_scan(self, pattern: str, path: str = ".", lang: str | None = None, limit: int = 50) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_pattern = str(pattern or "").strip()
+        if not clean_pattern:
+            return {"ok": False, "tool": "semgrep_scan", "summary": "semgrep_scan requires a pattern."}
+        clean_lang = (lang or self._semgrep_lang_for_path(base) or "python").strip().lower()
+        allowed_langs = {"python", "javascript", "typescript", "go", "rust", "java", "c", "cpp", "csharp", "ruby", "php"}
+        if clean_lang not in allowed_langs:
+            return {"ok": False, "tool": "semgrep_scan", "summary": f"Unsupported semgrep language: {clean_lang}"}
+        semgrep = self._semgrep_executable()
+        if not semgrep:
+            return self._run_semgrep_in_docker(clean_pattern, base, clean_lang, limit)
+        command = [semgrep, "--json", "--quiet", "-e", clean_pattern, "--lang", clean_lang, str(base)]
+        completed = self._run_process(command, cwd=self.workspace_root, timeout=60, shell=False)
+        return self._format_semgrep_result(completed.stdout or "", completed.stderr or "", completed.returncode, base, clean_lang, limit, backend="cli")
+
     def _missing_dependency_result(self, tool: str, dependency: str, summary: str) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "ok": False,
             "tool": tool,
             "summary": summary,
             "missing_dependency": dependency,
             "error_class": "missing_dependency",
         }
+        resolved = resolve_dependency(dependency)
+        if resolved is not None:
+            status = dependency_status(resolved, workspace_root=self.workspace_root)
+            result.update(
+                {
+                    "tool_id": resolved.id,
+                    "optional": resolved.optional,
+                    "supported": status["supported"],
+                    "platform": status["platform"],
+                    "install_hints": status["install_hints"],
+                    "verify_command": status["verify_command"],
+                    "dependency_purpose": resolved.purpose,
+                }
+            )
+        return result
+
+    def _ast_grep_executable(self) -> str | None:
+        for name in ("ast-grep.exe", "sg.exe", "ast-grep", "sg"):
+            resolved = shutil.which(name)
+            if not resolved:
+                continue
+            candidate = Path(resolved)
+            if candidate.suffix.lower() == ".exe":
+                return str(candidate)
+            package_dir = candidate.parent / "node_modules" / "@ast-grep" / "cli"
+            for exe_name in ("ast-grep.exe", "sg.exe"):
+                package_exe = package_dir / exe_name
+                if package_exe.exists():
+                    return str(package_exe)
+            return resolved
+        return None
+
+    def _semgrep_executable(self) -> str | None:
+        return resolve_tool_executable("semgrep", "semgrep", workspace_root=self.workspace_root) or shutil.which("semgrep")
+
+    def _docker_command(self) -> str | None:
+        return resolve_tool_executable("docker", "docker", workspace_root=self.workspace_root) or shutil.which("docker")
+
+    def _docker_host(self) -> str | None:
+        host = (
+            os.environ.get("OLLAMA_CODE_DOCKER_HOST")
+            or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
+            or os.environ.get("DOCKER_HOST")
+        )
+        if not host:
+            return None
+        clean = host.strip()
+        if clean and "://" not in clean:
+            clean = f"ssh://{clean}"
+        return clean or None
+
+    def _docker_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        host = self._docker_host()
+        if host:
+            env["DOCKER_HOST"] = host
+        return env
+
+    def _docker_tools_enabled(self) -> bool:
+        flag = os.environ.get("OLLAMA_CODE_ENABLE_DOCKER_TOOLS", "").strip().lower()
+        return bool(self._docker_host()) or flag in {"1", "true", "yes", "on"}
+
+    def _docker_process(self, args: list[str], *, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+        docker = self._docker_command()
+        if not docker:
+            raise FileNotFoundError("docker")
+        return self._run_process([docker, *args], cwd=self.workspace_root, timeout=timeout, shell=False, env=self._docker_env())
+
+    def _run_semgrep_in_docker(self, pattern: str, base: Path, lang: str, limit: int) -> dict[str, Any]:
+        docker = self._docker_command()
+        if not docker or not self._docker_tools_enabled():
+            return self._missing_dependency_result("semgrep_scan", "semgrep", "semgrep is not installed. Install semgrep or enable Docker-backed semgrep with OLLAMA_CODE_DOCKER_HOST=ssh://host.")
+        container_target = f"/src/target{base.suffix}" if base.is_file() and base.suffix else "/src/target"
+        create_command = [
+            "create",
+            "-w",
+            "/src",
+            "semgrep/semgrep",
+            "semgrep",
+            "--json",
+            "--quiet",
+            "-e",
+            pattern,
+            "--lang",
+            lang,
+            container_target,
+        ]
+        created = self._docker_process(create_command, timeout=120)
+        container_id = (created.stdout or "").strip().splitlines()[-1] if created.returncode == 0 and created.stdout.strip() else ""
+        if not container_id:
+            output = self._collect_process_output(created)
+            return {
+                "ok": False,
+                "tool": "semgrep_scan",
+                "summary": "Docker-backed semgrep could not create a container. Pull semgrep/semgrep or check remote Docker access.",
+                "output": output,
+                "docker_host": self._docker_host(),
+            }
+        try:
+            copied = self._docker_process(["cp", str(base), f"{container_id}:{container_target}"], timeout=300)
+            if copied.returncode != 0:
+                return {"ok": False, "tool": "semgrep_scan", "summary": "Docker copy into semgrep container failed.", "output": self._collect_process_output(copied), "docker_host": self._docker_host()}
+            started = self._docker_process(["start", "-a", container_id], timeout=180)
+            inspected = self._docker_process(["inspect", "-f", "{{.State.ExitCode}}", container_id], timeout=30)
+            try:
+                exit_code = int((inspected.stdout or "").strip())
+            except ValueError:
+                exit_code = started.returncode
+        finally:
+            try:
+                self._docker_process(["rm", "-f", container_id], timeout=30)
+            except Exception:
+                pass
+        return self._format_semgrep_result(started.stdout or "", started.stderr or "", exit_code, base, lang, limit, backend="docker", docker_host=self._docker_host())
+
+    def _format_tool_dependency_rows(self, rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return "(no optional tool dependencies matched)"
+        lines: list[str] = []
+        for row in rows:
+            state = "installed" if row.get("installed") else ("unsupported" if not row.get("supported") else "missing")
+            recommended = " recommended" if row.get("recommended") else ""
+            hint_text = ""
+            hints = row.get("install_hints")
+            if isinstance(hints, list) and hints:
+                first = hints[0]
+                if isinstance(first, dict) and first.get("command"):
+                    hint_text = f" mode={first.get('mode', row.get('install_mode', 'host'))} install={first['command']}"
+            notes = f" notes={row['notes']}" if row.get("notes") else ""
+            if not hint_text:
+                hint_text = f" mode={row.get('install_mode', 'host')}"
+            lines.append(f"{row['id']}: {state}{recommended} category={row['category']}{hint_text}{notes}")
+        return "\n".join(lines)
+
+    def tool_status(self, scope: str = "all", tool_id: str | None = None) -> dict[str, Any]:
+        clean_scope = str(scope or "all").strip().lower()
+        if tool_id:
+            dependency = resolve_dependency(tool_id)
+            if dependency is None:
+                return {"ok": False, "tool": "tool_status", "summary": f"Unknown optional tool dependency: {tool_id}"}
+            rows = [dependency_status(dependency, workspace_root=self.workspace_root)]
+        else:
+            recommended_only = clean_scope in {"recommended", "recommended-missing", "recommended_missing"}
+            missing_only = clean_scope in {"missing", "recommended-missing", "recommended_missing"}
+            rows = dependency_statuses(recommended_only=recommended_only, missing_only=missing_only, workspace_root=self.workspace_root)
+        installed = sum(1 for row in rows if row.get("installed"))
+        missing = sum(1 for row in rows if row.get("supported") and not row.get("installed"))
+        unsupported = sum(1 for row in rows if not row.get("supported"))
+        return {
+            "ok": True,
+            "tool": "tool_status",
+            "scope": clean_scope,
+            "platform": current_platform(),
+            "count": len(rows),
+            "installed": installed,
+            "missing": missing,
+            "unsupported": unsupported,
+            "dependencies": rows,
+            "output": self._format_tool_dependency_rows(rows),
+        }
+
+    def _install_plan_for_dependency(self, dependency_id: str) -> dict[str, Any]:
+        dependency = resolve_dependency(dependency_id)
+        if dependency is None:
+            return {"ok": False, "dependency": dependency_id, "summary": f"Unknown optional tool dependency: {dependency_id}"}
+        status = dependency_status(dependency, workspace_root=self.workspace_root)
+        if status.get("installed"):
+            return {"ok": True, "dependency": dependency.id, "already_installed": True, "summary": f"{dependency.id} is already installed.", "status": status}
+        if not status.get("supported"):
+            return {"ok": False, "dependency": dependency.id, "unsupported": True, "summary": f"{dependency.id} is unsupported on {status.get('platform')}.", "status": status}
+        hint = first_install_hint(dependency)
+        if hint is None:
+            return {"ok": False, "dependency": dependency.id, "summary": f"No install command is configured for {dependency.id}.", "status": status}
+        return {
+            "ok": True,
+            "dependency": dependency.id,
+            "already_installed": False,
+            "manager": hint.manager,
+            "mode": hint.mode,
+            "argv": list(hint.command),
+            "command": command_to_text(hint.command),
+            "summary": f"{dependency.id} can be installed with {command_to_text(hint.command)} mode={hint.mode}",
+            "status": status,
+        }
+
+    def tool_install(
+        self,
+        tool_id: str | None = None,
+        *,
+        all_recommended: bool = False,
+        confirm: bool = False,
+        timeout: int = 600,
+    ) -> dict[str, Any]:
+        if all_recommended:
+            requested = [dependency.id for dependency in TOOL_DEPENDENCIES if dependency.recommended]
+        elif tool_id:
+            requested = [str(tool_id).strip()]
+        else:
+            return {"ok": False, "tool": "tool_install", "summary": "tool_install requires tool_id or all_recommended=true."}
+        plans = [self._install_plan_for_dependency(item) for item in requested]
+        runnable = [plan for plan in plans if plan.get("ok") and not plan.get("already_installed") and plan.get("argv")]
+        if not confirm:
+            return {
+                "ok": True,
+                "tool": "tool_install",
+                "planned": True,
+                "plans": plans,
+                "output": "\n".join(str(plan.get("summary", "")) for plan in plans),
+                "summary": "Install plan only. Re-run with confirm=true from an interactive session to execute.",
+            }
+        if self.approval_mode == "read-only":
+            return {"ok": False, "tool": "tool_install", "plans": plans, "summary": "Install denied because approval mode is read-only."}
+        if not runnable:
+            return {
+                "ok": all(plan.get("ok") for plan in plans),
+                "tool": "tool_install",
+                "plans": plans,
+                "summary": "No installable missing supported tools in the requested set.",
+                "output": "\n".join(str(plan.get("summary", "")) for plan in plans),
+            }
+        command_block = "\n".join(str(plan["command"]) for plan in runnable)
+        approved = self._confirm(
+            "Install optional tooling with these command(s)?\n"
+            f"{command_block}\n"
+            "Prefer isolated-venv/docker modes for Python tools; host modes may modify package manager state."
+        )
+        if not approved:
+            return {"ok": False, "tool": "tool_install", "plans": plans, "summary": "User rejected optional tool install."}
+        results: list[dict[str, Any]] = []
+        for plan in runnable:
+            argv = [str(part) for part in plan.get("argv", [])]
+            try:
+                completed = self._run_process(argv, cwd=self.workspace_root, timeout=max(1, int(timeout)), shell=False)
+            except subprocess.TimeoutExpired:
+                results.append({"dependency": plan["dependency"], "ok": False, "command": plan["command"], "summary": "Install command timed out."})
+                continue
+            output = self._collect_process_output(completed)
+            dependency = resolve_dependency(str(plan["dependency"]))
+            post_status = dependency_status(dependency, workspace_root=self.workspace_root) if dependency is not None else {}
+            results.append(
+                {
+                    "dependency": plan["dependency"],
+                    "ok": completed.returncode == 0 and bool(post_status.get("installed", completed.returncode == 0)),
+                    "exit_code": completed.returncode,
+                    "command": plan["command"],
+                    "output": output,
+                    "status": post_status,
+                }
+            )
+        ok = all(item.get("ok") for item in results)
+        lines = [
+            f"{item['dependency']}: {'ok' if item.get('ok') else 'failed'} command={item.get('command')}"
+            for item in results
+        ]
+        return {"ok": ok, "tool": "tool_install", "plans": plans, "results": results, "output": "\n".join(lines), "summary": "Optional tool install complete." if ok else "One or more optional tool installs failed."}
 
     def ast_search(self, pattern: str, path: str = ".", lang: str | None = None, limit: int = 50) -> dict[str, Any]:
         self._check_interrupted()
-        executable = shutil.which("ast-grep") or shutil.which("sg")
+        executable = self._ast_grep_executable()
         if not executable:
             return self._missing_dependency_result("ast_search", "ast-grep", "ast-grep is not installed. Install ast-grep or sg to use AST search.")
         base = self.resolve_path(path, allow_missing=False)
@@ -2998,6 +3286,119 @@ class ToolExecutor:
             "lang": clean_lang or None,
             "count": len(rows),
             "output": "\n".join(rows) if rows else ("(no ast-grep matches)" if completed.returncode in {0, 1} else output),
+        }
+
+    def structural_rewrite(
+        self,
+        pattern: str,
+        rewrite: str,
+        path: str = ".",
+        lang: str | None = None,
+        apply: bool = False,
+        timeout: int = 60,
+    ) -> dict[str, Any]:
+        self._check_interrupted()
+        executable = self._ast_grep_executable()
+        if not executable:
+            return self._missing_dependency_result("structural_rewrite", "ast-grep", "ast-grep is not installed. Install ast-grep or sg to use structural rewrite.")
+        base = self.resolve_path(path, allow_missing=False)
+        clean_pattern = str(pattern or "").strip()
+        clean_rewrite = str(rewrite or "").strip()
+        if not clean_pattern or not clean_rewrite:
+            return {"ok": False, "tool": "structural_rewrite", "summary": "structural_rewrite requires pattern and rewrite."}
+        clean_lang = (lang or self._semgrep_lang_for_path(base) or "").strip().lower()
+        command = [executable, "-p", clean_pattern, "-r", clean_rewrite]
+        if clean_lang:
+            command.extend(["--lang", clean_lang])
+        if apply:
+            approved, reason = self._approve_mutation(
+                f"Run ast-grep structural rewrite on {self.relative_label(base)}?",
+                f"pattern: {clean_pattern}\nrewrite: {clean_rewrite}",
+            )
+            if not approved:
+                return {"ok": False, "tool": "structural_rewrite", "summary": reason or "User rejected structural rewrite."}
+            command.append("--update-all")
+        command.append(str(base))
+        completed = self._run_process(command, cwd=self.workspace_root, timeout=max(1, int(timeout)), shell=False)
+        output = self._collect_process_output(completed)
+        return {
+            "ok": completed.returncode in {0, 1},
+            "tool": "structural_rewrite",
+            "path": self.relative_label(base),
+            "lang": clean_lang or None,
+            "applied": bool(apply),
+            "command": command_to_text(tuple(command)),
+            "output": output,
+        }
+
+    def _tree_sitter_language_for_path(self, path: Path) -> str | None:
+        suffix = path.suffix.lower()
+        return {
+            ".py": "python",
+            ".js": "javascript",
+            ".jsx": "javascript",
+            ".ts": "typescript",
+            ".tsx": "tsx",
+            ".go": "go",
+            ".rs": "rust",
+            ".java": "java",
+            ".c": "c",
+            ".h": "c",
+            ".cc": "cpp",
+            ".cpp": "cpp",
+            ".hpp": "cpp",
+        }.get(suffix)
+
+    def _tree_sitter_parser_for_language(self, language: str) -> Any:
+        cached = self._tree_sitter_parsers.get(language)
+        if cached is not None:
+            return cached
+        language_pack = importlib.import_module("tree_sitter_language_pack")
+        get_parser = getattr(language_pack, "get_parser")
+        parser = get_parser(language)
+        self._tree_sitter_parsers[language] = parser
+        return parser
+
+    def _tree_sitter_syntax_diagnostic(self, target: Path, text: str) -> str | None:
+        language = self._tree_sitter_language_for_path(target)
+        if not language:
+            return None
+        try:
+            parser = self._tree_sitter_parser_for_language(language)
+        except (ImportError, ModuleNotFoundError, AttributeError, LookupError):
+            return None
+        try:
+            tree = parser.parse(text)
+        except TypeError:
+            tree = parser.parse(text.encode("utf-8", errors="replace"))
+        root_node = getattr(tree, "root_node", None)
+        if root_node is not None and getattr(root_node, "has_error", False):
+            return f"{self.relative_label(target)}: tree-sitter reported syntax errors for {language}"
+        return None
+
+    def tree_sitter_syntax(self, path: str = ".", limit: int = 200) -> dict[str, Any]:
+        self._check_interrupted()
+        dependency = resolve_dependency("py-tree-sitter")
+        if dependency is not None and not dependency_status(dependency)["installed"]:
+            return self._missing_dependency_result("tree_sitter_syntax", "py-tree-sitter", "tree-sitter Python bindings are not installed.")
+        base = self.resolve_path(path, allow_missing=False)
+        checked: list[str] = []
+        diagnostics: list[str] = []
+        for file_path in self._iter_code_files(base, limit=max(1, int(limit))):
+            if self._tree_sitter_language_for_path(file_path) is None:
+                continue
+            checked.append(self.relative_label(file_path))
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
+            if diagnostic:
+                diagnostics.append(diagnostic)
+        return {
+            "ok": not diagnostics,
+            "tool": "tree_sitter_syntax",
+            "path": self.relative_label(base),
+            "checked": checked,
+            "diagnostics": diagnostics,
+            "output": "\n".join(diagnostics) if diagnostics else f"tree-sitter syntax ok: {len(checked)} file(s)",
         }
 
     def _language_for_path(self, path: Path) -> str | None:
@@ -9897,6 +10298,22 @@ import string
             return candidate.exists()
         return shutil.which(executable) is not None or (working_dir / executable).exists() or (self.workspace_root / executable).exists()
 
+    def _python_module_command(self, module: str, *args: str) -> list[str] | None:
+        if importlib.util.find_spec(module) is None:
+            return None
+        return [sys.executable, "-m", module, *args]
+
+    def _python_tool_command(self, executable: str, module: str, *args: str) -> list[str] | None:
+        dependency = resolve_dependency(executable) or resolve_dependency(module)
+        if dependency is not None:
+            resolved_tool = resolve_tool_executable(dependency.id, executable, workspace_root=self.workspace_root)
+            if resolved_tool:
+                return [resolved_tool, *args]
+        resolved = shutil.which(executable)
+        if resolved:
+            return [resolved, *args]
+        return self._python_module_command(module, *args)
+
     def _read_toml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
@@ -9939,15 +10356,22 @@ import string
         def add(kind: str, lang: str, command: str, reason: str) -> None:
             validators.append({"kind": kind, "lang": lang, "command": command, "available": self._available_command(command, cwd=root), "reason": reason})
 
+        def python_tool_command_text(executable: str, module: str, *args: str) -> str:
+            command = self._python_tool_command(executable, module, *args)
+            return command_to_text(tuple(command)) if command else command_to_text((executable, *args))
+
         pyproject = self._read_toml(root / "pyproject.toml")
         repo_files = self._iter_repo_files(root, limit=50000)
         suffixes = {file_path.suffix.lower() for file_path in repo_files}
         file_names = [file_path.name.lower() for file_path in repo_files]
-        rel_paths = [self.relative_label(file_path).replace("\\", "/").lower() for file_path in repo_files]
+        rel_paths = [self.relative_label(file_path).replace("\\", "/") for file_path in repo_files]
+        rel_paths_lower = [rel.lower() for rel in rel_paths]
+        if (root / ".pre-commit-config.yaml").exists() or (root / ".pre-commit-config.yml").exists():
+            add("validate", "repo", python_tool_command_text("pre-commit", "pre_commit", "run", "--all-files"), "pre-commit config found.")
         python_files = ".py" in suffixes
         python_tests = any(
             name.startswith("test_") or name.endswith("_test.py") or "/tests/" in f"/{rel}/"
-            for name, rel in zip(file_names, rel_paths)
+            for name, rel in zip(file_names, rel_paths_lower)
         ) or (root / "tests").exists()
         pytest_config = (
             (root / "pytest.ini").exists()
@@ -9961,6 +10385,12 @@ import string
             if pytest_config:
                 add("collect", "python", f"{sys.executable} -m pytest --collect-only -q", "pytest config found.")
                 add("test", "python", f"{sys.executable} -m pytest", "pytest config found.")
+                if importlib.util.find_spec("pytest_jsonreport") is not None:
+                    add("test-report", "python", f"{sys.executable} -m pytest --json-report --json-report-file=.pytest-report.json", "pytest-json-report is importable.")
+                if importlib.util.find_spec("pytest_timeout") is not None:
+                    add("test", "python", f"{sys.executable} -m pytest --timeout=120", "pytest-timeout is importable.")
+                if importlib.util.find_spec("xdist") is not None:
+                    add("test", "python", f"{sys.executable} -m pytest -n auto", "pytest-xdist is importable.")
             if python_tests:
                 add("test", "python", f"{sys.executable} -m unittest discover -s tests -v", "Python unittest discovery.")
             if (
@@ -9979,10 +10409,27 @@ import string
                 add("typecheck", "python", "mypy .", "mypy config found.")
             if (root / "pyrightconfig.json").exists() or self._toml_tool_section(pyproject, "pyright"):
                 add("typecheck", "python", "pyright", "pyright config found.")
+            basedpyright_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error")
+            if (root / "pyrightconfig.json").exists() or self._toml_tool_section(pyproject, "basedpyright") or basedpyright_command:
+                add("typecheck", "python", command_to_text(tuple(basedpyright_command or ["basedpyright"])), "basedpyright config, module, or executable found.")
+            deptry_command = self._python_tool_command("deptry", "deptry", ".")
+            if deptry_command:
+                add("dependency-check", "python", command_to_text(tuple(deptry_command)), "deptry module or executable found.")
+            vulture_command = self._python_tool_command("vulture", "vulture", ".")
+            if vulture_command:
+                add("dead-code", "python", command_to_text(tuple(vulture_command)), "vulture module or executable found.")
+            coverage_command = self._python_tool_command("coverage", "coverage", "run", "-m", "pytest")
+            if coverage_command:
+                add("coverage", "python", command_to_text(tuple(coverage_command)), "coverage.py module or executable found.")
+            if shutil.which("pytest") and importlib.util.find_spec("testmon") is not None:
+                add("test", "python", f"{sys.executable} -m pytest --testmon", "pytest-testmon is importable.")
             if (root / "tox.ini").exists() or self._toml_tool_section(pyproject, "tox"):
-                add("test", "python", "tox", "tox config found.")
+                add("test", "python", python_tool_command_text("tox", "tox"), "tox config found.")
             if (root / "noxfile.py").exists():
-                add("test", "python", "nox", "noxfile.py found.")
+                add("test", "python", python_tool_command_text("nox", "nox"), "noxfile.py found.")
+            pipdeptree_command = self._python_tool_command("pipdeptree", "pipdeptree", "--warn", "fail")
+            if pipdeptree_command:
+                add("dependency-check", "python", command_to_text(tuple(pipdeptree_command)), "pipdeptree module or executable found.")
         package_json = root / "package.json"
         if package_json.exists():
             manager = self._package_manager_for(root)
@@ -9997,11 +10444,32 @@ import string
                         add(kind, "javascript", f"{manager} run {name}" if name != "test" else f"{manager} test", f"package.json script: {name}")
             if (root / "tsconfig.json").exists():
                 add("typecheck", "typescript", "tsc --noEmit", "tsconfig.json found.")
+            if (root / ".eslintrc").exists() or (root / ".eslintrc.json").exists() or (root / ".eslintrc.js").exists():
+                add("lint", "javascript", "eslint .", "ESLint config or executable found.")
+            if (root / "biome.json").exists() or (root / "biome.jsonc").exists():
+                add("lint", "javascript", "biome check .", "Biome config or executable found.")
+            if (
+                (root / ".stylelintrc").exists()
+                or (root / ".stylelintrc.json").exists()
+                or (root / "stylelint.config.js").exists()
+                or ".css" in suffixes
+                or ".scss" in suffixes
+            ):
+                add("lint", "css", "stylelint \"**/*.{css,scss}\"", "Stylelint config or stylesheet files found.")
+            if (
+                (root / ".prettierrc").exists()
+                or (root / ".prettierrc.json").exists()
+                or (root / ".prettierrc.js").exists()
+                or (root / "prettier.config.js").exists()
+            ):
+                add("format-check", "javascript", "prettier --check .", "Prettier config or executable found.")
         if (root / "go.mod").exists() or ".go" in suffixes:
             add("test", "go", "go test ./...", "Go module or source files found.")
+            add("lint", "go", "golangci-lint run", "Go module or source files found.")
         if (root / "Cargo.toml").exists() or ".rs" in suffixes:
             add("check", "rust", "cargo check", "Cargo project or Rust source files found.")
             add("test", "rust", "cargo test", "Cargo project or Rust source files found.")
+            add("test", "rust", "cargo nextest run", "Cargo project or Rust source files found.")
         gradlew = "gradlew.bat" if os.name == "nt" else "./gradlew"
         if (root / "build.gradle").exists() or (root / "settings.gradle").exists() or (root / gradlew).exists() or ".java" in suffixes:
             command = gradlew + " test" if (root / gradlew).exists() else "gradle test"
@@ -10010,6 +10478,56 @@ import string
             if (root / "build").exists():
                 add("test", "cpp", "ctest --test-dir build --output-on-failure", "CMake build directory found.")
             add("setup", "cpp", "cmake -S . -B build", "CMake project detected; creates/updates build dir if run.")
+        if any(rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml")) for rel in rel_paths_lower):
+            add("lint", "github-actions", "actionlint", "GitHub Actions workflow files found.")
+            add(
+                "schema",
+                "github-actions",
+                python_tool_command_text("check-jsonschema", "check_jsonschema", "--builtin-schema", "vendor.github-workflows", ".github/workflows"),
+                "GitHub Actions workflow files found.",
+            )
+        yaml_file = next((rel for rel in rel_paths if rel.lower().endswith((".yml", ".yaml"))), None)
+        if yaml_file:
+            add("lint", "yaml", python_tool_command_text("yamllint", "yamllint", yaml_file), "YAML files found.")
+        shell_script = next((rel for rel, name in zip(rel_paths, file_names) if Path(name).suffix.lower() in SHELL_SCRIPT_SUFFIXES), None)
+        if shell_script:
+            add("syntax", "shell", command_to_text(("bash", "-n", shell_script)), "Shell scripts found; bash -n catches syntax errors cheaply.")
+            add("lint", "shell", command_to_text(("shellcheck", shell_script)), "Shell scripts found.")
+            add("format-check", "shell", command_to_text(("shfmt", "-d", shell_script)), "Shell scripts found.")
+        dockerfile = next((rel for rel, name in zip(rel_paths, file_names) if name == "dockerfile" or name.endswith(".dockerfile")), None)
+        if dockerfile:
+            add("lint", "dockerfile", f"hadolint {dockerfile}", "Dockerfile found.")
+        markdown_file = next((rel for rel in rel_paths if rel.lower().endswith((".md", ".markdown"))), None)
+        if markdown_file:
+            add("lint", "markdown", "markdownlint-cli2 \"**/*.md\"", "Markdown docs found.")
+        if markdown_file or python_files:
+            add("lint", "text", "codespell .", "Docs or Python files found.")
+        sql_file = next((rel for rel in rel_paths if rel.lower().endswith(".sql")), None)
+        if sql_file:
+            add("lint", "sql", "sqlfluff lint .", "SQL files found.")
+        schema_file = next((rel for rel in rel_paths if rel.lower().endswith((".schema.json", ".jsonschema"))), None)
+        if schema_file:
+            add("schema", "json", python_tool_command_text("check-jsonschema", "check_jsonschema", "--check-metaschema", schema_file), "JSON schema files found.")
+        dependency_manifest_names = {
+            "requirements.txt",
+            "poetry.lock",
+            "pdm.lock",
+            "uv.lock",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "go.sum",
+            "cargo.lock",
+            "gemfile.lock",
+        }
+        if dependency_manifest_names.intersection(file_names):
+            add("security", "dependencies", "osv-scanner scan .", "Dependency manifest or lockfile found.")
+            if "requirements.txt" in file_names or "pyproject.toml" in file_names:
+                add("security", "python", python_tool_command_text("pip-audit", "pip_audit"), "Python dependency manifest found.")
+            add("security", "dependencies", "trivy fs --quiet .", "Dependency manifest or lockfile found.")
+            add("security", "dependencies", "grype dir:.", "Dependency manifest or lockfile found.")
+        if ".toml" in suffixes and shutil.which("taplo"):
+            add("config", "toml", "taplo check .", "TOML files and taplo executable found.")
         selected = validators[: max(1, int(limit))]
         lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
         return {
@@ -10055,6 +10573,12 @@ import string
             "suggested_paths": suggested_paths,
             "validator_commands": [item.get("command") for item in validators.get("validators", []) if isinstance(item, dict)][:6],
         }
+        dependency = resolve_dependency(str(missing or command or imported or ""))
+        if dependency is not None:
+            status = dependency_status(dependency)
+            facts["tool_id"] = dependency.id
+            facts["install_hints"] = status["install_hints"]
+            facts["dependency_purpose"] = dependency.purpose
         lines = [f"{key}={value}" for key, value in facts.items() if value]
         return {
             "ok": True,
@@ -10072,26 +10596,63 @@ import string
         raw_paths = paths if isinstance(paths, list) else [paths]
         checked: list[str] = []
         diagnostics: list[str] = []
+        python_targets: set[str] = set()
+        shell_targets: list[str] = []
         for raw_path in raw_paths:
             base = self.resolve_path(str(raw_path), allow_missing=False)
             files = self._iter_code_files(base, limit=50000)
+            if files and (base.is_file() or base == self.workspace_root or self.workspace_root in base.parents):
+                python_targets.add(self.relative_label(base))
             for file_path in files:
                 rel = self.relative_label(file_path)
                 checked.append(rel)
                 text = file_path.read_text(encoding="utf-8", errors="replace")
                 if file_path.suffix.lower() == ".py":
+                    python_targets.add(rel)
                     diagnostic = self._python_syntax_diagnostic(file_path, text)
                     if diagnostic:
                         diagnostics.append(diagnostic)
+                elif file_path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
+                    shell_targets.append(rel)
                 elif file_path.suffix.lower() in {".js", ".jsx"} and shutil.which("node"):
                     completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
                     if completed.returncode != 0:
                         diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=500))
+                elif self._tree_sitter_language_for_path(file_path) is not None:
+                    diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
+                    if diagnostic:
+                        diagnostics.append(diagnostic)
+        validator_commands: list[str] = []
+        if python_targets and shutil.which("ruff"):
+            target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
+            command = ["ruff", "check", "--no-cache", *target_args]
+            validator_commands.append(command_to_text(tuple(command)))
+            completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+            if completed.returncode != 0:
+                diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
+        typechecker_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error") or self._python_tool_command("pyright", "pyright", "--level", "error")
+        if python_targets and typechecker_command:
+            target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
+            command = [*typechecker_command, *target_args]
+            validator_commands.append(command_to_text(tuple(command)))
+            completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+            if completed.returncode != 0:
+                diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
+        bash = shutil.which("bash")
+        if bash:
+            for rel in shell_targets[:100]:
+                command = [bash, "-n", rel]
+                validator_commands.append(command_to_text(("bash", "-n", rel)))
+                completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+                if completed.returncode != 0:
+                    output = self._collect_process_output(completed) or f"{rel}: bash -n failed"
+                    diagnostics.append(self._truncate_text(output, limit=1200))
         return {
             "ok": not diagnostics,
             "tool": "lint_typecheck",
             "checked": checked,
             "diagnostics": diagnostics,
+            "validator_commands": validator_commands,
             "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} code file(s)",
         }
 
@@ -12065,6 +12626,8 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             available.append(("osv-scanner", ["osv-scanner", "--recursive", str(base)]))
         if ("auto" in requested_names or "trivy" in requested_names) and shutil.which("trivy"):
             available.append(("trivy", ["trivy", "fs", "--quiet", str(base)]))
+        if ("auto" in requested_names or "grype" in requested_names) and shutil.which("grype"):
+            available.append(("grype", ["grype", f"dir:{base}"]))
         if not available:
             return self._missing_dependency_result("security_scan", "security scanner", "No supported security scanners found on PATH.")
         outputs: list[str] = []

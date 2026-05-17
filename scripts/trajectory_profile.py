@@ -645,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Profile coding-agent trajectory datasets for inefficient workflow patterns.")
     parser.add_argument("--data-root", default=str(DEFAULT_DATA_ROOT), help="Root folder containing downloaded dataset directories.")
     parser.add_argument("--datasets", nargs="+", choices=sorted(DATASET_SPECS), default=sorted(DATASET_SPECS), help="Dataset directories to profile.")
-    parser.add_argument("--max-rows", type=int, default=5000, help="Maximum rows per dataset to scan.")
+    parser.add_argument("--max-rows", type=int, default=5000, help="Maximum rows per dataset to scan; use 0 for all rows.")
     parser.add_argument("--output", default="scratch/external/datasets/trajectory-profile.json", help="JSON output path.")
     args = parser.parse_args(argv)
 
@@ -666,12 +666,13 @@ def main(argv: list[str] | None = None) -> int:
                 }
             )
             continue
-        summaries.append(_summarize_dataset(dataset_name, adapter, _iter_parquet_rows(paths, max_rows=args.max_rows)))
+        max_rows = None if args.max_rows == 0 else args.max_rows
+        summaries.append(_summarize_dataset(dataset_name, adapter, _iter_parquet_rows(paths, max_rows=max_rows)))
 
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "data_root": str(root.resolve(strict=False)),
-        "max_rows_per_dataset": args.max_rows,
+        "max_rows_per_dataset": None if args.max_rows == 0 else args.max_rows,
         "datasets": summaries,
     }
     payload["portfolio_recommendations"] = _portfolio_recommendations(summaries)

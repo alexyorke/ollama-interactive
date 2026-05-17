@@ -35,6 +35,7 @@ from ollama_code.indexer import BackgroundIndexer
 from ollama_code.interrupts import InterruptController, OperationInterrupted
 from ollama_code.ollama_client import OllamaClient, OllamaError
 from ollama_code.sessions import latest_session_path, load_transcript_payload, new_session_path, resolve_transcript_path
+from ollama_code.tool_dependencies import dependency_statuses
 from ollama_code.tools import ToolExecutor
 
 PREFERRED_FALLBACK_MODELS = [
@@ -444,6 +445,9 @@ def startup_help_text(agent: OllamaCodeAgent) -> str:
             "  /index status|refresh|stop|start  manage the repo-local search indexer",
             "  /todos                           show current todo list",
             "  /tools                           show compact model-facing tools",
+            "  /tools groups                    show grouped model-facing tool families",
+            "  /tools missing                   show optional OSS integrations not installed",
+            "  /tools install <tool-id>          prompt to install one optional integration",
             "  /help                            show all slash commands",
             "  /quit                            exit",
             "",
@@ -476,7 +480,9 @@ def slash_help_text() -> str:
             "  /diff [--cached] [path]          show git diff",
             "  /commit <message>                commit via git_commit tool",
             "  /test [command]                  run tests",
-            "  /tools [full]                    show compact tools, or full descriptions",
+            "  /tools [full|groups]             show compact tools, grouped tools, or full descriptions",
+            "  /tools missing                   show optional OSS integrations not installed",
+            "  /tools install <tool-id>|--recommended",
             "  /quit                            exit",
             "",
             "Tips:",
@@ -579,21 +585,34 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
             else:
                 lines.append("python sdk embeddings: disabled; set OLLAMA_CODE_SDK_EMBED_MODEL to enable")
 
-    optional_tools = {
-        "rg": "fast text search",
-        "fd": "fast file discovery",
-        "ast-grep": "structural search",
-        "semgrep": "structural/security scan",
-        "gitleaks": "secret scan",
-        "trivy": "dependency/security scan",
-        "osv-scanner": "dependency vulnerability scan",
-    }
-    found = [name for name in optional_tools if shutil.which(name)]
-    missing = [name for name in optional_tools if name not in found]
-    if found:
-        lines.append("optional tools: found " + ", ".join(found))
-    if missing:
-        lines.append("optional tools: missing " + ", ".join(missing) + " (safe to install later; adapters fail closed)")
+    tool_rows = dependency_statuses(workspace_root=agent.workspace_root())
+    installed_tools = [str(row["id"]) for row in tool_rows if row.get("installed")]
+    missing_recommended = [
+        str(row["id"])
+        for row in tool_rows
+        if row.get("recommended") and row.get("supported") and not row.get("installed")
+    ]
+    unsupported_recommended = [
+        str(row["id"])
+        for row in tool_rows
+        if row.get("recommended") and not row.get("supported")
+    ]
+    lines.append(f"optional tools: installed {len(installed_tools)}/{len(tool_rows)}")
+    docker_host = (
+        os.environ.get("OLLAMA_CODE_DOCKER_HOST")
+        or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
+        or os.environ.get("DOCKER_HOST")
+    )
+    if docker_host:
+        normalized_docker_host = docker_host if "://" in docker_host else f"ssh://{docker_host}"
+        lines.append(f"docker tools: remote host {normalized_docker_host}")
+    elif any(row.get("id") == "docker" and row.get("installed") for row in tool_rows):
+        lines.append("docker tools: local client detected; set OLLAMA_CODE_DOCKER_HOST=ssh://host for remote container tools")
+    if missing_recommended:
+        lines.append("optional tools: recommended missing " + ", ".join(missing_recommended))
+        lines.append("optional tools: install interactively with /tools install --recommended or inspect with /tools missing")
+    if unsupported_recommended:
+        lines.append("optional tools: unsupported here " + ", ".join(unsupported_recommended))
     if shutil.which("ollama-code"):
         lines.append("console script: ok ollama-code")
     else:
@@ -779,8 +798,44 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(output)
         return True
     if action == "/tools":
-        full = _strip_matching_quotes(remainder).lower() == "full"
-        writer(agent.tool_help(compact=not full))
+        try:
+            args = shlex.split(remainder, posix=os.name != "nt") if remainder else []
+        except ValueError:
+            writer("Usage: /tools [full|groups|missing|recommended|all|install <tool-id>|install --recommended]")
+            return True
+        if not args:
+            writer(agent.tool_help(compact=True))
+            return True
+        subcommand = _strip_matching_quotes(args[0]).lower()
+        if subcommand == "full":
+            writer(agent.tool_help(compact=False))
+            return True
+        if subcommand == "groups":
+            group_method = getattr(agent, "tool_group_help", None)
+            writer(group_method() if callable(group_method) else agent.tool_help(compact=True))
+            return True
+        status_method = getattr(agent, "tool_dependency_status", None)
+        install_method = getattr(agent, "tool_dependency_install", None)
+        if subcommand in {"missing", "recommended", "all"}:
+            if not callable(status_method):
+                writer("optional tool dependency status is not available for this agent")
+                return True
+            scope = "missing" if subcommand == "missing" else subcommand
+            result = status_method(scope=scope)
+            writer(str(result.get("output") or result.get("summary", "(no output)")))
+            return True
+        if subcommand == "install":
+            if not callable(install_method):
+                writer("optional tool install is not available for this agent")
+                return True
+            if len(args) < 2:
+                writer("Usage: /tools install <tool-id>|--recommended")
+                return True
+            target = _strip_matching_quotes(args[1])
+            result = install_method(None if target == "--recommended" else target, all_recommended=target == "--recommended", confirm=True)
+            writer(str(result.get("output") or result.get("summary", "(no output)")))
+            return True
+        writer("Usage: /tools [full|groups|missing|recommended|all|install <tool-id>|install --recommended]")
         return True
     writer(f"Unknown command: {command}")
     return True

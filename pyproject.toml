@@ -13,6 +13,44 @@ authors = [{ name = "OpenAI Codex" }]
 [project.scripts]
 ollama-code = "ollama_code.cli:main"
 
+[project.optional-dependencies]
+tools = [
+    "basedpyright",
+    "check-jsonschema",
+    "codespell",
+    "coverage",
+    "deptry",
+    "hypothesis",
+    "mypy",
+    "py-spy",
+    "pyright",
+    "pip-audit",
+    "pipdeptree",
+    "pre-commit",
+    "pytest",
+    "pytest-cov",
+    "pytest-json-report",
+    "pytest-timeout",
+    "pytest-testmon",
+    "pytest-xdist",
+    "ruff",
+    "scalene",
+    "sqlite-vec",
+    "sqlfluff",
+    "tree-sitter",
+    "tree-sitter-language-pack",
+    "tox<4.54",
+    "uv",
+    "vulture",
+    "yamllint",
+]
+eval = [
+    "inspect-ai",
+]
+security = [
+    "semgrep",
+]
+
 [tool.setuptools]
 packages = ["ollama_code", "ollama_code.tools"]
 

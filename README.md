@@ -32,7 +32,7 @@ Runtime requirements:
 - `git` for git-aware status/diff/commit helpers
 - `ripgrep` (`rg`) recommended for fast search; the CLI has slower fallbacks when it is missing
 
-The Python package intentionally has no required third-party Python dependencies. Optional adapters such as `fd`, `ast-grep`, Semgrep, Playwright, Gitleaks, Trivy, OSV-Scanner, and language servers are detected at runtime and fail closed with install guidance when missing.
+The Python package intentionally has no required third-party Python dependencies. Optional adapters such as tree-sitter, `ast-grep`, `rg`, `fd`, `jq`, `yq`, `uv`, Ruff, pytest helpers, mypy, Pyright/basedpyright, deptry, Vulture, Hypothesis, Python profilers, TypeScript/ESLint/Prettier/Biome, `difftastic`, actionlint, ShellCheck, Hadolint, OSV-Scanner, Semgrep/Opengrep, SCIP indexers, OPA, Inspect AI, `sqlite-vec`, Comby, Phoenix, Ctags, Mergiraf, Playwright, and language servers are detected at runtime and fail closed with install guidance when missing.
 
 Fresh Ubuntu/Debian quickstart:
 
@@ -62,6 +62,16 @@ Editable install in an already prepared Python environment:
 ```bash
 python -m pip install -e .
 ```
+
+Optional local tooling can be installed as needed. `--doctor` reports installed/missing integrations, `/tools missing` shows install hints, and `/tools install <tool-id>` prompts before running the exact installer command. Nothing is installed silently, including in `--approval auto` mode.
+
+The recommended Python-side tooling bundle can be installed manually with:
+
+```bash
+python -m pip install -e ".[tools]"
+```
+
+External CLIs such as `ast-grep`, `rg`, `fd`, `jq`, `yq`, TypeScript/ESLint/Prettier/Biome, ShellCheck, Hadolint, `difftastic`, OPA, and OSV-Scanner remain external package-manager installs. Use `/tools install --recommended` in an interactive session to review and approve available install commands for the current platform.
 
 Inside WSL:
 
@@ -414,6 +424,8 @@ git push origin v0.1.0
 - `/commit <message>`
 - `/test [command]`
 - `/tools`
+- `/tools missing`
+- `/tools install <tool-id>|--recommended`
 - `/quit`
 
 ## Notes

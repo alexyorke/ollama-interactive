@@ -105,6 +105,16 @@ TOOL_DESCRIPTIONS = [
         "description": "Refresh the persistent repo index for faster future symbol and text searches.",
     },
     {
+        "name": "tool_status",
+        "arguments": {"scope": "all|missing|recommended, default all", "tool_id": "optional tool dependency id"},
+        "description": "Report installed/missing optional OSS integrations with install hints.",
+    },
+    {
+        "name": "tool_install",
+        "arguments": {"tool_id": "optional dependency id", "all_recommended": "bool, default false", "confirm": "bool, default false"},
+        "description": "Plan or explicitly prompt to install optional OSS integrations; never installs silently.",
+    },
+    {
         "name": "semgrep_scan",
         "arguments": {"pattern": "Semgrep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
         "description": "Run Semgrep structurally when semgrep is installed; useful for syntax-aware code search.",
@@ -113,6 +123,16 @@ TOOL_DESCRIPTIONS = [
         "name": "ast_search",
         "arguments": {"pattern": "ast-grep pattern", "path": "relative path, default .", "lang": "optional language", "limit": "int, default 50"},
         "description": "Run ast-grep structural search when ast-grep/sg is installed.",
+    },
+    {
+        "name": "structural_rewrite",
+        "arguments": {"pattern": "ast-grep pattern", "rewrite": "ast-grep rewrite", "path": "relative path, default .", "lang": "optional language", "apply": "bool, default false"},
+        "description": "Preview or apply an ast-grep structural rewrite behind normal mutation approval.",
+    },
+    {
+        "name": "tree_sitter_syntax",
+        "arguments": {"path": "file or directory, default .", "limit": "int, default 200"},
+        "description": "Run optional tree-sitter syntax parsing over supported files when py-tree-sitter is installed.",
     },
     {
         "name": "lsp_diagnostics",
@@ -212,7 +232,7 @@ TOOL_DESCRIPTIONS = [
     {
         "name": "discover_validators",
         "arguments": {"path": "relative path, default .", "limit": "int, default 12"},
-        "description": "Detect focused test/lint/typecheck commands for Python, JS/TS, Go, Rust, Java, and C/C++ projects.",
+        "description": "Detect focused test/lint/typecheck commands for Python, shell, JS/TS, Go, Rust, Java, and C/C++ projects.",
     },
     {
         "name": "diagnose_dependency_error",
@@ -341,6 +361,115 @@ TOOL_DESCRIPTIONS = [
     },
 ]
 
+TOOL_GROUPS = [
+    {
+        "id": "planning",
+        "description": "Plan multi-step work and preserve task state.",
+        "tools": ("todo_read", "todo_write", "systems_lens", "context_pack"),
+    },
+    {
+        "id": "navigation",
+        "description": "Find files, symbols, snippets, and current Python/library facts.",
+        "tools": (
+            "list_files",
+            "read_file",
+            "search",
+            "file_search",
+            "fd_search",
+            "file_index_refresh",
+            "everything_search",
+            "search_symbols",
+            "code_outline",
+            "read_symbol",
+            "inspect_library_source",
+            "python_sdk_search",
+            "python_sdk_refresh",
+            "repo_index_search",
+            "fts_search",
+            "fts_refresh",
+            "indexed_search",
+            "repo_index_refresh",
+        ),
+    },
+    {
+        "id": "structural",
+        "description": "Use syntax-aware search, rewrite, parse, and xref helpers.",
+        "tools": (
+            "semgrep_scan",
+            "ast_search",
+            "structural_rewrite",
+            "tree_sitter_syntax",
+            "lsp_diagnostics",
+            "lsp_definition",
+            "lsp_references",
+        ),
+    },
+    {
+        "id": "validation",
+        "description": "Run focused tests, diagnostics, type/lint checks, and failure repair aids.",
+        "tools": (
+            "find_implementation_target",
+            "diagnose_test_failure",
+            "test_spec_extract",
+            "implementation_spec",
+            "run_function_probe",
+            "lint_typecheck",
+            "discover_validators",
+            "diagnose_dependency_error",
+            "contract_check",
+            "select_tests",
+            "generate_tests_from_spec",
+            "run_test",
+        ),
+    },
+    {
+        "id": "editing",
+        "description": "Make bounded text, symbol, and structured code edits.",
+        "tools": (
+            "replace_symbol",
+            "replace_symbols",
+            "write_file",
+            "replace_in_file",
+            "apply_structured_edit",
+            "edit_intent",
+        ),
+    },
+    {
+        "id": "verified-functions",
+        "description": "Reuse and verify known local functions before inventing new code.",
+        "tools": (
+            "call_graph",
+            "contract_graph",
+            "verified_function_index",
+            "verified_function_search",
+            "verified_function_show",
+            "verify_function_contract",
+            "compose_verified_functions",
+            "promote_verified_function",
+        ),
+    },
+    {
+        "id": "security",
+        "description": "Scan dependencies, secrets, and risky changes only when needed.",
+        "tools": ("browser_smoke", "security_scan"),
+    },
+    {
+        "id": "git",
+        "description": "Inspect and checkpoint repository changes.",
+        "tools": ("git_status", "git_diff", "git_branch", "git_log", "git_commit"),
+    },
+    {
+        "id": "runtime",
+        "description": "Run shell, MCP, or child-agent actions behind policy controls.",
+        "tools": ("run_shell", "mcp_list_tools", "mcp_call", "run_agent"),
+    },
+    {
+        "id": "tooling",
+        "description": "Inspect or install optional OSS integrations with explicit approval.",
+        "tools": ("tool_status", "tool_install"),
+    },
+]
+
 
 def format_tool_help(tool_names: Iterable[str] | None = None) -> str:
     lines: list[str] = []
@@ -353,7 +482,7 @@ def format_tool_help(tool_names: Iterable[str] | None = None) -> str:
     return "\n".join(lines)
 
 
-def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
+def format_compact_tool_help(tool_names: Iterable[str] | None = None, *, grouped: bool = False) -> str:
     signatures = {
         "todo_read": "todo_read()",
         "todo_write": 'todo_write(items=[{"content":"inspect","status":"pending"}])',
@@ -375,8 +504,12 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "fts_refresh": "fts_refresh(path='.',limit=2000)",
         "indexed_search": "indexed_search(query,path='.',limit=100)",
         "repo_index_refresh": "repo_index_refresh(path='.',limit=1000)",
+        "tool_status": "tool_status(scope='all|missing|recommended',tool_id?)",
+        "tool_install": "tool_install(tool_id?,all_recommended=false,confirm=false)",
         "semgrep_scan": "semgrep_scan(pattern,path='.',lang?,limit=50)",
         "ast_search": "ast_search(pattern,path='.',lang?,limit=50)",
+        "structural_rewrite": "structural_rewrite(pattern,rewrite,path='.',lang?,apply=false)",
+        "tree_sitter_syntax": "tree_sitter_syntax(path='.',limit=200)",
         "lsp_diagnostics": "lsp_diagnostics(path='.',lang?,timeout=60)",
         "lsp_definition": "lsp_definition(path,line,column,limit=20)",
         "lsp_references": "lsp_references(path,line,column,limit=40)",
@@ -421,4 +554,41 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None) -> str:
         "run_agent": "run_agent(prompt,model?,approval?,rounds?)",
     }
     allowed = set(tool_names) if tool_names is not None else None
-    return "\n".join(signatures[tool["name"]] for tool in TOOL_DESCRIPTIONS if allowed is None or tool["name"] in allowed)
+    ordered = [str(tool["name"]) for tool in TOOL_DESCRIPTIONS if allowed is None or tool["name"] in allowed]
+    if not grouped:
+        return "\n".join(signatures[name] for name in ordered if name in signatures)
+
+    remaining = set(ordered)
+    lines: list[str] = []
+    for group in TOOL_GROUPS:
+        group_tools = [name for name in group["tools"] if name in remaining and name in signatures]
+        if not group_tools:
+            continue
+        lines.append(f"[{group['id']}]")
+        lines.extend(signatures[name] for name in group_tools)
+        remaining.difference_update(group_tools)
+    extra_tools = [name for name in ordered if name in remaining and name in signatures]
+    if extra_tools:
+        lines.append("[other]")
+        lines.extend(signatures[name] for name in extra_tools)
+    return "\n".join(lines)
+
+
+def format_tool_group_help(tool_names: Iterable[str] | None = None) -> str:
+    allowed = set(tool_names) if tool_names is not None else None
+    lines: list[str] = []
+    grouped_names: set[str] = set()
+    for group in TOOL_GROUPS:
+        group_tools = [name for name in group["tools"] if allowed is None or name in allowed]
+        if not group_tools:
+            continue
+        grouped_names.update(group_tools)
+        lines.append(f"{group['id']}: {group['description']} tools={', '.join(group_tools)}")
+    extras = [
+        str(tool["name"])
+        for tool in TOOL_DESCRIPTIONS
+        if (allowed is None or tool["name"] in allowed) and tool["name"] not in grouped_names
+    ]
+    if extras:
+        lines.append(f"other: Other available tools. tools={', '.join(extras)}")
+    return "\n".join(lines)

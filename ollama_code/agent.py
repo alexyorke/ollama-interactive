@@ -94,7 +94,7 @@ from ollama_code.sessions import (
     load_transcript_payload,
     resolve_transcript_path,
 )
-from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_help
+from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
 
 
 
@@ -157,7 +157,7 @@ class OllamaCodeAgent:
         selected = available if tool_names is None else set(tool_names) & available
         return SYSTEM_PROMPT_TEMPLATE.format(
             workspace_root=self.tools.workspace_root.as_posix(),
-            tool_help=format_compact_tool_help(selected),
+            tool_help=format_compact_tool_help(selected, grouped=True),
         )
 
     def _primary_tool_names_for_request(
@@ -335,6 +335,24 @@ class OllamaCodeAgent:
     def tool_help(self, *, compact: bool = False) -> str:
         tool_names = self.tools.available_tool_names()
         return format_compact_tool_help(tool_names) if compact else format_tool_help(tool_names)
+
+    def tool_group_help(self) -> str:
+        return format_tool_group_help(self.tools.available_tool_names())
+
+    def tool_dependency_status(self, scope: str = "all", tool_id: str | None = None) -> dict[str, Any]:
+        return self.tools.execute("tool_status", {"scope": scope, "tool_id": tool_id})
+
+    def tool_dependency_install(
+        self,
+        tool_id: str | None = None,
+        *,
+        all_recommended: bool = False,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        return self.tools.execute(
+            "tool_install",
+            {"tool_id": tool_id, "all_recommended": all_recommended, "confirm": confirm},
+        )
 
     def todo_read(self) -> dict[str, Any]:
         return self.tools.execute("todo_read", {})

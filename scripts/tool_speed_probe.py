@@ -66,6 +66,9 @@ def run_probe(generated_files: int) -> dict[str, Any]:
             _measure("fts_refresh", lambda: tools.fts_refresh()),
             _measure("context_pack", lambda: tools.context_pack("fix discount calculation")),
             _measure("discover_validators", lambda: tools.discover_validators()),
+            _measure("tree_sitter_syntax", lambda: tools.tree_sitter_syntax("src")),
+            _measure("ast_search", lambda: tools.ast_search("def $F($$$A): $$$B", "src/pricing.py", lang="python")),
+            _measure("lint_typecheck", lambda: tools.lint_typecheck("src", timeout=120)),
         ]
     return {"generated_files": generated_files, "rows": rows}
 
