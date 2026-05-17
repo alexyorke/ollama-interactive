@@ -125,8 +125,13 @@ def _safe_session_paths(workspace_root: Path) -> list[Path]:
 
 
 def latest_session_path(workspace_root: Path) -> Path | None:
-    candidates = _safe_session_paths(workspace_root)
-    return candidates[0] if candidates else None
+    for candidate in _safe_session_paths(workspace_root):
+        try:
+            load_transcript_payload(candidate)
+        except ValueError:
+            continue
+        return candidate
+    return None
 
 
 def _payload_summary(payload: dict[str, Any]) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -109,6 +110,21 @@ class SessionPathTests(unittest.TestCase):
             latest = latest_session_path(root)
 
         self.assertEqual(latest, kept.resolve())
+
+    def test_latest_session_path_skips_newer_invalid_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            older = session_dir / "older.json"
+            newer = session_dir / "newer.json"
+            self._write_session(older, "resume me")
+            newer.parent.mkdir(parents=True, exist_ok=True)
+            newer.write_text("{not json", encoding="utf-8")
+            older_ts = newer.stat().st_mtime - 10
+            os.utime(older, (older_ts, older_ts))
+            latest = latest_session_path(root)
+
+        self.assertEqual(latest, older.resolve())
 
     def test_list_sessions_ignores_symlink_that_resolves_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
