@@ -925,6 +925,28 @@ class AgentTests(unittest.TestCase):
         system_prompt = client.calls[0]["messages"][0]["content"]
         self.assertNotIn("read_file(path", str(system_prompt))
 
+    def test_subagent_inherits_parent_enabled_tool_allowlist(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"final","message":"child done"}'])
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["run_test", "read_file"],
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        captured: dict[str, object] = {}
+
+        class SpyToolExecutor(ToolExecutor):
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                captured["enabled_tools"] = kwargs.get("enabled_tools")
+                super().__init__(*args, **kwargs)
+
+        with patch("ollama_code.agent.ToolExecutor", SpyToolExecutor):
+            result = agent._run_sub_agent({"prompt": "Say ok.", "approval_mode": "read-only"})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(set(captured["enabled_tools"]), {"run_test", "read_file"})
+
     def test_agent_normalizes_near_match_subagent_model(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(

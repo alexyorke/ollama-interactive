@@ -6103,6 +6103,7 @@ class OllamaCodeAgent:
             input_func=self.tools.input_func,
             test_command=self.tools.default_test_command,
             default_tools_enabled=self.tools.default_tools_enabled,
+            enabled_tools=self.tools.enabled_tools,
             disabled_tools=self.tools.disabled_tools,
             mcp_servers=self.tools.mcp_servers,
             browser_enabled=self.tools.browser_enabled,
