@@ -4805,6 +4805,44 @@ def double(value: int) -> int:
         self.assertIn("unexpected end of file", result["output"])
         self.assertIn("-n", run_process.call_args.args[0])
 
+    def test_lint_typecheck_returns_structured_timeout_for_python_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pkg.py").write_text("print('ok')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            timeout = subprocess.TimeoutExpired(["ruff", "check", "--no-cache", "pkg.py"], 1, output="partial stdout", stderr="partial stderr")
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
+                with patch.object(tools, "_run_process", side_effect=timeout):
+                    result = tools.lint_typecheck("pkg.py", timeout=1)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["error_class"], "timeout")
+        self.assertEqual(result["summary"], "Command timed out after 1 seconds.")
+        self.assertEqual(result["command"], "ruff check --no-cache pkg.py")
+        self.assertIn("ruff check --no-cache pkg.py", result["validator_commands"])
+        self.assertIn("partial stdout", result["output"])
+        self.assertIn("partial stderr", result["output"])
+
+    def test_lint_typecheck_returns_structured_timeout_for_shell_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "script.sh").write_text("echo ok\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            timeout = subprocess.TimeoutExpired(["bash", "-n", "script.sh"], 1, output="", stderr="shell partial stderr")
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "bash" if name == "bash" else None):
+                with patch.object(tools, "_python_tool_command", return_value=None):
+                    with patch.object(tools, "_run_process", side_effect=timeout):
+                        result = tools.lint_typecheck("script.sh", timeout=1)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["error_class"], "timeout")
+        self.assertEqual(result["summary"], "Command timed out after 1 seconds.")
+        self.assertEqual(result["command"], "bash -n script.sh")
+        self.assertIn("bash -n script.sh", result["validator_commands"])
+        self.assertIn("shell partial stderr", result["output"])
+
     def test_select_tests_maps_python_source_to_importing_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -651,6 +651,11 @@ class ToolExecutor:
             parts.append(stderr.strip())
         return "\n".join(parts) if parts else "(no output)"
 
+    def _timeout_command_text(self, command: Any) -> str:
+        if isinstance(command, (list, tuple)):
+            return command_to_text(tuple(str(part) for part in command))
+        return str(command)
+
     def _check_interrupted(self) -> None:
         if self._interrupt_event is not None and self._interrupt_event.is_set():
             raise OperationInterrupted("Interrupted by user.")
@@ -10648,55 +10653,75 @@ import string
         diagnostics: list[str] = []
         python_targets: set[str] = set()
         shell_targets: list[str] = []
-        for raw_path in raw_paths:
-            base = self.resolve_path(str(raw_path), allow_missing=False)
-            files = self._iter_code_files(base, limit=50000)
-            if files and (base.is_file() or base == self.workspace_root or self.workspace_root in base.parents):
-                python_targets.add(self.relative_label(base))
-            for file_path in files:
-                rel = self.relative_label(file_path)
-                checked.append(rel)
-                text = file_path.read_text(encoding="utf-8", errors="replace")
-                if file_path.suffix.lower() == ".py":
-                    python_targets.add(rel)
-                    diagnostic = self._python_syntax_diagnostic(file_path, text)
-                    if diagnostic:
-                        diagnostics.append(diagnostic)
-                elif file_path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
-                    shell_targets.append(rel)
-                elif file_path.suffix.lower() in {".js", ".jsx"} and shutil.which("node"):
-                    completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
-                    if completed.returncode != 0:
-                        diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=500))
-                elif self._tree_sitter_language_for_path(file_path) is not None:
-                    diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
-                    if diagnostic:
-                        diagnostics.append(diagnostic)
         validator_commands: list[str] = []
-        if python_targets and shutil.which("ruff"):
-            target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
-            command = ["ruff", "check", "--no-cache", *target_args]
-            validator_commands.append(command_to_text(tuple(command)))
-            completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
-            if completed.returncode != 0:
-                diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
-        typechecker_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error") or self._python_tool_command("pyright", "pyright", "--level", "error")
-        if python_targets and typechecker_command:
-            target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
-            command = [*typechecker_command, *target_args]
-            validator_commands.append(command_to_text(tuple(command)))
-            completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
-            if completed.returncode != 0:
-                diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
-        bash = shutil.which("bash")
-        if bash:
-            for rel in shell_targets[:100]:
-                command = [bash, "-n", rel]
-                validator_commands.append(command_to_text(("bash", "-n", rel)))
+        try:
+            for raw_path in raw_paths:
+                base = self.resolve_path(str(raw_path), allow_missing=False)
+                files = self._iter_code_files(base, limit=50000)
+                if files and (base.is_file() or base == self.workspace_root or self.workspace_root in base.parents):
+                    python_targets.add(self.relative_label(base))
+                for file_path in files:
+                    rel = self.relative_label(file_path)
+                    checked.append(rel)
+                    text = file_path.read_text(encoding="utf-8", errors="replace")
+                    if file_path.suffix.lower() == ".py":
+                        python_targets.add(rel)
+                        diagnostic = self._python_syntax_diagnostic(file_path, text)
+                        if diagnostic:
+                            diagnostics.append(diagnostic)
+                    elif file_path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
+                        shell_targets.append(rel)
+                    elif file_path.suffix.lower() in {".js", ".jsx"} and shutil.which("node"):
+                        completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
+                        if completed.returncode != 0:
+                            diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=500))
+                    elif self._tree_sitter_language_for_path(file_path) is not None:
+                        diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
+                        if diagnostic:
+                            diagnostics.append(diagnostic)
+            if python_targets and shutil.which("ruff"):
+                target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
+                command = ["ruff", "check", "--no-cache", *target_args]
+                validator_commands.append(command_to_text(tuple(command)))
                 completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
                 if completed.returncode != 0:
-                    output = self._collect_process_output(completed) or f"{rel}: bash -n failed"
-                    diagnostics.append(self._truncate_text(output, limit=1200))
+                    diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
+            typechecker_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error") or self._python_tool_command("pyright", "pyright", "--level", "error")
+            if python_targets and typechecker_command:
+                target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
+                command = [*typechecker_command, *target_args]
+                validator_commands.append(command_to_text(tuple(command)))
+                completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+                if completed.returncode != 0:
+                    diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
+            bash = shutil.which("bash")
+            if bash:
+                for rel in shell_targets[:100]:
+                    command = [bash, "-n", rel]
+                    validator_commands.append(command_to_text(("bash", "-n", rel)))
+                    completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+                    if completed.returncode != 0:
+                        output = self._collect_process_output(completed) or f"{rel}: bash -n failed"
+                        diagnostics.append(self._truncate_text(output, limit=1200))
+        except subprocess.TimeoutExpired as exc:
+            timeout_summary = f"Command timed out after {exc.timeout} seconds."
+            timeout_output = self._collect_timeout_output(exc)
+            timeout_command = self._timeout_command_text(exc.cmd)
+            timeout_details = f"{timeout_summary} Validator: {timeout_command}"
+            if timeout_output != "(no output)":
+                timeout_details = f"{timeout_details}\n{timeout_output}"
+            return {
+                "ok": False,
+                "tool": "lint_typecheck",
+                "checked": checked,
+                "diagnostics": [*diagnostics, timeout_details],
+                "validator_commands": validator_commands,
+                "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
+                "summary": timeout_summary,
+                "error_class": "timeout",
+                "timed_out": True,
+                "command": timeout_command,
+            }
         return {
             "ok": not diagnostics,
             "tool": "lint_typecheck",
