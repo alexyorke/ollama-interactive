@@ -653,20 +653,24 @@ class ToolExecutor:
             )
             if process.poll() is None:
                 process.kill()
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                return
+            try:
+                process.wait(timeout=1)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                return
         try:
             process.wait(timeout=1)
-            return
         except subprocess.TimeoutExpired:
             pass
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return
 
     def _run_process(
         self,
@@ -688,21 +692,32 @@ class ToolExecutor:
             start_new_session=True,
             **kwargs,
         )
-        deadline = time.monotonic() + timeout
-        while True:
-            self._check_interrupted()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                self._terminate_process(process)
-                raise subprocess.TimeoutExpired(process.args, timeout)
-            try:
-                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
-                return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
-            except subprocess.TimeoutExpired:
+        try:
+            deadline = time.monotonic() + timeout
+            while True:
                 if self._interrupt_event is not None and self._interrupt_event.is_set():
                     self._terminate_process(process)
                     raise OperationInterrupted("Interrupted by user.")
-                continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._terminate_process(process)
+                    raise subprocess.TimeoutExpired(process.args, timeout)
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+                except subprocess.TimeoutExpired:
+                    if self._interrupt_event is not None and self._interrupt_event.is_set():
+                        self._terminate_process(process)
+                        raise OperationInterrupted("Interrupted by user.")
+                    continue
+        except BaseException:
+            if process.poll() is None:
+                self._terminate_process(process)
+            raise
+        finally:
+            for stream in (process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
 
     def _path_cwd(self, path: Path | None) -> Path:
         if path is None:

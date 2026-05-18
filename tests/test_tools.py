@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 import json
 import re
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import warnings
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -4978,6 +4980,28 @@ def double(value: int) -> int:
         self.assertFalse(result["ok"])
         self.assertTrue(result["interrupted"])
         self.assertEqual(result["summary"], "Interrupted by user.")
+
+    def test_execute_interrupt_for_run_shell_closes_process_pipes(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        interrupted = threading.Event()
+        tools.set_interrupt_event(interrupted)
+        trigger = threading.Timer(0.2, interrupted.set)
+        trigger.start()
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                result = tools.execute("run_shell", {"command": f'"{sys.executable}" -c "import time; time.sleep(5)"', "timeout": 10})
+                gc.collect()
+        finally:
+            trigger.cancel()
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["interrupted"])
+        self.assertFalse(
+            [warning for warning in caught if issubclass(warning.category, ResourceWarning)],
+            [str(warning.message) for warning in caught],
+        )
 
     def test_run_shell_ignores_posix_shell_env_override(self) -> None:
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
