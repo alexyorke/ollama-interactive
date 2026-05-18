@@ -623,6 +623,7 @@ class ToolExecutor:
             rf"{statement_start}\$[A-Za-z_][\w:]*\s*=",
             rf"{statement_start}\.[\\/].+\.ps1(?:\s|$)",
             rf"{statement_start}(?:Get|Set|New|Remove|Move|Copy|Join|Split|Resolve|Test|Write|Start|Stop|Select|Where|ForEach|Measure|Sort)-[A-Za-z]+\b",
+            rf"{statement_start}(?:cat|clear|cp|ls|mv|pwd|rm)\b",
             r"\|\s*(?:Where-Object|Select-Object|ForEach-Object|Sort-Object|Measure-Object)\b",
         ]
         return any(re.search(pattern, command, flags=re.IGNORECASE) for pattern in patterns)

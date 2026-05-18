@@ -5119,6 +5119,31 @@ def double(value: int) -> int:
         self.assertEqual(result["output"], "123")
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_run_shell_routes_powershell_aliases_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(
+                args=["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "cat note.txt"],
+                returncode=0,
+                stdout="hello\n",
+                stderr="",
+            )
+
+            with patch.object(ToolExecutor, "_windows_powershell", return_value="pwsh"):
+                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                    result = tools.run_shell("cat note.txt")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["output"], "hello")
+        self.assertEqual(
+            run_mock.call_args.args[0],
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "cat note.txt"],
+        )
+        self.assertFalse(run_mock.call_args.kwargs["shell"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_does_not_misclassify_dollar_sign_inside_quoted_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
