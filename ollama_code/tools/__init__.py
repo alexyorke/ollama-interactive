@@ -637,6 +637,20 @@ class ToolExecutor:
             parts.append(completed.stderr.strip())
         return "\n".join(parts) if parts else "(no output)"
 
+    def _collect_timeout_output(self, exc: subprocess.TimeoutExpired) -> str:
+        parts = []
+        stdout = exc.output
+        stderr = exc.stderr
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        if isinstance(stdout, str) and stdout.strip():
+            parts.append(stdout.strip())
+        if isinstance(stderr, str) and stderr.strip():
+            parts.append(stderr.strip())
+        return "\n".join(parts) if parts else "(no output)"
+
     def _check_interrupted(self) -> None:
         if self._interrupt_event is not None and self._interrupt_event.is_set():
             raise OperationInterrupted("Interrupted by user.")
@@ -701,7 +715,13 @@ class ToolExecutor:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._terminate_process(process)
-                    raise subprocess.TimeoutExpired(process.args, timeout)
+                    stdout = ""
+                    stderr = ""
+                    try:
+                        stdout, stderr = process.communicate(timeout=0.2)
+                    except Exception:
+                        pass
+                    raise subprocess.TimeoutExpired(process.args, timeout, output=stdout, stderr=stderr)
                 try:
                     stdout, stderr = process.communicate(timeout=min(0.1, remaining))
                     return subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
@@ -13163,7 +13183,21 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             if shell_kwargs.get("shell") is True and powershell and self._looks_like_powershell_command(command):
                 run_args = [powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command]
                 shell_kwargs = {"shell": False}
-        completed = self._run_process(run_args, cwd=working_dir, timeout=timeout_value, **shell_kwargs)
+        try:
+            completed = self._run_process(run_args, cwd=working_dir, timeout=timeout_value, **shell_kwargs)
+        except subprocess.TimeoutExpired as exc:
+            result = {
+                "ok": False,
+                "tool": "run_shell",
+                "cwd": relative_cwd,
+                "summary": f"Command timed out after {timeout_value} seconds.",
+                "output": self._collect_timeout_output(exc),
+                "error_class": "timeout",
+                "timed_out": True,
+            }
+            if validation.get("recognized") is True:
+                result["validation"] = validation
+            return result
         output = self._collect_process_output(completed)
         result = {
             "ok": completed.returncode == 0,

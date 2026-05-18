@@ -5003,6 +5003,22 @@ def double(value: int) -> int:
             [str(warning.message) for warning in caught],
         )
 
+    def test_run_shell_timeout_returns_structured_result_with_partial_output(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        result = tools.run_shell(
+            f'"{sys.executable}" -c "import sys,time; print(123); sys.stdout.flush(); time.sleep(2)"',
+            timeout=1,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["error_class"], "timeout")
+        self.assertEqual(result["cwd"], ".")
+        self.assertEqual(result["output"], "123")
+        self.assertEqual(result["summary"], "Command timed out after 1 seconds.")
+
     def test_run_shell_ignores_posix_shell_env_override(self) -> None:
         tools = ToolExecutor(Path.cwd(), approval_mode="auto")
         completed = subprocess.CompletedProcess(args=["echo", "ok"], returncode=0, stdout="ok\n", stderr="")
@@ -5252,6 +5268,20 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"])
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
+
+    def test_run_test_timeout_returns_structured_result_with_command(self) -> None:
+        root = self._workspace_scratch()
+        command = f'"{sys.executable}" -c "import sys,time; print(321); sys.stdout.flush(); time.sleep(2)"'
+        tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+
+        result = tools.run_test(timeout=1)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["command"], command)
+        self.assertEqual(result["output"], "321")
+        self.assertEqual(result["summary"], "Command timed out after 1 seconds.")
 
     def test_run_test_reports_inline_python_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
