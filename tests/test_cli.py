@@ -734,6 +734,35 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.approval_mode(), "auto")
         self.assertEqual(agent.messages[1]["content"], "remember me")
 
+    def test_build_agent_continue_skips_newer_system_only_session(self) -> None:
+        root = self._workspace_scratch()
+        session_dir = root / ".ollama-code" / "sessions"
+        session_dir.mkdir(parents=True)
+        older = session_dir / "older.json"
+        newer = session_dir / "newer.json"
+        older.write_text(
+            '{"model":"gemma4:latest","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
+            encoding="utf-8",
+        )
+        newer.write_text(
+            '{"model":"blank-model","approval_mode":"read-only","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"}],"events":[]}',
+            encoding="utf-8",
+        )
+        older_ts = newer.stat().st_mtime - 10
+        os.utime(older, (older_ts, older_ts))
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.model, "gemma4:latest")
+        self.assertEqual(agent.approval_mode(), "auto")
+        self.assertEqual(agent.messages[1]["content"], "remember me")
+
     def test_build_agent_continue_uses_loaded_latest_session_payload_without_second_reload(self) -> None:
         root = self._workspace_scratch()
         session_dir = root / ".ollama-code" / "sessions"

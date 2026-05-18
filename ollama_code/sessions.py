@@ -98,6 +98,7 @@ def payload_can_restore_session(payload: dict[str, Any], workspace_root: Path) -
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return False
+    has_conversation_history = False
     for message in messages:
         if not isinstance(message, dict):
             return False
@@ -105,7 +106,9 @@ def payload_can_restore_session(payload: dict[str, Any], workspace_root: Path) -
         content = message.get("content")
         if not isinstance(role, str) or not isinstance(content, str):
             return False
-    return True
+        if role != "system":
+            has_conversation_history = True
+    return has_conversation_history
 
 
 def write_transcript_payload(path: Path, payload: dict[str, Any]) -> None:

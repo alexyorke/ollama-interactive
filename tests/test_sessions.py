@@ -187,6 +187,27 @@ class SessionPathTests(unittest.TestCase):
 
         self.assertEqual(latest, older.resolve())
 
+    def test_latest_session_path_skips_newer_system_only_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            older = session_dir / "older.json"
+            newer = session_dir / "newer.json"
+            self._write_session(older, "resume me")
+            newer.parent.mkdir(parents=True, exist_ok=True)
+            newer.write_text(
+                '{"model":"blank-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[{"role":"system","content":"sys"}],"events":[]}',
+                encoding="utf-8",
+            )
+            older_ts = newer.stat().st_mtime - 10
+            os.utime(older, (older_ts, older_ts))
+
+            latest = latest_session_path(root)
+
+        self.assertEqual(latest, older.resolve())
+
     def test_list_sessions_ignores_symlink_that_resolves_outside_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -219,6 +240,25 @@ class SessionPathTests(unittest.TestCase):
 
             with patch.object(Path, "read_text", autospec=True, side_effect=denied_read_text):
                 sessions = list_sessions(root)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].path, kept.resolve())
+
+    def test_list_sessions_skips_system_only_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            kept = session_dir / "kept.json"
+            blank = session_dir / "blank.json"
+            self._write_session(kept, "keep me")
+            blank.write_text(
+                '{"model":"blank-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[{"role":"system","content":"sys"}],"events":[]}',
+                encoding="utf-8",
+            )
+
+            sessions = list_sessions(root)
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0].path, kept.resolve())
