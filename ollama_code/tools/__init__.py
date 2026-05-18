@@ -620,6 +620,7 @@ class ToolExecutor:
     def _looks_like_powershell_command(self, command: str) -> bool:
         statement_start = r"(?:^|[;&]\s*)"
         patterns = [
+            r"^\s*&\s*(?!&)\S",
             rf"{statement_start}\$[A-Za-z_][\w:]*\s*=",
             rf"{statement_start}\.[\\/].+\.ps1(?:\s|$)",
             rf"{statement_start}(?:Get|Set|New|Remove|Move|Copy|Join|Split|Resolve|Test|Write|Start|Stop|Select|Where|ForEach|Measure|Sort)-[A-Za-z]+\b",

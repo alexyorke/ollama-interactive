@@ -5144,6 +5144,30 @@ def double(value: int) -> int:
         self.assertFalse(run_mock.call_args.kwargs["shell"])
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_run_shell_routes_powershell_call_operator_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            command = '& ".\\script with spaces.ps1" -Name demo'
+            completed = subprocess.CompletedProcess(
+                args=["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                returncode=0,
+                stdout="ok\n",
+                stderr="",
+            )
+
+            with patch.object(ToolExecutor, "_windows_powershell", return_value="pwsh"):
+                with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
+                    result = tools.run_shell(command)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["output"], "ok")
+        self.assertEqual(
+            run_mock.call_args.args[0],
+            ["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+        )
+        self.assertFalse(run_mock.call_args.kwargs["shell"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_does_not_misclassify_dollar_sign_inside_quoted_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
