@@ -907,6 +907,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("first_name", first["output"])
         self.assertIn("second_name", second["output"])
 
+    def test_repo_index_search_invalidates_same_size_changed_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "ops.py"
+            target.write_text("def first_name():\n    return 'old'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            first = tools.repo_index_search("first_name")
+            target.write_text("def third_name():\n    return 'new'\n", encoding="utf-8")
+            second = tools.repo_index_search("third_name")
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertIn("first_name", first["output"])
+        self.assertIn("third_name", second["output"])
+
     def test_indexed_search_uses_cached_lines_and_invalidates_changed_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

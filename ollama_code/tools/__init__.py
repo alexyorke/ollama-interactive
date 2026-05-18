@@ -2744,6 +2744,25 @@ class ToolExecutor:
         except OSError:
             return
 
+    def _repo_index_record_matches(self, cached: Any, file_path: Path, stat: os.stat_result) -> bool:
+        if not (
+            isinstance(cached, dict)
+            and cached.get("mtime_ns") == int(stat.st_mtime_ns)
+            and cached.get("ctime_ns") == int(stat.st_ctime_ns)
+            and cached.get("size") == int(stat.st_size)
+            and isinstance(cached.get("line_index"), list)
+        ):
+            return False
+        cached_sha1 = str(cached.get("sha1") or "").strip()
+        if not cached_sha1:
+            return False
+        try:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        current_sha1 = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()
+        return current_sha1 == cached_sha1
+
     def _indexed_code_records(self, base: Path, *, limit: int = 1000) -> list[dict[str, Any]]:
         payload = self._load_repo_index()
         files_payload = payload.setdefault("files", {})
@@ -2757,13 +2776,7 @@ class ToolExecutor:
             seen.add(rel)
             stat = file_path.stat()
             cached = files_payload.get(rel)
-            if not (
-                isinstance(cached, dict)
-                and cached.get("mtime_ns") == int(stat.st_mtime_ns)
-                and cached.get("ctime_ns") == int(stat.st_ctime_ns)
-                and cached.get("size") == int(stat.st_size)
-                and isinstance(cached.get("line_index"), list)
-            ):
+            if not self._repo_index_record_matches(cached, file_path, stat):
                 cached = self._code_index_record(file_path)
                 files_payload[rel] = cached
                 changed = True
