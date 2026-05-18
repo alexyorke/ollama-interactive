@@ -10658,13 +10658,13 @@ import string
             for raw_path in raw_paths:
                 base = self.resolve_path(str(raw_path), allow_missing=False)
                 files = self._iter_code_files(base, limit=50000)
-                if files and (base.is_file() or base == self.workspace_root or self.workspace_root in base.parents):
-                    python_targets.add(self.relative_label(base))
+                base_has_python = False
                 for file_path in files:
                     rel = self.relative_label(file_path)
                     checked.append(rel)
                     text = file_path.read_text(encoding="utf-8", errors="replace")
                     if file_path.suffix.lower() == ".py":
+                        base_has_python = True
                         python_targets.add(rel)
                         diagnostic = self._python_syntax_diagnostic(file_path, text)
                         if diagnostic:
@@ -10679,6 +10679,8 @@ import string
                         diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
                         if diagnostic:
                             diagnostics.append(diagnostic)
+                if base_has_python and (base.is_file() or base == self.workspace_root or self.workspace_root in base.parents):
+                    python_targets.add(self.relative_label(base))
             if python_targets and shutil.which("ruff"):
                 target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
                 command = ["ruff", "check", "--no-cache", *target_args]
