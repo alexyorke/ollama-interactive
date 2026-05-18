@@ -5078,6 +5078,34 @@ def double(value: int) -> int:
         self.assertIn("path escapes workspace", result["summary"])
         run_mock.assert_not_called()
 
+    def test_run_shell_rejects_path_escape_for_unknown_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside = root.parent / "outside.txt"
+            outside.write_text("secret\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch.object(ToolExecutor, "_run_process") as run_mock:
+                result = tools.run_shell("cat ../outside.txt")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("path escapes workspace", result["summary"])
+        run_mock.assert_not_called()
+
+    def test_run_shell_rejects_executable_path_escape_for_unknown_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside_name = "outside-tool.bat" if os.name == "nt" else "outside-tool.sh"
+            outside = root.parent / outside_name
+            outside.write_text("@echo off\r\necho hi\r\n" if os.name == "nt" else "#!/bin/sh\necho hi\n", encoding="utf-8")
+            command = f"..\\{outside_name} --help" if os.name == "nt" else f"../{outside_name} --help"
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch.object(ToolExecutor, "_run_process") as run_mock:
+                result = tools.run_shell(command)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("path escapes workspace", result["summary"])
+        run_mock.assert_not_called()
+
     def test_run_shell_validates_local_executable_relative_to_cwd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -12833,6 +12833,36 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         root = self.workspace_root.resolve(strict=False)
         return resolved != root and root not in resolved.parents
 
+    def _token_looks_like_path(self, token: str) -> bool:
+        clean = str(token or "").strip().strip("'\"")
+        if not clean:
+            return False
+        if clean in {".", ".."}:
+            return True
+        if clean.startswith(("./", "../", ".\\", "..\\")):
+            return True
+        normalized = clean.replace("\\", "/")
+        return bool(
+            clean.startswith(("/", "\\"))
+            or "/" in clean
+            or "\\" in clean
+            or WINDOWS_DRIVE_PATH.match(normalized)
+            or WSL_MOUNT_PATH.match(normalized)
+        )
+
+    def _validate_executable_path(self, executable: str, cwd: Path) -> str | None:
+        clean = str(executable or "").strip().strip("'\"")
+        if not clean:
+            return None
+        candidate = self._coerce_input_path(clean)
+        if candidate.is_absolute():
+            return None
+        if not self._token_looks_like_path(clean):
+            return None
+        if self._command_path_escapes(clean, cwd):
+            return f"path escapes workspace: {clean}"
+        return None
+
     def _validate_path_args(self, argv: list[str], cwd: Path, *, start: int = 1) -> str | None:
         for token in argv[start:]:
             if self._command_path_escapes(token, cwd):
@@ -12985,11 +13015,18 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         family = self._command_family(argv)
         if family == "python_exec":
             argv = self._normalize_python_exec_argv(argv)
+        executable = str(argv[0]).strip().strip("'\"")
+        executable_path_error = self._validate_executable_path(executable, cwd)
+        path_error = self._validate_path_args(argv, cwd)
         if self._needs_bash_syntax_check(command, family):
             syntax_error = self._bash_syntax_validation(command)
             if syntax_error is not None:
                 return None, syntax_error
         if family is None:
+            shell_path_error = executable_path_error or path_error
+            if shell_path_error:
+                shell_family = "powershell" if os.name == "nt" and self._looks_like_powershell_command(command) else "shell"
+                return None, self._validation_result(family=shell_family, valid=False, reason=shell_path_error)
             if os.name == "nt" and self._looks_like_powershell_command(command):
                 return None, {"recognized": False, "valid": True, "family": "powershell"}
             executable_error = self._unknown_command_error(argv, cwd)
@@ -12998,10 +13035,10 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             return None, {"recognized": False, "valid": True, "family": "unknown"}
         if family not in {"python", "python_exec"} and self._command_has_shell_chaining(command):
             return None, self._validation_result(family=family, valid=False, reason="shell chaining/redirection is not allowed for validated command families")
-        executable = str(argv[0]).strip().strip("'\"")
         if not self._executable_available_for_cwd(executable, cwd):
             return None, self._validation_result(family=family, valid=False, reason=f"executable not found: {executable}")
-        path_error = self._validate_path_args(argv, cwd)
+        if executable_path_error:
+            return None, self._validation_result(family=family, valid=False, reason=executable_path_error)
         if path_error:
             return None, self._validation_result(family=family, valid=False, reason=path_error)
         if family == "git":
