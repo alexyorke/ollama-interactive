@@ -41,6 +41,7 @@ class DummyAgent:
         self._session_path = Path("session.json").resolve()
         self._test_command = "python -m unittest -v"
         self._todos = "1. [pending] inspect\n2. [completed] setup"
+        self.diff_request: dict[str, object] | None = None
         self.tools = ToolView()
 
     def workspace_root(self) -> Path:
@@ -110,6 +111,7 @@ class DummyAgent:
         return {"ok": True, "output": "## main\n M tracked.txt"}
 
     def git_diff(self, *, cached: bool = False, path: str | None = None) -> dict[str, object]:
+        self.diff_request = {"cached": cached, "path": path}
         return {"ok": True, "output": "--- a/tracked.txt\n+++ b/tracked.txt\n+after"}
 
     def git_commit(self, message: str, *, add_all: bool = True) -> dict[str, object]:
@@ -602,6 +604,23 @@ class CliCommandTests(unittest.TestCase):
         handled = handle_meta_command("/diff --cached tracked.txt", agent, output.append)
         self.assertTrue(handled)
         self.assertIn("+after", output[0])
+        self.assertEqual(agent.diff_request, {"cached": True, "path": "tracked.txt"})
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_diff_command_preserves_windows_backslashes_on_posix(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command(r"/diff C:\Users\yorke\ws\ollama-interactive\tracked.txt", agent, output.append)
+        self.assertTrue(handled)
+        self.assertEqual(agent.diff_request, {"cached": False, "path": r"C:\Users\yorke\ws\ollama-interactive\tracked.txt"})
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_diff_command_keeps_posix_escaped_spaces(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command(r"/diff dir\ with\ spaces/file.txt", agent, output.append)
+        self.assertTrue(handled)
+        self.assertEqual(agent.diff_request, {"cached": False, "path": "dir with spaces/file.txt"})
 
     def test_test_command_preserves_windows_executable_path(self) -> None:
         agent = DummyAgent()

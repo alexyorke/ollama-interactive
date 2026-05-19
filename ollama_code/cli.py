@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import os
+import re
 import shutil
 import shlex
 import sys
@@ -186,6 +187,13 @@ def _bool_from_text(value: str | None) -> bool | None:
     if lowered in {"0", "false", "no", "off"}:
         return False
     return None
+
+
+def _split_meta_args(value: str) -> list[str]:
+    posix_mode = os.name != "nt"
+    if posix_mode and re.search(r"\\\S", value):
+        return shlex.split(value, posix=False)
+    return shlex.split(value, posix=posix_mode)
 
 
 def _reconcile_from_text(value: str | None) -> str | None:
@@ -765,7 +773,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         return True
     if action == "/diff":
         try:
-            diff_parts = shlex.split(remainder, posix=os.name != "nt") if remainder else []
+            diff_parts = _split_meta_args(remainder) if remainder else []
         except ValueError:
             writer("Usage: /diff [--cached] [path]")
             return True
@@ -799,7 +807,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         return True
     if action == "/tools":
         try:
-            args = shlex.split(remainder, posix=os.name != "nt") if remainder else []
+            args = _split_meta_args(remainder) if remainder else []
         except ValueError:
             writer("Usage: /tools [full|groups|missing|recommended|all|install <tool-id>|install --recommended]")
             return True
