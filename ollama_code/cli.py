@@ -847,7 +847,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(output)
         return True
     if action == "/test":
-        command_text = remainder or None
+        command_text = _strip_matching_quotes(remainder) or None
         result = agent.run_test(command_text)
         output = str(result.get("output") or result.get("summary", "(no output)"))
         writer(output)

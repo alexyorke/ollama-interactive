@@ -694,6 +694,14 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIn(command, output[0])
 
+    def test_test_command_strips_wrapping_quotes(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command('/test "pytest -q"', agent, output.append)
+        self.assertTrue(handled)
+        self.assertIn("pytest -q", output[0])
+        self.assertNotIn('"pytest -q"', output[0])
+
     def test_commit_command_prints_commit_output(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
