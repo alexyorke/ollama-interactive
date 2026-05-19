@@ -598,6 +598,24 @@ class CliCommandTests(unittest.TestCase):
         self.assertIsNotNone(agent.loaded_path)
         self.assertIn(r"C:\Users\yorke\saved.json", str(agent.loaded_path))
 
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_save_command_keeps_posix_escaped_spaces(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command(r"/save dir\ with\ spaces/trace.json", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIsNotNone(agent.saved_path)
+        self.assertTrue(str(agent.saved_path).endswith(str(Path("dir with spaces") / "trace.json")))
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_load_command_keeps_posix_escaped_spaces(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command(r"/load dir\ with\ spaces/saved.json", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIsNotNone(agent.loaded_path)
+        self.assertTrue(str(agent.loaded_path).endswith(str(Path("dir with spaces") / "saved.json")))
+
     def test_diff_command_prints_git_diff(self) -> None:
         agent = DummyAgent()
         output: list[str] = []

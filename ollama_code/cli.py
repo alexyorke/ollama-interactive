@@ -196,6 +196,21 @@ def _split_meta_args(value: str) -> list[str]:
     return shlex.split(value, posix=posix_mode)
 
 
+def _parse_single_meta_path(value: str) -> str | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    unquoted = _strip_matching_quotes(stripped)
+    if unquoted != stripped:
+        return unquoted
+    if os.name != "nt" and re.search(r"\\\s", stripped):
+        parts = shlex.split(stripped, posix=True)
+        if len(parts) != 1:
+            raise ValueError("expected a single path argument")
+        return parts[0]
+    return stripped
+
+
 def _reconcile_from_text(value: str | None) -> str | None:
     if value is None:
         return None
@@ -737,7 +752,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer("conversation reset")
         return True
     if action == "/save":
-        target = _strip_matching_quotes(remainder) or None
+        try:
+            target = _parse_single_meta_path(remainder)
+        except ValueError:
+            writer("Usage: /save [path]")
+            return True
         saved = agent.save_transcript(target)
         writer(f"saved transcript to {saved.as_posix()}")
         return True
@@ -760,7 +779,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer("\n".join(lines))
         return True
     if action == "/load":
-        target = _strip_matching_quotes(remainder)
+        try:
+            target = _parse_single_meta_path(remainder)
+        except ValueError:
+            writer("Usage: /load <path>")
+            return True
         if not target:
             writer("Usage: /load <path>")
             return True
