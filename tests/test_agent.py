@@ -2458,6 +2458,33 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(tool_calls)
         self.assertTrue(all(event["name"] == "run_test" for event in tool_calls))
 
+    def test_agent_accepts_dynamic_mcp_tool_name_without_explicit_type_field(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                '{"name":"mcp.demo.echo","arguments":{"text":"hi"}}',
+                '{"type":"final","message":"done"}',
+            ]
+        )
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["mcp_call"],
+            mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
+        )
+        with patch.object(
+            tools,
+            "mcp_call",
+            return_value={"ok": True, "tool": "mcp_call", "server": "demo", "mcp_tool": "echo", "output": '{"value":"ok"}'},
+        ) as mcp_call:
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Use the MCP tool to inspect the workspace, then answer.")
+
+        self.assertEqual(result.message, "done")
+        mcp_call.assert_called_once_with("demo", "echo", {"text": "hi"})
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual([event["name"] for event in tool_calls], ["mcp.demo.echo"])
+
     def test_agent_normalizes_run_shell_to_run_test_for_explicit_benchmark_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -2813,22 +2813,29 @@ class OllamaCodeAgent:
                             message = arg_content
             normalized = {"type": "final", "message": str(message or "").strip()}
             return normalized
-        if isinstance(response_type, str) and response_type in KNOWN_TOOL_NAMES:
+        if isinstance(response_type, str) and self._is_supported_tool_name(response_type):
             normalized["type"] = "tool"
             if not isinstance(tool_name, str) or not tool_name:
                 normalized["name"] = response_type
             if not isinstance(arguments, dict):
                 normalized["arguments"] = {}
             return normalized
-        if isinstance(tool_name, str) and tool_name in KNOWN_TOOL_NAMES and response_type in {None, "", "function", "tool_call"}:
+        if isinstance(tool_name, str) and self._is_supported_tool_name(tool_name) and response_type in {None, "", "function", "tool_call"}:
             normalized["type"] = "tool"
             if not isinstance(arguments, dict):
                 normalized["arguments"] = {}
             return normalized
         return normalized
 
+    def _is_supported_tool_name(self, name: str) -> bool:
+        clean = str(name or "").strip()
+        if clean in KNOWN_TOOL_NAMES:
+            return True
+        parts = clean.split(".", 2)
+        return len(parts) == 3 and parts[0] == "mcp" and all(part.strip() for part in parts[1:])
+
     def _counts_as_real_tool_use(self, name: str, result: dict[str, Any]) -> bool:
-        if name not in KNOWN_TOOL_NAMES:
+        if not self._is_supported_tool_name(name):
             return False
         return result.get("ok") is True
 
@@ -2842,7 +2849,7 @@ class OllamaCodeAgent:
         return None
 
     def _failure_result_counts_for_request(self, request_text: str, name: str, result: dict[str, Any]) -> bool:
-        if name not in KNOWN_TOOL_NAMES:
+        if not self._is_supported_tool_name(name):
             return False
         if name == "run_agent":
             return False

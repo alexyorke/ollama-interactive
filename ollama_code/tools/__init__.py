@@ -307,11 +307,18 @@ class ToolExecutor:
         clean = str(name or "").strip()
         if not clean:
             return False
+        if clean.startswith("mcp."):
+            parts = clean.split(".", 2)
+            if len(parts) != 3 or not all(part.strip() for part in parts):
+                return False
+            if clean in self.disabled_tools or "mcp_call" in self.disabled_tools or "mcp" in self.disabled_tools:
+                return False
+            if self.enabled_tools and clean not in self.enabled_tools and "mcp_call" not in self.enabled_tools and "mcp" not in self.enabled_tools:
+                return False
+            return self.default_tools_enabled
         if self.enabled_tools and clean not in self.enabled_tools:
             return False
         if clean in self.disabled_tools:
-            return False
-        if clean.startswith("mcp.") and ("mcp_call" in self.disabled_tools or "mcp" in self.disabled_tools):
             return False
         return self.default_tools_enabled
 

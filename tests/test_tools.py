@@ -1301,6 +1301,29 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(blocked["ok"])
         self.assertIn("disabled", blocked["summary"])
 
+    def test_enabled_tools_allowlist_allows_dynamic_mcp_tool_names_via_mcp_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(
+                Path(tmp),
+                approval_mode="auto",
+                enabled_tools=["mcp_call"],
+                mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
+            )
+            with patch.object(tools, "_approve_shell", return_value=(True, "")):
+                with patch.object(
+                    tools,
+                    "_mcp_request",
+                    return_value=(True, [{"id": 2, "result": {"value": "ok"}}], ""),
+                ) as request_mock:
+                    result = tools.execute("mcp.demo.echo", {"text": "hi"})
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["tool"], "mcp_call")
+        self.assertEqual(result["server"], "demo")
+        self.assertEqual(result["mcp_tool"], "echo")
+        self.assertIn('"value": "ok"', result["output"])
+        self.assertEqual(request_mock.call_args.args[0], "demo")
+
     def test_systems_lens_frames_complex_task_without_grounding_edit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
