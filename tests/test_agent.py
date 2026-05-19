@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import os
 import shutil
@@ -2912,6 +2913,46 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(session.read_text(encoding="utf-8"), original)
         self.assertEqual(list(session.parent.glob(f".{session.name}.*.tmp")), [])
+
+    def test_save_transcript_normalizes_and_compacts_diagnostic_payloads(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", session_file=session, debate_enabled=False)
+        full_message = "remember " + ("m" * 5000)
+        agent.messages.append({"role": "user", "content": full_message})
+        agent.events.append(
+            {
+                "type": "tool_result",
+                "name": "run_test",
+                "result": {
+                    "ok": False,
+                    "output": "x" * 12000,
+                    "path": root / "nested" / "file.txt",
+                    "payload": b"\xff\x00",
+                    "when": datetime(2026, 5, 18, tzinfo=timezone.utc),
+                    "nan": float("nan"),
+                    "items": {"beta", "alpha"},
+                },
+            }
+        )
+        agent.llm_telemetry_events.append({"type": "llm_call", "preview": "y" * 9000})
+
+        saved = agent.save_transcript()
+        payload = json.loads(saved.read_text(encoding="utf-8"))
+        result = payload["events"][0]["result"]
+
+        self.assertEqual(payload["messages"][-1]["content"], full_message)
+        self.assertEqual(result["path"], (root / "nested" / "file.txt").as_posix())
+        self.assertEqual(result["payload"], "b'\\xff\\x00'")
+        self.assertEqual(result["when"], "2026-05-18T00:00:00+00:00")
+        self.assertEqual(result["nan"], "nan")
+        self.assertEqual(result["items"], ["alpha", "beta"])
+        self.assertIn("truncated", result["output"])
+        self.assertLess(len(result["output"]), 5000)
+        self.assertIn("truncated", payload["llm_telemetry_events"][0]["preview"])
+        self.assertLess(len(payload["llm_telemetry_events"][0]["preview"]), 5000)
 
     def test_agent_can_load_saved_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

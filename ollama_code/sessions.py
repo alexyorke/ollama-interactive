@@ -121,7 +121,7 @@ def write_transcript_payload(path: Path, payload: dict[str, Any]) -> None:
     tmp_path = Path(raw_tmp_path)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2)
+            json.dump(payload, handle, indent=2, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, path)

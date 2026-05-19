@@ -4,11 +4,12 @@ import ast
 from copy import deepcopy
 import difflib
 import json
+import math
 import re
 import textwrap
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Callable
 import threading
 
@@ -98,6 +99,7 @@ from ollama_code.sessions import (
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
 
 
+TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT = 4000
 
 
 class OllamaCodeAgent:
@@ -463,13 +465,45 @@ class OllamaCodeAgent:
             "approval_mode": self.tools.approval_mode,
             "todos": self.tools.todo_snapshot(),
             "messages": self.messages,
-            "events": self.events,
-            "llm_telemetry_events": self.llm_telemetry_events,
+            "events": self._normalize_transcript_diagnostic_payload(self.events),
+            "llm_telemetry_events": self._normalize_transcript_diagnostic_payload(self.llm_telemetry_events),
         }
         write_transcript_payload(target, payload)
         if self.session_file is not None and target.resolve(strict=False) == self.session_file.resolve(strict=False):
             self._transcript_dirty = False
         return target
+
+    def _normalize_transcript_diagnostic_payload(self, value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        if isinstance(value, str):
+            if len(value) <= TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT:
+                return value
+            omitted = len(value) - TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT
+            return value[:TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT] + f"\n... [truncated {omitted} chars for transcript]"
+        if isinstance(value, PurePath):
+            return value.as_posix()
+        if isinstance(value, dict):
+            return {
+                str(key): self._normalize_transcript_diagnostic_payload(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._normalize_transcript_diagnostic_payload(item) for item in value]
+        if isinstance(value, set):
+            return [
+                self._normalize_transcript_diagnostic_payload(item)
+                for item in sorted(value, key=lambda item: str(item))
+            ]
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            try:
+                return str(isoformat())
+            except TypeError:
+                pass
+        return self._normalize_transcript_diagnostic_payload(str(value))
 
     def _autosave(self) -> None:
         if self.session_file is not None and self._transcript_dirty:
