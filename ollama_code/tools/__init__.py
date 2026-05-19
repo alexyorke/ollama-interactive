@@ -10346,12 +10346,14 @@ import string
 
     def _available_command(self, command: str, cwd: Path | None = None) -> bool:
         try:
-            argv = shlex.split(command, posix=os.name != "nt")
+            argv = self._split_command_text(command)
         except ValueError:
             return False
         if not argv:
             return False
         executable = str(argv[0]).strip().strip("'\"")
+        if self._token_looks_like_path(executable):
+            executable = str(self._coerce_input_path(executable))
         working_dir = cwd or self.workspace_root
         if executable.startswith(("./", ".\\")):
             return (working_dir / executable).exists()
@@ -12876,7 +12878,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
                 code = code[1:-1]
             return [python_inline.group("exe"), "-c", code], None
         try:
-            argv = shlex.split(command, posix=os.name != "nt")
+            argv = self._split_command_text(command)
         except ValueError as exc:
             return None, {
                 "recognized": False,
@@ -12892,6 +12894,45 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
                 "reason": "Command rejected before execution: empty command.",
             }
         return argv, None
+
+    def _command_looks_like_cross_platform_path_input(self, command: str) -> bool:
+        if os.name == "nt" or "\\" not in command:
+            return False
+        for token in re.findall(r'"[^"]*"|\'[^\']*\'|\S+', command):
+            stripped = token.strip().strip("'\"")
+            if not stripped:
+                continue
+            normalized = stripped.replace("\\", "/")
+            if WINDOWS_DRIVE_PATH.match(normalized) or WSL_MOUNT_PATH.match(normalized):
+                return True
+            if stripped.startswith((".\\", "..\\")):
+                return True
+            if re.search(r"[A-Za-z0-9_.-]\\[A-Za-z0-9_.-]", stripped):
+                return True
+        return False
+
+    def _split_command_text(self, command: str) -> list[str]:
+        posix_mode = os.name != "nt"
+        if posix_mode and self._command_looks_like_cross_platform_path_input(command):
+            return shlex.split(command, posix=False)
+        return shlex.split(command, posix=posix_mode)
+
+    def _normalize_command_argv_paths(self, argv: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for index, token in enumerate(argv):
+            raw = str(token).strip()
+            clean = raw.strip("'\"")
+            if index == 0:
+                if self._token_looks_like_path(clean):
+                    normalized.append(str(self._coerce_input_path(clean)))
+                else:
+                    normalized.append(clean)
+                continue
+            if not clean or raw.startswith("-") or not self._token_looks_like_path(clean):
+                normalized.append(raw)
+                continue
+            normalized.append(str(self._coerce_input_path(clean)))
+        return normalized
 
     def _command_has_shell_chaining(self, command: str) -> bool:
         return bool(re.search(r"&&|\|\||[;|<>]", command))
@@ -13094,6 +13135,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             return None, split_error
         assert argv is not None
         argv = [str(argv[0]).strip().strip("'\""), *argv[1:]]
+        argv = self._normalize_command_argv_paths(argv)
         family = self._command_family(argv)
         if family == "python_exec":
             argv = self._normalize_python_exec_argv(argv)

@@ -5350,6 +5350,43 @@ def double(value: int) -> int:
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
 
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_validate_common_command_normalizes_windows_style_paths_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        with patch.object(ToolExecutor, "_executable_available_for_cwd", return_value=True):
+            argv, validation = tools._validate_common_command(
+                r"C:\Python312\python.exe -m unittest discover -s tests\unit -v",
+                root,
+            )
+
+        self.assertEqual(
+            argv,
+            ["/mnt/c/Python312/python.exe", "-m", "unittest", "discover", "-s", "tests/unit", "-v"],
+        )
+        self.assertTrue(validation["valid"])
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_run_test_normalizes_backslash_relative_path_argument_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        test_dir = root / "tests" / "unit"
+        test_dir.mkdir(parents=True, exist_ok=True)
+        (test_dir / "test_sample.py").write_text(
+            "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        result = tools.run_test(f"{sys.executable} -m unittest discover -s tests\\unit -v")
+
+        self.assertTrue(result["ok"], result.get("summary") or result.get("output"))
+        self.assertEqual(
+            result["command"],
+            f"{sys.executable} -m unittest discover -s tests\\unit -v",
+        )
+        self.assertIn("OK", result["output"])
+
     def test_run_test_timeout_returns_structured_result_with_command(self) -> None:
         root = self._workspace_scratch()
         command = f'"{sys.executable}" -c "import sys,time; print(321); sys.stdout.flush(); time.sleep(2)"'
