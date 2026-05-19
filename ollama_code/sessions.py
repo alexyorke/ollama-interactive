@@ -58,7 +58,11 @@ def resolve_transcript_path(workspace_root: Path, raw_path: str | Path) -> Path:
     root = workspace_root.resolve()
     candidate = _coerce_cross_platform_absolute_path(raw_path)
     if candidate is None:
-        candidate = Path(raw_path)
+        text = str(raw_path).strip()
+        if os.name != "nt" and "\\" in text:
+            candidate = Path(text.replace("\\", "/"))
+        else:
+            candidate = Path(raw_path)
     if not candidate.is_absolute():
         candidate = root / candidate
     resolved = candidate.resolve(strict=False)

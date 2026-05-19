@@ -841,6 +841,25 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.model, "bom-model")
         self.assertEqual(agent.messages[1]["content"], "remember me")
 
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_build_agent_resume_accepts_backslash_relative_path_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_text(
+            '{"model":"saved-model","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"user","content":"remember me"}]}',
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--resume", r".ollama-code\sessions\saved.json", "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.model, "saved-model")
+        self.assertEqual(agent.messages[1]["content"], "remember me")
+
     def test_build_agent_resume_unreadable_session_raises_value_error(self) -> None:
         root = self._workspace_scratch()
         session = root / ".ollama-code" / "sessions" / "denied.json"

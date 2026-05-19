@@ -62,6 +62,14 @@ class SessionPathTests(unittest.TestCase):
         resolved = resolve_transcript_path(root, f"{alias_root}/.ollama-code/sessions/saved.json")
         self.assertEqual(resolved, (root / ".ollama-code" / "sessions" / "saved.json").resolve(strict=False))
 
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_resolve_transcript_path_normalizes_backslash_relative_path_on_posix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            resolved = resolve_transcript_path(root, r".ollama-code\sessions\saved.json")
+
+        self.assertEqual(resolved, (root / ".ollama-code" / "sessions" / "saved.json").resolve())
+
     def test_resolve_transcript_path_blocks_cross_platform_alias_escape(self) -> None:
         root, alias_root = self._cross_platform_workspace_pair()
         escaped_alias = alias_root.rsplit("/", 1)[0] + "/other-workspace/saved.json"
