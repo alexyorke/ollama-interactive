@@ -211,6 +211,51 @@ class CliCommandTests(unittest.TestCase):
         ):
             self.assertIn(name, agent.tools.available_tool_names())
 
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_build_agent_reads_windows_style_cwd_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('{"model":"cwd-alias-model"}', encoding="utf-8")
+        root_path = root.as_posix()
+        if not root_path.startswith("/mnt/") or len(root_path) < 8 or root_path[6] != "/":
+            self.skipTest("requires a /mnt/<drive> workspace path")
+        windows_style = f"{root_path[5].upper()}:{root_path[6:]}"
+        args = build_parser().parse_args(["--cwd", windows_style, "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.workspace_root().resolve(strict=False), root.resolve(strict=False))
+        self.assertEqual(agent.model, "cwd-alias-model")
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_build_agent_reads_backslash_relative_cwd_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('{"model":"cwd-relative-model"}', encoding="utf-8")
+        relative = root.relative_to(Path.cwd()).as_posix().replace("/", "\\")
+        args = build_parser().parse_args(["--cwd", relative, "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.workspace_root().resolve(strict=False), root.resolve(strict=False))
+        self.assertEqual(agent.model, "cwd-relative-model")
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_build_agent_reads_wsl_alias_cwd_on_windows(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('{"model":"cwd-alias-model"}', encoding="utf-8")
+        alias = f"/mnt/{root.drive[:1].lower()}{root.as_posix()[2:]}"
+        args = build_parser().parse_args(["--cwd", alias, "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertEqual(agent.workspace_root().resolve(strict=False), root.resolve(strict=False))
+        self.assertEqual(agent.model, "cwd-alias-model")
+
     def test_status_renderer_shows_last_three_thinking_lines_and_clears_on_status(self) -> None:
         stream = io.StringIO()
         renderer = CliStatusRenderer(stream=stream, use_ansi=True, update_interval=0.0)

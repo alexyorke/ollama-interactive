@@ -50,6 +50,8 @@ PREFERRED_FALLBACK_MODELS = [
     "gpt-oss:20b",
 ]
 DEFAULT_MODEL_PULL_HINT = f"Install the recommended default with: ollama pull {DEFAULT_MODEL}"
+WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
+WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 
 
 class CliStatusRenderer:
@@ -211,6 +213,28 @@ def _parse_single_meta_path(value: str) -> str | None:
     return stripped
 
 
+def _resolve_workspace_root(raw_path: str | Path) -> Path:
+    text = str(raw_path).strip()
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        normalized = text.replace("\\", "/")
+        windows_match = WINDOWS_DRIVE_PATH.match(normalized)
+        if windows_match:
+            drive = windows_match.group("drive").lower()
+            rest = (windows_match.group("rest") or "").strip("/")
+            suffix = f"/{rest}" if rest else ""
+            candidate = Path(f"/mnt/{drive}{suffix}")
+        else:
+            wsl_match = WSL_MOUNT_PATH.match(normalized)
+            if wsl_match:
+                drive = wsl_match.group("drive").upper()
+                rest = (wsl_match.group("rest") or "").strip("/")
+                candidate = Path(f"{drive}:/{rest}") if rest else Path(f"{drive}:/")
+            elif os.name != "nt" and "\\" in text:
+                candidate = Path(normalized)
+    return candidate.resolve(strict=False)
+
+
 def _reconcile_from_text(value: str | None) -> str | None:
     if value is None:
         return None
@@ -229,7 +253,7 @@ def build_agent(
     status_printer: Callable[[str], None] | None = None,
     thinking_printer: Callable[[str], None] | None = None,
 ) -> OllamaCodeAgent:
-    workspace_root = Path(args.cwd).resolve()
+    workspace_root = _resolve_workspace_root(args.cwd)
     config = load_config(workspace_root, args.config)
     restored_payload: dict[str, object] | None = None
     resume_path: Path | None = None
