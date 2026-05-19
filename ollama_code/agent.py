@@ -924,16 +924,25 @@ class OllamaCodeAgent:
         for name in KNOWN_TOOL_NAMES:
             if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name.lower())}(?![A-Za-z0-9_])", text):
                 matches.add(name)
+        for match in re.findall(r"(?<![A-Za-z0-9_])(mcp\.[a-z0-9_-]+\.[a-z0-9_.-]+)(?![A-Za-z0-9_])", text):
+            clean = match.rstrip(".,;:")
+            if self._is_supported_tool_name(clean):
+                matches.add(clean)
         return matches
 
     def _forbidden_tool_names(self, text: str) -> set[str]:
         lowered = text.lower()
-        fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", lowered)
-        fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", lowered))
-        fragments.extend(re.findall(r"\bnot\s+(?:with|using|via)?\s*[^.?!\n]{0,80}", lowered))
+        masked = re.sub(
+            r"mcp\.[a-z0-9_-]+\.[a-z0-9_.-]+",
+            lambda match: match.group(0).replace(".", "__mcpdot__"),
+            lowered,
+        )
+        fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", masked)
+        fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", masked))
+        fragments.extend(re.findall(r"\bnot\s+(?:with|using|via)?\s*[^.?!\n]{0,80}", masked))
         forbidden: set[str] = set()
         for fragment in fragments:
-            forbidden.update(self._tool_names_in_fragment(fragment))
+            forbidden.update(self._tool_names_in_fragment(fragment.replace("__mcpdot__", ".")))
         return forbidden
 
     def _intrinsic_forbidden_tool_names(self) -> set[str]:
@@ -1001,8 +1010,8 @@ class OllamaCodeAgent:
         if verdict not in {"accept", "retry"}:
             verdict = "retry"
         reason = str(decision.get("reason", "")).strip()
-        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
-        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and self._is_supported_tool_name(name)]
+        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and self._is_supported_tool_name(name)]
         rewrite_guidance = self._normalize_audit_text_items(decision.get("rewrite_guidance"))
         return {
             "verdict": verdict,
@@ -1213,8 +1222,8 @@ class OllamaCodeAgent:
         if verdict not in {"accept", "retry"}:
             verdict = "retry"
         reason = str(decision.get("reason", "")).strip()
-        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
-        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and self._is_supported_tool_name(name)]
+        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and self._is_supported_tool_name(name)]
         return {
             "verdict": verdict,
             "reason": reason,
@@ -1341,8 +1350,8 @@ class OllamaCodeAgent:
         if verdict not in {"accept", "retry"}:
             verdict = "retry"
         reason = str(decision.get("reason", "")).strip()
-        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
-        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and name in KNOWN_TOOL_NAMES]
+        required_tools = [name for name in decision.get("required_tools", []) if isinstance(name, str) and self._is_supported_tool_name(name)]
+        forbidden_tools = [name for name in decision.get("forbidden_tools", []) if isinstance(name, str) and self._is_supported_tool_name(name)]
         return {
             "verdict": verdict,
             "reason": reason,
@@ -1545,23 +1554,19 @@ class OllamaCodeAgent:
         sticky_forbidden_tool_names: set[str],
     ) -> dict[str, Any]:
         normalized = dict(decision)
-        available_tool_names = self.tools.available_tool_names()
         required_tools = {
             name
             for name in normalized.get("required_tools", [])
-            if isinstance(name, str) and name in KNOWN_TOOL_NAMES
+            if isinstance(name, str) and self._is_supported_tool_name(name)
         }
         forbidden_tools = {
             name
             for name in normalized.get("forbidden_tools", [])
-            if isinstance(name, str) and name in KNOWN_TOOL_NAMES
+            if isinstance(name, str) and self._is_supported_tool_name(name)
         }
-        if available_tool_names:
-            required_tools = {name for name in required_tools if name in available_tool_names}
-            sticky_required = {name for name in sticky_required_tool_names if name in available_tool_names}
-        else:
-            sticky_required = set(sticky_required_tool_names)
-        sticky_forbidden = {name for name in sticky_forbidden_tool_names if name in KNOWN_TOOL_NAMES}
+        required_tools = {name for name in required_tools if self.tools.is_tool_enabled(name)}
+        sticky_required = {name for name in sticky_required_tool_names if self._is_supported_tool_name(name) and self.tools.is_tool_enabled(name)}
+        sticky_forbidden = {name for name in sticky_forbidden_tool_names if self._is_supported_tool_name(name)}
         required_tools.update(sticky_required)
         forbidden_tools.update(sticky_forbidden)
         required_tools.difference_update(forbidden_tools)

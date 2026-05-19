@@ -1290,6 +1290,52 @@ class AgentTests(unittest.TestCase):
         self.assertIn("Required tools for this turn: run_test.", retry_prompt)
         self.assertIn("Forbidden tools for this turn: run_shell.", retry_prompt)
 
+    def test_dynamic_mcp_tool_names_are_parsed_from_request_constraints(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["mcp_call", "read_file"],
+            mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        text = "Use mcp.demo.echo before answering, and do not use mcp.demo.delete."
+        forbidden = agent._forbidden_tool_names(text)
+        requested = agent._requested_tool_names(text, forbidden_tool_names=forbidden)
+
+        self.assertEqual(forbidden, {"mcp.demo.delete"})
+        self.assertEqual(requested, {"mcp.demo.echo"})
+
+    def test_verification_retry_preserves_explicit_dynamic_mcp_constraint(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["mcp_call", "read_file"],
+            mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        decision = agent._stabilize_retry_tool_constraints(
+            {
+                "verdict": "retry",
+                "reason": "Use the allowed MCP tool only.",
+                "required_tools": ["read_file"],
+                "forbidden_tools": ["mcp.demo.delete"],
+            },
+            sticky_required_tool_names={"mcp.demo.echo"},
+            sticky_forbidden_tool_names={"mcp.demo.delete"},
+        )
+
+        self.assertEqual(decision["required_tools"], ["mcp.demo.echo", "read_file"])
+        self.assertEqual(decision["forbidden_tools"], ["mcp.demo.delete"])
+        retry_prompt = agent._verification_retry_message(decision)
+        self.assertIn("Required tools for this turn: mcp.demo.echo, read_file.", retry_prompt)
+        self.assertIn("Forbidden tools for this turn: mcp.demo.delete.", retry_prompt)
+
     def test_agent_fails_closed_after_verification_retry_cap(self) -> None:
         root = self._workspace_scratch()
         (root / "note.txt").write_text("hello\n", encoding="utf-8")
@@ -2484,6 +2530,36 @@ class AgentTests(unittest.TestCase):
         mcp_call.assert_called_once_with("demo", "echo", {"text": "hi"})
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual([event["name"] for event in tool_calls], ["mcp.demo.echo"])
+
+    def test_agent_requires_explicit_dynamic_mcp_tool_before_final_after_other_tool_use(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"done without mcp"}',
+                '{"type":"tool","name":"mcp.demo.echo","arguments":{"text":"hi"}}',
+                '{"type":"final","message":"done with mcp"}',
+            ]
+        )
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["read_file", "mcp_call"],
+            mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
+        )
+        with patch.object(
+            tools,
+            "mcp_call",
+            return_value={"ok": True, "tool": "mcp_call", "server": "demo", "mcp_tool": "echo", "output": '{"value":"ok"}'},
+        ) as mcp_call:
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Use mcp.demo.echo before answering about note.txt.")
+
+        self.assertEqual(result.message, "done with mcp")
+        mcp_call.assert_called_once_with("demo", "echo", {"text": "hi"})
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual([event["name"] for event in tool_calls], ["read_file", "mcp.demo.echo"])
 
     def test_agent_normalizes_run_shell_to_run_test_for_explicit_benchmark_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
