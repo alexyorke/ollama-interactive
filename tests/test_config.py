@@ -103,6 +103,28 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(loaded.model, "alias-model")
 
+    def test_load_config_reports_invalid_utf8(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_bytes(b"\xff\xfe\x80")
+
+        with self.assertRaisesRegex(ValueError, "Invalid config encoding"):
+            load_config(root)
+
+    def test_load_config_accepts_utf8_bom(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_bytes(
+            b"\xef\xbb\xbf" + json.dumps({"model": "bom-model", "host": "http://127.0.0.1:11435"}).encode("utf-8")
+        )
+
+        loaded = load_config(root)
+
+        self.assertEqual(loaded.model, "bom-model")
+        self.assertEqual(loaded.host, "http://127.0.0.1:11435")
+
     def test_continue_session_model_overrides_config_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -159,6 +181,22 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(agent.verifier_model_name(), "env-verifier")
         self.assertEqual(agent.reconcile_mode(), "off")
 
+    def test_build_agent_reads_bom_prefixed_workspace_config(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_bytes(
+            b"\xef\xbb\xbf"
+            + json.dumps({"host": "http://127.0.0.1:11435", "model": "bom-config-model"}).encode("utf-8")
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--quiet"])
+        with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": "", "OLLAMA_CODE_VERIFIER_MODEL": "", "OLLAMA_CODE_RECONCILE": ""}, clear=False):
+            agent = build_agent(args)
+
+        self.assertEqual(agent.client.host, "http://127.0.0.1:11435")
+        self.assertEqual(agent.model, "bom-config-model")
+
     def test_missing_explicit_config_file_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -166,6 +204,17 @@ class ConfigTests(unittest.TestCase):
             args = parser.parse_args(["--cwd", str(root), "--config", "missing.json", "--quiet"])
             with self.assertRaisesRegex(ValueError, "Config file not found"):
                 build_agent(args)
+
+    def test_build_agent_invalid_utf8_workspace_config_raises_value_error(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_bytes(b"\xff\xfe\x80")
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--quiet"])
+
+        with self.assertRaisesRegex(ValueError, "Invalid config encoding"):
+            build_agent(args)
 
     def test_integer_config_rejects_json_boolean(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
