@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -25,6 +27,9 @@ ENV_OLLAMA_CODE_RECONCILE = "OLLAMA_CODE_RECONCILE"
 ENV_OLLAMA_CODE_NUM_CTX = "OLLAMA_CODE_NUM_CTX"
 ENV_OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR = "OLLAMA_CODE_DISABLE_SPEC_GUIDED_REPAIR"
 ENV_OLLAMA_CODE_REQUIRE_LLM_FOR_TURN = "OLLAMA_CODE_REQUIRE_LLM_FOR_TURN"
+
+WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
+WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,25 @@ class CliConfig:
 def resolve_config_path(workspace_root: Path, raw_path: str | Path | None = None) -> Path:
     if raw_path is None:
         return (workspace_root / DEFAULT_CONFIG_PATH).resolve(strict=False)
-    candidate = Path(raw_path)
+
+    text = str(raw_path).strip()
+    candidate = Path(text)
+    if not candidate.is_absolute():
+        normalized = text.replace("\\", "/")
+        windows_match = WINDOWS_DRIVE_PATH.match(normalized)
+        if windows_match:
+            drive = windows_match.group("drive").lower()
+            rest = (windows_match.group("rest") or "").strip("/")
+            suffix = f"/{rest}" if rest else ""
+            candidate = Path(f"/mnt/{drive}{suffix}")
+        else:
+            wsl_match = WSL_MOUNT_PATH.match(normalized)
+            if wsl_match:
+                drive = wsl_match.group("drive").upper()
+                rest = (wsl_match.group("rest") or "").strip("/")
+                candidate = Path(f"{drive}:/{rest}") if rest else Path(f"{drive}:/")
+            elif os.name != "nt" and "\\" in text:
+                candidate = Path(normalized)
     if not candidate.is_absolute():
         candidate = workspace_root / candidate
     return candidate.resolve(strict=False)

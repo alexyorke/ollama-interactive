@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -10,12 +11,19 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
+from uuid import uuid4
 
 from ollama_code.cli import build_agent, build_parser
 from ollama_code.config import DEFAULT_MODEL, load_config
 
 
 class ConfigTests(unittest.TestCase):
+    def _workspace_scratch(self) -> Path:
+        root = (Path.cwd() / "verify_scratch" / f"test-config-{uuid4().hex}").resolve()
+        root.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
+        return root
+
     def test_build_agent_reads_workspace_config_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -50,6 +58,50 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(agent.client.host, "http://127.0.0.1:23456")
         self.assertEqual(agent.model, "nested-model")
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_build_agent_reads_backslash_relative_config_path_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(
+            json.dumps({"ollama": {"host": "http://127.0.0.1:23456", "model": "backslash-model"}}),
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--config", r".ollama-code\config.json", "--quiet"])
+        with patch.dict(os.environ, {"OLLAMA_HOST": "", "OLLAMA_CODE_MODEL": "", "OLLAMA_CODE_VERIFIER_MODEL": "", "OLLAMA_CODE_RECONCILE": ""}, clear=False):
+            agent = build_agent(args)
+
+        self.assertEqual(agent.client.host, "http://127.0.0.1:23456")
+        self.assertEqual(agent.model, "backslash-model")
+
+    @unittest.skipUnless(os.name != "nt", "POSIX only")
+    def test_load_config_reads_windows_style_absolute_path_on_posix(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"model": "alias-model"}), encoding="utf-8")
+        config_path = config.as_posix()
+        if not config_path.startswith("/mnt/") or len(config_path) < 8 or config_path[6] != "/":
+            self.skipTest("requires a /mnt/<drive> workspace path")
+        windows_style = f"{config_path[5].upper()}:{config_path[6:]}"
+
+        loaded = load_config(root, windows_style)
+
+        self.assertEqual(loaded.model, "alias-model")
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_load_config_reads_wsl_alias_path_on_windows(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"model": "alias-model"}), encoding="utf-8")
+        alias = f"/mnt/{root.drive[:1].lower()}{config.as_posix()[2:]}"
+
+        loaded = load_config(root, alias)
+
+        self.assertEqual(loaded.model, "alias-model")
 
     def test_continue_session_model_overrides_config_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
