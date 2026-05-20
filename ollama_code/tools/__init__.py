@@ -10533,7 +10533,8 @@ import string
         if (root / "Cargo.toml").exists() or ".rs" in suffixes:
             add("check", "rust", "cargo check", "Cargo project or Rust source files found.")
             add("test", "rust", "cargo test", "Cargo project or Rust source files found.")
-            add("test", "rust", "cargo nextest run", "Cargo project or Rust source files found.")
+            if shutil.which("cargo-nextest"):
+                add("test", "rust", "cargo nextest run", "Cargo project or Rust source files found and cargo-nextest is available.")
         gradlew = "gradlew.bat" if os.name == "nt" else "./gradlew"
         if (root / "build.gradle").exists() or (root / "settings.gradle").exists() or (root / gradlew).exists() or ".java" in suffixes:
             command = gradlew + " test" if (root / gradlew).exists() else "gradle test"
@@ -13190,7 +13191,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             if tuple(argv[1:2]) != ("test",):
                 return None, self._validation_result(family=family, valid=False, reason="go command is not an allowed validation command")
         elif family == "cargo":
-            if tuple(argv[1:2]) not in {("test",), ("check",)}:
+            if tuple(argv[1:2]) not in {("test",), ("check",)} and tuple(argv[1:3]) != ("nextest", "run"):
                 return None, self._validation_result(family=family, valid=False, reason="cargo command is not an allowed validation command")
         elif family in {"gradle", "gradlew", "gradlew.bat"}:
             if "test" not in argv[1:]:

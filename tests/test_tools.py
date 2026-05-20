@@ -4271,6 +4271,19 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("gradle test", output)
         self.assertIn("cmake -S . -B build", output)
 
+    def test_discover_validators_skips_cargo_nextest_without_plugin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "cargo" if name == "cargo" else None):
+                result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertIn("cargo test", output)
+        self.assertNotIn("cargo nextest run", output)
+
     def test_discover_validators_checks_local_wrappers_in_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -5365,6 +5378,17 @@ def double(value: int) -> int:
             argv,
             ["/mnt/c/Python312/python.exe", "-m", "unittest", "discover", "-s", "tests/unit", "-v"],
         )
+        self.assertTrue(validation["valid"])
+
+    def test_validate_common_command_allows_cargo_nextest_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            with patch.object(ToolExecutor, "_executable_available_for_cwd", return_value=True):
+                argv, validation = tools._validate_common_command("cargo nextest run", root)
+
+        self.assertEqual(argv, ["cargo", "nextest", "run"])
         self.assertTrue(validation["valid"])
 
     @unittest.skipUnless(os.name != "nt", "POSIX only")
