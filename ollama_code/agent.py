@@ -391,9 +391,15 @@ class OllamaCodeAgent:
         events = payload.get("events")
         llm_telemetry_events = payload.get("llm_telemetry_events")
         todos = payload.get("todos")
+        normalized_events = self._normalize_transcript_diagnostic_payload(list(events)) if isinstance(events, list) else []
+        normalized_telemetry = (
+            self._normalize_transcript_diagnostic_payload(list(llm_telemetry_events))
+            if isinstance(llm_telemetry_events, list)
+            else []
+        )
         self.messages = restored_messages
-        self.events = list(events) if isinstance(events, list) else []
-        self.llm_telemetry_events = list(llm_telemetry_events) if isinstance(llm_telemetry_events, list) else []
+        self.events = normalized_events if isinstance(normalized_events, list) else []
+        self.llm_telemetry_events = normalized_telemetry if isinstance(normalized_telemetry, list) else []
         self.tools.set_todos(todos if isinstance(todos, list) else [])
         self._transcript_dirty = True
         self._autosave()

@@ -894,6 +894,31 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.messages[1]["content"], "newer")
         self.assertEqual(newer_reads, 1)
 
+    def test_build_agent_continue_normalizes_oversized_diagnostic_payloads(self) -> None:
+        root = self._workspace_scratch()
+        session_dir = root / ".ollama-code" / "sessions"
+        session_dir.mkdir(parents=True)
+        session = session_dir / "saved.json"
+        session.write_text(
+            '{"model":"gemma4:latest","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"tool_result","payload":"'
+            + ("x" * 12000)
+            + '"}],"llm_telemetry_events":[{"type":"llm_call","preview":"'
+            + ("y" * 9000)
+            + '"}]}',
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
+
+        agent = build_agent(args)
+
+        self.assertIn("truncated", agent.events[0]["payload"])
+        self.assertLess(len(agent.events[0]["payload"]), 5000)
+        self.assertIn("truncated", agent.llm_telemetry_events[0]["preview"])
+        self.assertLess(len(agent.llm_telemetry_events[0]["preview"]), 5000)
+
     def test_build_agent_resume_missing_session_raises_value_error(self) -> None:
         missing = f"missing-{uuid4().hex}.json"
         parser = build_parser()

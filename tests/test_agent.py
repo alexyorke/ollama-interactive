@@ -3033,6 +3033,33 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(agent.messages[1]["content"], "remember TOKEN_42")
         self.assertEqual(agent.events[0]["content"], "remember TOKEN_42")
 
+    def test_restore_transcript_normalizes_oversized_diagnostic_payloads(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+            debate_enabled=False,
+        )
+        payload = {
+            "model": "fake-model",
+            "approval_mode": "auto",
+            "workspace_root": root.as_posix(),
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "remember me"},
+            ],
+            "events": [{"type": "tool_result", "payload": "x" * 12000}],
+            "llm_telemetry_events": [{"type": "llm_call", "preview": "y" * 9000}],
+        }
+
+        agent.restore_transcript(payload)
+
+        self.assertIn("truncated", agent.events[0]["payload"])
+        self.assertLess(len(agent.events[0]["payload"]), 5000)
+        self.assertIn("truncated", agent.llm_telemetry_events[0]["preview"])
+        self.assertLess(len(agent.llm_telemetry_events[0]["preview"]), 5000)
+
     def test_todos_are_saved_and_restored_with_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
