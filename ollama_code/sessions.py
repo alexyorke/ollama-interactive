@@ -175,7 +175,7 @@ def latest_restorable_session(workspace_root: Path) -> tuple[Path, dict[str, Any
 def _payload_summary(payload: dict[str, Any]) -> str:
     messages = payload.get("messages")
     if isinstance(messages, list):
-        for message in messages:
+        for message in reversed(messages):
             if isinstance(message, dict) and message.get("role") == "user":
                 content = str(message.get("content", "")).strip()
                 if content:
@@ -183,7 +183,7 @@ def _payload_summary(payload: dict[str, Any]) -> str:
                     return single_line[:77] + "..." if len(single_line) > 80 else single_line
     events = payload.get("events")
     if isinstance(events, list):
-        for event in events:
+        for event in reversed(events):
             if isinstance(event, dict) and event.get("type") == "user":
                 content = str(event.get("content", "")).strip()
                 if content:

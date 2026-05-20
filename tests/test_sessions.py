@@ -313,6 +313,40 @@ class SessionPathTests(unittest.TestCase):
         self.assertEqual(sessions[0].path, valid.resolve())
         self.assertEqual(sessions[0].summary, "keep me")
 
+    def test_list_sessions_summary_uses_latest_user_message(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session = root / ".ollama-code" / "sessions" / "thread.json"
+            session.parent.mkdir(parents=True, exist_ok=True)
+            session.write_text(
+                '{"model":"fake-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"first prompt"},{"role":"assistant","content":"working"},{"role":"user","content":"latest issue to resume"}],"events":[]}',
+                encoding="utf-8",
+            )
+
+            sessions = list_sessions(root)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].summary, "latest issue to resume")
+
+    def test_list_sessions_summary_falls_back_to_latest_user_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session = root / ".ollama-code" / "sessions" / "events-only.json"
+            session.parent.mkdir(parents=True, exist_ok=True)
+            session.write_text(
+                '{"model":"fake-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[{"role":"system","content":"sys"},{"role":"assistant","content":"still here"}],"events":[{"type":"user","content":"first event"},{"type":"user","content":"latest event"}]}',
+                encoding="utf-8",
+            )
+
+            sessions = list_sessions(root)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0].summary, "latest event")
+
     def test_latest_session_path_skips_session_that_disappears_during_discovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
