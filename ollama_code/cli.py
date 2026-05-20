@@ -889,10 +889,13 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
             if not callable(install_method):
                 writer("optional tool install is not available for this agent")
                 return True
-            if len(args) < 2:
+            if len(args) != 2:
                 writer("Usage: /tools install <tool-id>|--recommended")
                 return True
             target = _strip_matching_quotes(args[1])
+            if not target:
+                writer("Usage: /tools install <tool-id>|--recommended")
+                return True
             result = install_method(None if target == "--recommended" else target, all_recommended=target == "--recommended", confirm=True)
             writer(str(result.get("output") or result.get("summary", "(no output)")))
             return True

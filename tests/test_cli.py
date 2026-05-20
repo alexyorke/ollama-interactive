@@ -42,6 +42,7 @@ class DummyAgent:
         self._test_command = "python -m unittest -v"
         self._todos = "1. [pending] inspect\n2. [completed] setup"
         self.diff_request: dict[str, object] | None = None
+        self.install_requests: list[dict[str, object]] = []
         self.tools = ToolView()
 
     def workspace_root(self) -> Path:
@@ -131,6 +132,7 @@ class DummyAgent:
         return {"ok": True, "output": f"tool dependency status scope={scope} tool_id={tool_id or '-'}"}
 
     def tool_dependency_install(self, tool_id: str | None = None, *, all_recommended: bool = False, confirm: bool = False) -> dict[str, object]:
+        self.install_requests.append({"tool_id": tool_id, "all_recommended": all_recommended, "confirm": confirm})
         target = "--recommended" if all_recommended else tool_id
         return {"ok": True, "output": f"install target={target} confirm={confirm}"}
 
@@ -501,6 +503,33 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("scope=missing", output[0])
         self.assertIn("install target=ruff confirm=True", output[1])
         self.assertIn("install target=--recommended confirm=True", output[2])
+        self.assertEqual(
+            agent.install_requests,
+            [
+                {"tool_id": "ruff", "all_recommended": False, "confirm": True},
+                {"tool_id": None, "all_recommended": True, "confirm": True},
+            ],
+        )
+
+    def test_tools_install_command_rejects_extra_args(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command("/tools install ruff extra", agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
+        self.assertEqual(agent.install_requests, [])
+
+    def test_tools_install_command_rejects_empty_target(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/tools install ""', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
+        self.assertEqual(agent.install_requests, [])
 
     def test_todos_command_shows_and_clears_todo_list(self) -> None:
         agent = DummyAgent()
