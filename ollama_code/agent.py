@@ -100,6 +100,9 @@ from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_too
 
 
 TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT = 4000
+TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT = 40
+TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER = "[nested payload truncated for transcript]"
+TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER = "[circular reference omitted for transcript]"
 
 
 class OllamaCodeAgent:
@@ -473,7 +476,13 @@ class OllamaCodeAgent:
             self._transcript_dirty = False
         return target
 
-    def _normalize_transcript_diagnostic_payload(self, value: Any) -> Any:
+    def _normalize_transcript_diagnostic_payload(
+        self,
+        value: Any,
+        *,
+        _depth: int = 0,
+        _seen: set[int] | None = None,
+    ) -> Any:
         if value is None or isinstance(value, (bool, int)):
             return value
         if isinstance(value, float):
@@ -485,18 +494,47 @@ class OllamaCodeAgent:
             return value[:TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT] + f"\n... [truncated {omitted} chars for transcript]"
         if isinstance(value, PurePath):
             return value.as_posix()
+        if _depth >= TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT:
+            return TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER
         if isinstance(value, dict):
-            return {
-                str(key): self._normalize_transcript_diagnostic_payload(item)
-                for key, item in value.items()
-            }
+            marker = id(value)
+            active = _seen if _seen is not None else set()
+            if marker in active:
+                return TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER
+            active.add(marker)
+            try:
+                return {
+                    str(key): self._normalize_transcript_diagnostic_payload(item, _depth=_depth + 1, _seen=active)
+                    for key, item in value.items()
+                }
+            finally:
+                active.remove(marker)
         if isinstance(value, (list, tuple)):
-            return [self._normalize_transcript_diagnostic_payload(item) for item in value]
+            marker = id(value)
+            active = _seen if _seen is not None else set()
+            if marker in active:
+                return TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER
+            active.add(marker)
+            try:
+                return [
+                    self._normalize_transcript_diagnostic_payload(item, _depth=_depth + 1, _seen=active)
+                    for item in value
+                ]
+            finally:
+                active.remove(marker)
         if isinstance(value, set):
-            return [
-                self._normalize_transcript_diagnostic_payload(item)
-                for item in sorted(value, key=lambda item: str(item))
-            ]
+            marker = id(value)
+            active = _seen if _seen is not None else set()
+            if marker in active:
+                return TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER
+            active.add(marker)
+            try:
+                return [
+                    self._normalize_transcript_diagnostic_payload(item, _depth=_depth + 1, _seen=active)
+                    for item in sorted(value, key=lambda item: str(item))
+                ]
+            finally:
+                active.remove(marker)
         isoformat = getattr(value, "isoformat", None)
         if callable(isoformat):
             try:

@@ -12,7 +12,16 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from ollama_code.agent import AgentResult, GROUNDING_EVIDENCE_TOOL_NAMES, OllamaCodeAgent, _workspace_roots_match, extract_json_response
+from ollama_code.agent import (
+    AgentResult,
+    GROUNDING_EVIDENCE_TOOL_NAMES,
+    OllamaCodeAgent,
+    TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER,
+    TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT,
+    TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER,
+    _workspace_roots_match,
+    extract_json_response,
+)
 from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
 from ollama_code.ollama_client import ChatResponse, TokenUsage
 from ollama_code.tools import ToolExecutor
@@ -2953,6 +2962,53 @@ class AgentTests(unittest.TestCase):
         self.assertLess(len(result["output"]), 5000)
         self.assertIn("truncated", payload["llm_telemetry_events"][0]["preview"])
         self.assertLess(len(payload["llm_telemetry_events"][0]["preview"]), 5000)
+
+    def test_save_transcript_truncates_deeply_nested_diagnostic_payloads(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+            session_file=session,
+            debate_enabled=False,
+        )
+        nested: dict[str, object] = {}
+        current = nested
+        for index in range(TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT + 10):
+            child: dict[str, object] = {"index": index}
+            current["next"] = child
+            current = child
+        agent.events.append({"type": "tool_result", "name": "mcp_call", "result": nested})
+
+        saved = agent.save_transcript()
+        payload = json.loads(saved.read_text(encoding="utf-8"))
+        cursor = payload["events"][0]["result"]
+        for _ in range(TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT + 2):
+            if isinstance(cursor, str):
+                break
+            cursor = cursor["next"]
+
+        self.assertEqual(cursor, TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER)
+
+    def test_save_transcript_replaces_circular_diagnostic_references(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+            session_file=session,
+            debate_enabled=False,
+        )
+        nested: dict[str, object] = {"label": "root"}
+        nested["self"] = nested
+        agent.events.append({"type": "tool_result", "name": "mcp_call", "result": nested})
+
+        saved = agent.save_transcript()
+        payload = json.loads(saved.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["events"][0]["result"]["self"], TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER)
 
     def test_agent_can_load_saved_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
