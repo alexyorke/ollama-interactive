@@ -199,6 +199,17 @@ def _optional_path_argument(value: object, flag: str) -> str | None:
     return stripped
 
 
+def _optional_text_argument(value: object, flag: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{flag} must be a non-empty value.")
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{flag} must be a non-empty value.")
+    return stripped
+
+
 def _parse_positive_meta_int(value: str, usage: str) -> int:
     try:
         parsed = int(_strip_matching_quotes(value))
@@ -297,7 +308,7 @@ def build_agent(
             raise ValueError(f"No saved sessions found in {workspace_root.as_posix()}/.ollama-code/sessions")
         resume_path, restored_payload = latest_session
 
-    explicit_model = _non_empty_string(args.model)
+    explicit_model = _optional_text_argument(args.model, "--model")
     session_model: str | None = None
     model = config.model or DEFAULT_MODEL
     model_source = f"config:{config.path.as_posix()}" if config.model and config.path is not None else "built-in default"
@@ -328,7 +339,7 @@ def build_agent(
     env_verifier_model = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_VERIFIER_MODEL))
     if env_verifier_model:
         verifier_model = env_verifier_model
-    explicit_verifier_model = _non_empty_string(args.verifier_model)
+    explicit_verifier_model = _optional_text_argument(args.verifier_model, "--verifier-model")
     if restored_payload is not None:
         saved_verifier_model = restored_payload.get("verifier_model")
         if explicit_verifier_model is None and env_verifier_model is None and isinstance(saved_verifier_model, str) and saved_verifier_model.strip():
@@ -339,7 +350,7 @@ def build_agent(
     env_host = _non_empty_string(os.environ.get(ENV_OLLAMA_HOST))
     if env_host:
         host = env_host
-    explicit_host = _non_empty_string(args.host)
+    explicit_host = _optional_text_argument(args.host, "--host")
     if explicit_host:
         host = explicit_host
     if args.approval is not None:
@@ -373,7 +384,7 @@ def build_agent(
     env_test_command = _non_empty_string(os.environ.get(ENV_OLLAMA_CODE_TEST_CMD))
     if env_test_command:
         test_command = env_test_command
-    explicit_test_command = _non_empty_string(args.test_cmd)
+    explicit_test_command = _optional_text_argument(args.test_cmd, "--test-cmd")
     if explicit_test_command:
         test_command = explicit_test_command
     resolved_status_printer = status_printer or ((lambda message: None) if args.quiet else (lambda message: print(f"[status] {message}")))

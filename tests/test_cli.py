@@ -235,6 +235,26 @@ class CliCommandTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     build_agent(args)
 
+    def test_build_agent_rejects_empty_startup_text_flags(self) -> None:
+        root = self._workspace_scratch()
+        parser = build_parser()
+        cases = [
+            (["--cwd", str(root), "--quiet", "--model", ""], "--model must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--model", "   "], "--model must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--host", ""], "--host must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--host", "   "], "--host must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--verifier-model", ""], "--verifier-model must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--verifier-model", "   "], "--verifier-model must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--test-cmd", ""], "--test-cmd must be a non-empty value."),
+            (["--cwd", str(root), "--quiet", "--test-cmd", "   "], "--test-cmd must be a non-empty value."),
+        ]
+
+        for argv, message in cases:
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                with self.assertRaisesRegex(ValueError, message):
+                    build_agent(args)
+
     def test_build_agent_uses_config_default_model(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root), "--quiet"])
