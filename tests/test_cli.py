@@ -668,6 +668,20 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIn("trace.json", output[0])
 
+    def test_sessions_command_rejects_zero_limit(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/sessions 0", agent, output.append)
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /sessions [limit]"])
+
+    def test_sessions_command_rejects_negative_limit(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/sessions -5", agent, output.append)
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /sessions [limit]"])
+
     def test_load_command_updates_session(self) -> None:
         agent = DummyAgent()
         output: list[str] = []

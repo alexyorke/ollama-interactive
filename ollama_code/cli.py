@@ -188,6 +188,16 @@ def _positive_int_argument(value: object, flag: str) -> int | None:
     return value
 
 
+def _parse_positive_meta_int(value: str, usage: str) -> int:
+    try:
+        parsed = int(_strip_matching_quotes(value))
+    except ValueError as exc:
+        raise ValueError(usage) from exc
+    if parsed < 1:
+        raise ValueError(usage)
+    return parsed
+
+
 def _bool_from_text(value: str | None) -> bool | None:
     if value is None:
         return None
@@ -794,7 +804,7 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         limit = 10
         if remainder:
             try:
-                limit = max(1, int(_strip_matching_quotes(remainder)))
+                limit = _parse_positive_meta_int(remainder, "Usage: /sessions [limit]")
             except ValueError:
                 writer("Usage: /sessions [limit]")
                 return True
