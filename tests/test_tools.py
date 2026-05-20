@@ -5353,6 +5353,46 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "a $HOME b")
 
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_validate_common_command_preserves_inline_python_path_literals_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = ToolExecutor(root, approval_mode="auto")
+            command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('scratch/artifact.txt').write_text('ok\\n')",
+                ]
+            )
+
+            argv, validation = tools._validate_common_command(command, root)
+
+        self.assertIsNotNone(argv)
+        assert argv is not None
+        self.assertEqual(argv[2], "from pathlib import Path; Path('scratch/artifact.txt').write_text('ok\\n')")
+        self.assertTrue(validation["valid"])
+
+    @unittest.skipUnless(os.name == "nt", "Windows only")
+    def test_run_shell_preserves_inline_python_path_literals_on_windows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scratch").mkdir()
+            tools = ToolExecutor(root, approval_mode="auto")
+            command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('scratch/artifact.txt').write_text('ok\\n')",
+                ]
+            )
+
+            result = tools.run_shell(command)
+            artifact_exists = (root / "scratch" / "artifact.txt").is_file()
+
+        self.assertTrue(result["ok"], result.get("output") or result.get("summary"))
+        self.assertTrue(artifact_exists)
+
     def test_run_test_uses_configured_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

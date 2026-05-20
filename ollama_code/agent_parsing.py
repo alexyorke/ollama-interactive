@@ -30,6 +30,12 @@ def extract_json_response(raw_text: str, *, _depth: int = 0) -> dict[str, Any] |
             end_index = -1
         if isinstance(top_level, str) and not candidate[end_index:].strip():
             return extract_json_response(top_level, _depth=_depth + 1)
+        if isinstance(top_level, list) and len(top_level) == 1 and not candidate[end_index:].strip():
+            only_item = top_level[0]
+            if isinstance(only_item, dict):
+                return only_item
+            if isinstance(only_item, str):
+                return extract_json_response(only_item, _depth=_depth + 1)
     starts = [index for index, char in enumerate(candidate) if char == "{"]
     if candidate.startswith("{"):
         starts = [0] + [index for index in starts if index != 0]

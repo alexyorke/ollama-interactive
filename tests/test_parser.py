@@ -50,3 +50,11 @@ class ParserTests(unittest.TestCase):
     def test_extracts_json_string_wrapped_verifier_payload(self) -> None:
         payload = extract_json_response('"{\\"verdict\\":\\"accept\\"}"')
         self.assertEqual(payload, {"verdict": "accept"})
+
+    def test_extracts_singleton_array_wrapped_agent_payload(self) -> None:
+        payload = extract_json_response('[{"type":"final","message":"ok"}]')
+        self.assertEqual(payload, {"type": "final", "message": "ok"})
+
+    def test_extracts_singleton_array_wrapped_json_string_payload(self) -> None:
+        payload = extract_json_response('["{\\"type\\":\\"tool\\",\\"name\\":\\"run_shell\\",\\"arguments\\":{\\"command\\":\\"echo hi\\"}}"]')
+        self.assertEqual(payload, {"type": "tool", "name": "run_shell", "arguments": {"command": "echo hi"}})

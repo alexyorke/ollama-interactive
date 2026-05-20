@@ -2864,6 +2864,20 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.rounds, 1)
         self.assertEqual(len(client.calls), 1)
 
+    def test_agent_accepts_singleton_array_wrapped_final_payload(self) -> None:
+        client = FakeClient(
+            [
+                '[{"type":"final","message":"done"}]',
+            ]
+        )
+        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(result.rounds, 1)
+        self.assertEqual(len(client.calls), 1)
+
     def test_relative_transcript_paths_use_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

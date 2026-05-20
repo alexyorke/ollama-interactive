@@ -12929,6 +12929,10 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
                 else:
                     normalized.append(clean)
                 continue
+            previous = str(argv[index - 1]).strip().strip("'\"") if index > 0 else ""
+            if previous == "-c":
+                normalized.append(raw)
+                continue
             if not clean or raw.startswith("-") or not self._token_looks_like_path(clean):
                 normalized.append(raw)
                 continue
