@@ -186,6 +186,21 @@ class CliCommandTests(unittest.TestCase):
         self.assertFalse(args.disable_spec_guided_repair)
         self.assertFalse(args.require_llm_for_turn)
 
+    def test_build_agent_rejects_non_positive_runtime_limits(self) -> None:
+        root = self._workspace_scratch()
+        parser = build_parser()
+        cases = [
+            (["--cwd", str(root), "--quiet", "--max-tool-rounds", "0"], "--max-tool-rounds must be a positive integer."),
+            (["--cwd", str(root), "--quiet", "--max-agent-depth", "-1"], "--max-agent-depth must be a positive integer."),
+            (["--cwd", str(root), "--quiet", "--timeout", "0"], "--timeout must be a positive integer."),
+        ]
+
+        for argv, message in cases:
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                with self.assertRaisesRegex(ValueError, message):
+                    build_agent(args)
+
     def test_build_agent_uses_config_default_model(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root), "--quiet"])

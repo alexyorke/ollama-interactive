@@ -180,6 +180,14 @@ def _non_empty_string(value: object) -> str | None:
     return stripped or None
 
 
+def _positive_int_argument(value: object, flag: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{flag} must be a positive integer.")
+    return value
+
+
 def _bool_from_text(value: str | None) -> bool | None:
     if value is None:
         return None
@@ -250,6 +258,9 @@ def build_agent(
 ) -> OllamaCodeAgent:
     workspace_root = _resolve_workspace_root(args.cwd)
     config = load_config(workspace_root, args.config)
+    explicit_max_tool_rounds = _positive_int_argument(args.max_tool_rounds, "--max-tool-rounds")
+    explicit_max_agent_depth = _positive_int_argument(args.max_agent_depth, "--max-agent-depth")
+    explicit_timeout = _positive_int_argument(args.timeout, "--timeout")
     restored_payload: dict[str, object] | None = None
     resume_path: Path | None = None
     if args.resume:
@@ -325,9 +336,9 @@ def build_agent(
             reconcile_mode = _reconcile_from_text(saved_reconcile) or reconcile_mode
     if explicit_reconcile is not None:
         reconcile_mode = explicit_reconcile
-    max_tool_rounds = args.max_tool_rounds if args.max_tool_rounds is not None else (config.max_tool_rounds or DEFAULT_MAX_TOOL_ROUNDS)
-    max_agent_depth = args.max_agent_depth if args.max_agent_depth is not None else (config.max_agent_depth or DEFAULT_MAX_AGENT_DEPTH)
-    timeout = args.timeout if args.timeout is not None else (config.timeout or DEFAULT_TIMEOUT)
+    max_tool_rounds = explicit_max_tool_rounds if explicit_max_tool_rounds is not None else (config.max_tool_rounds or DEFAULT_MAX_TOOL_ROUNDS)
+    max_agent_depth = explicit_max_agent_depth if explicit_max_agent_depth is not None else (config.max_agent_depth or DEFAULT_MAX_AGENT_DEPTH)
+    timeout = explicit_timeout if explicit_timeout is not None else (config.timeout or DEFAULT_TIMEOUT)
     session_file = args.session_file
     if session_file is None:
         session_file = resume_path or new_session_path(workspace_root)
