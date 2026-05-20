@@ -202,15 +202,10 @@ def _parse_single_meta_path(value: str) -> str | None:
     stripped = value.strip()
     if not stripped:
         return None
-    unquoted = _strip_matching_quotes(stripped)
-    if unquoted != stripped:
-        return unquoted
-    if os.name != "nt" and re.search(r"\\\s", stripped):
-        parts = shlex.split(stripped, posix=True)
-        if len(parts) != 1:
-            raise ValueError("expected a single path argument")
-        return parts[0]
-    return stripped
+    parts = _split_meta_args(stripped)
+    if len(parts) != 1:
+        raise ValueError("expected a single path argument")
+    return _strip_matching_quotes(parts[0])
 
 
 def _resolve_workspace_root(raw_path: str | Path) -> Path:

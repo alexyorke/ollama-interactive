@@ -634,6 +634,22 @@ class CliCommandTests(unittest.TestCase):
         self.assertIsNotNone(agent.loaded_path)
         self.assertTrue(str(agent.loaded_path).endswith("saved.json"))
 
+    def test_save_command_rejects_extra_path_args(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/save first.json second.json", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIsNone(agent.saved_path)
+        self.assertEqual(output, ["Usage: /save [path]"])
+
+    def test_load_command_rejects_extra_path_args(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/load saved.json trailing", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIsNone(agent.loaded_path)
+        self.assertEqual(output, ["Usage: /load <path>"])
+
     def test_load_command_preserves_windows_backslashes(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
