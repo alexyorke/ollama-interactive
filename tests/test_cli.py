@@ -203,6 +203,22 @@ class CliCommandTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     build_agent(args)
 
+    def test_build_agent_rejects_empty_session_path_flags(self) -> None:
+        root = self._workspace_scratch()
+        parser = build_parser()
+        cases = [
+            (["--cwd", str(root), "--quiet", "--resume", ""], "--resume must be a non-empty path."),
+            (["--cwd", str(root), "--quiet", "--resume", "   "], "--resume must be a non-empty path."),
+            (["--cwd", str(root), "--quiet", "--session-file", ""], "--session-file must be a non-empty path."),
+            (["--cwd", str(root), "--quiet", "--session-file", "   "], "--session-file must be a non-empty path."),
+        ]
+
+        for argv, message in cases:
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                with self.assertRaisesRegex(ValueError, message):
+                    build_agent(args)
+
     def test_build_agent_uses_config_default_model(self) -> None:
         root = self._workspace_scratch()
         args = build_parser().parse_args(["--cwd", str(root), "--quiet"])

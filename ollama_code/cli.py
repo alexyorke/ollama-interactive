@@ -188,6 +188,17 @@ def _positive_int_argument(value: object, flag: str) -> int | None:
     return value
 
 
+def _optional_path_argument(value: object, flag: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{flag} must be a non-empty path.")
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{flag} must be a non-empty path.")
+    return stripped
+
+
 def _parse_positive_meta_int(value: str, usage: str) -> int:
     try:
         parsed = int(_strip_matching_quotes(value))
@@ -271,10 +282,12 @@ def build_agent(
     explicit_max_tool_rounds = _positive_int_argument(args.max_tool_rounds, "--max-tool-rounds")
     explicit_max_agent_depth = _positive_int_argument(args.max_agent_depth, "--max-agent-depth")
     explicit_timeout = _positive_int_argument(args.timeout, "--timeout")
+    explicit_resume_path = _optional_path_argument(args.resume, "--resume")
+    explicit_session_file = _optional_path_argument(args.session_file, "--session-file")
     restored_payload: dict[str, object] | None = None
     resume_path: Path | None = None
-    if args.resume:
-        resume_path = resolve_transcript_path(workspace_root, args.resume)
+    if explicit_resume_path is not None:
+        resume_path = resolve_transcript_path(workspace_root, explicit_resume_path)
         restored_payload = load_transcript_payload(resume_path)
     elif args.continue_session:
         latest_session = latest_restorable_session(workspace_root)
@@ -349,7 +362,7 @@ def build_agent(
     max_tool_rounds = explicit_max_tool_rounds if explicit_max_tool_rounds is not None else (config.max_tool_rounds or DEFAULT_MAX_TOOL_ROUNDS)
     max_agent_depth = explicit_max_agent_depth if explicit_max_agent_depth is not None else (config.max_agent_depth or DEFAULT_MAX_AGENT_DEPTH)
     timeout = explicit_timeout if explicit_timeout is not None else (config.timeout or DEFAULT_TIMEOUT)
-    session_file = args.session_file
+    session_file = explicit_session_file
     if session_file is None:
         session_file = resume_path or new_session_path(workspace_root)
     active_session_file = None if restored_payload is not None else session_file
