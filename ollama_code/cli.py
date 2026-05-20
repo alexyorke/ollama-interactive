@@ -277,8 +277,10 @@ def build_agent(
     status_printer: Callable[[str], None] | None = None,
     thinking_printer: Callable[[str], None] | None = None,
 ) -> OllamaCodeAgent:
-    workspace_root = _resolve_workspace_root(args.cwd)
-    config = load_config(workspace_root, args.config)
+    explicit_cwd = _optional_path_argument(args.cwd, "--cwd") or "."
+    explicit_config_path = _optional_path_argument(args.config, "--config")
+    workspace_root = _resolve_workspace_root(explicit_cwd)
+    config = load_config(workspace_root, explicit_config_path)
     explicit_max_tool_rounds = _positive_int_argument(args.max_tool_rounds, "--max-tool-rounds")
     explicit_max_agent_depth = _positive_int_argument(args.max_agent_depth, "--max-agent-depth")
     explicit_timeout = _positive_int_argument(args.timeout, "--timeout")
