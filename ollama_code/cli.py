@@ -264,6 +264,16 @@ def _parse_optional_single_meta_arg(value: str) -> str | None:
     return parsed
 
 
+def _parse_optional_meta_text(value: str) -> str | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    parsed = _strip_matching_quotes(stripped)
+    if not parsed.strip():
+        raise ValueError("expected a non-empty argument")
+    return parsed
+
+
 def _resolve_workspace_root(raw_path: str | Path) -> Path:
     text = str(raw_path).strip()
     candidate = Path(text)
@@ -913,8 +923,12 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(str(result.get("output") or result.get("summary", "(no output)")))
         return True
     if action == "/commit":
-        message = _strip_matching_quotes(remainder)
-        if not message:
+        try:
+            message = _parse_optional_meta_text(remainder)
+        except ValueError:
+            writer("Usage: /commit <message>")
+            return True
+        if message is None:
             writer("Usage: /commit <message>")
             return True
         result = agent.git_commit(message)
@@ -922,13 +936,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(output)
         return True
     if action == "/test":
-        if remainder:
-            command_text = _strip_matching_quotes(remainder)
-            if not command_text.strip():
-                writer("Usage: /test [command]")
-                return True
-        else:
-            command_text = None
+        try:
+            command_text = _parse_optional_meta_text(remainder)
+        except ValueError:
+            writer("Usage: /test [command]")
+            return True
         result = agent.run_test(command_text)
         output = str(result.get("output") or result.get("summary", "(no output)"))
         writer(output)
@@ -967,8 +979,12 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
             if len(args) != 2:
                 writer("Usage: /tools install <tool-id>|--recommended")
                 return True
-            target = _strip_matching_quotes(args[1])
-            if not target:
+            try:
+                target = _parse_optional_meta_text(args[1])
+            except ValueError:
+                writer("Usage: /tools install <tool-id>|--recommended")
+                return True
+            if target is None:
                 writer("Usage: /tools install <tool-id>|--recommended")
                 return True
             result = install_method(None if target == "--recommended" else target, all_recommended=target == "--recommended", confirm=True)

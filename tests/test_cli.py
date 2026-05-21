@@ -47,6 +47,7 @@ class DummyAgent:
         self._todos = "1. [pending] inspect\n2. [completed] setup"
         self.diff_request: dict[str, object] | None = None
         self.install_requests: list[dict[str, object]] = []
+        self.commit_requests: list[str] = []
         self.tools = ToolView()
 
     def workspace_root(self) -> Path:
@@ -120,6 +121,7 @@ class DummyAgent:
         return {"ok": True, "output": "--- a/tracked.txt\n+++ b/tracked.txt\n+after"}
 
     def git_commit(self, message: str, *, add_all: bool = True) -> dict[str, object]:
+        self.commit_requests.append(message)
         return {"ok": True, "output": f"[main abc123] {message}"}
 
     def run_test(self, command: str | None = None) -> dict[str, object]:
@@ -602,6 +604,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
         self.assertEqual(agent.install_requests, [])
 
+    def test_tools_install_command_rejects_whitespace_only_target(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/tools install "   "', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
+        self.assertEqual(agent.install_requests, [])
+
     def test_todos_command_shows_and_clears_todo_list(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
@@ -943,6 +955,16 @@ class CliCommandTests(unittest.TestCase):
         handled = handle_meta_command('/commit "Save work"', agent, output.append)
         self.assertTrue(handled)
         self.assertIn("Save work", output[0])
+
+    def test_commit_command_rejects_whitespace_only_quoted_message(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/commit "   "', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /commit <message>"])
+        self.assertEqual(agent.commit_requests, [])
 
     def test_test_command_prints_test_output(self) -> None:
         agent = DummyAgent()
