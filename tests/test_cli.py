@@ -182,6 +182,14 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(agent.model, "gemma3:4b")
 
+    def test_model_command_rejects_extra_args(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+        handled = handle_meta_command("/model gemma3:4b trailing", agent, output.append)
+        self.assertTrue(handled)
+        self.assertEqual(agent.model, DEFAULT_MODEL)
+        self.assertEqual(output, ["Usage: /model <name>"])
+
     def test_parser_defaults_max_tool_rounds_to_100(self) -> None:
         args = build_parser().parse_args([])
         self.assertIsNone(args.max_tool_rounds)

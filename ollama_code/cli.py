@@ -747,7 +747,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(", ".join(models) if models else "(no local models)")
         return True
     if action == "/model":
-        model_name = _strip_matching_quotes(remainder)
+        try:
+            model_name = _parse_single_meta_path(remainder)
+        except ValueError:
+            writer("Usage: /model <name>")
+            return True
         if not model_name:
             writer("Usage: /model <name>")
             return True
