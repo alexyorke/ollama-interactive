@@ -94,6 +94,7 @@ from ollama_code.sessions import (
     list_sessions as collect_sessions,
     load_transcript_payload,
     resolve_transcript_path,
+    transcript_message_role_supported,
     write_transcript_payload,
 )
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
@@ -387,7 +388,7 @@ class OllamaCodeAgent:
                 raise ValueError("Saved session contains an invalid message entry.")
             role = message.get("role")
             content = message.get("content")
-            if not isinstance(role, str) or not isinstance(content, str):
+            if not transcript_message_role_supported(role) or not isinstance(content, str):
                 raise ValueError("Saved session contains a malformed message.")
             restored_messages.append({"role": role, "content": content})
         events = payload.get("events")

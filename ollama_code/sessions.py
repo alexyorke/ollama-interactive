@@ -16,6 +16,7 @@ from ollama_code.agent_parsing import _workspace_roots_match
 SESSION_SUBDIR = Path(".ollama-code") / "sessions"
 WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
 WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
+TRANSCRIPT_MESSAGE_ROLES = frozenset({"system", "user", "assistant"})
 
 
 @dataclass
@@ -96,6 +97,10 @@ def load_transcript_payload(path: Path) -> dict[str, Any]:
     return payload
 
 
+def transcript_message_role_supported(role: Any) -> bool:
+    return isinstance(role, str) and role in TRANSCRIPT_MESSAGE_ROLES
+
+
 def payload_can_restore_session(payload: dict[str, Any], workspace_root: Path) -> bool:
     if not _workspace_roots_match(payload.get("workspace_root"), workspace_root):
         return False
@@ -108,7 +113,7 @@ def payload_can_restore_session(payload: dict[str, Any], workspace_root: Path) -
             return False
         role = message.get("role")
         content = message.get("content")
-        if not isinstance(role, str) or not isinstance(content, str):
+        if not transcript_message_role_supported(role) or not isinstance(content, str):
             return False
         if role != "system":
             has_conversation_history = True

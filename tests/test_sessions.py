@@ -195,6 +195,27 @@ class SessionPathTests(unittest.TestCase):
 
         self.assertEqual(latest, older.resolve())
 
+    def test_latest_session_path_skips_newer_session_with_unsupported_message_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            session_dir = root / ".ollama-code" / "sessions"
+            older = session_dir / "older.json"
+            newer = session_dir / "newer.json"
+            self._write_session(older, "resume me")
+            newer.parent.mkdir(parents=True, exist_ok=True)
+            newer.write_text(
+                '{"model":"bad-model","approval_mode":"auto","workspace_root":"'
+                + root.as_posix()
+                + '","messages":[{"role":"system","content":"sys"},{"role":"tool","content":"bad role"}],"events":[]}',
+                encoding="utf-8",
+            )
+            older_ts = newer.stat().st_mtime - 10
+            os.utime(older, (older_ts, older_ts))
+
+            latest = latest_session_path(root)
+
+        self.assertEqual(latest, older.resolve())
+
     def test_latest_session_path_skips_newer_system_only_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()

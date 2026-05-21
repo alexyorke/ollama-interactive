@@ -1255,6 +1255,22 @@ class CliCommandTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid transcript encoding"):
             build_agent(args)
 
+    def test_build_agent_resume_unsupported_message_role_raises_value_error(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "bad-role.json"
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_text(
+            '{"model":"fake-model","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"tool","content":"bad role"}],"events":[]}',
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--resume", str(session), "--quiet"])
+
+        with self.assertRaisesRegex(ValueError, "Saved session contains a malformed message"):
+            build_agent(args)
+
     def test_build_agent_resume_accepts_utf8_bom_session(self) -> None:
         root = self._workspace_scratch()
         session = root / ".ollama-code" / "sessions" / "bom.json"

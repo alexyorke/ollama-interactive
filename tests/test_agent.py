@@ -3101,6 +3101,28 @@ class AgentTests(unittest.TestCase):
         self.assertIn("truncated", agent.llm_telemetry_events[0]["preview"])
         self.assertLess(len(agent.llm_telemetry_events[0]["preview"]), 5000)
 
+    def test_restore_transcript_rejects_unsupported_message_role(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+            debate_enabled=False,
+        )
+        payload = {
+            "model": "fake-model",
+            "approval_mode": "auto",
+            "workspace_root": root.as_posix(),
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "tool", "content": "bad role"},
+            ],
+            "events": [],
+        }
+
+        with self.assertRaisesRegex(ValueError, "Saved session contains a malformed message"):
+            agent.restore_transcript(payload)
+
     def test_restore_transcript_truncates_large_nested_diagnostic_collections(self) -> None:
         root = self._workspace_scratch()
         agent = OllamaCodeAgent(
