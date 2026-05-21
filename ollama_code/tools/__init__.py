@@ -13297,6 +13297,21 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
 
     def run_test(self, command: str | None = None, cwd: str = ".", timeout: int = 1200) -> dict[str, Any]:
         timeout_value = self._coerce_int(timeout, default=1200, minimum=1)
+        if command is not None:
+            if not isinstance(command, str):
+                return {
+                    "ok": False,
+                    "tool": "run_test",
+                    "summary": "Explicit test command must be a non-empty string.",
+                    "error_class": "invalid_args",
+                }
+            if not command.strip():
+                return {
+                    "ok": False,
+                    "tool": "run_test",
+                    "summary": "Explicit test command must be a non-empty string.",
+                    "error_class": "invalid_args",
+                }
         selected_command = command.strip() if isinstance(command, str) and command.strip() else self.default_test_command
         discovered = None
         if not selected_command:

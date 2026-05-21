@@ -5403,6 +5403,30 @@ def double(value: int) -> int:
         self.assertEqual(result["tool"], "run_test")
         self.assertEqual(result["output"], "321")
 
+    def test_run_test_rejects_explicit_whitespace_command(self) -> None:
+        root = self._workspace_scratch()
+        command = f'"{sys.executable}" -c "print(321)"'
+        tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+
+        result = tools.run_test("   ")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertEqual(result["summary"], "Explicit test command must be a non-empty string.")
+
+    def test_run_test_rejects_non_string_explicit_command(self) -> None:
+        root = self._workspace_scratch()
+        command = f'"{sys.executable}" -c "print(321)"'
+        tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+
+        result = tools.run_test(command=123)  # type: ignore[arg-type]
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tool"], "run_test")
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertEqual(result["summary"], "Explicit test command must be a non-empty string.")
+
     @unittest.skipUnless(os.name != "nt", "POSIX only")
     def test_validate_common_command_normalizes_windows_style_paths_on_posix(self) -> None:
         root = self._workspace_scratch()
