@@ -854,6 +854,9 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(str(result.get("output") or result.get("summary", "(no todos)")))
         return True
     if action == "/reset":
+        if remainder:
+            writer("Usage: /reset")
+            return True
         agent.reset()
         writer("conversation reset")
         return True

@@ -48,6 +48,7 @@ class DummyAgent:
         self.diff_request: dict[str, object] | None = None
         self.install_requests: list[dict[str, object]] = []
         self.commit_requests: list[str] = []
+        self.reset_requests = 0
         self.tools = ToolView()
 
     def workspace_root(self) -> Path:
@@ -87,7 +88,7 @@ class DummyAgent:
         self._reconcile_mode = mode
 
     def reset(self) -> None:
-        pass
+        self.reset_requests += 1
 
     def save_transcript(self, path: str | None = None) -> Path:
         self.saved_path = Path(path or "session.json").resolve()
@@ -756,6 +757,18 @@ class CliCommandTests(unittest.TestCase):
         agent = DummyAgent()
         handled = handle_meta_command("/quit", agent, lambda _: None)
         self.assertFalse(handled)
+
+    def test_reset_command_rejects_extra_args(self) -> None:
+        for command in ('/reset "   "', "/reset later"):
+            with self.subTest(command=command):
+                agent = DummyAgent()
+                output: list[str] = []
+
+                handled = handle_meta_command(command, agent, output.append)
+
+                self.assertTrue(handled)
+                self.assertEqual(output, ["Usage: /reset"])
+                self.assertEqual(agent.reset_requests, 0)
 
     def test_models_command_lists_models(self) -> None:
         agent = DummyAgent()
