@@ -274,6 +274,11 @@ def _parse_optional_meta_text(value: str) -> str | None:
     return parsed
 
 
+def _require_no_meta_args(value: str, usage: str) -> None:
+    if value.strip():
+        raise ValueError(usage)
+
+
 def _resolve_workspace_root(raw_path: str | Path) -> Path:
     text = str(raw_path).strip()
     candidate = Path(text)
@@ -754,11 +759,26 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
     action = head.lower()
     remainder = tail.strip()
     if action in {"/quit", "/exit"}:
+        try:
+            _require_no_meta_args(remainder, "Usage: /quit")
+        except ValueError:
+            writer("Usage: /quit")
+            return True
         return False
     if action == "/help":
+        try:
+            _require_no_meta_args(remainder, "Usage: /help")
+        except ValueError:
+            writer("Usage: /help")
+            return True
         writer(slash_help_text())
         return True
     if action == "/status":
+        try:
+            _require_no_meta_args(remainder, "Usage: /status")
+        except ValueError:
+            writer("Usage: /status")
+            return True
         session = agent.session_path().as_posix() if agent.session_path() is not None else "(none)"
         test_command = agent.configured_test_command() or "(none)"
         config_path = getattr(agent, "config_path", None)
@@ -769,6 +789,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         )
         return True
     if action == "/models":
+        try:
+            _require_no_meta_args(remainder, "Usage: /models")
+        except ValueError:
+            writer("Usage: /models")
+            return True
         models = agent.list_models()
         writer(", ".join(models) if models else "(no local models)")
         return True
@@ -809,6 +834,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(f"reconcile set to {agent.reconcile_mode()}")
         return True
     if action == "/doctor":
+        try:
+            _require_no_meta_args(remainder, "Usage: /doctor")
+        except ValueError:
+            writer("Usage: /doctor")
+            return True
         report, _ = doctor_report(agent)
         writer(report)
         return True
@@ -900,6 +930,11 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(f"loaded session {loaded.as_posix()}")
         return True
     if action == "/git":
+        try:
+            _require_no_meta_args(remainder, "Usage: /git")
+        except ValueError:
+            writer("Usage: /git")
+            return True
         result = agent.git_status()
         writer(str(result.get("output") or result.get("summary", "(no output)")))
         return True

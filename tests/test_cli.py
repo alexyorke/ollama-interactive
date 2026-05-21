@@ -524,6 +524,15 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(len(output), 1)
         self.assertIn("Ollama Code doctor", output[0])
 
+    def test_doctor_command_rejects_extra_args(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/doctor "   "', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /doctor"])
+
     def test_status_command_prints_config_and_model_source(self) -> None:
         agent = DummyAgent()
         agent.config_path = Path("settings.json").resolve()
@@ -757,6 +766,17 @@ class CliCommandTests(unittest.TestCase):
         agent = DummyAgent()
         handled = handle_meta_command("/quit", agent, lambda _: None)
         self.assertFalse(handled)
+
+    def test_quit_command_rejects_extra_args(self) -> None:
+        for command in ('/quit "   "', "/quit later", "/exit now"):
+            with self.subTest(command=command):
+                agent = DummyAgent()
+                output: list[str] = []
+
+                handled = handle_meta_command(command, agent, output.append)
+
+                self.assertTrue(handled)
+                self.assertEqual(output, ["Usage: /quit"])
 
     def test_reset_command_rejects_extra_args(self) -> None:
         for command in ('/reset "   "', "/reset later"):
