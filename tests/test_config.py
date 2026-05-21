@@ -112,6 +112,22 @@ class ConfigTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid config encoding"):
             load_config(root)
 
+    def test_load_config_reports_unreadable_file(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"model": "blocked-model"}), encoding="utf-8")
+        original_read_text = Path.read_text
+
+        def denied_read_text(target: Path, *args: object, **kwargs: object) -> str:
+            if target.resolve(strict=False) == config.resolve(strict=False):
+                raise PermissionError("denied")
+            return original_read_text(target, *args, **kwargs)
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=denied_read_text):
+            with self.assertRaisesRegex(ValueError, "Unable to read config file"):
+                load_config(root)
+
     def test_load_config_accepts_utf8_bom(self) -> None:
         root = self._workspace_scratch()
         config = root / ".ollama-code" / "config.json"
@@ -215,6 +231,24 @@ class ConfigTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Invalid config encoding"):
             build_agent(args)
+
+    def test_build_agent_unreadable_workspace_config_raises_value_error(self) -> None:
+        root = self._workspace_scratch()
+        config = root / ".ollama-code" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"model": "blocked-model"}), encoding="utf-8")
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--quiet"])
+        original_read_text = Path.read_text
+
+        def denied_read_text(target: Path, *args: object, **kwargs: object) -> str:
+            if target.resolve(strict=False) == config.resolve(strict=False):
+                raise PermissionError("denied")
+            return original_read_text(target, *args, **kwargs)
+
+        with patch.object(Path, "read_text", autospec=True, side_effect=denied_read_text):
+            with self.assertRaisesRegex(ValueError, "Unable to read config file"):
+                build_agent(args)
 
     def test_integer_config_rejects_json_boolean(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

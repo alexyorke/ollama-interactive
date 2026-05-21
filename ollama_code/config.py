@@ -158,9 +158,13 @@ def load_config(workspace_root: Path, raw_path: str | Path | None = None) -> Cli
     if not path.is_file():
         raise ValueError(f"Config path is not a file: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        raw = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ValueError(f"Invalid config encoding in {path}; expected UTF-8") from exc
+    except OSError as exc:
+        raise ValueError(f"Unable to read config file: {path} ({exc})") from exc
+    try:
+        payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid config JSON in {path}") from exc
     if not isinstance(payload, dict):
