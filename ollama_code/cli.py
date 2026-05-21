@@ -245,7 +245,10 @@ def _parse_single_meta_path(value: str) -> str | None:
     parts = _split_meta_args(stripped)
     if len(parts) != 1:
         raise ValueError("expected a single path argument")
-    return _strip_matching_quotes(parts[0])
+    parsed = _strip_matching_quotes(parts[0])
+    if not parsed.strip():
+        raise ValueError("expected a non-empty path argument")
+    return parsed
 
 
 def _resolve_workspace_root(raw_path: str | Path) -> Path:

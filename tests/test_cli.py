@@ -763,10 +763,50 @@ class CliCommandTests(unittest.TestCase):
         self.assertIsNone(agent.saved_path)
         self.assertEqual(output, ["Usage: /save [path]"])
 
+    def test_save_command_rejects_explicit_empty_path(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/save ""', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertIsNone(agent.saved_path)
+        self.assertEqual(output, ["Usage: /save [path]"])
+
+    def test_save_command_rejects_whitespace_only_quoted_path(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/save "   "', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertIsNone(agent.saved_path)
+        self.assertEqual(output, ["Usage: /save [path]"])
+
     def test_load_command_rejects_extra_path_args(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
         handled = handle_meta_command("/load saved.json trailing", agent, output.append)
+        self.assertTrue(handled)
+        self.assertIsNone(agent.loaded_path)
+        self.assertEqual(output, ["Usage: /load <path>"])
+
+    def test_load_command_rejects_explicit_empty_path(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/load ""', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertIsNone(agent.loaded_path)
+        self.assertEqual(output, ["Usage: /load <path>"])
+
+    def test_load_command_rejects_whitespace_only_quoted_path(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/load "   "', agent, output.append)
+
         self.assertTrue(handled)
         self.assertIsNone(agent.loaded_path)
         self.assertEqual(output, ["Usage: /load <path>"])
