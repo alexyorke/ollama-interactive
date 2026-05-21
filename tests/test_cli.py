@@ -40,6 +40,7 @@ class DummyAgent:
         self.loaded_path: Path | PureWindowsPath | None = None
         self._session_path = Path("session.json").resolve()
         self._test_command = "python -m unittest -v"
+        self.test_requests: list[str | None] = []
         self._todos = "1. [pending] inspect\n2. [completed] setup"
         self.diff_request: dict[str, object] | None = None
         self.install_requests: list[dict[str, object]] = []
@@ -119,6 +120,7 @@ class DummyAgent:
         return {"ok": True, "output": f"[main abc123] {message}"}
 
     def run_test(self, command: str | None = None) -> dict[str, object]:
+        self.test_requests.append(command)
         selected = command or self._test_command
         return {"ok": True, "output": f"ran {selected}"}
 
@@ -835,6 +837,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertIn("pytest -q", output[0])
         self.assertNotIn('"pytest -q"', output[0])
+
+    def test_test_command_rejects_explicit_empty_command(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/test ""', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /test [command]"])
+        self.assertEqual(agent.test_requests, [])
 
     def test_commit_command_prints_commit_output(self) -> None:
         agent = DummyAgent()
