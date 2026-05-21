@@ -890,6 +890,26 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(handled)
         self.assertEqual(agent.diff_request, {"cached": False, "path": "dir with spaces/file.txt"})
 
+    def test_diff_command_rejects_explicit_empty_path(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/diff ""', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /diff [--cached] [path]"])
+        self.assertIsNone(agent.diff_request)
+
+    def test_diff_command_rejects_whitespace_only_quoted_path_with_cached_flag(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/diff --cached "   "', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /diff [--cached] [path]"])
+        self.assertIsNone(agent.diff_request)
+
     def test_test_command_preserves_windows_executable_path(self) -> None:
         agent = DummyAgent()
         output: list[str] = []

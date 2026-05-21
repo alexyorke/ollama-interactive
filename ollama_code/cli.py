@@ -901,6 +901,9 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         for token in (_strip_matching_quotes(part) for part in diff_parts):
             if token == "--cached":
                 cached = True
+            elif not token.strip():
+                writer("Usage: /diff [--cached] [path]")
+                return True
             elif path is None:
                 path = token
             else:
