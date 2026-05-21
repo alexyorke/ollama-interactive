@@ -42,6 +42,8 @@ class DummyAgent:
         self._session_path = Path("session.json").resolve()
         self._test_command = "python -m unittest -v"
         self.test_requests: list[str | None] = []
+        self.todo_requests: list[str] = []
+        self.index_requests: list[str] = []
         self._todos = "1. [pending] inspect\n2. [completed] setup"
         self.diff_request: dict[str, object] | None = None
         self.install_requests: list[dict[str, object]] = []
@@ -140,9 +142,11 @@ class DummyAgent:
         return {"ok": True, "output": f"install target={target} confirm={confirm}"}
 
     def todo_read(self) -> dict[str, object]:
+        self.todo_requests.append("read")
         return {"ok": True, "output": self._todos}
 
     def todo_clear(self) -> dict[str, object]:
+        self.todo_requests.append("clear")
         self._todos = "(empty)"
         return {"ok": True, "output": self._todos}
 
@@ -150,6 +154,7 @@ class DummyAgent:
         return [DEFAULT_MODEL, "gemma4:latest"]
 
     def index_status(self) -> dict[str, object]:
+        self.index_requests.append("status")
         return {
             "ok": True,
             "enabled": True,
@@ -162,12 +167,15 @@ class DummyAgent:
         }
 
     def refresh_index(self) -> dict[str, object]:
+        self.index_requests.append("refresh")
         return {"ok": True, "summary": "index refresh queued"}
 
     def start_indexer(self) -> bool:
+        self.index_requests.append("start")
         return True
 
     def stop_indexer(self) -> None:
+        self.index_requests.append("stop")
         return
 
 
@@ -606,6 +614,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("[pending] inspect", output[0])
         self.assertEqual(output[1], "(empty)")
 
+    def test_todos_command_rejects_explicit_empty_subcommand(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/todos ""', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /todos [clear]"])
+        self.assertEqual(agent.todo_requests, [])
+
     def test_index_command_reports_and_controls_indexer(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
@@ -623,6 +641,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(output[1], "index refresh queued")
         self.assertEqual(output[2], "indexer stopped")
         self.assertEqual(output[3], "indexer started")
+
+    def test_index_command_rejects_whitespace_only_quoted_subcommand(self) -> None:
+        agent = DummyAgent()
+        output: list[str] = []
+
+        handled = handle_meta_command('/index "   "', agent, output.append)
+
+        self.assertTrue(handled)
+        self.assertEqual(output, ["Usage: /index status|refresh|stop|start"])
+        self.assertEqual(agent.index_requests, [])
 
     def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
         stream = io.StringIO()

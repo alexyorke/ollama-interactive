@@ -251,6 +251,19 @@ def _parse_single_meta_path(value: str) -> str | None:
     return parsed
 
 
+def _parse_optional_single_meta_arg(value: str) -> str | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    parts = _split_meta_args(stripped)
+    if len(parts) != 1:
+        raise ValueError("expected zero or one argument")
+    parsed = _strip_matching_quotes(parts[0])
+    if not parsed.strip():
+        raise ValueError("expected a non-empty argument")
+    return parsed
+
+
 def _resolve_workspace_root(raw_path: str | Path) -> Path:
     text = str(raw_path).strip()
     candidate = Path(text)
@@ -790,7 +803,12 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer(report)
         return True
     if action == "/index":
-        command = _strip_matching_quotes(remainder).lower() or "status"
+        try:
+            command = _parse_optional_single_meta_arg(remainder)
+        except ValueError:
+            writer("Usage: /index status|refresh|stop|start")
+            return True
+        command = (command or "status").lower()
         if command == "status":
             writer(_format_index_status(agent.index_status()))
             return True
@@ -809,7 +827,12 @@ def handle_meta_command(command: str, agent: OllamaCodeAgent, writer: Callable[[
         writer("Usage: /index status|refresh|stop|start")
         return True
     if action == "/todos":
-        command = _strip_matching_quotes(remainder).lower()
+        try:
+            command = _parse_optional_single_meta_arg(remainder)
+        except ValueError:
+            writer("Usage: /todos [clear]")
+            return True
+        command = (command or "").lower()
         if command == "clear":
             result = agent.todo_clear()
             writer(str(result.get("output") or result.get("summary", "(no todos)")))
