@@ -9,6 +9,7 @@ from pathlib import Path, PureWindowsPath
 from unittest.mock import patch
 from uuid import uuid4
 
+from ollama_code.agent import TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT, TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY
 from ollama_code.cli import CliStatusRenderer, build_agent, build_parser, doctor_report, ensure_runtime_default_model, handle_meta_command, main, startup_help_text
 from ollama_code.config import DEFAULT_MODEL
 
@@ -1064,6 +1065,33 @@ class CliCommandTests(unittest.TestCase):
         self.assertLess(len(agent.events[0]["payload"]), 5000)
         self.assertIn("truncated", agent.llm_telemetry_events[0]["preview"])
         self.assertLess(len(agent.llm_telemetry_events[0]["preview"]), 5000)
+
+    def test_build_agent_continue_truncates_large_nested_diagnostic_collections(self) -> None:
+        root = self._workspace_scratch()
+        session_dir = root / ".ollama-code" / "sessions"
+        session_dir.mkdir(parents=True)
+        session = session_dir / "saved.json"
+        rows = ",".join('{"index":%d}' % index for index in range(TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 6))
+        mapping = ",".join('"key_%d":%d' % (index, index) for index in range(TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 4))
+        session.write_text(
+            '{"model":"gemma4:latest","approval_mode":"auto","workspace_root":"'
+            + root.as_posix()
+            + '","messages":[{"role":"system","content":"sys"},{"role":"user","content":"remember me"}],"events":[{"type":"tool_result","result":{"rows":['
+            + rows
+            + '],"mapping":{'
+            + mapping
+            + '}}}]}',
+            encoding="utf-8",
+        )
+        parser = build_parser()
+        args = parser.parse_args(["--cwd", str(root), "--continue", "--quiet"])
+
+        agent = build_agent(args)
+        result = agent.events[0]["result"]
+
+        self.assertEqual(len(result["rows"]), TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 1)
+        self.assertEqual(result["rows"][-1], "[truncated 6 items for transcript]")
+        self.assertEqual(result["mapping"][TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY], "[truncated 4 entries for transcript]")
 
     def test_build_agent_resume_missing_session_raises_value_error(self) -> None:
         missing = f"missing-{uuid4().hex}.json"

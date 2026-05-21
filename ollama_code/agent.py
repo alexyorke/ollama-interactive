@@ -101,8 +101,10 @@ from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_too
 
 TRANSCRIPT_DIAGNOSTIC_STRING_LIMIT = 4000
 TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT = 40
+TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT = 200
 TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER = "[nested payload truncated for transcript]"
 TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER = "[circular reference omitted for transcript]"
+TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY = "__ollama_code_transcript_truncated__"
 
 
 class OllamaCodeAgent:
@@ -509,10 +511,21 @@ class OllamaCodeAgent:
                 return TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER
             active.add(marker)
             try:
-                return {
+                items = list(value.items())
+                omitted = 0
+                if _depth > 0 and len(items) > TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT:
+                    omitted = len(items) - TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT
+                    items = items[:TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT]
+                normalized = {
                     str(key): self._normalize_transcript_diagnostic_payload(item, _depth=_depth + 1, _seen=active)
-                    for key, item in value.items()
+                    for key, item in items
                 }
+                if omitted:
+                    marker_key = TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY
+                    while marker_key in normalized:
+                        marker_key += "_"
+                    normalized[marker_key] = f"[truncated {omitted} entries for transcript]"
+                return normalized
             finally:
                 active.remove(marker)
         if isinstance(value, (list, tuple)):
@@ -522,10 +535,18 @@ class OllamaCodeAgent:
                 return TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER
             active.add(marker)
             try:
-                return [
+                items = list(value)
+                omitted = 0
+                if _depth > 0 and len(items) > TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT:
+                    omitted = len(items) - TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT
+                    items = items[:TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT]
+                normalized = [
                     self._normalize_transcript_diagnostic_payload(item, _depth=_depth + 1, _seen=active)
-                    for item in value
+                    for item in items
                 ]
+                if omitted:
+                    normalized.append(f"[truncated {omitted} items for transcript]")
+                return normalized
             finally:
                 active.remove(marker)
         if isinstance(value, set):
@@ -535,10 +556,18 @@ class OllamaCodeAgent:
                 return TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER
             active.add(marker)
             try:
-                return [
+                items = sorted(value, key=lambda item: str(item))
+                omitted = 0
+                if _depth > 0 and len(items) > TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT:
+                    omitted = len(items) - TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT
+                    items = items[:TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT]
+                normalized = [
                     self._normalize_transcript_diagnostic_payload(item, _depth=_depth + 1, _seen=active)
-                    for item in sorted(value, key=lambda item: str(item))
+                    for item in items
                 ]
+                if omitted:
+                    normalized.append(f"[truncated {omitted} items for transcript]")
+                return normalized
             finally:
                 active.remove(marker)
         isoformat = getattr(value, "isoformat", None)

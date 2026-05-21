@@ -16,7 +16,9 @@ from ollama_code.agent import (
     AgentResult,
     GROUNDING_EVIDENCE_TOOL_NAMES,
     OllamaCodeAgent,
+    TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT,
     TRANSCRIPT_DIAGNOSTIC_CYCLE_MARKER,
+    TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY,
     TRANSCRIPT_DIAGNOSTIC_DEPTH_LIMIT,
     TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER,
     _workspace_roots_match,
@@ -3005,6 +3007,31 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(cursor, TRANSCRIPT_DIAGNOSTIC_DEPTH_MARKER)
 
+    def test_save_transcript_truncates_large_nested_diagnostic_collections(self) -> None:
+        root = self._workspace_scratch()
+        session = root / ".ollama-code" / "sessions" / "saved.json"
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+            session_file=session,
+            debate_enabled=False,
+        )
+        nested_rows = [{"index": index} for index in range(TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 5)]
+        nested_mapping = {f"key_{index}": index for index in range(TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 3)}
+        agent.events.append({"type": "tool_result", "name": "mcp_call", "result": {"rows": nested_rows, "mapping": nested_mapping}})
+
+        saved = agent.save_transcript()
+        payload = json.loads(saved.read_text(encoding="utf-8"))
+        result = payload["events"][0]["result"]
+
+        self.assertEqual(len(result["rows"]), TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 1)
+        self.assertEqual(result["rows"][-1], "[truncated 5 items for transcript]")
+        self.assertEqual(result["rows"][0], {"index": 0})
+        self.assertEqual(len(result["mapping"]), TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 1)
+        self.assertEqual(result["mapping"][TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY], "[truncated 3 entries for transcript]")
+        self.assertEqual(result["mapping"]["key_0"], 0)
+
     def test_save_transcript_replaces_circular_diagnostic_references(self) -> None:
         root = self._workspace_scratch()
         session = root / ".ollama-code" / "sessions" / "saved.json"
@@ -3073,6 +3100,40 @@ class AgentTests(unittest.TestCase):
         self.assertLess(len(agent.events[0]["payload"]), 5000)
         self.assertIn("truncated", agent.llm_telemetry_events[0]["preview"])
         self.assertLess(len(agent.llm_telemetry_events[0]["preview"]), 5000)
+
+    def test_restore_transcript_truncates_large_nested_diagnostic_collections(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+            debate_enabled=False,
+        )
+        payload = {
+            "model": "fake-model",
+            "approval_mode": "auto",
+            "workspace_root": root.as_posix(),
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "remember me"},
+            ],
+            "events": [
+                {
+                    "type": "tool_result",
+                    "result": {
+                        "rows": [{"index": index} for index in range(TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 2)],
+                        "mapping": {f"key_{index}": index for index in range(TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 4)},
+                    },
+                }
+            ],
+        }
+
+        agent.restore_transcript(payload)
+        result = agent.events[0]["result"]
+
+        self.assertEqual(len(result["rows"]), TRANSCRIPT_DIAGNOSTIC_COLLECTION_LIMIT + 1)
+        self.assertEqual(result["rows"][-1], "[truncated 2 items for transcript]")
+        self.assertEqual(result["mapping"][TRANSCRIPT_DIAGNOSTIC_DICT_MARKER_KEY], "[truncated 4 entries for transcript]")
 
     def test_todos_are_saved_and_restored_with_transcript(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
