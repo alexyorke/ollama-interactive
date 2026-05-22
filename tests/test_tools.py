@@ -1216,6 +1216,15 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIsNone(tools._docker_host())
         self.assertFalse(tools._docker_tools_enabled())
 
+    def test_docker_env_scrubs_inherited_host_when_disabled(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        with patch.dict(os.environ, {"OLLAMA_CODE_DOCKER_HOST": "false", "DOCKER_HOST": "ssh://car-detection-server"}, clear=False):
+            env = tools._docker_env()
+
+        self.assertNotIn("DOCKER_HOST", env)
+
     def test_semgrep_scan_reports_cli_error_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

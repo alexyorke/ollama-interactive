@@ -9,6 +9,7 @@ import site
 import subprocess
 import sys
 import sysconfig
+from urllib.parse import urlparse
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,22 @@ class ToolDependency:
     install_hints: tuple[InstallHint, ...] = ()
     verify_command: tuple[str, ...] = ()
     notes: str = ""
+
+
+@dataclass(frozen=True)
+class DockerHostSetting:
+    host: str | None
+    source: str | None = None
+    raw: str | None = None
+    status: str = "absent"
+
+
+_DOCKER_HOST_ENV_VARS = (
+    "OLLAMA_CODE_DOCKER_HOST",
+    "OLLAMA_CODE_REMOTE_DOCKER_HOST",
+    "DOCKER_HOST",
+)
+_DOCKER_HOST_DISABLED_VALUES = frozenset({"0", "false", "none", "off"})
 
 
 def _python_pip_command(*packages: str) -> tuple[str, ...]:
@@ -995,29 +1012,63 @@ def normalize_docker_host(value: str | None) -> str | None:
     clean = value.strip()
     if not clean:
         return None
-    if clean.lower() in {"0", "false", "none", "off"}:
+    if clean.lower() in _DOCKER_HOST_DISABLED_VALUES:
         return None
     if "://" not in clean:
         clean = f"ssh://{clean}"
+    parsed = urlparse(clean)
+    if not parsed.scheme:
+        return None
+    if parsed.scheme.lower() in {"unix", "npipe"}:
+        if not parsed.path:
+            return None
+    elif not parsed.netloc:
+        return None
     return clean
 
 
+def docker_host_kind(value: str | None) -> str | None:
+    host = normalize_docker_host(value)
+    if not host:
+        return None
+    scheme = urlparse(host).scheme.lower()
+    if scheme in {"unix", "npipe"}:
+        return "local"
+    if scheme == "ssh":
+        return "remote"
+    return "custom"
+
+
+def configured_docker_host_setting() -> DockerHostSetting:
+    for name in _DOCKER_HOST_ENV_VARS:
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        clean = raw.strip()
+        if not clean:
+            continue
+        if clean.lower() in _DOCKER_HOST_DISABLED_VALUES:
+            return DockerHostSetting(host=None, source=name, raw=raw, status="disabled")
+        normalized = normalize_docker_host(raw)
+        if normalized is not None:
+            return DockerHostSetting(host=normalized, source=name, raw=raw, status="configured")
+        return DockerHostSetting(host=None, source=name, raw=raw, status="invalid")
+    return DockerHostSetting(host=None)
+
+
 def configured_docker_host() -> str | None:
-    return normalize_docker_host(
-        os.environ.get("OLLAMA_CODE_DOCKER_HOST")
-        or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
-        or os.environ.get("DOCKER_HOST")
-    )
+    return configured_docker_host_setting().host
 
 
 def prefer_docker_tools() -> bool:
-    if normalize_docker_host(
-        os.environ.get("OLLAMA_CODE_DOCKER_HOST")
-        or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
-    ):
+    docker_setting = configured_docker_host_setting()
+    if docker_setting.host and docker_setting.source in {
+        "OLLAMA_CODE_DOCKER_HOST",
+        "OLLAMA_CODE_REMOTE_DOCKER_HOST",
+    }:
         return True
     value = os.environ.get("OLLAMA_CODE_PREFER_DOCKER_TOOLS", "").strip().lower()
-    return bool(value) and value not in {"0", "false", "none", "off"}
+    return bool(value) and value not in _DOCKER_HOST_DISABLED_VALUES
 
 
 def _ordered_install_hints(hints: Iterable[InstallHint], platform_name: str | None = None) -> list[InstallHint]:

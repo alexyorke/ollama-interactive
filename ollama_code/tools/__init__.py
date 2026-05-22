@@ -3096,6 +3096,8 @@ class ToolExecutor:
         host = self._docker_host()
         if host:
             env["DOCKER_HOST"] = host
+        else:
+            env.pop("DOCKER_HOST", None)
         return env
 
     def _docker_tools_enabled(self) -> bool:

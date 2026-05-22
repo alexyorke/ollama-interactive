@@ -526,6 +526,31 @@ class CliCommandTests(unittest.TestCase):
         self.assertNotIn("docker tools: remote host", report)
         self.assertIn("docker tools: local client detected", report)
 
+    def test_doctor_report_labels_local_unix_docker_host_as_local(self) -> None:
+        agent = DummyAgent()
+        tool_rows = [{"id": "docker", "installed": True, "recommended": False, "supported": True}]
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            with patch("ollama_code.cli.dependency_statuses", return_value=tool_rows):
+                with patch.dict("os.environ", {"DOCKER_HOST": "unix:///var/run/docker.sock"}):
+                    report, ok = doctor_report(agent)
+
+        self.assertTrue(ok)
+        self.assertIn("docker tools: local host unix:///var/run/docker.sock", report)
+        self.assertNotIn("docker tools: remote host", report)
+
+    def test_doctor_report_rejects_invalid_docker_host_transport(self) -> None:
+        agent = DummyAgent()
+        tool_rows = [{"id": "docker", "installed": True, "recommended": False, "supported": True}]
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            with patch("ollama_code.cli.dependency_statuses", return_value=tool_rows):
+                with patch.dict("os.environ", {"DOCKER_HOST": "ssh://"}):
+                    report, ok = doctor_report(agent)
+
+        self.assertFalse(ok)
+        self.assertIn("docker tools: invalid DOCKER_HOST=ssh://", report)
+
     def test_doctor_command_prints_report(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
