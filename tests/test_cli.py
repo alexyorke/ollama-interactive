@@ -513,6 +513,19 @@ class CliCommandTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("python sdk embeddings: ok on-demand candidate rerank via qwen3-embedding:8b", report)
 
+    def test_doctor_report_ignores_disabled_docker_host_sentinel(self) -> None:
+        agent = DummyAgent()
+        tool_rows = [{"id": "docker", "installed": True, "recommended": False, "supported": True}]
+
+        with patch("ollama_code.cli.shutil.which", return_value=None):
+            with patch("ollama_code.cli.dependency_statuses", return_value=tool_rows):
+                with patch.dict("os.environ", {"OLLAMA_CODE_DOCKER_HOST": " false "}):
+                    report, ok = doctor_report(agent)
+
+        self.assertTrue(ok)
+        self.assertNotIn("docker tools: remote host", report)
+        self.assertIn("docker tools: local client detected", report)
+
     def test_doctor_command_prints_report(self) -> None:
         agent = DummyAgent()
         output: list[str] = []

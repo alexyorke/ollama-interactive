@@ -1201,6 +1201,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("cp", copy_call.args[0])
         self.assertEqual(create_call.kwargs["env"]["DOCKER_HOST"], "ssh://car-detection-server")
 
+    def test_docker_host_false_disables_docker_backed_semgrep(self) -> None:
+        root = self._workspace_scratch()
+        (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        with patch.object(tools, "_semgrep_executable", return_value=None):
+            with patch.object(tools, "_docker_command", return_value="docker"):
+                with patch.dict(os.environ, {"OLLAMA_CODE_DOCKER_HOST": "false"}, clear=False):
+                    result = tools.semgrep_scan("eval(...)", lang="python")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["missing_dependency"], "semgrep")
+        self.assertIsNone(tools._docker_host())
+        self.assertFalse(tools._docker_tools_enabled())
+
     def test_semgrep_scan_reports_cli_error_output(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

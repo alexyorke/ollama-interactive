@@ -989,13 +989,34 @@ def install_hint_supported(hint: InstallHint, platform_name: str | None = None) 
     return "any" in hint.platforms or platform_name in hint.platforms
 
 
-def prefer_docker_tools() -> bool:
-    value = (
-        os.environ.get("OLLAMA_CODE_PREFER_DOCKER_TOOLS")
-        or os.environ.get("OLLAMA_CODE_DOCKER_HOST")
+def normalize_docker_host(value: str | None) -> str | None:
+    if not value:
+        return None
+    clean = value.strip()
+    if not clean:
+        return None
+    if clean.lower() in {"0", "false", "none", "off"}:
+        return None
+    if "://" not in clean:
+        clean = f"ssh://{clean}"
+    return clean
+
+
+def configured_docker_host() -> str | None:
+    return normalize_docker_host(
+        os.environ.get("OLLAMA_CODE_DOCKER_HOST")
         or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
-        or ""
-    ).strip().lower()
+        or os.environ.get("DOCKER_HOST")
+    )
+
+
+def prefer_docker_tools() -> bool:
+    if normalize_docker_host(
+        os.environ.get("OLLAMA_CODE_DOCKER_HOST")
+        or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
+    ):
+        return True
+    value = os.environ.get("OLLAMA_CODE_PREFER_DOCKER_TOOLS", "").strip().lower()
     return bool(value) and value not in {"0", "false", "none", "off"}
 
 

@@ -35,6 +35,7 @@ from ollama_code.interrupts import OperationInterrupted
 from ollama_code.tool_dependencies import (
     TOOL_DEPENDENCIES,
     command_to_text,
+    configured_docker_host,
     current_platform,
     dependency_status,
     dependency_statuses,
@@ -3088,17 +3089,7 @@ class ToolExecutor:
         return resolve_tool_executable("docker", "docker", workspace_root=self.workspace_root) or shutil.which("docker")
 
     def _docker_host(self) -> str | None:
-        host = (
-            os.environ.get("OLLAMA_CODE_DOCKER_HOST")
-            or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
-            or os.environ.get("DOCKER_HOST")
-        )
-        if not host:
-            return None
-        clean = host.strip()
-        if clean and "://" not in clean:
-            clean = f"ssh://{clean}"
-        return clean or None
+        return configured_docker_host()
 
     def _docker_env(self) -> dict[str, str]:
         env = os.environ.copy()

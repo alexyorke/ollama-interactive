@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from ollama_code.tool_dependencies import dependency_status, resolve_dependency
+from ollama_code.tool_dependencies import configured_docker_host, dependency_status, resolve_dependency
 from ollama_code.tools import ToolExecutor
 
 
@@ -145,6 +145,10 @@ class ToolDependencyTests(unittest.TestCase):
 
         self.assertEqual(semgrep_hints[0]["mode"], "docker")
         self.assertIn("docker pull", semgrep_hints[0]["command"])
+
+    def test_configured_docker_host_ignores_disabled_sentinel_values(self) -> None:
+        with patch.dict(os.environ, {"OLLAMA_CODE_DOCKER_HOST": " off "}, clear=False):
+            self.assertIsNone(configured_docker_host())
 
     def test_dependency_status_detects_isolated_venv_executable(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

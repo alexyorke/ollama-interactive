@@ -36,7 +36,7 @@ from ollama_code.indexer import BackgroundIndexer
 from ollama_code.interrupts import InterruptController, OperationInterrupted
 from ollama_code.ollama_client import OllamaClient, OllamaError
 from ollama_code.sessions import latest_restorable_session, load_transcript_payload, new_session_path, resolve_transcript_path
-from ollama_code.tool_dependencies import dependency_statuses
+from ollama_code.tool_dependencies import configured_docker_host, dependency_statuses
 from ollama_code.tools import ToolExecutor
 
 PREFERRED_FALLBACK_MODELS = [
@@ -718,14 +718,9 @@ def doctor_report(agent: OllamaCodeAgent) -> tuple[str, bool]:
         if row.get("recommended") and not row.get("supported")
     ]
     lines.append(f"optional tools: installed {len(installed_tools)}/{len(tool_rows)}")
-    docker_host = (
-        os.environ.get("OLLAMA_CODE_DOCKER_HOST")
-        or os.environ.get("OLLAMA_CODE_REMOTE_DOCKER_HOST")
-        or os.environ.get("DOCKER_HOST")
-    )
+    docker_host = configured_docker_host()
     if docker_host:
-        normalized_docker_host = docker_host if "://" in docker_host else f"ssh://{docker_host}"
-        lines.append(f"docker tools: remote host {normalized_docker_host}")
+        lines.append(f"docker tools: remote host {docker_host}")
     elif any(row.get("id") == "docker" and row.get("installed") for row in tool_rows):
         lines.append("docker tools: local client detected; set OLLAMA_CODE_DOCKER_HOST=ssh://host for remote container tools")
     if missing_recommended:
