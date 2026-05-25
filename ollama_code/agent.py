@@ -79,6 +79,7 @@ from ollama_code.agent_protocol import (
     VERIFIED_FUNCTION_TOOL_NAMES,
     AgentResult,
 )
+from ollama_code.controller import NavigationValidationController, NavigationValidationTurn
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
 from ollama_code.prompts import (
     ARTIFACT_RECONCILER_SYSTEM_PROMPT,
@@ -5171,336 +5172,18 @@ class OllamaCodeAgent:
             )
             if import_repair is not None:
                 return import_repair
-
-        if exact_shell_command and "run_shell" not in forbidden_tool_names:
-            round_number += 1
-            result = self._execute_controller_tool(
-                name="run_shell",
-                arguments={"command": exact_shell_command},
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            message = self._synthesize_final_from_tool_result(
-                request_text=request_text,
-                name="run_shell",
-                arguments={"command": exact_shell_command},
-                result=result,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                required_tool_names=required_tool_names,
-                expected_exact_reply_text=expected_exact_reply_text,
-            )
-            if message:
-                return self._record_synthesized_final(message, tool="run_shell", round_number=round_number)
-            return None
-        if exact_shell_command and "run_test" in required_tool_names and "run_test" not in forbidden_tool_names:
-            round_number += 1
-            result = self._execute_controller_tool(
-                name="run_test",
-                arguments={"command": exact_shell_command},
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            message = self._synthesize_final_from_tool_result(
-                request_text=request_text,
-                name="run_test",
-                arguments={"command": exact_shell_command},
-                result=result,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                required_tool_names=required_tool_names,
-                expected_exact_reply_text=expected_exact_reply_text,
-            )
-            if message:
-                return self._record_synthesized_final(message, tool="run_test", round_number=round_number)
-            return None
-
-        if "run_test" in required_tool_names and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
-            round_number += 1
-            args = {"command": self.tools.default_test_command}
-            result = self._execute_controller_tool(
-                name="run_test",
-                arguments=args,
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            message = self._synthesize_final_from_tool_result(
-                request_text=request_text,
-                name="run_test",
-                arguments=args,
-                result=result,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                required_tool_names=required_tool_names,
-                expected_exact_reply_text=expected_exact_reply_text,
-            )
-            if message:
-                return self._record_synthesized_final(message, tool="run_test", round_number=round_number)
-            return None
-
-        if {"git_status", "git_diff"}.issubset(required_tool_names) and "git_status" not in forbidden_tool_names and "git_diff" not in forbidden_tool_names:
-            value_match = re.search(r"\breturn\s+([A-Za-z0-9_]+)\b", request_text)
-            path = self._requested_git_tool_path(request_text)
-            if value_match and path:
-                round_number += 1
-                status_args = {"path": path}
-                self._execute_controller_tool(
-                    name="git_status",
-                    arguments=status_args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                round_number += 1
-                diff_args: dict[str, Any] = {"path": path}
-                if requested_git_diff_mode == "staged":
-                    diff_args["cached"] = True
-                result = self._execute_controller_tool(
-                    name="git_diff",
-                    arguments=diff_args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                message = self._synthesize_final_from_tool_result(
-                    request_text=request_text,
-                    name="git_diff",
-                    arguments=diff_args,
-                    result=result,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    required_tool_names=required_tool_names,
-                    expected_exact_reply_text=expected_exact_reply_text,
-                )
-                if message:
-                    return self._record_synthesized_final(message, tool="git_diff", round_number=round_number)
-            return None
-
-        context_followup_sequence = self._requested_context_followup_mechanical_sequence(
-            request_text,
+        controller = NavigationValidationController(self)
+        turn = NavigationValidationTurn(
+            request_text=request_text,
+            target_line_read=target_line_read,
+            symbol_read=symbol_read,
+            exact_shell_command=exact_shell_command,
+            expected_exact_reply_text=expected_exact_reply_text,
+            required_tool_names=required_tool_names,
             forbidden_tool_names=forbidden_tool_names,
+            requested_git_diff_mode=requested_git_diff_mode,
         )
-        if context_followup_sequence:
-            messages: list[str] = []
-            final_tool = context_followup_sequence[-1][1].name
-            for index, (fragment, spec) in enumerate(context_followup_sequence):
-                step_request_text = fragment
-                round_number += 1
-                result = self._execute_controller_tool(
-                    name=spec.name,
-                    arguments=spec.arguments,
-                    request_text=step_request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                message = self._synthesize_final_from_tool_result(
-                    request_text=step_request_text,
-                    name=spec.name,
-                    arguments=spec.arguments,
-                    result=result,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    required_tool_names={spec.name},
-                    expected_exact_reply_text=expected_exact_reply_text,
-                )
-                if spec.name == "search":
-                    output = str(result.get("output", ""))
-                    for line in output.splitlines():
-                        match = re.match(r"(?P<path>.+):\d+:", line)
-                        if not match:
-                            continue
-                        raw_path = match.group("path").strip()
-                        try:
-                            path = Path(raw_path)
-                            label = self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
-                        except (OSError, ValueError):
-                            label = raw_path.replace("\\", "/")
-                        message = f"{label} contains the match."
-                        break
-                if message and (
-                    index == len(context_followup_sequence) - 1
-                    or spec.name in {"list_files", "search", "discover_validators"}
-                ):
-                    messages.append(message)
-            if messages:
-                return self._record_synthesized_final("\n".join(messages), tool=final_tool, round_number=round_number)
-            return None
-
-        mechanical_tool = self._requested_mechanical_tool_call(request_text, forbidden_tool_names=forbidden_tool_names)
-        if mechanical_tool is not None:
-            round_number += 1
-            result = self._execute_controller_tool(
-                name=mechanical_tool.name,
-                arguments=mechanical_tool.arguments,
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            message = self._synthesize_final_from_tool_result(
-                request_text=request_text,
-                name=mechanical_tool.name,
-                arguments=mechanical_tool.arguments,
-                result=result,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                required_tool_names=required_tool_names,
-                expected_exact_reply_text=expected_exact_reply_text,
-            )
-            if self._should_chain_run_test_after_mechanical(
-                request_text=request_text,
-                mechanical_tool_name=mechanical_tool.name,
-                forbidden_tool_names=forbidden_tool_names,
-            ):
-                context_message = message
-                round_number += 1
-                test_args = {"command": self.tools.default_test_command} if self.tools.default_test_command else {}
-                test_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments=test_args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                test_message = self._synthesize_final_from_tool_result(
-                    request_text=request_text,
-                    name="run_test",
-                    arguments=test_args,
-                    result=test_result,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    required_tool_names=required_tool_names,
-                    expected_exact_reply_text=expected_exact_reply_text,
-                )
-                if context_message and test_message:
-                    return self._record_synthesized_final(
-                        context_message + "\n" + test_message,
-                        tool="run_test",
-                        round_number=round_number,
-                    )
-                if test_message:
-                    return self._record_synthesized_final(test_message, tool="run_test", round_number=round_number)
-            if message:
-                return self._record_synthesized_final(message, tool=mechanical_tool.name, round_number=round_number)
-            return None
-
-        if (
-            symbol_read is not None
-            and "search_symbols" not in forbidden_tool_names
-            and "read_symbol" not in forbidden_tool_names
-            and ("token" in lowered or "marker" in lowered or ("return" in lowered and "value" in lowered))
-        ):
-            round_number += 1
-            search_args = {"query": symbol_read.symbol, "path": symbol_read.path}
-            search_result = self._execute_controller_tool(
-                name="search_symbols",
-                arguments=search_args,
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            if search_result.get("ok") is not True:
-                return None
-            round_number += 1
-            read_args = {"path": symbol_read.path, "symbol": symbol_read.symbol, "include_context": 0}
-            result = self._execute_controller_tool(
-                name="read_symbol",
-                arguments=read_args,
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            message = self._synthesize_final_from_tool_result(
-                request_text=request_text,
-                name="read_symbol",
-                arguments=read_args,
-                result=result,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                required_tool_names=required_tool_names,
-                expected_exact_reply_text=expected_exact_reply_text,
-            )
-            if message:
-                return self._record_synthesized_final(message, tool="read_symbol", round_number=round_number)
-            return None
-
-        natural_read_path = self._requested_natural_read_file_path(request_text)
-        read_path = target_line_read.path if target_line_read is not None else (self._requested_read_file_path(request_text) or natural_read_path)
-        exact_line_read_requested = target_line_read is not None and self._request_asks_exact_line_text(request_text)
-        direct_file_contents_requested = natural_read_path is not None and self._request_asks_direct_file_contents(request_text)
-        if read_path and "read_file" not in forbidden_tool_names and (
-            self._request_asks_token_only(request_text)
-            or self._request_expects_exact_tool_error(request_text)
-            or exact_line_read_requested
-            or direct_file_contents_requested
-        ):
-            if target_line_read is not None:
-                read_args = {"path": target_line_read.path, "start": target_line_read.start, "end": target_line_read.end}
-            else:
-                read_args = {"path": read_path}
-            read_count = 2 if self._request_mentions_repeated_read(request_text) else 1
-            result: dict[str, Any] = {}
-            for _ in range(read_count):
-                round_number += 1
-                result = self._execute_controller_tool(
-                    name="read_file",
-                    arguments=read_args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-            message = self._synthesize_final_from_tool_result(
-                request_text=request_text,
-                name="read_file",
-                arguments=read_args,
-                result=result,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                required_tool_names=required_tool_names,
-                expected_exact_reply_text=expected_exact_reply_text,
-            )
-            if message:
-                return self._record_synthesized_final(message, tool="read_file", round_number=round_number)
-
-        if lowered.startswith("use read_file") and self._request_expects_exact_tool_error(request_text) and read_path and "read_file" not in forbidden_tool_names:
-            round_number += 1
-            result = self._execute_controller_tool(
-                name="read_file",
-                arguments={"path": read_path},
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            message = str(result.get("summary") or result.get("output") or "").strip()
-            if message:
-                return self._record_synthesized_final(message, tool="read_file", round_number=round_number)
-        return None
+        return controller.handle(turn)
 
     def _read_only_mutation_probe(self, request_text: str, exact_file_write: ExactFileWriteSpec | None) -> tuple[str, dict[str, Any]] | None:
         if self.approval_mode() != "read-only":
@@ -5663,11 +5346,13 @@ class OllamaCodeAgent:
                 for item in successful_tool_results[-QUESTION_PLANNER_EVIDENCE_LIMIT:]
             ],
             "decision_focus": [
+                "highest-leverage ambiguity axis",
                 "scope boundary",
                 "acceptance signal",
+                "optimization priority",
                 "risk/tradeoff",
+                "irreversible/high-cost choice",
                 "model limits",
-                "second-order effects",
             ],
         }
 
@@ -5676,6 +5361,135 @@ class OllamaCodeAgent:
             {"role": "system", "content": QUESTION_PLANNER_SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=True, separators=(",", ":"))},
         ]
+
+    def _normalize_question_choices(self, raw_choices: list[str]) -> list[str]:
+        choices: list[str] = []
+        seen: set[str] = set()
+        for raw_choice in raw_choices:
+            cleaned = self._truncate_text(str(raw_choice).strip().rstrip(".,;:"), limit=80)
+            if not cleaned:
+                continue
+            normalized = re.sub(r"\s+", " ", cleaned).strip().lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            choices.append(cleaned)
+            if len(choices) >= 4:
+                break
+        return choices
+
+    def _question_aspect_tags(self, text: str) -> list[str]:
+        lowered = text.lower()
+        tag_patterns = {
+            "scope": (r"\b(?:scope|boundary|in scope|out of scope|keep fixed|hold fixed|surface)\b",),
+            "acceptance": (r"\b(?:acceptance|success|definition of done|pass rate|tests?|correctness|quality bar)\b",),
+            "risk": (r"\b(?:risk|safe|safety|fail-closed|permission|security)\b",),
+            "tradeoff": (r"\b(?:tradeoff|priority|prioritize|optimi[sz]e|latency|speed|throughput|token|cost|ux)\b",),
+            "workflow": (r"\b(?:workflow|path|happy path|first-use|first use|user path|operator|maintainer|benchmark runner)\b",),
+            "compatibility": (r"\b(?:compatib|public api|cli surface|session/transcript|tool contracts?|benchmark comparability)\b",),
+        }
+        tags: list[str] = []
+        for tag, patterns in tag_patterns.items():
+            if any(re.search(pattern, lowered) for pattern in patterns):
+                tags.append(tag)
+        return tags
+
+    def _question_is_compound(self, question: str) -> bool:
+        lowered = question.lower()
+        conjunctions = len(re.findall(r"\b(?:and|or)\b", lowered))
+        return question.count("?") > 1 or conjunctions >= 2
+
+    def _question_looks_eba_style(self, question: str, choices: list[str]) -> bool:
+        if not 2 <= len(choices) <= 4:
+            return False
+        lowered = question.lower().strip()
+        if "should i proceed" in lowered or "should i continue" in lowered:
+            return False
+        if not any(
+            lowered.startswith(prefix)
+            for prefix in (
+                "which ",
+                "which one ",
+                "which single ",
+                "what outcome ",
+                "what should ",
+                "for this pass, which ",
+            )
+        ):
+            return False
+        generic_choices = {"yes", "no", "maybe", "proceed", "continue"}
+        normalized_choices = {
+            re.sub(r"[^a-z0-9]+", " ", choice.lower()).strip()
+            for choice in choices
+            if str(choice).strip()
+        }
+        if len({choice for choice in normalized_choices if choice not in generic_choices}) < 2:
+            return False
+        return bool(self._question_aspect_tags(question + " " + " ".join(choices)))
+
+    def _question_quality_metrics(self, item: dict[str, Any], *, request_text: str = "") -> dict[str, Any]:
+        question = str(item.get("question") or "").strip()
+        why = str(item.get("why_it_matters") or "").strip()
+        recommended_default = str(item.get("recommended_default") or "").strip()
+        choices = self._normalize_question_choices(
+            [str(choice) for choice in list(item.get("choices") or []) if str(choice).strip()]
+        )
+        low_value = self._question_text_is_low_value(question)
+        compound = self._question_is_compound(question)
+        aspect_tags = self._question_aspect_tags(" ".join([question, why, recommended_default, *choices]))
+        request_tags = set(self._question_aspect_tags(request_text))
+        eba_style = self._question_looks_eba_style(question, choices)
+        score = 0
+        if low_value:
+            score -= 6
+        if 2 <= len(choices) <= 4:
+            score += 3
+        elif not choices:
+            score -= 3
+        else:
+            score -= 1
+        if recommended_default:
+            score += 2
+        if why:
+            score += 1
+        if eba_style:
+            score += 4
+        if compound:
+            score -= 2
+        if aspect_tags:
+            score += 1
+        if request_tags.intersection(aspect_tags):
+            score += 1
+        return {
+            "quality_score": score,
+            "eba_style": eba_style,
+            "compound": compound,
+            "aspect_tags": aspect_tags,
+            "normalized_choices": choices,
+        }
+
+    def _build_clarifying_question(
+        self,
+        *,
+        question: str,
+        why_it_matters: str = "",
+        recommended_default: str = "",
+        choices: list[str] | None = None,
+        request_text: str = "",
+    ) -> dict[str, Any] | None:
+        normalized_question = self._truncate_text(str(question).strip(), limit=260)
+        if not normalized_question or self._question_text_is_low_value(normalized_question):
+            return None
+        row = {
+            "question": normalized_question,
+            "why_it_matters": self._truncate_text(str(why_it_matters).strip(), limit=220),
+            "recommended_default": self._truncate_text(str(recommended_default).strip(), limit=220),
+            "choices": self._normalize_question_choices(
+                [str(choice) for choice in list(choices or []) if str(choice).strip()]
+            ),
+        }
+        row.update(self._question_quality_metrics(row, request_text=request_text))
+        return row
 
     def _question_text_is_low_value(self, question: str) -> bool:
         lowered = question.lower()
@@ -5703,25 +5517,43 @@ class OllamaCodeAgent:
         if re.search(r"\b(?:throughput|performance|perf|latency|speed|token|benchmark)\b", lowered):
             return [
                 {
-                    "question": "Which outcome should dominate this pass: lower wall-clock latency, fewer tool/model tokens, higher benchmark pass rate, or safer first-use UX?",
-                    "why_it_matters": "That choice changes whether the edit targets controller policy, indexing, prompt size, validation, or model selection.",
-                    "recommended_default": "Preserve pass rate first, then reduce wall-clock time and repeated tool/model loops.",
-                    "choices": ["pass rate", "wall-clock latency", "token/tool-call count", "first-use UX"],
+                    "question": "Which single optimization axis should dominate this pass: benchmark pass rate, wall-clock latency, model/tool token cost, or first-use UX?",
+                    "why_it_matters": "That one axis decides whether the next change should favor controller routing, context compaction, validation, or onboarding behavior.",
+                    "recommended_default": "Preserve benchmark pass rate first, then reduce repeated tool/model loops and wall-clock latency.",
+                    "choices": ["benchmark pass rate", "wall-clock latency", "model/tool token cost", "first-use UX"],
+                }
+            ]
+        if re.search(r"\b(?:rewrite|refactor|architecture|design|public api|schema|session|transcript|tool contract|compatib)\b", lowered):
+            return [
+                {
+                    "question": "Which boundary should stay fixed in this pass: CLI surface, session/transcript format, tool contracts, or benchmark comparability?",
+                    "why_it_matters": "That boundary determines how aggressive the internal rewrite can be without breaking existing usage or muddying performance claims.",
+                    "recommended_default": "Keep the CLI surface and session/transcript format stable first, then refactor internals behind those boundaries.",
+                    "choices": ["CLI surface", "session/transcript format", "tool contracts", "benchmark comparability"],
                 }
             ]
         if re.search(r"\b(?:workflow|flow|ux|first use|out of the box|e2e)\b", lowered):
             return [
                 {
-                    "question": "Which workflow or user path should define success for this pass?",
-                    "why_it_matters": "Different paths can require different files, validators, and acceptance checks.",
-                    "recommended_default": "Use the first-use happy path unless local evidence shows a failing test or runtime error.",
-                    "choices": ["first-use path", "failing-test path", "developer workflow", "user-visible runtime path"],
+                    "question": "Which workflow should define success for this pass: first-time local setup, repeat coding loop, benchmark runner, or user-visible runtime path?",
+                    "why_it_matters": "Different paths prioritize different files, validators, and acceptance checks.",
+                    "recommended_default": "Use the first-time local setup path unless local evidence already shows a more urgent failing runtime or test path.",
+                    "choices": ["first-time local setup", "repeat coding loop", "benchmark runner", "user-visible runtime path"],
+                }
+            ]
+        if re.search(r"\b(?:security|auth|permission|secrets?|credentials?)\b", lowered):
+            return [
+                {
+                    "question": "Which risk posture should dominate this pass: fail-closed safety, compatibility with existing workflows, operator convenience, or minimal code churn?",
+                    "why_it_matters": "That choice changes whether the agent should tighten guards, preserve legacy behavior, or optimize for least-invasive edits.",
+                    "recommended_default": "Prefer fail-closed safety unless that would block a currently required and verified workflow.",
+                    "choices": ["fail-closed safety", "compatibility with existing workflows", "operator convenience", "minimal code churn"],
                 }
             ]
         if re.search(r"\b(?:most important|priority|highest impact)\b", lowered):
             return [
                 {
-                    "question": "Which signal should decide what is most important: failing tests, user-visible breakage, performance, security, or developer friction?",
+                    "question": "Which signal should decide what is most important in this pass: failing tests, user-visible breakage, performance, or security?",
                     "why_it_matters": "The priority signal changes what subsystem gets edited first.",
                     "recommended_default": "Prioritize reproducible failures and first-use blockers before cleanup.",
                     "choices": ["failing tests", "user-visible breakage", "performance", "security"],
@@ -5729,10 +5561,10 @@ class OllamaCodeAgent:
             ]
         return [
             {
-                "question": "What outcome should I optimize for in this pass, and what behavior must remain unchanged?",
-                "why_it_matters": "The answer sets the boundary, acceptance check, and risk tolerance for the edit.",
-                "recommended_default": "Make the smallest evidence-backed change that improves the current user-facing failure while preserving tests and public behavior.",
-                "choices": [],
+                "question": "Which aspect should break ties in this pass: scope coverage, acceptance strictness, safety, or speed?",
+                "why_it_matters": "That single tie-breaker sets the boundary, acceptance bar, and risk tolerance for the next edit.",
+                "recommended_default": "Prefer acceptance strictness first, then safety, before expanding scope or chasing speed.",
+                "choices": ["scope coverage", "acceptance strictness", "safety", "speed"],
             }
         ]
 
@@ -5741,37 +5573,28 @@ class OllamaCodeAgent:
         verdict = str(decision.get("verdict", "")).strip().lower()
         if verdict not in {"ask", "proceed"}:
             verdict = "proceed"
+        explicit_clarification = self._request_explicitly_wants_clarification(request_text) if request_text else False
+        risky_clarification = self._request_has_clarification_risk_signal(request_text) if request_text else False
         questions: list[dict[str, Any]] = []
         raw_questions = decision.get("questions")
         if isinstance(raw_questions, list):
             for item in raw_questions:
                 if isinstance(item, str):
-                    question = item.strip()
-                    why = ""
-                    recommended_default = ""
-                    choices: list[str] = []
+                    normalized = self._build_clarifying_question(question=item.strip(), request_text=request_text)
                 elif isinstance(item, dict):
-                    question = str(item.get("question") or item.get("text") or "").strip()
-                    why = self._truncate_text(str(item.get("why_it_matters") or item.get("why") or "").strip(), limit=220)
-                    recommended_default = self._truncate_text(str(item.get("recommended_default") or item.get("default") or "").strip(), limit=220)
                     raw_choices = item.get("choices")
-                    choices = [
-                        self._truncate_text(str(choice).strip(), limit=80)
-                        for choice in raw_choices
-                        if isinstance(raw_choices, list) and str(choice).strip()
-                    ] if isinstance(raw_choices, list) else []
+                    normalized = self._build_clarifying_question(
+                        question=str(item.get("question") or item.get("text") or "").strip(),
+                        why_it_matters=str(item.get("why_it_matters") or item.get("why") or "").strip(),
+                        recommended_default=str(item.get("recommended_default") or item.get("default") or "").strip(),
+                        choices=[str(choice) for choice in raw_choices] if isinstance(raw_choices, list) else [],
+                        request_text=request_text,
+                    )
                 else:
                     continue
-                if not question or self._question_text_is_low_value(question):
+                if normalized is None:
                     continue
-                questions.append(
-                    {
-                        "question": self._truncate_text(question, limit=260),
-                        "why_it_matters": why,
-                        "recommended_default": recommended_default,
-                        "choices": choices[:4],
-                    }
-                )
+                questions.append(normalized)
                 if len(questions) >= QUESTION_PLANNER_MAX_QUESTIONS:
                     break
         raw_ambiguities = decision.get("ambiguities")
@@ -5799,11 +5622,67 @@ class OllamaCodeAgent:
         if (
             not questions
             and request_text
-            and (verdict == "ask" or self._question_planner_reason_indicates_ambiguity(reason))
-            and (self._request_has_clarification_risk_signal(request_text) or self._request_explicitly_wants_clarification(request_text))
+            and (verdict == "ask" or self._question_planner_reason_indicates_ambiguity(reason) or explicit_clarification)
+            and (risky_clarification or explicit_clarification)
         ):
-            questions = self._fallback_clarifying_questions(request_text, reason)[:QUESTION_PLANNER_MAX_QUESTIONS]
+            questions = [
+                normalized
+                for normalized in (
+                    self._build_clarifying_question(
+                        question=str(item.get("question") or ""),
+                        why_it_matters=str(item.get("why_it_matters") or ""),
+                        recommended_default=str(item.get("recommended_default") or ""),
+                        choices=[str(choice) for choice in list(item.get("choices") or [])],
+                        request_text=request_text,
+                    )
+                    for item in self._fallback_clarifying_questions(request_text, reason)[:QUESTION_PLANNER_MAX_QUESTIONS]
+                )
+                if normalized is not None
+            ]
             verdict = "ask"
+        if questions:
+            if (
+                (verdict == "ask" or explicit_clarification)
+                and request_text
+                and not any(bool(item.get("eba_style")) for item in questions)
+                and (risky_clarification or explicit_clarification)
+            ):
+                fallback_questions = [
+                    normalized
+                    for normalized in (
+                        self._build_clarifying_question(
+                            question=str(item.get("question") or ""),
+                            why_it_matters=str(item.get("why_it_matters") or ""),
+                            recommended_default=str(item.get("recommended_default") or ""),
+                            choices=[str(choice) for choice in list(item.get("choices") or [])],
+                            request_text=request_text,
+                        )
+                        for item in self._fallback_clarifying_questions(request_text, reason)[:QUESTION_PLANNER_MAX_QUESTIONS]
+                    )
+                    if normalized is not None
+                ]
+                if fallback_questions:
+                    questions = fallback_questions
+            questions.sort(
+                key=lambda item: (
+                    -int(item.get("quality_score", 0)),
+                    0 if item.get("eba_style") else 1,
+                    0 if 2 <= len(list(item.get("choices") or [])) <= 4 else 1,
+                    len(str(item.get("question") or "")),
+                )
+            )
+            high_value_eba = next(
+                (
+                    item
+                    for item in questions
+                    if bool(item.get("eba_style")) and int(item.get("quality_score", 0)) >= 6
+                ),
+                None,
+            )
+            if high_value_eba is not None:
+                questions = [high_value_eba]
+            else:
+                questions = questions[:QUESTION_PLANNER_MAX_QUESTIONS]
         if verdict == "ask" and not questions:
             verdict = "proceed"
         return {
@@ -5830,7 +5709,7 @@ class OllamaCodeAgent:
                 lines.append(prefix + question)
             choices = item.get("choices") if isinstance(item.get("choices"), list) else []
             if choices:
-                lines.append("Choices: " + " | ".join(str(choice) for choice in choices[:4]))
+                lines.append("Choices (pick one): " + " | ".join(str(choice) for choice in choices[:4]))
             recommended_default = str(item.get("recommended_default", "")).strip()
             if recommended_default:
                 lines.append("Recommended default: " + recommended_default)

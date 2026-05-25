@@ -285,7 +285,7 @@ Use the gated report harness to measure product changes before proposing impleme
 python scripts/nightly_self_improvement_report.py --models gemma4:e4b --strict-accuracy --strict-budget
 ```
 
-The report writes `scratch/nightly-self-improvement/<timestamp>/report.json` with pass/fail deltas, token totals, tool latency, slowest tools, and suggested implementation targets. It does not edit, merge, push, or run a background worker.
+The report writes `scratch/nightly-self-improvement/<timestamp>/report.json` with pass/fail deltas, token totals, tool latency, slowest tools, clarification-question quality, local trajectory analysis, dataset-catalog status, and suggested implementation targets. It does not edit, merge, push, or run a background worker.
 
 ### Python SDK Retrieval
 

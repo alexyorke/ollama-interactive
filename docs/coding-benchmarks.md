@@ -105,6 +105,66 @@ python scripts/public_benchmark_eval.py --models granite4.1:8b --modes off --job
 
 Raw JSON stays ignored under `scratch/`. Track only concise summaries when results are worth preserving.
 
+## Live Model Gate
+
+Use `scripts/live_model_gate.py` when you need one release-style artifact that proves the stack hit a real local Ollama model rather than only `FakeClient` or mocked HTTP tests.
+
+Default gate steps:
+
+- `scripts/e2e_suite.py` on explicit live-model scenarios with `--require-llm-for-turn`
+- `scripts/verification_eval.py --strict-on`
+- `scripts/coding_benchmark_eval.py` with `--require-llm-for-agent-benchmarks` on the runtime default feature profile `all`
+
+Frequent local release gate:
+
+```bash
+python scripts/live_model_gate.py --models gemma4:e4b --benchmark-suite local-small --benchmark-jobs 1
+```
+
+Fast proof that skips the longer benchmark step:
+
+```bash
+python scripts/live_model_gate.py --models gemma4:e4b --skip-benchmarks
+```
+
+Artifacts land under:
+
+- `scratch/live-model-gate/live-model-gate-summary.json`
+- `scratch/live-model-gate/coding-benchmark-<model>.json`
+
+The summary JSON records the detected `OLLAMA_HOST`, installed models, resolved models, exact commands, return codes, durations, and command output tails for each gate step.
+
+If you want to A/B a narrower profile such as `trajectory-guards`, pass it explicitly with `--benchmark-feature-profiles trajectory-guards`. Keep that separate from release gating, because the gate should reflect the actual shipped/default runtime profile.
+
+For GitHub Actions, the repository now includes `.github/workflows/live-model-gate.yml`. It is intentionally manual and expects a `self-hosted` runner labeled `ollama`, because the default hosted runners do not provide local Ollama models.
+
+## Clarification Quality
+
+Use `scripts/question_quality_eval.py` to score whether the agent asks high-leverage elimination-by-aspect clarification questions when broad requests are genuinely ambiguous, while still proceeding on focused exact-edit requests.
+
+Run it with:
+
+```bash
+python scripts/question_quality_eval.py
+```
+
+Run the live Ollama-backed clarification scenario with:
+
+```bash
+python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_clarifying_question_eba
+```
+
+Artifacts land under:
+
+- `scratch/question-quality/clarification-question-eval.json`
+- `scratch/question-quality/clarification-question-eval.md`
+
+The synthetic eval uses broad prompts plus pretend human answers to check question quality separately from coding accuracy. It verifies:
+
+- EBA-style question shape: one highest-leverage axis, 2-4 mutually exclusive choices, recommended default
+- question/choice alignment: pretend answers map cleanly to one choice
+- restraint: focused exact-edit requests stay on `proceed` instead of asking unnecessary questions
+
 ## Anti-Cheat Rules
 
 - `coding_accuracy` prompts must not include synthetic marker tokens, exact answer literals, forced tool clauses, or public task-specific answers.

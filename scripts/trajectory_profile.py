@@ -30,6 +30,10 @@ DATASET_SPECS = {
         "paths": ["data/train-*.parquet", "data/tool-*.parquet", "data/xml-*.parquet", "data/ticks-*.parquet"],
         "adapter": "smith",
     },
+    "nvidia-swe-hero-openhands-trajectories": {
+        "paths": ["data/train-*.parquet"],
+        "adapter": "openhands",
+    },
 }
 
 READ_TOOLS = {

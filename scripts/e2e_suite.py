@@ -989,6 +989,30 @@ def scenario_multiturn_repl(repo_root: Path, workspace: Path, model: str) -> Non
     require("tool_call" in event_names(session) and "assistant" in event_names(session), "repl transcript missing expected events", stdout=result.stdout, stderr=result.stderr, session=session)
 
 
+def scenario_clarifying_question_eba(repo_root: Path, workspace: Path, model: str) -> None:
+    session_file = workspace / "scratch" / "clarify-eba.json"
+    result = run_cli(
+        repo_root,
+        workspace,
+        model,
+        (
+            "Before you edit anything, ask me one clarification question first and do not assume. "
+            "Refactor the architecture heavily, but keep the important external surfaces stable."
+        ),
+        session_file=session_file,
+    )
+    session = load_session(session_file)
+    clarification_events = [
+        event for event in session.get("events", []) if isinstance(event, dict) and event.get("type") == "clarification_plan"
+    ]
+    require(result.returncode == 0, "clarifying-question scenario failed", stdout=result.stdout, stderr=result.stderr, session=session)
+    require_llm_used(session, minimum=1, message="clarifying-question scenario did not call the LLM", stdout=result.stdout, stderr=result.stderr)
+    require(any(event.get("verdict") == "ask" for event in clarification_events), "clarification plan did not ask", stdout=result.stdout, stderr=result.stderr, session=session)
+    require("Need one clarification before continuing:" in result.stdout, "final answer did not ask for clarification", stdout=result.stdout, stderr=result.stderr, session=session)
+    require("Choices (pick one):" in result.stdout, "clarification answer omitted explicit choices", stdout=result.stdout, stderr=result.stderr, session=session)
+    require("Recommended default:" in result.stdout, "clarification answer omitted recommended default", stdout=result.stdout, stderr=result.stderr, session=session)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run stricter end-to-end checks against a real Ollama Code model.")
     parser.add_argument("--model", default="gemma4:e4b", help="Model to test.")
@@ -1019,6 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         ("scenario_git_tools", scenario_git_tools),
         ("scenario_continue_session", scenario_continue_session),
         ("scenario_multiturn_repl", scenario_multiturn_repl),
+        ("scenario_clarifying_question_eba", scenario_clarifying_question_eba),
     ]
     if args.scenarios:
         requested = set(args.scenarios)

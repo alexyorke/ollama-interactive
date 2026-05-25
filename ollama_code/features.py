@@ -102,12 +102,52 @@ REPAIR_STRATEGY_SCHEMA: dict[str, Any] = {
     "additionalProperties": True,
 }
 
+QUESTION_PLANNER_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "verdict": {"type": "string", "enum": ["ask", "proceed"]},
+        "reason": {"type": "string"},
+        "ambiguities": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["scope", "intent", "acceptance", "risk", "tradeoff"]},
+                    "detail": {"type": "string"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["kind", "detail"],
+                "additionalProperties": True,
+            },
+        },
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "why_it_matters": {"type": "string"},
+                    "recommended_default": {"type": "string"},
+                    "choices": {"type": "array", "items": {"type": "string"}},
+                    "aspect": {"type": "string"},
+                },
+                "required": ["question"],
+                "additionalProperties": True,
+            },
+        },
+    },
+    "required": ["verdict"],
+    "additionalProperties": True,
+}
+
 
 def response_format_for_purpose(purpose: str, fallback: str | dict[str, Any] | None) -> str | dict[str, Any] | None:
     if not feature_enabled("schema") or fallback != "json":
         return fallback
     if purpose == "primary":
         return PRIMARY_RESPONSE_SCHEMA
+    if purpose == "question_planner":
+        return QUESTION_PLANNER_SCHEMA
     if purpose in {"verification", "final_verifier", "assumption_audit", "artifact_reconciliation", "reconciliation"}:
         return VERDICT_SCHEMA
     if purpose in {"verification_rewrite", "final_rewrite"}:

@@ -377,9 +377,114 @@ class AgentTests(unittest.TestCase):
             result = agent.handle_user("Improve the checkout workflow and fix the most important issue.")
 
         self.assertTrue(result.completed)
-        self.assertIn("Which workflow or user path", result.message)
+        self.assertIn("Which workflow should define success", result.message)
         self.assertIn("Recommended default:", result.message)
         self.assertTrue(any(event.get("type") == "clarification_plan" and event.get("verdict") == "ask" for event in agent.events))
+
+    def test_clarification_planner_uses_schema_and_eba_fallback_for_broad_architecture_request(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "verdict": "ask",
+                        "reason": "The request is broad and asks for a rewrite.",
+                        "ambiguities": [],
+                        "questions": [{"question": "Should I proceed?", "choices": ["yes", "no"]}],
+                    }
+                )
+            ],
+            script_question_planner=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "all"}):
+            result = agent.handle_user("Refactor the architecture heavily, but keep the important external surfaces stable.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Which boundary should stay fixed in this pass", result.message)
+        self.assertIn("Choices (pick one):", result.message)
+        self.assertIn("Recommended default:", result.message)
+        self.assertIsInstance(client.calls[0]["response_format"], dict)
+        self.assertTrue(any(event.get("type") == "clarification_plan" and event.get("verdict") == "ask" for event in agent.events))
+
+    def test_clarification_planner_honors_explicit_question_request_even_when_model_proceeds(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value():\n    return 1\n", encoding="utf-8")
+        client = FakeClient(
+            ['{"verdict":"proceed","reason":"Enough information available.","ambiguities":[],"questions":[]}'],
+            script_question_planner=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "all"}):
+            result = agent.handle_user(
+                "Before you edit anything, ask me one clarification question first and do not assume. "
+                "Refactor the architecture heavily, but keep the important external surfaces stable."
+            )
+
+        self.assertTrue(result.completed)
+        self.assertIn("Need one clarification before continuing:", result.message)
+        self.assertIn("Which boundary should stay fixed in this pass", result.message)
+        self.assertTrue(any(event.get("type") == "clarification_plan" and event.get("verdict") == "ask" for event in agent.events))
+
+    def test_question_planner_normalization_prefers_high_quality_eba_question(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        decision = agent._normalize_question_planner_payload(
+            {
+                "verdict": "ask",
+                "reason": "The request is broad and leaves the rewrite boundary unresolved.",
+                "questions": [
+                    {"question": "Should I proceed?", "why_it_matters": "Need permission first.", "choices": ["yes", "no"]},
+                    {
+                        "question": "Which boundary should stay fixed in this pass: CLI surface, session/transcript format, tool contracts, or benchmark comparability?",
+                        "why_it_matters": "That boundary determines how aggressive the internal rewrite can be.",
+                        "recommended_default": "Keep the CLI surface stable first.",
+                        "choices": ["CLI surface", "session/transcript format", "tool contracts", "benchmark comparability"],
+                    },
+                ],
+            },
+            request_text="Refactor the architecture heavily, but keep the important external surfaces stable.",
+        )
+
+        self.assertEqual(decision["verdict"], "ask")
+        self.assertEqual(len(decision["questions"]), 1)
+        question = decision["questions"][0]
+        self.assertTrue(question["eba_style"])
+        self.assertGreaterEqual(question["quality_score"], 6)
+        self.assertIn("Which boundary should stay fixed", question["question"])
+        self.assertEqual(question["choices"], ["CLI surface", "session/transcript format", "tool contracts", "benchmark comparability"])
+
+    def test_question_planner_fallback_generates_architecture_boundary_question(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        decision = agent._normalize_question_planner_payload(
+            {
+                "verdict": "proceed",
+                "reason": "The request is broad and leaves the rewrite boundary unspecified.",
+                "questions": [],
+                "ambiguities": [],
+            },
+            request_text="Refactor the architecture heavily, but do not break the surfaces that matter most.",
+        )
+
+        self.assertEqual(decision["verdict"], "ask")
+        self.assertEqual(len(decision["questions"]), 1)
+        question = decision["questions"][0]
+        self.assertIn("Which boundary should stay fixed in this pass", question["question"])
+        self.assertTrue(question["eba_style"])
+        self.assertIn("CLI surface", question["choices"])
+        self.assertIn("tool contracts", question["choices"])
 
     def test_clarification_planner_skips_focused_path_edit(self) -> None:
         root = self._workspace_scratch()

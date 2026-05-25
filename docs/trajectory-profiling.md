@@ -7,8 +7,28 @@ Supported local datasets under ignored `scratch/external/datasets/`:
 - `nebius-swe-agent-trajectories`
 - `nebius-swe-rebench-openhands-trajectories`
 - `swe-smith-trajectories`
+- `nvidia-swe-hero-openhands-trajectories`
 
 `SWE-chat` is intentionally not assumed to be present because the Hugging Face dataset is gated.
+
+## Dataset Catalog
+
+Use the catalog script to keep track of local trajectory corpora, public high-value candidates, and gated datasets that may still matter for future analysis:
+
+```bash
+python scripts/trajectory_dataset_catalog.py
+```
+
+It writes:
+
+- `scratch/external/datasets/trajectory-dataset-catalog.json`
+
+The catalog probes:
+
+- local availability under `scratch/external/datasets/`
+- Hugging Face dataset metadata such as gated/public status and file previews
+- a small remote schema/row preview for public datasets when available
+- high-priority public candidates that are not yet downloaded locally
 
 ## Usage
 
@@ -136,6 +156,40 @@ Mapped shell prevention:
 - `unrecognized_argument`: keep family-specific argv allowlists for common validators and test runners.
 - `permission_denied`: fail closed instead of retrying or changing permissions automatically.
 - common observed mistake: Python code pasted directly into bash (`def ...`, `print(module.attr)`) is caught by `bash -n`; the model should use `python -c`, `run_function_probe`, or `run_test` instead.
+
+## Message-Level Evidence Report
+
+`scripts/trajectory_evidence_report.py` scans every raw message in the locally downloaded trajectory datasets, not only extracted tool events. It produces:
+
+- raw JSON with per-dataset message counts, message-theme counts, error-theme counts, row-pattern counts, and example citations
+- a Markdown report that maps evidence themes back to current Ollama Interactive fix coverage and remaining gaps
+
+Use it when you need a sale-grade evidence chain for claims such as:
+
+- where tokens are wasted in real coding sessions
+- which failure classes dominate across datasets
+- which fixes are already implemented, partially implemented, or still missing in the current product
+
+Run it over the full local corpora:
+
+```bash
+python scripts/trajectory_evidence_report.py
+```
+
+Sample only a bounded subset while iterating on the report:
+
+```bash
+python scripts/trajectory_evidence_report.py --max-rows 500
+```
+
+Default outputs:
+
+- `scratch/external/datasets/trajectory-evidence-report.json`
+- `scratch/external/datasets/trajectory-evidence-report.md`
+
+The report intentionally keeps example citations short and references them by dataset, row id, and message index so findings can be traced back to the original local corpus without copying large raw transcripts into version control.
+
+When `--max-rows` is set, the citation layer is sampled from that bounded slice only. If the default reference JSONs are present, the report also merges full-corpus trajectory/error aggregates so you can cite portfolio-scale counts without rescanning every raw message on each iteration.
 
 Validation after implementing the generic guards:
 

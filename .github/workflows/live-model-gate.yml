@@ -1,0 +1,56 @@
+name: Live Model Gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      models:
+        description: "Space-separated local Ollama models"
+        required: false
+        default: "gemma4:e4b granite4.1:8b qwen3:8b"
+      benchmark_suite:
+        description: "Benchmark suite"
+        required: false
+        default: "local-small"
+      benchmark_jobs:
+        description: "Parallel benchmark jobs"
+        required: false
+        default: "1"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
+
+jobs:
+  live-model-gate:
+    name: Live Model Gate
+    runs-on:
+      - self-hosted
+      - ollama
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Run live-model gate
+        shell: pwsh
+        run: |
+          $models = "${{ github.event.inputs.models }}".Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+          python scripts/live_model_gate.py --models $models --benchmark-suite "${{ github.event.inputs.benchmark_suite }}" --benchmark-jobs "${{ github.event.inputs.benchmark_jobs }}"
+
+      - name: Upload live-model artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: live-model-gate
+          path: scratch/live-model-gate/*
+          if-no-files-found: warn
