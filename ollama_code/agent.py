@@ -7703,6 +7703,25 @@ class OllamaCodeAgent:
                                 satisfied_tool_names=satisfied_tool_names,
                                 tool_calls_this_turn=tool_calls_this_turn,
                             )
+                        elif self.tools.default_test_command:
+                            self._record_event(
+                                "auto_validation",
+                                name="run_test",
+                                arguments={"command": self.tools.default_test_command},
+                                reason="fallback to configured test command after empty targeted selection",
+                                mutation_version=mutation_version,
+                                rounds=round_number,
+                            )
+                            validation_name = "run_test"
+                            validation_result = self._execute_controller_tool(
+                                name="run_test",
+                                arguments={"command": self.tools.default_test_command},
+                                request_text=text,
+                                round_number=round_number,
+                                successful_tool_results=successful_tool_results,
+                                satisfied_tool_names=satisfied_tool_names,
+                                tool_calls_this_turn=tool_calls_this_turn,
+                            )
                     if validation_result.get("ok") is True:
                         last_successful_validation_version = mutation_version
                         if validation_name == "run_test":
@@ -8908,6 +8927,25 @@ class OllamaCodeAgent:
                             satisfied_tool_names=satisfied_tool_names,
                             tool_calls_this_turn=tool_calls_this_turn,
                         )
+                    elif self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+                        self._record_event(
+                            "auto_validation",
+                            name="run_test",
+                            arguments={"command": self.tools.default_test_command},
+                            reason="final-chance fallback to configured test command after empty targeted selection",
+                            mutation_version=mutation_version,
+                            rounds=self.max_tool_rounds,
+                        )
+                        validation_name = "run_test"
+                        validation_result = self._execute_controller_tool(
+                            name="run_test",
+                            arguments={"command": self.tools.default_test_command},
+                            request_text=text,
+                            round_number=self.max_tool_rounds,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
                 if (
                     validation_name == "lint_typecheck"
                     and validation_result.get("ok") is True
@@ -8974,6 +9012,25 @@ class OllamaCodeAgent:
                         validation_result = self._execute_controller_tool(
                             name="run_test",
                             arguments={"command": targeted_command},
+                            request_text=text,
+                            round_number=self.max_tool_rounds,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                    elif self.tools.default_test_command:
+                        self._record_event(
+                            "auto_validation",
+                            name="run_test",
+                            arguments={"command": self.tools.default_test_command},
+                            reason="final-chance fallback to configured test command after empty targeted selection",
+                            mutation_version=mutation_version,
+                            rounds=self.max_tool_rounds,
+                        )
+                        validation_name = "run_test"
+                        validation_result = self._execute_controller_tool(
+                            name="run_test",
+                            arguments={"command": self.tools.default_test_command},
                             request_text=text,
                             round_number=self.max_tool_rounds,
                             successful_tool_results=successful_tool_results,

@@ -111,6 +111,19 @@ class CountingToolExecutor(ToolExecutor):
         return super().execute(name, arguments)
 
 
+class EmptySelectTestsToolExecutor(CountingToolExecutor):
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
+        if name == "select_tests":
+            return {
+                "ok": True,
+                "tool": "select_tests",
+                "summary": "No targeted tests found.",
+                "test_commands": [],
+            }
+        return ToolExecutor.execute(self, name, arguments)
+
+
 class AgentTests(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -3723,6 +3736,30 @@ class AgentTests(unittest.TestCase):
         run_tests = [event for event in tool_events if event.get("name") == "run_test"]
         self.assertTrue(run_tests)
         self.assertIn("test_pricing.py", str(run_tests[-1].get("arguments", {}).get("command", "")))
+
+    def test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value():\n    return 0\n", encoding="utf-8")
+        pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return 0","new":"return 1"}}',
+            ]
+        )
+        tools = EmptySelectTestsToolExecutor(root, approval_mode="auto", test_command=pass_command)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Ran validation after the latest edit: passed.")
+        self.assertEqual(tools.execute_counts.get("select_tests"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertTrue(run_tests)
+        self.assertEqual(run_tests[-1].get("arguments", {}).get("command"), pass_command)
 
     def test_agent_requires_edits_to_explicitly_named_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
