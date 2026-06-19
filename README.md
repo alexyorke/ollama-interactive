@@ -285,7 +285,15 @@ Use the gated report harness to measure product changes before proposing impleme
 python scripts/nightly_self_improvement_report.py --models gemma4:e4b --strict-accuracy --strict-budget
 ```
 
-The report writes `scratch/nightly-self-improvement/<timestamp>/report.json` with pass/fail deltas, token totals, tool latency, slowest tools, clarification-question quality, local trajectory analysis, dataset-catalog status, and suggested implementation targets. It does not edit, merge, push, or run a background worker.
+For a cheap local baseline that skips model-driven evals but still records tool speed, SDK retrieval, question quality, dataset-catalog status, and compare-path behavior:
+
+```bash
+python scripts/nightly_self_improvement_report.py --skip-llm --generated-files 100 --strict-accuracy
+```
+
+The report writes `scratch/nightly-self-improvement/<timestamp>/report.json` with pass/fail deltas, token totals, tool latency, slowest tools, clarification-question quality, local trajectory analysis, dataset-catalog status, and suggested implementation targets. When `--compare` is omitted it auto-selects the latest prior report from either `scratch/nightly-self-improvement/` or the legacy `.ollama-code/self-improvement-runs/` location. It also records `runtime.llm_skip_reason` and `runtime.trajectory_skip_reason` so skipped sections are explicit in the JSON.
+
+Trajectory profile, error, and evidence commands only run when local datasets exist under `scratch/external/datasets/` (or a custom `--trajectory-data-root`). The harness does not edit, merge, push, or run a background worker.
 
 ### Python SDK Retrieval
 

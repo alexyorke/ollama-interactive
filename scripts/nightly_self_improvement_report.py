@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -277,19 +278,55 @@ def _available_trajectory_datasets(data_root: Path) -> list[str]:
     return available
 
 
+def _run_dir_timestamp(path: Path) -> str | None:
+    name = path.name.strip()
+    if not re.fullmatch(r"\d{8}T\d{6}Z", name):
+        legacy = re.fullmatch(r"(?P<day>\d{8})-(?P<clock>\d{6})", name)
+        if legacy is None:
+            return None
+        return f"{legacy.group('day')}T{legacy.group('clock')}Z"
+    return name
+
+
+def _report_roots(repo_root: Path) -> tuple[Path, ...]:
+    return (
+        repo_root / "scratch" / "nightly-self-improvement",
+        repo_root / ".ollama-code" / "self-improvement-runs",
+    )
+
+
 def _default_compare_path(repo_root: Path, current_run_dir: Path) -> Path | None:
-    root = repo_root / "scratch" / "nightly-self-improvement"
-    if not root.exists():
-        return None
-    candidates: list[Path] = []
-    for path in root.glob("*/report.json"):
-        if current_run_dir in path.parents:
+    timestamped: list[tuple[str, Path]] = []
+    fallback: list[tuple[float, Path]] = []
+    current_timestamp = _run_dir_timestamp(current_run_dir)
+    for root in _report_roots(repo_root):
+        if not root.exists():
             continue
-        candidates.append(path)
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item.parent.name, str(item)), reverse=True)
-    return candidates[0]
+        for path in root.glob("*/report.json"):
+            if current_run_dir in path.parents:
+                continue
+            run_dir = path.parent
+            run_timestamp = _run_dir_timestamp(run_dir)
+            if run_timestamp is not None:
+                timestamped.append((run_timestamp, path))
+                continue
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            fallback.append((mtime, path))
+    if timestamped:
+        if current_timestamp is not None:
+            prior = [item for item in timestamped if item[0] < current_timestamp]
+            if prior:
+                prior.sort(key=lambda item: item[0], reverse=True)
+                return prior[0][1]
+        timestamped.sort(key=lambda item: item[0], reverse=True)
+        return timestamped[0][1]
+    if fallback:
+        fallback.sort(key=lambda item: item[0], reverse=True)
+        return fallback[0][1]
+    return None
 
 
 def _normalize_ollama_host(host: str) -> str:
@@ -398,8 +435,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     available_trajectory_datasets = _available_trajectory_datasets(args.trajectory_data_root)
     resolved_ollama_host = None if args.skip_llm else _resolve_ollama_host()
     llm_skip_reason = ""
-    if not args.skip_llm and not resolved_ollama_host:
+    trajectory_skip_reason = ""
+    if args.skip_llm:
+        llm_skip_reason = "LLM commands were skipped because --skip-llm was requested."
+    elif not resolved_ollama_host:
         llm_skip_reason = "No reachable Ollama host found; skipped token-efficiency and coding-benchmark commands."
+    if args.skip_trajectories:
+        trajectory_skip_reason = "Trajectory commands were skipped because --skip-trajectories was requested."
+    elif not available_trajectory_datasets:
+        trajectory_skip_reason = f"No local trajectory datasets found under {args.trajectory_data_root}; skipped trajectory profile, error, and evidence commands."
 
     commands: list[dict[str, Any]] = []
     py = sys.executable
@@ -678,6 +722,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "runtime": {
             "resolved_ollama_host": resolved_ollama_host,
             "llm_skip_reason": llm_skip_reason,
+            "trajectory_skip_reason": trajectory_skip_reason,
         },
         "compare_path": str(compare_path) if compare_path else None,
         "run_dir": str(run_dir),

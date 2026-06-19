@@ -112,7 +112,7 @@ Local-small Gemma 4B coding benchmark, comparing the pre-pass local profile (`sc
 | `multi_turn_session_task` | pass -> pass | 9,812 -> 8,793 | -10.4% |
 | Common passing median | pass -> pass | 2,266.5 -> 1,953.5 | -13.8% |
 
-Overall local-small accuracy improved from `6/8` to `7/8`. The remaining `multi_file_refactor` failure is model-quality instability; it passed in one intermediate run at 7,554 tokens and failed in the final full run after extra attempts.
+Overall local-small accuracy improved from `6/8` to `7/8` in that historical snapshot. That older `multi_file_refactor` failure is no longer the current baseline: on June 19, 2026, targeted reruns with `gemma4:e4b`, debate off, reconcile auto, and feature profile `all` passed `multi_file_refactor` three consecutive times in `scratch/coding-benchmark/multi_file_refactor-baseline-vs-all.json`, `scratch/coding-benchmark/multi_file_refactor-all-run2.json`, and `scratch/coding-benchmark/multi_file_refactor-all-run3.json`.
 
 ## Second-Pass Direct Routing
 
