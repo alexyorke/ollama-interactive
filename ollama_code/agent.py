@@ -1962,6 +1962,19 @@ class OllamaCodeAgent:
                 break
         return list(reversed(paths))
 
+    def _recent_identifier_search_query(self, successful_tool_results: list[dict[str, Any]]) -> str | None:
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "search":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            query = str(arguments.get("query") or "").strip()
+            if re.fullmatch(r"[A-Za-z_][\w.]*", query):
+                return query
+        return None
+
     def _stub_targets_for_paths(self, paths: list[str]) -> list[str]:
         targets = [{"path": path} for path in paths]
         return self._remaining_stub_targets(targets)
@@ -3222,6 +3235,7 @@ class OllamaCodeAgent:
         lowered = text.lower()
         mutation_required = self._request_requires_mutation(text)
         path = self._requested_git_tool_path(text)
+        implementation_target_spec = self._requested_find_implementation_target_spec(text)
         wants_validator_listing = bool(
             re.search(
                 r"\bdiscover_validators\b|\b(?:discover|show|list|find)\s+(?:the\s+)?(?:test|lint|validation|validator)s?\s+(?:commands?|tools?)\b",
@@ -3234,6 +3248,8 @@ class OllamaCodeAgent:
             and "test" in lowered
             and any(term in lowered for term in ["validation", "validator", "lint"])
         )
+        if not mutation_required and implementation_target_spec and "find_implementation_target" not in forbidden_tool_names:
+            return MechanicalToolSpec("find_implementation_target", implementation_target_spec)
         if (
             not mutation_required
             and "git_status" not in forbidden_tool_names
@@ -3307,6 +3323,23 @@ class OllamaCodeAgent:
             match = re.search(pattern, text, flags=re.IGNORECASE)
             if match:
                 return match.group("path").strip().rstrip(".,;:")
+        return None
+
+    def _requested_find_implementation_target_spec(self, text: str) -> dict[str, Any] | None:
+        path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
+        patterns = [
+            rf"\bfind_implementation_target\b.*?\b(?:for|on|path|test_path)\s+(?P<path>{path_pattern})",
+            rf"\b(?:identify|find|show)\s+(?:the\s+)?(?:relevant\s+|likely\s+)?implementation\s+(?:target|file|path)(?:s)?\s+(?:for|from)\s+(?P<path>{path_pattern})",
+            rf"\bwhich\s+implementation\s+(?:file|path)\s+(?:corresponds\s+to|matches|goes\s+with|for)\s+(?P<path>{path_pattern})",
+            rf"\bwhat\s+is\s+the\s+(?:relevant\s+|likely\s+)?implementation\s+(?:file|path)\s+for\s+(?P<path>{path_pattern})",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            path = match.group("path").strip().rstrip(".,;:")
+            if path:
+                return {"test_path": path}
         return None
 
     def _requested_search_symbols_spec(self, text: str) -> dict[str, Any] | None:
@@ -3865,17 +3898,29 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]],
         forbidden_tool_names: set[str],
     ) -> tuple[str, dict[str, Any]] | None:
+        source_paths = self._recent_source_paths(successful_tool_results)
+        test_paths = self._recent_test_paths(successful_tool_results)
         if "find_implementation_target" not in forbidden_tool_names and not self._has_successful_tool_named(successful_tool_results, "find_implementation_target"):
-            source_paths = self._recent_source_paths(successful_tool_results)
-            test_paths = self._recent_test_paths(successful_tool_results)
             if test_paths and not source_paths:
                 return "find_implementation_target", {"test_path": test_paths[-1], "limit": 6}
+        if source_paths:
+            latest_source_path = source_paths[-1]
+            recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
+            if (
+                recent_identifier_query
+                and "search_symbols" not in forbidden_tool_names
+                and not self._has_successful_tool_named(successful_tool_results, "search_symbols")
+            ):
+                return "search_symbols", {"query": recent_identifier_query, "path": latest_source_path}
+            if "code_outline" not in forbidden_tool_names and not self._has_successful_tool_named(successful_tool_results, "code_outline"):
+                return "code_outline", {"path": latest_source_path}
         return None
 
     def _context_planner_probe_retry_message(
         self,
         *,
         probe_name: str,
+        probe_arguments: dict[str, Any],
         probe_result: dict[str, Any],
         mutation_required: bool,
         code_mutation_required: bool,
@@ -3901,6 +3946,25 @@ class OllamaCodeAgent:
                             next_step += ", then run_test"
                         return f"Use the grounded implementation target(s) {target_list}. {next_step}. Next JSON only."
                     return f"Use the grounded implementation target(s) {target_list}. Continue from that narrower target or answer from current evidence. Next JSON only."
+        if probe_name == "search_symbols":
+            query = str(probe_arguments.get("query") or "").strip()
+            path = str(probe_result.get("path") or probe_arguments.get("path") or "").strip()
+            if query and path:
+                if mutation_required or code_mutation_required:
+                    next_step = f"Use the symbol-level matches for {query} in {path}. Read or edit the exact implementation symbol now"
+                    if test_run_required:
+                        next_step += ", then run_test"
+                    return next_step + ". Next JSON only."
+                return f"Use the symbol-level matches for {query} in {path}. Continue from that narrower symbol target or answer from current evidence. Next JSON only."
+        if probe_name == "code_outline":
+            path = str(probe_result.get("path") or probe_arguments.get("path") or "").strip()
+            if path:
+                if mutation_required or code_mutation_required:
+                    next_step = f"Use the code outline for {path}. Read or edit the exact implementation symbol now"
+                    if test_run_required:
+                        next_step += ", then run_test"
+                    return next_step + ". Next JSON only."
+                return f"Use the code outline for {path}. Continue with a narrower symbol-level read or answer from current evidence. Next JSON only."
         return self._context_guard_retry_message(
             mutation_required=mutation_required,
             code_mutation_required=code_mutation_required,
@@ -4258,6 +4322,27 @@ class OllamaCodeAgent:
             return False
         if name not in MUTATING_TOOL_NAMES:
             return False
+        if not self._mutation_has_explicit_path_target(arguments):
+            if latest_run_test_failed:
+                has_contextual_grounding = any(
+                    str(item.get("name", "")).strip() in GROUNDING_EVIDENCE_TOOL_NAMES for item in successful_tool_results
+                )
+                if not has_contextual_grounding:
+                    return not self._direct_file_creation_allowed(request_text, name, arguments)
+            else:
+                pathless_probe = self._pathless_mutation_grounding_probe(
+                    name=name,
+                    arguments=arguments,
+                    successful_tool_results=successful_tool_results,
+                )
+                if pathless_probe is None:
+                    return not self._direct_file_creation_allowed(request_text, name, arguments)
+                if not self._pathless_mutation_is_grounded(
+                    name=name,
+                    arguments=arguments,
+                    successful_tool_results=successful_tool_results,
+                ):
+                    return not self._direct_file_creation_allowed(request_text, name, arguments)
         if self._has_grounding_evidence(successful_tool_results=successful_tool_results, latest_run_test_failed=latest_run_test_failed):
             return False
         return not self._direct_file_creation_allowed(request_text, name, arguments)
@@ -4266,6 +4351,94 @@ class OllamaCodeAgent:
         if re.search(r"\b(?:traceback|failed|failing|pytest|unittest|test)\b", request_text, flags=re.IGNORECASE):
             return "Need current-turn evidence before mutation. Call find_implementation_target or diagnose_test_failure, then edit the grounded source. Next JSON only."
         return "Need current-turn evidence before mutation. Read the target file/symbol or call context_pack/repo_index_search first. Next JSON only."
+
+    def _mutation_has_explicit_path_target(self, arguments: dict[str, Any]) -> bool:
+        return any(str(arguments.get(key) or "").strip() for key in ("path", "file", "filename"))
+
+    def _mutation_requested_symbol_name(self, *, name: str, arguments: dict[str, Any]) -> str:
+        raw_symbol = ""
+        if name == "replace_symbol":
+            raw_symbol = str(arguments.get("symbol") or "").strip()
+        elif name == "edit_intent":
+            intent = str(arguments.get("intent") or "").strip().lower()
+            if intent in {"replace_symbol", "replace_body", "replace_signature"}:
+                raw_symbol = str(arguments.get("target") or arguments.get("symbol") or "").strip()
+        elif name == "replace_symbols":
+            replacements = arguments.get("replacements")
+            if isinstance(replacements, list) and len(replacements) == 1 and isinstance(replacements[0], dict):
+                raw_symbol = str(replacements[0].get("symbol") or replacements[0].get("target") or "").strip()
+        if raw_symbol and re.fullmatch(r"[A-Za-z_][\w.]*", raw_symbol):
+            return raw_symbol
+        return ""
+
+    def _parse_search_symbols_matches(self, output: str) -> list[tuple[str, str]]:
+        matches: list[tuple[str, str]] = []
+        for raw_line in output.splitlines():
+            line = raw_line.strip()
+            if not line or line == "(no symbols found)":
+                continue
+            match = re.match(r"^(?P<path>.+?):\d+-\d+\s+\w+\s+(?P<qualname>[A-Za-z_][\w.]*)\b", line)
+            if not match:
+                continue
+            path = match.group("path").strip().replace("\\", "/").lstrip("./")
+            qualname = match.group("qualname").strip()
+            if path and qualname:
+                matches.append((path, qualname))
+        return matches
+
+    def _successful_symbol_search_match(
+        self,
+        *,
+        query: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> tuple[str, str] | None:
+        normalized_query = str(query or "").strip().lower()
+        if not normalized_query:
+            return None
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "search_symbols":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if str(arguments_dict.get("query") or "").strip().lower() != normalized_query:
+                continue
+            exact_matches: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            for path, qualname in self._parse_search_symbols_matches(str(result.get("output") or "")):
+                leaf_name = qualname.rsplit(".", 1)[-1].lower()
+                if normalized_query not in {leaf_name, qualname.lower()}:
+                    continue
+                candidate = (path, qualname)
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                exact_matches.append(candidate)
+            if len(exact_matches) == 1:
+                return exact_matches[0]
+            return None
+        return None
+
+    def _has_successful_symbol_search_query(
+        self,
+        *,
+        query: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        normalized_query = str(query or "").strip().lower()
+        if not normalized_query:
+            return False
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "search_symbols":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if str(arguments_dict.get("query") or "").strip().lower() == normalized_query:
+                return True
+        return False
 
     def _mutation_symbol_grounding_target(self, *, name: str, arguments: dict[str, Any]) -> tuple[str, str] | None:
         raw_path = str(arguments.get("path") or arguments.get("file") or arguments.get("filename") or "").strip().replace("\\", "/").lstrip("./")
@@ -4280,20 +4453,77 @@ class OllamaCodeAgent:
         rel_path = self.tools.relative_label(resolved)
         if not self._path_looks_like_code_file(rel_path):
             return None
-        raw_symbol = ""
-        if name == "replace_symbol":
-            raw_symbol = str(arguments.get("symbol") or "").strip()
-        elif name == "edit_intent":
-            intent = str(arguments.get("intent") or "").strip().lower()
-            if intent in {"replace_symbol", "replace_body", "replace_signature"}:
-                raw_symbol = str(arguments.get("target") or arguments.get("symbol") or "").strip()
-        elif name == "replace_symbols":
-            replacements = arguments.get("replacements")
-            if isinstance(replacements, list) and len(replacements) == 1 and isinstance(replacements[0], dict):
-                raw_symbol = str(replacements[0].get("symbol") or replacements[0].get("target") or "").strip()
-        if not raw_symbol or not re.fullmatch(r"[A-Za-z_][\w.]*", raw_symbol):
+        raw_symbol = self._mutation_requested_symbol_name(name=name, arguments=arguments)
+        if not raw_symbol:
             return None
         return rel_path, raw_symbol
+
+    def _pathless_mutation_grounding_probe(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any]] | None:
+        if self._mutation_has_explicit_path_target(arguments):
+            return None
+        source_paths = self._recent_source_paths(successful_tool_results)
+        bridge = self._test_to_source_bridge(successful_tool_results)
+        candidate_source = bridge[1] if bridge is not None else (source_paths[-1] if source_paths else "")
+        symbol_name = self._mutation_requested_symbol_name(name=name, arguments=arguments)
+        if not candidate_source:
+            if not symbol_name:
+                return None
+            search_match = self._successful_symbol_search_match(
+                query=symbol_name,
+                successful_tool_results=successful_tool_results,
+            )
+            if search_match is not None:
+                search_path, matched_symbol = search_match
+                return "read_symbol", {"path": search_path, "symbol": matched_symbol, "include_context": 0}
+            if not self._has_successful_symbol_search_query(
+                query=symbol_name,
+                successful_tool_results=successful_tool_results,
+            ):
+                return "search_symbols", {"query": symbol_name, "path": "."}
+            return None
+        if symbol_name:
+            return "read_symbol", {"path": candidate_source, "symbol": symbol_name, "include_context": 0}
+        return "read_file", {"path": candidate_source}
+
+    def _pathless_mutation_is_grounded(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        probe = self._pathless_mutation_grounding_probe(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results,
+        )
+        if probe is None:
+            return False
+        expected_name, expected_arguments = probe
+        expected_path = str(expected_arguments.get("path") or "").strip().replace("\\", "/")
+        expected_symbol = str(expected_arguments.get("symbol") or "").strip()
+        for item in reversed(successful_tool_results):
+            if item.get("name") != expected_name:
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            result_path = str(result.get("path") or arguments_dict.get("path") or "").strip().replace("\\", "/")
+            if expected_path and result_path != expected_path:
+                continue
+            if expected_name == "read_symbol":
+                result_symbol = str(result.get("symbol") or arguments_dict.get("symbol") or "").strip()
+                if expected_symbol and result_symbol != expected_symbol:
+                    continue
+            return True
+        return False
 
     def _trajectory_grounding_probe(
         self,
@@ -4303,11 +4533,32 @@ class OllamaCodeAgent:
         arguments: dict[str, Any],
         required_mutation_paths: set[str],
         forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        latest_run_test_failed: bool,
+        latest_run_test_failure_output: str,
     ) -> tuple[str, dict[str, Any]] | None:
         symbol_target = self._mutation_symbol_grounding_target(name=name, arguments=arguments)
         if symbol_target is not None and "read_symbol" not in forbidden_tool_names:
             symbol_path, symbol_name = symbol_target
             return "read_symbol", {"path": symbol_path, "symbol": symbol_name, "include_context": 0}
+        if not latest_run_test_failed:
+            pathless_probe = self._pathless_mutation_grounding_probe(
+                name=name,
+                arguments=arguments,
+                successful_tool_results=successful_tool_results,
+            )
+            if pathless_probe is not None:
+                probe_name, probe_arguments = pathless_probe
+                if probe_name not in forbidden_tool_names:
+                    return probe_name, probe_arguments
+        if latest_run_test_failed:
+            failed_output = latest_run_test_failure_output.strip()
+            if failed_output:
+                failed_test_path, _failed_source_path = self._failed_test_output_paths_from_text(failed_output)
+                if failed_test_path and "find_implementation_target" not in forbidden_tool_names:
+                    return "find_implementation_target", {"test_path": failed_test_path, "output": failed_output, "limit": 6}
+                if "diagnose_test_failure" not in forbidden_tool_names:
+                    return "diagnose_test_failure", {"output": failed_output, "limit": 6}
         candidate_paths: list[str] = []
         seen_paths: set[str] = set()
         for raw in (
@@ -4347,6 +4598,7 @@ class OllamaCodeAgent:
         *,
         request_text: str,
         probe_name: str,
+        probe_arguments: dict[str, Any],
         probe_result: dict[str, Any],
         required_mutation_paths: set[str],
         mutated_paths_this_turn: set[str],
@@ -4363,6 +4615,47 @@ class OllamaCodeAgent:
         grounded_symbol = str(probe_result.get("symbol") or "").strip()
         if probe_name == "read_symbol" and grounded_path and grounded_symbol:
             next_step = f"Use the grounded symbol {grounded_symbol} in {grounded_path} to make the edit now"
+            if test_run_required:
+                next_step += ", then run_test"
+            return next_step + ". Next JSON only."
+        if probe_name == "search_symbols":
+            query = str(probe_arguments.get("query") or "").strip()
+            exact_matches = self._parse_search_symbols_matches(str(probe_result.get("output") or ""))
+            unique_exact_match = self._successful_symbol_search_match(
+                query=query,
+                successful_tool_results=[
+                    {
+                        "name": probe_name,
+                        "arguments": probe_arguments,
+                        "result": probe_result,
+                    }
+                ],
+            )
+            if unique_exact_match is not None:
+                match_path, match_symbol = unique_exact_match
+                return (
+                    f"Search found a unique symbol match for {match_symbol} in {match_path}. "
+                    "Read that exact symbol now before editing. Next JSON only."
+                )
+            if query and exact_matches:
+                return f"Use the symbol-level matches for {query}. Read the exact implementation symbol now before editing. Next JSON only."
+            if query:
+                return f"Search did not ground a unique symbol for {query}. Name the target path or read the exact implementation symbol before editing. Next JSON only."
+        if probe_name == "diagnose_test_failure":
+            targets = probe_result.get("targets")
+            if isinstance(targets, list):
+                grounded_targets = [
+                    str(item.get("path") or "").strip()
+                    for item in targets
+                    if isinstance(item, dict) and str(item.get("path") or "").strip()
+                ]
+                if grounded_targets:
+                    target_list = ", ".join(grounded_targets[:3])
+                    next_step = f"Use the diagnosis above to edit {target_list}"
+                    if test_run_required:
+                        next_step += ", then run_test"
+                    return next_step + ". Next JSON only."
+            next_step = "Use the diagnosis above to edit implementation"
             if test_run_required:
                 next_step += ", then run_test"
             return next_step + ". Next JSON only."
@@ -4609,6 +4902,25 @@ class OllamaCodeAgent:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
 
+    def _discover_validators_test_command(self, validation_result: dict[str, Any]) -> str | None:
+        configured = str(self.tools.default_test_command or "").strip()
+        if configured:
+            return configured
+        validators = validation_result.get("validators")
+        if not isinstance(validators, list):
+            return None
+        for item in validators:
+            if not isinstance(item, dict):
+                continue
+            if item.get("available") is not True:
+                continue
+            if str(item.get("kind") or "").strip().lower() != "test":
+                continue
+            command = str(item.get("command") or "").strip()
+            if command:
+                return command
+        return None
+
     def _execute_auto_validation_plan(
         self,
         *,
@@ -4680,6 +4992,28 @@ class OllamaCodeAgent:
                 )
                 validation_name = "run_test"
                 validation_arguments = {"command": self.tools.default_test_command}
+                validation_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+        if validation_name == "discover_validators" and validation_result.get("ok") is True and "run_test" not in forbidden_tool_names:
+            discovered_test_command = self._discover_validators_test_command(validation_result)
+            if discovered_test_command:
+                self._record_event(
+                    "auto_validation",
+                    name="run_test",
+                    arguments={"command": discovered_test_command},
+                    reason=f"{reason_prefix}test command selected after validator discovery",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "run_test"
+                validation_arguments = {"command": discovered_test_command}
                 validation_result = self._execute_controller_tool(
                     name="run_test",
                     arguments=validation_arguments,
@@ -4811,7 +5145,7 @@ class OllamaCodeAgent:
             return False
         if unresolved_syntax_diagnostics or unresolved_static_diagnostics or unresolved_probe_diagnostics:
             return False
-        return any(Path(path).suffix.lower() in CODE_EDIT_SUFFIXES for path in mutated_paths) or self._request_requires_test_run(request_text)
+        return bool(mutated_paths) or self._request_requires_test_run(request_text)
 
     def _failure_delta_summary(self, previous: str, current: str) -> str:
         previous_lines = {line.strip() for line in previous.splitlines() if line.strip()}
@@ -5016,6 +5350,39 @@ class OllamaCodeAgent:
                     except (OSError, ValueError):
                         label = raw_path.replace("\\", "/")
                     return f"{label} contains the match."
+            output = str(result.get("output") or result.get("summary") or "").strip()
+            if output and mechanical_tool_name == name:
+                return self._truncate_text(output, limit=2600)
+
+        if name == "find_implementation_target" and result.get("ok") is True:
+            lowered = request_text.lower()
+            targets = result.get("targets") if isinstance(result.get("targets"), list) else []
+            rendered_targets: list[str] = []
+            for item in targets[:3]:
+                if not isinstance(item, dict):
+                    continue
+                path = str(item.get("path") or "").strip()
+                symbol = str(item.get("symbol") or "").strip()
+                if not path:
+                    continue
+                rendered_targets.append(path + (f"::{symbol}" if symbol else ""))
+            asks_for_file = any(
+                phrase in lowered
+                for phrase in [
+                    "implementation file",
+                    "implementation path",
+                    "implementation target",
+                    "relevant implementation",
+                    "likely implementation",
+                ]
+            )
+            if asks_for_file and rendered_targets:
+                first_path = rendered_targets[0].split("::", 1)[0]
+                if "only" in lowered:
+                    return first_path
+                if len(rendered_targets) == 1:
+                    return f"Relevant implementation file: {first_path}."
+                return "Implementation targets: " + ", ".join(rendered_targets) + "."
             output = str(result.get("output") or result.get("summary") or "").strip()
             if output and mechanical_tool_name == name:
                 return self._truncate_text(output, limit=2600)
@@ -8655,6 +9022,7 @@ class OllamaCodeAgent:
                                     "role": "user",
                                     "content": self._context_planner_probe_retry_message(
                                         probe_name=probe_name,
+                                        probe_arguments=probe_arguments,
                                         probe_result=probe_result,
                                         mutation_required=mutation_required,
                                         code_mutation_required=code_mutation_required,
@@ -8734,6 +9102,9 @@ class OllamaCodeAgent:
                         arguments=arguments,
                         required_mutation_paths=required_mutation_paths,
                         forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        latest_run_test_failed=latest_run_test_failed,
+                        latest_run_test_failure_output=latest_run_test_failure_output,
                     )
                     if grounding_probe is not None:
                         probe_name, probe_arguments = grounding_probe
@@ -8753,6 +9124,7 @@ class OllamaCodeAgent:
                                     "content": self._trajectory_ground_probe_retry_message(
                                         request_text=text,
                                         probe_name=probe_name,
+                                        probe_arguments=probe_arguments,
                                         probe_result=probe_result,
                                         required_mutation_paths=required_mutation_paths,
                                         mutated_paths_this_turn=mutated_paths_this_turn,

@@ -80,7 +80,7 @@ ROW_PATTERN_META: dict[str, dict[str, str]] = {
 PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     "mechanical-router": {
         "status": "partial",
-        "summary": "Deterministic routing exists for read/search/symbol/test/git exact paths, including plain-language symbol return reads.",
+        "summary": "Deterministic routing exists for read/search/symbol/test/git exact paths, including plain-language symbol return reads and direct implementation-target requests.",
         "references": [
             "ollama_code/controller/navigation_validation.py",
             "ollama_code/agent.py",
@@ -89,7 +89,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "context-planner": {
         "status": "partial",
-        "summary": "Compact context tools exist, the agent can preload context_pack, and repeated broad test inspection can auto-map tests to implementation targets.",
+        "summary": "Compact context tools exist, the agent can preload context_pack, repeated broad test inspection can auto-map tests to implementation targets, and repeated broad source inspection can auto-switch to search_symbols or code_outline.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
@@ -106,12 +106,12 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "post-edit-validation": {
         "status": "partial",
-        "summary": "After a successful code edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test before extra context gathering or a final answer.",
+        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, and non-code edits can route through discover_validators plus a configured test command before extra context gathering or a final answer.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Non-code mutations and broader validator families still do not all share the same compact post-edit validation policy.",
+        "next_gap": "Repos without a configured or discoverable test command still rely on validator discovery instead of a fully deterministic post-edit follow-up.",
     },
     "failure-compression": {
         "status": "implemented",
@@ -124,12 +124,12 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "ground-before-mutate": {
         "status": "partial",
-        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, and symbol-first navigation is available.",
+        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from recent source or test context, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols before read_symbol.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Requests without an explicit target path or symbol still rely on broader heuristics instead of a fully isolated mutation gate.",
+        "next_gap": "Ambiguous or missing repo-wide symbol matches still need manual disambiguation before pathless mutation can be grounded.",
     },
     "diagnose-test-failure": {
         "status": "implemented",
