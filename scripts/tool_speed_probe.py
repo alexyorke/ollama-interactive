@@ -47,12 +47,22 @@ def _measure(label: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]
     started = time.perf_counter()
     result = action()
     elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
-    return {
+    row = {
         "name": label,
         "elapsed_ms": elapsed_ms,
         "ok": result.get("ok") is True,
         "count": result.get("count") or result.get("files") or len(str(result.get("output", "")).splitlines()),
     }
+    phase_timings = {
+        key: float(result.get(key, 0.0) or 0.0)
+        for key in ("scan_ms", "ruff_ms", "typecheck_ms", "shell_ms")
+        if key in result
+    }
+    if phase_timings:
+        row["phase_timings_ms"] = phase_timings
+    if isinstance(result.get("validator_targets"), list) and result["validator_targets"]:
+        row["validator_targets"] = list(result["validator_targets"])
+    return row
 
 
 def run_probe(generated_files: int) -> dict[str, Any]:

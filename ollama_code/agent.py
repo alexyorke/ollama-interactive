@@ -3029,6 +3029,15 @@ class OllamaCodeAgent:
             return False
         return self._requested_natural_read_file_path(text) is not None
 
+    def _request_asks_symbol_return(self, text: str) -> bool:
+        lowered = text.lower()
+        return bool(
+            re.search(
+                r"\bwhat\s+does\b.*\breturn\b|\breturns?\s+what\b|\btell\s+me\s+what\b.*\breturns?\b|\bsummarize\b.*\breturns?\b|\breturn\s+value\b|\bvalue\s+it\s+returns?\b",
+                lowered,
+            )
+        )
+
     def _extract_uppercase_token_from_output(self, output: str) -> str | None:
         for token in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", output):
             if token in {"OK"}:
@@ -3850,6 +3859,58 @@ class OllamaCodeAgent:
             "find_implementation_target for tests/traceback, edit grounded target, run validation, or answer from current evidence. Next JSON only."
         )
 
+    def _context_planner_probe(
+        self,
+        *,
+        successful_tool_results: list[dict[str, Any]],
+        forbidden_tool_names: set[str],
+    ) -> tuple[str, dict[str, Any]] | None:
+        if "find_implementation_target" not in forbidden_tool_names and not self._has_successful_tool_named(successful_tool_results, "find_implementation_target"):
+            source_paths = self._recent_source_paths(successful_tool_results)
+            test_paths = self._recent_test_paths(successful_tool_results)
+            if test_paths and not source_paths:
+                return "find_implementation_target", {"test_path": test_paths[-1], "limit": 6}
+        return None
+
+    def _context_planner_probe_retry_message(
+        self,
+        *,
+        probe_name: str,
+        probe_result: dict[str, Any],
+        mutation_required: bool,
+        code_mutation_required: bool,
+        test_run_required: bool,
+        required_mutation_paths: set[str],
+        mutated_paths_this_turn: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        broad: bool,
+    ) -> str:
+        if probe_name == "find_implementation_target":
+            targets = probe_result.get("targets")
+            if isinstance(targets, list):
+                grounded_targets = [
+                    str(item.get("path") or "").strip()
+                    for item in targets
+                    if isinstance(item, dict) and str(item.get("path") or "").strip()
+                ]
+                if grounded_targets:
+                    target_list = ", ".join(grounded_targets[:3])
+                    if mutation_required or code_mutation_required:
+                        next_step = "Edit the grounded implementation now"
+                        if test_run_required:
+                            next_step += ", then run_test"
+                        return f"Use the grounded implementation target(s) {target_list}. {next_step}. Next JSON only."
+                    return f"Use the grounded implementation target(s) {target_list}. Continue from that narrower target or answer from current evidence. Next JSON only."
+        return self._context_guard_retry_message(
+            mutation_required=mutation_required,
+            code_mutation_required=code_mutation_required,
+            test_run_required=test_run_required,
+            required_mutation_paths=required_mutation_paths,
+            mutated_paths_this_turn=mutated_paths_this_turn,
+            successful_tool_results=successful_tool_results,
+            broad=broad,
+        )
+
     def _test_to_source_bridge(self, successful_tool_results: list[dict[str, Any]]) -> tuple[str, str] | None:
         recent_source_paths = self._recent_source_paths(successful_tool_results)
         if not recent_source_paths:
@@ -4065,10 +4126,16 @@ class OllamaCodeAgent:
             return ", ".join(source_paths[:3])
         return "the likely implementation source file from the failing tests"
 
-    def _failed_test_no_edit_guard_message(self, successful_tool_results: list[dict[str, Any]]) -> str:
+    def _failed_test_no_edit_guard_message(
+        self,
+        successful_tool_results: list[dict[str, Any]],
+        *,
+        latest_run_test_output: str = "",
+    ) -> str:
         target = self._failed_test_edit_target_hint(successful_tool_results)
-        repair_packet = self._run_test_repair_packet(latest_run_test_output := self._latest_failed_run_test_output(successful_tool_results), successful_tool_results=successful_tool_results)
-        packet_text = self._format_run_test_repair_packet(repair_packet) if latest_run_test_output else ""
+        latest_output = latest_run_test_output or self._latest_failed_run_test_output(successful_tool_results)
+        repair_packet = self._run_test_repair_packet(latest_output, successful_tool_results=successful_tool_results)
+        packet_text = self._format_run_test_repair_packet(repair_packet) if latest_output else ""
         return (
             "Tests are failing and source/tests have already been inspected. Stop reading. "
             f"Edit {target} now, preferably all remaining stubs in one replace_symbols or full-file edit, then rerun run_test. "
@@ -4200,6 +4267,126 @@ class OllamaCodeAgent:
             return "Need current-turn evidence before mutation. Call find_implementation_target or diagnose_test_failure, then edit the grounded source. Next JSON only."
         return "Need current-turn evidence before mutation. Read the target file/symbol or call context_pack/repo_index_search first. Next JSON only."
 
+    def _mutation_symbol_grounding_target(self, *, name: str, arguments: dict[str, Any]) -> tuple[str, str] | None:
+        raw_path = str(arguments.get("path") or arguments.get("file") or arguments.get("filename") or "").strip().replace("\\", "/").lstrip("./")
+        if not raw_path:
+            return None
+        try:
+            resolved = self.tools.resolve_path(raw_path, allow_missing=False)
+        except Exception:
+            return None
+        if not resolved.exists() or not resolved.is_file():
+            return None
+        rel_path = self.tools.relative_label(resolved)
+        if not self._path_looks_like_code_file(rel_path):
+            return None
+        raw_symbol = ""
+        if name == "replace_symbol":
+            raw_symbol = str(arguments.get("symbol") or "").strip()
+        elif name == "edit_intent":
+            intent = str(arguments.get("intent") or "").strip().lower()
+            if intent in {"replace_symbol", "replace_body", "replace_signature"}:
+                raw_symbol = str(arguments.get("target") or arguments.get("symbol") or "").strip()
+        elif name == "replace_symbols":
+            replacements = arguments.get("replacements")
+            if isinstance(replacements, list) and len(replacements) == 1 and isinstance(replacements[0], dict):
+                raw_symbol = str(replacements[0].get("symbol") or replacements[0].get("target") or "").strip()
+        if not raw_symbol or not re.fullmatch(r"[A-Za-z_][\w.]*", raw_symbol):
+            return None
+        return rel_path, raw_symbol
+
+    def _trajectory_grounding_probe(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        arguments: dict[str, Any],
+        required_mutation_paths: set[str],
+        forbidden_tool_names: set[str],
+    ) -> tuple[str, dict[str, Any]] | None:
+        symbol_target = self._mutation_symbol_grounding_target(name=name, arguments=arguments)
+        if symbol_target is not None and "read_symbol" not in forbidden_tool_names:
+            symbol_path, symbol_name = symbol_target
+            return "read_symbol", {"path": symbol_path, "symbol": symbol_name, "include_context": 0}
+        candidate_paths: list[str] = []
+        seen_paths: set[str] = set()
+        for raw in (
+            arguments.get("path"),
+            arguments.get("file"),
+            arguments.get("filename"),
+            *sorted(required_mutation_paths),
+        ):
+            normalized = str(raw or "").strip().replace("\\", "/").lstrip("./")
+            if not normalized or normalized in seen_paths:
+                continue
+            seen_paths.add(normalized)
+            try:
+                resolved = self.tools.resolve_path(normalized, allow_missing=False)
+            except Exception:
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            candidate_paths.append(self.tools.relative_label(resolved))
+        if candidate_paths:
+            return "read_file", {"path": candidate_paths[0]}
+        for raw in sorted(required_mutation_paths):
+            normalized = str(raw or "").strip().replace("\\", "/").lstrip("./")
+            if not normalized or not normalized.endswith(".py") or not self._path_looks_like_test_file(normalized):
+                continue
+            try:
+                rel_test = self.tools.relative_label(self.tools.resolve_path(normalized, allow_missing=False))
+            except Exception:
+                continue
+            return "find_implementation_target", {"test_path": rel_test, "limit": 6}
+        if feature_enabled("context-pack"):
+            return "context_pack", {"request": request_text, "path": ".", "limit": 6}
+        return None
+
+    def _trajectory_ground_probe_retry_message(
+        self,
+        *,
+        request_text: str,
+        probe_name: str,
+        probe_result: dict[str, Any],
+        required_mutation_paths: set[str],
+        mutated_paths_this_turn: set[str],
+        test_run_required: bool,
+    ) -> str:
+        pending_paths = sorted(required_mutation_paths - mutated_paths_this_turn)
+        if pending_paths:
+            target_list = ", ".join(pending_paths[:4])
+            next_step = "Edit the grounded target now"
+            if test_run_required:
+                next_step += ", then run_test"
+            return f"You now have current-turn grounding for {target_list}. {next_step}. Next JSON only."
+        grounded_path = str(probe_result.get("path") or "").strip()
+        grounded_symbol = str(probe_result.get("symbol") or "").strip()
+        if probe_name == "read_symbol" and grounded_path and grounded_symbol:
+            next_step = f"Use the grounded symbol {grounded_symbol} in {grounded_path} to make the edit now"
+            if test_run_required:
+                next_step += ", then run_test"
+            return next_step + ". Next JSON only."
+        if grounded_path:
+            next_step = f"Use the grounded file {grounded_path} to make the edit now"
+            if test_run_required:
+                next_step += ", then run_test"
+            return next_step + ". Next JSON only."
+        if probe_name == "find_implementation_target":
+            targets = probe_result.get("targets")
+            if isinstance(targets, list):
+                grounded_targets = [
+                    str(item.get("path") or "").strip()
+                    for item in targets
+                    if isinstance(item, dict) and str(item.get("path") or "").strip()
+                ]
+                if grounded_targets:
+                    target_list = ", ".join(grounded_targets[:3])
+                    next_step = "Edit the grounded implementation now"
+                    if test_run_required:
+                        next_step += ", then run_test"
+                    return f"Use the grounded implementation target(s) {target_list}. {next_step}. Next JSON only."
+        return self._trajectory_ground_guard_message(request_text)
+
     def _tool_error_class(self, result: dict[str, Any]) -> str:
         explicit = result.get("error_class")
         if isinstance(explicit, str) and explicit.strip():
@@ -4296,13 +4483,18 @@ class OllamaCodeAgent:
         tool_error_counts[key] = tool_error_counts.get(key, 0) + 1
         return error_class, tool_error_counts[key]
 
-    def _tool_error_guard_message(self, name: str, error_class: str) -> str:
+    def _tool_error_guard_message(self, name: str, error_class: str, *, diagnosis_ran: bool = False) -> str:
         if error_class.startswith("edit_intent:"):
             return (
                 f"A low-level edit already failed with {error_class.split(':', 1)[1]}. "
                 "Use edit_intent with intent, target, replacement, and scope instead of another low-level edit retry. Next JSON only."
             )
         if error_class in {"path_missing", "cwd_git"}:
+            if diagnosis_ran:
+                return (
+                    f"{name} already failed twice with {error_class}. Use the diagnosis above to repair the path/cwd, "
+                    "choose a nearby existing path, or fail closed before retrying. Next JSON only."
+                )
             return (
                 f"{name} already failed twice with {error_class}. Do not retry the same path/cwd. "
                 "Call list_files or repo_index_search to find the correct path, or fail closed. Next JSON only."
@@ -4312,7 +4504,12 @@ class OllamaCodeAgent:
                 f"{name} already failed with syntax_error. Inspect the exact symbol/diagnostic, repair the edit, "
                 "then use edit_intent replace_body with a syntactically complete function body or replace_symbol with complete source before tests. Next JSON only."
             )
-        if error_class in {"missing_dependency", "command_not_found"}:
+        if error_class in {"missing_dependency", "command_not_found", "import_error"}:
+            if diagnosis_ran:
+                return (
+                    f"{name} already failed twice with {error_class}. Use the diagnosis above to report the exact missing dependency/import, "
+                    "choose an available validator, repair the import, or fail closed before retrying. Next JSON only."
+                )
             return (
                 f"{name} already failed twice with {error_class}. Do not auto-install or retry blindly. "
                 "Report the exact missing dependency/command or choose an available validator. Next JSON only."
@@ -4412,6 +4609,210 @@ class OllamaCodeAgent:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
 
+    def _execute_auto_validation_plan(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        mutated_paths: set[str],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+        mutation_version: int,
+        reason_prefix: str = "",
+    ) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+        validation_plan = self._auto_validation_plan(
+            mutated_paths=mutated_paths,
+            forbidden_tool_names=forbidden_tool_names,
+        )
+        if validation_plan is None:
+            return None, None, None
+        validation_name, validation_arguments, validation_reason = validation_plan
+        self._record_event(
+            "auto_validation",
+            name=validation_name,
+            arguments=validation_arguments,
+            reason=f"{reason_prefix}{validation_reason}",
+            mutation_version=mutation_version,
+            rounds=round_number,
+        )
+        validation_result = self._execute_controller_tool(
+            name=validation_name,
+            arguments=validation_arguments,
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if validation_name == "select_tests" and validation_result.get("ok") is True:
+            commands = validation_result.get("test_commands")
+            if isinstance(commands, list) and commands and "run_test" not in forbidden_tool_names:
+                targeted_command = str(commands[0]).strip()
+                self._record_event(
+                    "auto_validation",
+                    name="run_test",
+                    arguments={"command": targeted_command},
+                    reason=f"{reason_prefix}targeted test selected from changed files",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "run_test"
+                validation_arguments = {"command": targeted_command}
+                validation_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+            elif self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+                self._record_event(
+                    "auto_validation",
+                    name="run_test",
+                    arguments={"command": self.tools.default_test_command},
+                    reason=f"{reason_prefix}fallback to configured test command after empty targeted selection",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "run_test"
+                validation_arguments = {"command": self.tools.default_test_command}
+                validation_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+        if (
+            validation_name == "lint_typecheck"
+            and validation_result.get("ok") is True
+            and mutated_paths
+            and "contract_check" not in forbidden_tool_names
+        ):
+            contract_args = {"changed_files": sorted(path for path in mutated_paths if path.endswith(".py"))}
+            if contract_args["changed_files"]:
+                self._record_event(
+                    "auto_validation",
+                    name="contract_check",
+                    arguments=contract_args,
+                    reason=f"{reason_prefix}contract check changed Python functions",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "contract_check"
+                validation_arguments = contract_args
+                validation_result = self._execute_controller_tool(
+                    name="contract_check",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+        if (
+            validation_name in {"lint_typecheck", "contract_check"}
+            and validation_result.get("ok") is True
+            and mutated_paths
+            and "select_tests" not in forbidden_tool_names
+            and "run_test" not in forbidden_tool_names
+        ):
+            select_args = {"changed_files": sorted(path for path in mutated_paths if path.endswith(".py"))}
+            self._record_event(
+                "auto_validation",
+                name="select_tests",
+                arguments=select_args,
+                reason=f"{reason_prefix}select targeted tests after syntax check",
+                mutation_version=mutation_version,
+                rounds=round_number,
+            )
+            select_result = self._execute_controller_tool(
+                name="select_tests",
+                arguments=select_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            commands = select_result.get("test_commands") if select_result.get("ok") is True else None
+            if isinstance(commands, list) and commands:
+                targeted_command = str(commands[0]).strip()
+                self._record_event(
+                    "auto_validation",
+                    name="run_test",
+                    arguments={"command": targeted_command},
+                    reason=f"{reason_prefix}targeted test selected from changed files",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "run_test"
+                validation_arguments = {"command": targeted_command}
+                validation_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+            elif self.tools.default_test_command:
+                self._record_event(
+                    "auto_validation",
+                    name="run_test",
+                    arguments={"command": self.tools.default_test_command},
+                    reason=f"{reason_prefix}fallback to configured test command after empty targeted selection",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "run_test"
+                validation_arguments = {"command": self.tools.default_test_command}
+                validation_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+        return validation_name, validation_arguments, validation_result
+
+    def _should_force_post_edit_validation(
+        self,
+        *,
+        request_text: str,
+        candidate_tool_name: str,
+        mutation_verified_this_turn: bool,
+        mutation_version: int,
+        last_successful_validation_version: int | None,
+        mutated_paths: set[str],
+        required_mutation_paths: set[str],
+        unresolved_syntax_diagnostics: dict[str, str],
+        unresolved_static_diagnostics: dict[str, str],
+        unresolved_probe_diagnostics: dict[str, str],
+    ) -> bool:
+        if not self._post_edit_validation_enabled():
+            return False
+        if not mutation_verified_this_turn or last_successful_validation_version == mutation_version:
+            return False
+        if self._request_forbids_validation(request_text):
+            return False
+        if candidate_tool_name in MUTATING_TOOL_NAMES or candidate_tool_name in VALIDATION_TOOL_NAMES:
+            return False
+        if required_mutation_paths - mutated_paths:
+            return False
+        if unresolved_syntax_diagnostics or unresolved_static_diagnostics or unresolved_probe_diagnostics:
+            return False
+        return any(Path(path).suffix.lower() in CODE_EDIT_SUFFIXES for path in mutated_paths) or self._request_requires_test_run(request_text)
+
     def _failure_delta_summary(self, previous: str, current: str) -> str:
         previous_lines = {line.strip() for line in previous.splitlines() if line.strip()}
         changed = [line.strip() for line in current.splitlines() if line.strip() and line.strip() not in previous_lines]
@@ -4504,7 +4905,7 @@ class OllamaCodeAgent:
                     candidate = "\n".join(content_lines).strip()
                     if candidate and len(candidate) <= 240:
                         return candidate
-            if name == "read_symbol" and "return" in request_text.lower() and "value" in request_text.lower():
+            if name == "read_symbol" and self._request_asks_symbol_return(request_text):
                 value = self._extract_return_value_from_symbol_output(output)
                 if value:
                     symbol = str(result.get("symbol") or arguments.get("symbol") or "symbol")
@@ -7143,16 +7544,20 @@ class OllamaCodeAgent:
         last_successful_validation_version: int | None = None
         latest_run_test_failed = False
         latest_run_test_failure_summary = ""
+        latest_run_test_failure_output = ""
         previous_run_test_failure_summary = ""
         failed_test_context_reads = 0
         context_planner_prompted = False
         bulk_stub_guard_counts: dict[str, int] = {}
         spec_guided_repair_attempted = False
         failed_test_mutation_version: int | None = None
+        last_failed_run_test_diagnosis_key: tuple[str, str, int] | None = None
         unresolved_syntax_diagnostics: dict[str, str] = {}
         unresolved_static_diagnostics: dict[str, str] = {}
         unresolved_probe_diagnostics: dict[str, str] = {}
         tool_error_counts: dict[tuple[str, str, str], int] = {}
+        diagnosed_tool_error_keys: set[tuple[str, str, str]] = set()
+        latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
         if (
             (mutation_required or code_mutation_required)
@@ -7558,11 +7963,17 @@ class OllamaCodeAgent:
                     and last_successful_validation_version != mutation_version
                     and not self._request_forbids_validation(text)
                 ):
-                    validation_plan = self._auto_validation_plan(
+                    validation_name, _validation_arguments, validation_result = self._execute_auto_validation_plan(
+                        request_text=text,
+                        round_number=round_number,
                         mutated_paths=mutated_paths_this_turn,
                         forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                        mutation_version=mutation_version,
                     )
-                    if validation_plan is None:
+                    if validation_name is None or validation_result is None:
                         if not any(Path(path).suffix.lower() in CODE_EDIT_SUFFIXES for path in mutated_paths_this_turn) and not test_run_required:
                             last_successful_validation_version = mutation_version
                             mutation_verified_this_turn = False
@@ -7579,149 +7990,7 @@ class OllamaCodeAgent:
                         self._record_event("assistant", content=failure, rounds=round_number)
                         self._flush_llm_call_events()
                         return AgentResult(message=failure, rounds=round_number, completed=False)
-                    validation_name, validation_arguments, validation_reason = validation_plan
-                    self._record_event(
-                        "auto_validation",
-                        name=validation_name,
-                        arguments=validation_arguments,
-                        reason=validation_reason,
-                        mutation_version=mutation_version,
-                        rounds=round_number,
-                    )
-                    validation_result = self._execute_controller_tool(
-                        name=validation_name,
-                        arguments=validation_arguments,
-                        request_text=text,
-                        round_number=round_number,
-                        successful_tool_results=successful_tool_results,
-                        satisfied_tool_names=satisfied_tool_names,
-                        tool_calls_this_turn=tool_calls_this_turn,
-                    )
                     tool_used_this_turn = True
-                    if validation_name == "select_tests" and validation_result.get("ok") is True:
-                        commands = validation_result.get("test_commands")
-                        if isinstance(commands, list) and commands and "run_test" not in forbidden_tool_names:
-                            targeted_command = str(commands[0]).strip()
-                            self._record_event(
-                                "auto_validation",
-                                name="run_test",
-                                arguments={"command": targeted_command},
-                                reason="targeted test selected from changed files",
-                                mutation_version=mutation_version,
-                                rounds=round_number,
-                            )
-                            validation_name = "run_test"
-                            validation_result = self._execute_controller_tool(
-                                name="run_test",
-                                arguments={"command": targeted_command},
-                                request_text=text,
-                                round_number=round_number,
-                                successful_tool_results=successful_tool_results,
-                                satisfied_tool_names=satisfied_tool_names,
-                                tool_calls_this_turn=tool_calls_this_turn,
-                            )
-                        else:
-                            validation_name = "run_test"
-                            validation_result = self._execute_controller_tool(
-                                name="run_test",
-                                arguments={"command": self.tools.default_test_command},
-                                request_text=text,
-                                round_number=round_number,
-                                successful_tool_results=successful_tool_results,
-                                satisfied_tool_names=satisfied_tool_names,
-                                tool_calls_this_turn=tool_calls_this_turn,
-                            )
-                    if (
-                        validation_name == "lint_typecheck"
-                        and validation_result.get("ok") is True
-                        and mutated_paths_this_turn
-                        and "contract_check" not in forbidden_tool_names
-                    ):
-                        contract_args = {"changed_files": sorted(path for path in mutated_paths_this_turn if path.endswith(".py"))}
-                        if contract_args["changed_files"]:
-                            self._record_event(
-                                "auto_validation",
-                                name="contract_check",
-                                arguments=contract_args,
-                                reason="contract check changed Python functions",
-                                mutation_version=mutation_version,
-                                rounds=round_number,
-                            )
-                            validation_name = "contract_check"
-                            validation_result = self._execute_controller_tool(
-                                name="contract_check",
-                                arguments=contract_args,
-                                request_text=text,
-                                round_number=round_number,
-                                successful_tool_results=successful_tool_results,
-                                satisfied_tool_names=satisfied_tool_names,
-                                tool_calls_this_turn=tool_calls_this_turn,
-                            )
-                    if (
-                        validation_name in {"lint_typecheck", "contract_check"}
-                        and validation_result.get("ok") is True
-                        and mutated_paths_this_turn
-                        and "select_tests" not in forbidden_tool_names
-                        and "run_test" not in forbidden_tool_names
-                    ):
-                        select_args = {"changed_files": sorted(path for path in mutated_paths_this_turn if path.endswith(".py"))}
-                        self._record_event(
-                            "auto_validation",
-                            name="select_tests",
-                            arguments=select_args,
-                            reason="select targeted tests after syntax check",
-                            mutation_version=mutation_version,
-                            rounds=round_number,
-                        )
-                        select_result = self._execute_controller_tool(
-                            name="select_tests",
-                            arguments=select_args,
-                            request_text=text,
-                            round_number=round_number,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
-                        )
-                        commands = select_result.get("test_commands") if select_result.get("ok") is True else None
-                        if isinstance(commands, list) and commands:
-                            targeted_command = str(commands[0]).strip()
-                            self._record_event(
-                                "auto_validation",
-                                name="run_test",
-                                arguments={"command": targeted_command},
-                                reason="targeted test selected from changed files",
-                                mutation_version=mutation_version,
-                                rounds=round_number,
-                            )
-                            validation_name = "run_test"
-                            validation_result = self._execute_controller_tool(
-                                name="run_test",
-                                arguments={"command": targeted_command},
-                                request_text=text,
-                                round_number=round_number,
-                                successful_tool_results=successful_tool_results,
-                                satisfied_tool_names=satisfied_tool_names,
-                                tool_calls_this_turn=tool_calls_this_turn,
-                            )
-                        elif self.tools.default_test_command:
-                            self._record_event(
-                                "auto_validation",
-                                name="run_test",
-                                arguments={"command": self.tools.default_test_command},
-                                reason="fallback to configured test command after empty targeted selection",
-                                mutation_version=mutation_version,
-                                rounds=round_number,
-                            )
-                            validation_name = "run_test"
-                            validation_result = self._execute_controller_tool(
-                                name="run_test",
-                                arguments={"command": self.tools.default_test_command},
-                                request_text=text,
-                                round_number=round_number,
-                                successful_tool_results=successful_tool_results,
-                                satisfied_tool_names=satisfied_tool_names,
-                                tool_calls_this_turn=tool_calls_this_turn,
-                            )
                     if validation_result.get("ok") is True:
                         last_successful_validation_version = mutation_version
                         if validation_name == "run_test":
@@ -8082,10 +8351,43 @@ class OllamaCodeAgent:
                     continue
                 if name == "run_test" and last_failed_run_test_key == self._run_test_repeat_key(arguments, mutation_version):
                     self._append_assistant_payload(payload)
+                    diagnosis_ran = False
+                    if (
+                        feature_enabled("trajectory-guards")
+                        and latest_run_test_failure_output
+                        and last_failed_run_test_diagnosis_key != last_failed_run_test_key
+                    ):
+                        self._record_event(
+                            "controller_guard",
+                            guard="failure-compression",
+                            candidate_tool=name,
+                            mutation_version=mutation_version,
+                            rounds=round_number,
+                        )
+                        diagnosis_result = self._execute_controller_tool(
+                            name="diagnose_test_failure",
+                            arguments={"output": latest_run_test_failure_output, "limit": 4},
+                            request_text=text,
+                            round_number=round_number,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                        if diagnosis_result.get("ok") is True:
+                            diagnosis_ran = True
+                            last_failed_run_test_diagnosis_key = last_failed_run_test_key
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": "The same run_test already failed and no file changed since. Inspect evidence or edit files before rerunning that test. Next JSON only.",
+                            "content": (
+                                "The same run_test already failed and no file changed since. "
+                                + (
+                                    "Use the diagnosis above to edit implementation before rerunning run_test. "
+                                    if diagnosis_ran
+                                    else "Inspect evidence or edit files before rerunning that test. "
+                                )
+                                + "Next JSON only."
+                            ),
                         }
                     )
                     continue
@@ -8206,7 +8508,15 @@ class OllamaCodeAgent:
                         forced_next_classes=["implementation_edit", "validation"],
                         rounds=round_number,
                     )
-                    self.messages.append({"role": "user", "content": self._failed_test_no_edit_guard_message(successful_tool_results)})
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._failed_test_no_edit_guard_message(
+                                successful_tool_results,
+                                latest_run_test_output=latest_run_test_failure_output,
+                            ),
+                        }
+                    )
                     continue
                 if (
                     latest_run_test_failed
@@ -8240,6 +8550,38 @@ class OllamaCodeAgent:
                 )
                 if repeated_error_class:
                     self._append_assistant_payload(payload)
+                    repeated_error_key = (name, self._tool_error_arg_key(name, arguments), repeated_error_class)
+                    diagnosis_ran = False
+                    if (
+                        feature_enabled("trajectory-guards")
+                        and repeated_error_class in {"missing_dependency", "command_not_found", "import_error", "path_missing", "cwd_git"}
+                        and repeated_error_key not in diagnosed_tool_error_keys
+                    ):
+                        prior_error_output = latest_tool_error_outputs.get(repeated_error_key, "")
+                        if prior_error_output:
+                            self._record_event(
+                                "controller_guard",
+                                guard="dependency-or-import-guard" if repeated_error_class in {"missing_dependency", "command_not_found", "import_error"} else "path-repair-guard",
+                                candidate_tool=name,
+                                error_class=repeated_error_class,
+                                rounds=round_number,
+                            )
+                            diagnosis_arguments: dict[str, Any] = {"output": prior_error_output}
+                            path_hint = str(arguments.get("path") or arguments.get("cwd") or ".").strip()
+                            if path_hint:
+                                diagnosis_arguments["path"] = path_hint
+                            diagnosis_result = self._execute_controller_tool(
+                                name="diagnose_dependency_error",
+                                arguments=diagnosis_arguments,
+                                request_text=text,
+                                round_number=round_number,
+                                successful_tool_results=successful_tool_results,
+                                satisfied_tool_names=satisfied_tool_names,
+                                tool_calls_this_turn=tool_calls_this_turn,
+                            )
+                            if diagnosis_result.get("ok") is True:
+                                diagnosis_ran = True
+                                diagnosed_tool_error_keys.add(repeated_error_key)
                     self._record_event(
                         "tool_error_guard",
                         guard="repeat-error",
@@ -8248,7 +8590,7 @@ class OllamaCodeAgent:
                         arguments=arguments,
                         rounds=round_number,
                     )
-                    self.messages.append({"role": "user", "content": self._tool_error_guard_message(name, repeated_error_class)})
+                    self.messages.append({"role": "user", "content": self._tool_error_guard_message(name, repeated_error_class, diagnosis_ran=diagnosis_ran)})
                     continue
                 if repeated_mutating_failure:
                     self._append_assistant_payload(payload)
@@ -8292,6 +8634,39 @@ class OllamaCodeAgent:
                     )
                     self._append_assistant_payload(payload)
                     context_planner_prompted = True
+                    context_probe = self._context_planner_probe(
+                        successful_tool_results=successful_tool_results,
+                        forbidden_tool_names=forbidden_tool_names,
+                    )
+                    if context_probe is not None:
+                        probe_name, probe_arguments = context_probe
+                        probe_result = self._execute_controller_tool(
+                            name=probe_name,
+                            arguments=probe_arguments,
+                            request_text=text,
+                            round_number=round_number,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                        if probe_result.get("ok") is True:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": self._context_planner_probe_retry_message(
+                                        probe_name=probe_name,
+                                        probe_result=probe_result,
+                                        mutation_required=mutation_required,
+                                        code_mutation_required=code_mutation_required,
+                                        test_run_required=test_run_required,
+                                        required_mutation_paths=required_mutation_paths,
+                                        mutated_paths_this_turn=mutated_paths_this_turn,
+                                        successful_tool_results=successful_tool_results,
+                                        broad=True,
+                                    ),
+                                }
+                            )
+                            continue
                     self.messages.append(
                         {
                             "role": "user",
@@ -8353,7 +8728,115 @@ class OllamaCodeAgent:
                         forced_next_classes=["read", "symbol", "implementation_target", "failure_diagnosis"],
                         rounds=round_number,
                     )
+                    grounding_probe = self._trajectory_grounding_probe(
+                        request_text=text,
+                        name=name,
+                        arguments=arguments,
+                        required_mutation_paths=required_mutation_paths,
+                        forbidden_tool_names=forbidden_tool_names,
+                    )
+                    if grounding_probe is not None:
+                        probe_name, probe_arguments = grounding_probe
+                        probe_result = self._execute_controller_tool(
+                            name=probe_name,
+                            arguments=probe_arguments,
+                            request_text=text,
+                            round_number=round_number,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                        if probe_result.get("ok") is True:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": self._trajectory_ground_probe_retry_message(
+                                        request_text=text,
+                                        probe_name=probe_name,
+                                        probe_result=probe_result,
+                                        required_mutation_paths=required_mutation_paths,
+                                        mutated_paths_this_turn=mutated_paths_this_turn,
+                                        test_run_required=test_run_required,
+                                    ),
+                                }
+                            )
+                            continue
                     self.messages.append({"role": "user", "content": self._trajectory_ground_guard_message(text)})
+                    continue
+                if self._should_force_post_edit_validation(
+                    request_text=text,
+                    candidate_tool_name=name,
+                    mutation_verified_this_turn=mutation_verified_this_turn,
+                    mutation_version=mutation_version,
+                    last_successful_validation_version=last_successful_validation_version,
+                    mutated_paths=mutated_paths_this_turn,
+                    required_mutation_paths=required_mutation_paths,
+                    unresolved_syntax_diagnostics=unresolved_syntax_diagnostics,
+                    unresolved_static_diagnostics=unresolved_static_diagnostics,
+                    unresolved_probe_diagnostics=unresolved_probe_diagnostics,
+                ):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="post-edit-validation",
+                        candidate_tool=name,
+                        forced_next_classes=["validation", "implementation_edit", "final"],
+                        rounds=round_number,
+                    )
+                    validation_name, validation_arguments, validation_result = self._execute_auto_validation_plan(
+                        request_text=text,
+                        round_number=round_number,
+                        mutated_paths=mutated_paths_this_turn,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                        mutation_version=mutation_version,
+                        reason_prefix="proactive ",
+                    )
+                    tool_used_this_turn = True
+                    if validation_name is None or validation_result is None:
+                        failure = "Stopped because validation was required after edits but no validator is configured."
+                        self._record_event("assistant", content=failure, rounds=round_number)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=failure, rounds=round_number, completed=False)
+                    if validation_result.get("ok") is True:
+                        last_successful_validation_version = mutation_version
+                        if validation_name == "run_test":
+                            last_failed_run_test_key = None
+                            last_failed_run_test_diagnosis_key = None
+                            last_successful_run_test_version = mutation_version
+                            latest_run_test_failed = False
+                            latest_run_test_failure_summary = ""
+                            latest_run_test_failure_output = ""
+                            previous_run_test_failure_summary = ""
+                            failed_test_context_reads = 0
+                            failed_test_mutation_version = None
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": "Validation already ran after the latest edit: passed. If another edit is still needed, edit directly; otherwise answer from current evidence. Next JSON only.",
+                            }
+                        )
+                        continue
+                    if validation_name == "run_test":
+                        last_failed_run_test_key = self._run_test_repeat_key(validation_arguments or {}, mutation_version)
+                        last_failed_run_test_diagnosis_key = None
+                        latest_run_test_failed = True
+                        failed_test_context_reads = 0
+                        failed_test_mutation_version = mutation_version
+                        raw_failure = str(validation_result.get("output") or validation_result.get("summary") or "").strip()
+                        latest_run_test_failure_output = raw_failure
+                        compact_failure = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
+                        latest_run_test_failure_summary = compact_failure
+                        if compact_failure:
+                            previous_run_test_failure_summary = compact_failure
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "Post-edit validation failed before more tool use. Fix the reported issue now instead of gathering more context. Next JSON only.",
+                        }
+                    )
                     continue
                 if (
                     name in MUTATING_TOOL_NAMES
@@ -8458,12 +8941,13 @@ class OllamaCodeAgent:
                         failed_test_mutation_version = mutation_version
                         failure_key = self._mutating_failure_key(name, arguments)
                         mutating_failure_counts[failure_key] = mutating_failure_counts.get(failure_key, 0) + 1
-                    self._remember_tool_error(
+                    error_class, _error_count = self._remember_tool_error(
                         name=name,
                         arguments=arguments,
                         result=result,
                         tool_error_counts=tool_error_counts,
                     )
+                    latest_tool_error_outputs[(name, self._tool_error_arg_key(name, arguments), error_class)] = str(result.get("output") or result.get("summary") or "").strip()
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
                 if real_tool_use:
@@ -8471,6 +8955,7 @@ class OllamaCodeAgent:
                     if name in MUTATING_TOOL_NAMES:
                         mutation_verified_this_turn = True
                         mutation_version += 1
+                        last_failed_run_test_diagnosis_key = None
                         failed_test_context_reads = 0
                         failed_test_mutation_version = None
                         result_path = str(result.get("path", "")).strip().replace("\\", "/").lstrip("./")
@@ -8490,18 +8975,22 @@ class OllamaCodeAgent:
                 if name == "run_test":
                     if result.get("ok") is True:
                         last_failed_run_test_key = None
+                        last_failed_run_test_diagnosis_key = None
                         last_successful_run_test_version = mutation_version
                         latest_run_test_failed = False
                         latest_run_test_failure_summary = ""
+                        latest_run_test_failure_output = ""
                         previous_run_test_failure_summary = ""
                         failed_test_context_reads = 0
                         failed_test_mutation_version = None
                     else:
                         last_failed_run_test_key = self._run_test_repeat_key(arguments, mutation_version)
+                        last_failed_run_test_diagnosis_key = None
                         latest_run_test_failed = True
                         failed_test_context_reads = 0
                         failed_test_mutation_version = mutation_version
                         raw_failure = str(result.get("output") or result.get("summary") or "").strip()
+                        latest_run_test_failure_output = raw_failure
                         compact_failure = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
                         if previous_run_test_failure_summary and compact_failure:
                             delta = self._failure_delta_summary(previous_run_test_failure_summary, compact_failure)
@@ -8871,7 +9360,10 @@ class OllamaCodeAgent:
         ):
             failure = (
                 "Stopped because tests failed and the controller blocked further read-only looping. "
-                + self._failed_test_no_edit_guard_message(successful_tool_results)
+                + self._failed_test_no_edit_guard_message(
+                    successful_tool_results,
+                    latest_run_test_output=latest_run_test_failure_output,
+                )
             )
             self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
             self._flush_llm_call_events()
@@ -8882,161 +9374,18 @@ class OllamaCodeAgent:
             and last_successful_validation_version != mutation_version
             and not self._request_forbids_validation(text)
         ):
-            validation_plan = self._auto_validation_plan(
+            validation_name, _validation_arguments, validation_result = self._execute_auto_validation_plan(
+                request_text=text,
+                round_number=self.max_tool_rounds,
                 mutated_paths=mutated_paths_this_turn,
                 forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+                mutation_version=mutation_version,
+                reason_prefix="final-chance ",
             )
-            if validation_plan is not None:
-                validation_name, validation_arguments, validation_reason = validation_plan
-                self._record_event(
-                    "auto_validation",
-                    name=validation_name,
-                    arguments=validation_arguments,
-                    reason=f"final-chance {validation_reason}",
-                    mutation_version=mutation_version,
-                    rounds=self.max_tool_rounds,
-                )
-                validation_result = self._execute_controller_tool(
-                    name=validation_name,
-                    arguments=validation_arguments,
-                    request_text=text,
-                    round_number=self.max_tool_rounds,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                if validation_name == "select_tests" and validation_result.get("ok") is True:
-                    commands = validation_result.get("test_commands")
-                    if isinstance(commands, list) and commands and "run_test" not in forbidden_tool_names:
-                        targeted_command = str(commands[0]).strip()
-                        self._record_event(
-                            "auto_validation",
-                            name="run_test",
-                            arguments={"command": targeted_command},
-                            reason="final-chance targeted test selected from changed files",
-                            mutation_version=mutation_version,
-                            rounds=self.max_tool_rounds,
-                        )
-                        validation_name = "run_test"
-                        validation_result = self._execute_controller_tool(
-                            name="run_test",
-                            arguments={"command": targeted_command},
-                            request_text=text,
-                            round_number=self.max_tool_rounds,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
-                        )
-                    elif self.tools.default_test_command and "run_test" not in forbidden_tool_names:
-                        self._record_event(
-                            "auto_validation",
-                            name="run_test",
-                            arguments={"command": self.tools.default_test_command},
-                            reason="final-chance fallback to configured test command after empty targeted selection",
-                            mutation_version=mutation_version,
-                            rounds=self.max_tool_rounds,
-                        )
-                        validation_name = "run_test"
-                        validation_result = self._execute_controller_tool(
-                            name="run_test",
-                            arguments={"command": self.tools.default_test_command},
-                            request_text=text,
-                            round_number=self.max_tool_rounds,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
-                        )
-                if (
-                    validation_name == "lint_typecheck"
-                    and validation_result.get("ok") is True
-                    and mutated_paths_this_turn
-                    and "contract_check" not in forbidden_tool_names
-                ):
-                    contract_args = {"changed_files": sorted(path for path in mutated_paths_this_turn if path.endswith(".py"))}
-                    if contract_args["changed_files"]:
-                        self._record_event(
-                            "auto_validation",
-                            name="contract_check",
-                            arguments=contract_args,
-                            reason="final-chance contract check changed Python functions",
-                            mutation_version=mutation_version,
-                            rounds=self.max_tool_rounds,
-                        )
-                        validation_name = "contract_check"
-                        validation_result = self._execute_controller_tool(
-                            name="contract_check",
-                            arguments=contract_args,
-                            request_text=text,
-                            round_number=self.max_tool_rounds,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
-                        )
-                if (
-                    validation_name in {"lint_typecheck", "contract_check"}
-                    and validation_result.get("ok") is True
-                    and mutated_paths_this_turn
-                    and "select_tests" not in forbidden_tool_names
-                    and "run_test" not in forbidden_tool_names
-                ):
-                    select_args = {"changed_files": sorted(path for path in mutated_paths_this_turn if path.endswith(".py"))}
-                    self._record_event(
-                        "auto_validation",
-                        name="select_tests",
-                        arguments=select_args,
-                        reason="final-chance select targeted tests after syntax check",
-                        mutation_version=mutation_version,
-                        rounds=self.max_tool_rounds,
-                    )
-                    select_result = self._execute_controller_tool(
-                        name="select_tests",
-                        arguments=select_args,
-                        request_text=text,
-                        round_number=self.max_tool_rounds,
-                        successful_tool_results=successful_tool_results,
-                        satisfied_tool_names=satisfied_tool_names,
-                        tool_calls_this_turn=tool_calls_this_turn,
-                    )
-                    commands = select_result.get("test_commands") if select_result.get("ok") is True else None
-                    if isinstance(commands, list) and commands:
-                        targeted_command = str(commands[0]).strip()
-                        self._record_event(
-                            "auto_validation",
-                            name="run_test",
-                            arguments={"command": targeted_command},
-                            reason="final-chance targeted test selected from changed files",
-                            mutation_version=mutation_version,
-                            rounds=self.max_tool_rounds,
-                        )
-                        validation_name = "run_test"
-                        validation_result = self._execute_controller_tool(
-                            name="run_test",
-                            arguments={"command": targeted_command},
-                            request_text=text,
-                            round_number=self.max_tool_rounds,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
-                        )
-                    elif self.tools.default_test_command:
-                        self._record_event(
-                            "auto_validation",
-                            name="run_test",
-                            arguments={"command": self.tools.default_test_command},
-                            reason="final-chance fallback to configured test command after empty targeted selection",
-                            mutation_version=mutation_version,
-                            rounds=self.max_tool_rounds,
-                        )
-                        validation_name = "run_test"
-                        validation_result = self._execute_controller_tool(
-                            name="run_test",
-                            arguments={"command": self.tools.default_test_command},
-                            request_text=text,
-                            round_number=self.max_tool_rounds,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
-                        )
+            if validation_name is not None and validation_result is not None:
                 if validation_result.get("ok") is True:
                     message = "Ran validation after the latest edit: passed."
                     self._record_event("assistant_synthesized", content=message, tool=validation_name, rounds=self.max_tool_rounds, auto=True)

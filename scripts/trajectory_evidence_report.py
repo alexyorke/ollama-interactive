@@ -80,21 +80,21 @@ ROW_PATTERN_META: dict[str, dict[str, str]] = {
 PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     "mechanical-router": {
         "status": "partial",
-        "summary": "Deterministic routing exists for read/search/symbol/test/git exact paths.",
+        "summary": "Deterministic routing exists for read/search/symbol/test/git exact paths, including plain-language symbol return reads.",
         "references": [
             "ollama_code/controller/navigation_validation.py",
             "ollama_code/agent.py",
         ],
-        "next_gap": "Mutation and failure-recovery routing still lives in the legacy agent monolith.",
+        "next_gap": "Mutation and failure-recovery routing still lives in the legacy agent monolith, and only part of the tool-selection surface is routed before the LLM loop.",
     },
     "context-planner": {
         "status": "partial",
-        "summary": "Compact context tools exist and the agent can preload context_pack.",
+        "summary": "Compact context tools exist, the agent can preload context_pack, and repeated broad test inspection can auto-map tests to implementation targets.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Planning heuristics are still embedded in agent.py instead of a dedicated planner/controller.",
+        "next_gap": "Only a subset of narrowing routes are proactive; broader inspection still relies on heuristics embedded in agent.py instead of a dedicated planner/controller.",
     },
     "loop-cap": {
         "status": "implemented",
@@ -106,21 +106,30 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "post-edit-validation": {
         "status": "partial",
-        "summary": "run_test, select_tests, lint_typecheck, and contract_check support post-edit validation.",
+        "summary": "After a successful code edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test before extra context gathering or a final answer.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Not every mutation path is uniformly forced through a compact post-edit validation policy.",
+        "next_gap": "Non-code mutations and broader validator families still do not all share the same compact post-edit validation policy.",
+    },
+    "failure-compression": {
+        "status": "implemented",
+        "summary": "Failed run_test output is compacted and repeated unchanged reruns auto-trigger diagnose_test_failure before another model retry.",
+        "references": [
+            "ollama_code/agent.py",
+            "ollama_code/tools/__init__.py",
+        ],
+        "next_gap": "Other validator families still do not all route through the same failure-compression path.",
     },
     "ground-before-mutate": {
         "status": "partial",
-        "summary": "Grounding guards exist and symbol-first navigation is available.",
+        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, and symbol-first navigation is available.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Grounding checks are still intertwined with legacy heuristics instead of an isolated mutation gate.",
+        "next_gap": "Requests without an explicit target path or symbol still rely on broader heuristics instead of a fully isolated mutation gate.",
     },
     "diagnose-test-failure": {
         "status": "implemented",
@@ -150,12 +159,13 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
         "next_gap": "Proof is mostly local-script based; CI does not yet gate on these live paths.",
     },
     "dependency-or-import-guard": {
-        "status": "partial",
-        "summary": "Dependency/import failures are classified and surfaced with targeted guidance.",
+        "status": "implemented",
+        "summary": "Dependency/import failures are classified, surfaced with targeted guidance, and repeated blind retries auto-trigger structured diagnosis.",
         "references": [
             "ollama_code/tools/__init__.py",
+            "ollama_code/agent.py",
         ],
-        "next_gap": "The repair strategy is not yet a first-class controller phase across all edit flows.",
+        "next_gap": "The first failure still relies on normal tool feedback; only repeated failures auto-trigger controller diagnosis.",
     },
     "bounded-command-validation": {
         "status": "implemented",
@@ -198,6 +208,10 @@ ROW_PATTERN_FIX_MAP: dict[str, tuple[str, ...]] = {
     "context-loop-row": ("loop-cap", "context-planner"),
     "edit-without-context-row": ("ground-before-mutate",),
     "edit-without-test-row": ("post-edit-validation",),
+}
+
+MESSAGE_THEME_FIX_MAP: dict[str, tuple[str, ...]] = {
+    "large-failure-blob": ("failure-compression",),
 }
 
 
@@ -688,6 +702,15 @@ def _fix_evidence_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
         for rec_id in fix_ids:
             grouped_counts[rec_id] += evidence_count
             grouped_datasets[rec_id].add(dataset_name)
+    message_theme_counts = summary.get("message_theme_counts")
+    if isinstance(message_theme_counts, dict):
+        for theme_name, fix_ids in MESSAGE_THEME_FIX_MAP.items():
+            evidence_count = int(message_theme_counts.get(theme_name, 0) or 0)
+            if evidence_count <= 0:
+                continue
+            for rec_id in fix_ids:
+                grouped_counts[rec_id] += evidence_count
+                grouped_datasets[rec_id].add(dataset_name)
 
     trajectory_recommendations = summary.get("recommendations", [])
     reference_trajectory = summary.get("reference_trajectory_metrics")

@@ -196,6 +196,7 @@ SKIP_WALK_GLOBS = (
     "!tmp*/**",
 )
 DENY_MUTATION_DIRS = {".git", ".hg", ".svn", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".ollama-code"}
+MAX_EXPLICIT_VALIDATOR_FILES = 20
 ERROR_CLASS_PATTERNS: dict[str, re.Pattern[str]] = {
     "missing_dependency": re.compile(r"ModuleNotFoundError:\s+No module named ['\"]([^'\"]+)['\"]|No module named ['\"]([^'\"]+)['\"]", re.IGNORECASE),
     "import_error": re.compile(r"ImportError|cannot import name", re.IGNORECASE),
@@ -1341,6 +1342,23 @@ class ToolExecutor:
             if len(selected) >= limit:
                 break
         return selected
+
+    def _python_validation_targets(
+        self,
+        *,
+        discovered_files: Iterable[str],
+        requested_scopes: Iterable[str],
+        limit: int = 100,
+    ) -> list[str]:
+        file_targets = self._collapse_validation_targets(discovered_files, limit=limit)
+        if not file_targets:
+            return []
+        scope_targets = self._collapse_validation_targets(requested_scopes, limit=limit)
+        if "." in scope_targets:
+            return ["."]
+        if len(file_targets) <= MAX_EXPLICIT_VALIDATOR_FILES:
+            return file_targets
+        return scope_targets or file_targets
 
     def _python_signature(self, lines: list[str], start: int) -> str:
         collected: list[str] = []
@@ -10676,7 +10694,8 @@ import string
         raw_paths = paths if isinstance(paths, list) else [paths]
         checked: list[str] = []
         diagnostics: list[str] = []
-        python_validator_roots: set[str] = set()
+        python_validator_files: set[str] = set()
+        python_validator_scopes: set[str] = set()
         shell_targets: list[str] = []
         seen_shell_targets: set[str] = set()
         validator_commands: list[str] = []
@@ -10695,6 +10714,7 @@ import string
                     text = file_path.read_text(encoding="utf-8", errors="replace")
                     if file_path.suffix.lower() == ".py":
                         base_has_python = True
+                        python_validator_files.add(rel)
                         diagnostic = self._python_syntax_diagnostic(file_path, text)
                         if diagnostic:
                             diagnostics.append(diagnostic)
@@ -10711,9 +10731,13 @@ import string
                         if diagnostic:
                             diagnostics.append(diagnostic)
                 if base_has_python:
-                    python_validator_roots.add(self.relative_label(base))
+                    python_validator_scopes.add(self.relative_label(base))
             phase_timings_ms["scan_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
-            validator_targets = self._collapse_validation_targets(python_validator_roots, limit=100)
+            validator_targets = self._python_validation_targets(
+                discovered_files=python_validator_files,
+                requested_scopes=python_validator_scopes,
+                limit=100,
+            )
             if validator_targets and shutil.which("ruff"):
                 target_args = validator_targets
                 command = ["ruff", "check", "--no-cache", *target_args]

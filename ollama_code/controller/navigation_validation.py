@@ -188,19 +188,24 @@ class NavigationValidationController:
 
         if (
             turn.symbol_read is not None
-            and "search_symbols" not in forbidden_tool_names
             and "read_symbol" not in forbidden_tool_names
-            and ("token" in lowered or "marker" in lowered or ("return" in lowered and "value" in lowered))
+            and not self.agent._request_requires_mutation(request_text)
+            and not self.agent._request_requires_test_run(request_text)
+            and ("token" in lowered or "marker" in lowered or self.agent._request_asks_symbol_return(request_text))
         ):
-            search_args = {"query": turn.symbol_read.symbol, "path": turn.symbol_read.path}
-            search_result = state.execute(
-                self.agent,
-                name="search_symbols",
-                arguments=search_args,
-                request_text=request_text,
-            )
-            if search_result.get("ok") is not True:
-                return None
+            search_requested = "search_symbols" in lowered or "exact match" in lowered
+            if search_requested:
+                if "search_symbols" in forbidden_tool_names:
+                    return None
+                search_args = {"query": turn.symbol_read.symbol, "path": turn.symbol_read.path}
+                search_result = state.execute(
+                    self.agent,
+                    name="search_symbols",
+                    arguments=search_args,
+                    request_text=request_text,
+                )
+                if search_result.get("ok") is not True:
+                    return None
             read_args = {"path": turn.symbol_read.path, "symbol": turn.symbol_read.symbol, "include_context": 0}
             result = state.execute(
                 self.agent,

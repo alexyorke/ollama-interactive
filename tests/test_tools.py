@@ -4942,19 +4942,75 @@ def double(value: int) -> int:
                         result = tools.lint_typecheck("src")
 
         self.assertTrue(result["ok"], result["output"])
-        self.assertEqual(result["validator_targets"], ["src"])
+        self.assertEqual(result["validator_targets"], ["src/one.py", "src/two.py"])
         self.assertEqual(
             result["validator_commands"],
-            ["ruff check --no-cache src", "basedpyright --level error src"],
+            [
+                "ruff check --no-cache src/one.py src/two.py",
+                "basedpyright --level error src/one.py src/two.py",
+            ],
         )
         self.assertEqual(
             calls,
-            [["ruff", "check", "--no-cache", "src"], ["basedpyright", "--level", "error", "src"]],
+            [
+                ["ruff", "check", "--no-cache", "src/one.py", "src/two.py"],
+                ["basedpyright", "--level", "error", "src/one.py", "src/two.py"],
+            ],
         )
         self.assertGreaterEqual(float(result["scan_ms"]), 0.0)
         self.assertGreaterEqual(float(result["ruff_ms"]), 0.0)
         self.assertGreaterEqual(float(result["typecheck_ms"]), 0.0)
         self.assertEqual(float(result["shell_ms"]), 0.0)
+
+    def test_lint_typecheck_preserves_workspace_scope_for_full_repo_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
+                calls.append(list(command))
+                return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
+                with patch.object(tools, "_python_tool_command", return_value=["basedpyright", "--level", "error"]):
+                    with patch.object(tools, "_run_process", side_effect=fake_run):
+                        result = tools.lint_typecheck(".")
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertEqual(result["validator_targets"], ["."])
+        self.assertEqual(
+            calls,
+            [["ruff", "check", "--no-cache", "."], ["basedpyright", "--level", "error", "."]],
+        )
+
+    def test_lint_typecheck_falls_back_to_requested_scope_for_large_python_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            for index in range(25):
+                (src / f"module_{index}.py").write_text(f"VALUE_{index} = {index}\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
+                calls.append(list(command))
+                return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
+                with patch.object(tools, "_python_tool_command", return_value=["basedpyright", "--level", "error"]):
+                    with patch.object(tools, "_run_process", side_effect=fake_run):
+                        result = tools.lint_typecheck("src")
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertEqual(result["validator_targets"], ["src"])
+        self.assertEqual(
+            calls,
+            [["ruff", "check", "--no-cache", "src"], ["basedpyright", "--level", "error", "src"]],
+        )
 
     def test_select_tests_maps_python_source_to_importing_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -106,8 +106,10 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         fix_ids = {row["id"] for row in fixes}
         self.assertIn("loop-cap", fix_ids)
         self.assertIn("diagnose-test-failure", fix_ids)
+        self.assertIn("failure-compression", fix_ids)
         fix_map = {row["id"]: row for row in fixes}
         self.assertEqual(fix_map["loop-cap"]["evidence_count"], 1)
+        self.assertGreater(fix_map["failure-compression"]["evidence_count"], 0)
 
     def test_format_markdown_mentions_fix_coverage(self) -> None:
         payload = {
