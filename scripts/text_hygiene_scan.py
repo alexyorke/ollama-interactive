@@ -7,14 +7,50 @@ from pathlib import Path
 from typing import Any
 
 WINDOWS_TEXT_SUFFIXES = {".ps1", ".psm1", ".psd1"}
+FALLBACK_IGNORED_DIRS = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "scratch",
+    "verify_scratch",
+}
 
 
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _fallback_files(repo_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in repo_root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative_parts = path.relative_to(repo_root).parts
+        if any(
+            part in FALLBACK_IGNORED_DIRS or part.startswith("ollama-code-bench-")
+            for part in relative_parts
+        ):
+            continue
+        paths.append(path)
+    return sorted(paths)
+
+
 def tracked_files(repo_root: Path) -> list[Path]:
-    output = subprocess.check_output(["git", "ls-files", "-z"], cwd=repo_root)
+    try:
+        output = subprocess.check_output(
+            ["git", "ls-files", "-z"],
+            cwd=repo_root,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return _fallback_files(repo_root)
     return [repo_root / Path(item) for item in output.decode("utf-8").split("\0") if item]
 
 

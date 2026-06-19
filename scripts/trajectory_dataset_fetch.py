@@ -116,10 +116,14 @@ def fetch_datasets(
     api: Any | None = None,
     downloader: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
-    api_class, default_downloader = _require_hf_download_support()
+    api_class: type[Any] | None = None
+    default_downloader: Callable[..., str] | None = None
+    if api is None or downloader is None:
+        api_class, default_downloader = _require_hf_download_support()
     data_root.mkdir(parents=True, exist_ok=True)
     hf_api = api or api_class()
     download = downloader or default_downloader
+    assert download is not None
     rows: list[dict[str, Any]] = []
     for dataset in datasets:
         spec = SUPPORTED_DATASET_SPECS[dataset]
