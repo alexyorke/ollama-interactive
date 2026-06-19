@@ -77,7 +77,7 @@ Additional live smoke:
 |---|---|---|
 | `gemma3:4b` | 18 deterministic/token-efficiency cases | 18/18 pass, 0 LLM calls |
 | `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass |
-| `qwen3:8b` | 8 local coding smoke cases | 7/8 pass; debate-on `instructed_edit` timed out, so this model is not recommended for complex edit loops |
+| `qwen3:8b` | 8 local coding smoke cases | 8/8 pass on the June 19, 2026 local-small live gate, but higher token cost than Granite so it remains a comparison model rather than the default |
 
 Public benchmark smoke from [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark), Python Exercism tasks `list-ops`, `pig-latin`, `wordy`, `granite4.1:8b`, debate off:
 

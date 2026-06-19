@@ -1320,6 +1320,28 @@ class ToolExecutor:
     def _iter_code_files(self, base: Path, *, limit: int = 200) -> list[Path]:
         return self._iter_repo_files(base, limit=limit, suffixes=CODE_FILE_SUFFIXES)
 
+    def _collapse_validation_targets(self, labels: Iterable[str], *, limit: int = 100) -> list[str]:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for raw_label in labels:
+            label = str(raw_label or "").strip().replace("\\", "/")
+            if not label:
+                continue
+            if label == ".":
+                return ["."]
+            if label in seen:
+                continue
+            seen.add(label)
+            cleaned.append(label)
+        selected: list[str] = []
+        for label in sorted(cleaned, key=lambda item: (item.count("/"), len(item), item)):
+            if any(label == existing or label.startswith(existing + "/") for existing in selected):
+                continue
+            selected.append(label)
+            if len(selected) >= limit:
+                break
+        return selected
+
     def _python_signature(self, lines: list[str], start: int) -> str:
         collected: list[str] = []
         paren_balance = 0
@@ -10654,9 +10676,14 @@ import string
         raw_paths = paths if isinstance(paths, list) else [paths]
         checked: list[str] = []
         diagnostics: list[str] = []
-        python_targets: set[str] = set()
+        python_validator_roots: set[str] = set()
         shell_targets: list[str] = []
+        seen_shell_targets: set[str] = set()
         validator_commands: list[str] = []
+        validator_targets: list[str] = []
+        phase_timings_ms = {"scan_ms": 0.0, "ruff_ms": 0.0, "typecheck_ms": 0.0, "shell_ms": 0.0}
+        active_phase = "scan_ms"
+        active_phase_started = time.perf_counter()
         try:
             for raw_path in raw_paths:
                 base = self.resolve_path(str(raw_path), allow_missing=False)
@@ -10668,12 +10695,13 @@ import string
                     text = file_path.read_text(encoding="utf-8", errors="replace")
                     if file_path.suffix.lower() == ".py":
                         base_has_python = True
-                        python_targets.add(rel)
                         diagnostic = self._python_syntax_diagnostic(file_path, text)
                         if diagnostic:
                             diagnostics.append(diagnostic)
                     elif file_path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
-                        shell_targets.append(rel)
+                        if rel not in seen_shell_targets:
+                            shell_targets.append(rel)
+                            seen_shell_targets.add(rel)
                     elif file_path.suffix.lower() in {".js", ".jsx"} and shutil.which("node"):
                         completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
                         if completed.returncode != 0:
@@ -10682,21 +10710,29 @@ import string
                         diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
                         if diagnostic:
                             diagnostics.append(diagnostic)
-                if base_has_python and (base.is_file() or base == self.workspace_root or self.workspace_root in base.parents):
-                    python_targets.add(self.relative_label(base))
-            if python_targets and shutil.which("ruff"):
-                target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
+                if base_has_python:
+                    python_validator_roots.add(self.relative_label(base))
+            phase_timings_ms["scan_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
+            validator_targets = self._collapse_validation_targets(python_validator_roots, limit=100)
+            if validator_targets and shutil.which("ruff"):
+                target_args = validator_targets
                 command = ["ruff", "check", "--no-cache", *target_args]
                 validator_commands.append(command_to_text(tuple(command)))
+                active_phase = "ruff_ms"
+                active_phase_started = time.perf_counter()
                 completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+                phase_timings_ms["ruff_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
                 if completed.returncode != 0:
                     diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
             typechecker_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error") or self._python_tool_command("pyright", "pyright", "--level", "error")
-            if python_targets and typechecker_command:
-                target_args = ["."] if "." in python_targets else sorted(python_targets)[:100]
+            if validator_targets and typechecker_command:
+                target_args = validator_targets
                 command = [*typechecker_command, *target_args]
                 validator_commands.append(command_to_text(tuple(command)))
+                active_phase = "typecheck_ms"
+                active_phase_started = time.perf_counter()
                 completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+                phase_timings_ms["typecheck_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
                 if completed.returncode != 0:
                     diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
             bash = shutil.which("bash")
@@ -10704,11 +10740,21 @@ import string
                 for rel in shell_targets[:100]:
                     command = [bash, "-n", rel]
                     validator_commands.append(command_to_text(("bash", "-n", rel)))
+                    active_phase = "shell_ms"
+                    active_phase_started = time.perf_counter()
                     completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
+                    phase_timings_ms["shell_ms"] = round(
+                        float(phase_timings_ms["shell_ms"]) + ((time.perf_counter() - active_phase_started) * 1000),
+                        3,
+                    )
                     if completed.returncode != 0:
                         output = self._collect_process_output(completed) or f"{rel}: bash -n failed"
                         diagnostics.append(self._truncate_text(output, limit=1200))
         except subprocess.TimeoutExpired as exc:
+            phase_timings_ms[active_phase] = round(
+                float(phase_timings_ms.get(active_phase, 0.0) or 0.0) + ((time.perf_counter() - active_phase_started) * 1000),
+                3,
+            )
             timeout_summary = f"Command timed out after {exc.timeout} seconds."
             timeout_output = self._collect_timeout_output(exc)
             timeout_command = self._timeout_command_text(exc.cmd)
@@ -10721,6 +10767,8 @@ import string
                 "checked": checked,
                 "diagnostics": [*diagnostics, timeout_details],
                 "validator_commands": validator_commands,
+                "validator_targets": validator_targets,
+                **phase_timings_ms,
                 "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
                 "summary": timeout_summary,
                 "error_class": "timeout",
@@ -10733,6 +10781,8 @@ import string
             "checked": checked,
             "diagnostics": diagnostics,
             "validator_commands": validator_commands,
+            "validator_targets": validator_targets,
+            **phase_timings_ms,
             "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} code file(s)",
         }
 

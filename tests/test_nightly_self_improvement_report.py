@@ -95,6 +95,14 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             (data_root / "nebius-swe-agent-trajectories").mkdir(parents=True)
+            (
+                data_root
+                / "nebius-swe-agent-trajectories"
+                / report.trajectory_dataset_fetch.MANIFEST_NAME
+            ).write_text(
+                '{"repo_id":"nebius/SWE-agent-trajectories","resolved_revision":"abc123","downloaded_at":"2026-06-19T00:00:00+00:00","file_count":1}',
+                encoding="utf-8",
+            )
             args = self._args(output_dir, data_root)
 
             def fake_run_command(repo: Path, name: str, command: list[str], timeout: int, output_path: Path | None = None) -> dict[str, object]:
@@ -182,6 +190,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(payload["metrics"]["trajectory_error_profile"]["top_errors"][0]["name"], "test_assertion")
         self.assertEqual(payload["metrics"]["trajectory_evidence_report"]["top_fix_coverage"][0]["id"], "mechanical-router")
         self.assertEqual(payload["metrics"]["trajectory_dataset_catalog"]["public_missing_entries"], 1)
+        self.assertEqual(payload["metrics"]["trajectory_dataset_catalog"]["local_manifests"][0]["resolved_revision"], "abc123")
         self.assertEqual(payload["runtime"]["resolved_ollama_host"], "http://[::1]:11434")
         self.assertEqual(payload["runtime"]["llm_skip_reason"], "")
         self.assertEqual(payload["runtime"]["trajectory_skip_reason"], "")

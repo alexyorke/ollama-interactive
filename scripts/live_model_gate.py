@@ -18,7 +18,7 @@ except ModuleNotFoundError:
 
 
 DEFAULT_OUTPUT_DIR = Path("scratch") / "live-model-gate"
-DEFAULT_MODELS = ("gemma4:e4b", "granite4.1:8b", "qwen3:8b")
+DEFAULT_MODELS = ("granite4.1:8b", "gemma4:e4b", "qwen3:8b")
 DEFAULT_E2E_SCENARIOS = ("scenario_transcripted_tool_use", "scenario_run_test")
 DEFAULT_BENCHMARK_FEATURE_PROFILES = ("all",)
 DEFAULT_BENCHMARK_CLASSES = ("agent", "controller")

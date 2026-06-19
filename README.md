@@ -52,7 +52,7 @@ ollama-code --doctor
 If Ollama is not installed or no model is pulled yet, `--doctor` will report that and print the default pull hint. Install Ollama separately, start the daemon, then pull the default model:
 
 ```bash
-ollama pull gemma4:e4b
+ollama pull granite4.1:8b
 ```
 
 Vagrant is not needed by the CLI itself. To test inside a Vagrant VM, install Vagrant plus a provider such as VirtualBox or Hyper-V on the host first, then run the same Linux quickstart inside the guest.
@@ -102,8 +102,8 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
 ```json
 {
   "host": "http://127.0.0.1:11434",
-  "model": "gemma4:e4b",
-  "verifier_model": "gemma4:e4b",
+  "model": "granite4.1:8b",
+  "verifier_model": "granite4.1:8b",
   "approval": "ask",
   "debate": true,
   "reconcile": "auto",
@@ -146,10 +146,10 @@ export OLLAMA_HOST=127.0.0.1:11434
 ollama-code
 ```
 
-The built-in default model is `gemma4:e4b`. Install it once if needed:
+The built-in default model is `granite4.1:8b`. Install it once if needed:
 
 ```bash
-ollama pull gemma4:e4b
+ollama pull granite4.1:8b
 ```
 
 Check first-use setup before asking it to edit code:
@@ -197,7 +197,7 @@ Use a stronger serial verifier/rewrite model while keeping the main working mode
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-ollama-code --model gemma4:e4b --verifier-model granite4.1:8b
+ollama-code --model granite4.1:8b --verifier-model granite4.1:8b
 ```
 
 Resume a specific saved transcript:
@@ -228,7 +228,7 @@ The verified function library stores Python cards in `.ollama-code/index/verifie
 Profile local Ollama speed with raw load/prompt/generation counters:
 
 ```bash
-python scripts/ollama_perf_probe.py --models gemma4:e4b qwen3:8b granite4.1:8b --output scratch/perf/ollama.json
+python scripts/ollama_perf_probe.py --models granite4.1:8b gemma4:e4b qwen3:8b --output scratch/perf/ollama.json
 ```
 
 ## Docker
@@ -282,7 +282,7 @@ Always-on self-hosting is not part of the core CLI path. The legacy watchdog/tas
 Use the gated report harness to measure product changes before proposing implementation work:
 
 ```bash
-python scripts/nightly_self_improvement_report.py --models gemma4:e4b --strict-accuracy --strict-budget
+python scripts/nightly_self_improvement_report.py --models granite4.1:8b --strict-accuracy --strict-budget
 ```
 
 For a cheap local baseline that skips model-driven evals but still records tool speed, SDK retrieval, question quality, dataset-catalog status, and compare-path behavior:
@@ -294,6 +294,14 @@ python scripts/nightly_self_improvement_report.py --skip-llm --generated-files 1
 The report writes `scratch/nightly-self-improvement/<timestamp>/report.json` with pass/fail deltas, token totals, tool latency, slowest tools, clarification-question quality, local trajectory analysis, dataset-catalog status, and suggested implementation targets. When `--compare` is omitted it auto-selects the latest prior report from either `scratch/nightly-self-improvement/` or the legacy `.ollama-code/self-improvement-runs/` location. It also records `runtime.llm_skip_reason` and `runtime.trajectory_skip_reason` so skipped sections are explicit in the JSON.
 
 Trajectory profile, error, and evidence commands only run when local datasets exist under `scratch/external/datasets/` (or a custom `--trajectory-data-root`). The harness does not edit, merge, push, or run a background worker.
+
+Bootstrap the local trajectory corpus with:
+
+```bash
+python scripts/trajectory_dataset_fetch.py --datasets nebius-swe-agent-trajectories
+```
+
+The fetcher downloads only the supported public Parquet globs for each requested dataset, writes a per-dataset manifest at `scratch/external/datasets/<dataset>/.ollama-interactive-manifest.json`, and records a summary at `scratch/external/datasets/trajectory-dataset-fetch.json`. Treat those local files and the generated JSON under `scratch/` as regenerated evidence, not versioned source data.
 
 ### Python SDK Retrieval
 
@@ -340,15 +348,15 @@ python3 scripts/live_matrix.py
 
 The default serial smoke matrix tries the installed baseline models first, then optional Granite and Gemma eval targets:
 
+- `granite4.1:8b`
 - `gemma4:e4b`
 - `qwen3:8b`
-- `granite4.1:8b`
 
 If your Ollama daemon is on a non-default host or port, set `OLLAMA_HOST` first. Example for the tested WSL daemon on `127.0.0.1:11434`:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-python3 scripts/live_matrix.py --models gemma4:e4b qwen3:8b
+python3 scripts/live_matrix.py --models granite4.1:8b gemma4:e4b qwen3:8b
 ```
 
 For stricter transcript-verified end-to-end checks against one model:
@@ -383,7 +391,7 @@ For realistic coding-task accuracy plus token-profile checks:
 
 ```bash
 export OLLAMA_HOST=127.0.0.1:11434
-python3 scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b qwen3:8b granite4.1:8b --modes off on --strict-accuracy --strict-budget
+python3 scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b gemma4:e4b qwen3:8b --modes off on --strict-accuracy --strict-budget
 ```
 
 See [docs/coding-benchmarks.md](docs/coding-benchmarks.md) for the local suites, recorded metrics, and optional external benchmark preflights.
@@ -454,6 +462,6 @@ git push origin v0.1.0
 - You can configure a default test runner with `--test-cmd` or `OLLAMA_CODE_TEST_CMD`, and the model can invoke it through `run_test` or `/test`.
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
 - `todo_read` and `todo_write` give the model a Claude Code-style in-session checklist for complex tasks. Todo state is saved in session transcripts, does not touch workspace files, and is shown to the model only when the current request benefits from it.
-- The recommended default coding model is `gemma4:e4b`; install it with `ollama pull gemma4:e4b`.
-- The recommended serial eval order is `gemma4:e4b`, `granite4.1:8b`, then `qwen3:8b`.
+- The recommended default coding model is `granite4.1:8b`; install it with `ollama pull granite4.1:8b`.
+- The recommended serial eval order is `granite4.1:8b`, `gemma4:e4b`, then `qwen3:8b`.
 - If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back only to a known preferred local model and prints the pull command. Custom `hf.co/...` or vendor tags are never selected implicitly; pass `--model` for those.

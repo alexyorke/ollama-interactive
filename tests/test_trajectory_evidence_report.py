@@ -1,4 +1,7 @@
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from scripts import trajectory_evidence_report as report
 
@@ -148,6 +151,22 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertIn("Trajectory Evidence Report", markdown)
         self.assertIn("Portfolio Fix Coverage", markdown)
         self.assertIn("mechanical-router", markdown)
+
+    def test_build_report_attaches_dataset_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            dataset_root = data_root / "nebius-swe-agent-trajectories"
+            (dataset_root / "data").mkdir(parents=True)
+            (dataset_root / report.trajectory_dataset_fetch.MANIFEST_NAME).write_text(
+                '{"repo_id":"nebius/SWE-agent-trajectories","resolved_revision":"abc123","file_count":1,"downloaded_at":"2026-06-19T00:00:00+00:00"}',
+                encoding="utf-8",
+            )
+            with patch.object(report, "_iter_dataset_rows", return_value=("swe_agent", iter([{"trajectory": []}]))):
+                payload = report.build_report(data_root, ["nebius-swe-agent-trajectories"], max_rows=1)
+
+        summary = payload["datasets"][0]
+        self.assertEqual(summary["source_manifest"]["repo_id"], "nebius/SWE-agent-trajectories")
+        self.assertEqual(summary["source_manifest"]["resolved_revision"], "abc123")
 
 
 if __name__ == "__main__":

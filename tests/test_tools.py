@@ -4923,6 +4923,39 @@ def double(value: int) -> int:
         self.assertIn("bash -n script.sh", result["validator_commands"])
         self.assertIn("shell partial stderr", result["output"])
 
+    def test_lint_typecheck_collapses_validator_targets_to_requested_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "src" / "two.py").write_text("OTHER = 2\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
+                calls.append(list(command))
+                return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
+                with patch.object(tools, "_python_tool_command", return_value=["basedpyright", "--level", "error"]):
+                    with patch.object(tools, "_run_process", side_effect=fake_run):
+                        result = tools.lint_typecheck("src")
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertEqual(result["validator_targets"], ["src"])
+        self.assertEqual(
+            result["validator_commands"],
+            ["ruff check --no-cache src", "basedpyright --level error src"],
+        )
+        self.assertEqual(
+            calls,
+            [["ruff", "check", "--no-cache", "src"], ["basedpyright", "--level", "error", "src"]],
+        )
+        self.assertGreaterEqual(float(result["scan_ms"]), 0.0)
+        self.assertGreaterEqual(float(result["ruff_ms"]), 0.0)
+        self.assertGreaterEqual(float(result["typecheck_ms"]), 0.0)
+        self.assertEqual(float(result["shell_ms"]), 0.0)
+
     def test_select_tests_maps_python_source_to_importing_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

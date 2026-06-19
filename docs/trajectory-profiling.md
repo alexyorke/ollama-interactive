@@ -32,6 +32,20 @@ The catalog probes:
 
 ## Usage
 
+Fetch one supported public dataset locally:
+
+```bash
+python scripts/trajectory_dataset_fetch.py --datasets nebius-swe-agent-trajectories
+```
+
+Fetch the full supported public set in the current priority order:
+
+```bash
+python scripts/trajectory_dataset_fetch.py
+```
+
+The fetcher downloads only the allowed Parquet globs for each supported dataset and writes a small manifest at `scratch/external/datasets/<dataset>/.ollama-interactive-manifest.json`. Treat these local files and the generated JSON under `scratch/` as regenerated evidence, not versioned source artifacts.
+
 Profile a manageable sample from every supported dataset:
 
 ```bash
@@ -200,7 +214,7 @@ scripts/token_efficiency_eval.py --strict-accuracy
   all default cases passed
 scripts/verification_eval.py --strict-on
   all strict-on cases passed
-scripts/e2e_suite.py --model gemma4:e4b
+scripts/e2e_suite.py --model granite4.1:8b
   all scenarios passed
 scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --feature-profiles trajectory-guards --strict-accuracy
   8/8 passed

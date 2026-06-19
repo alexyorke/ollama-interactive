@@ -16,7 +16,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts import trajectory_profile
+from scripts import trajectory_dataset_fetch, trajectory_profile
 
 
 def _repo_root() -> Path:
@@ -268,6 +268,24 @@ def _trajectory_catalog_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "gated_entries": int(summary.get("gated_entries", 0) or 0),
         "high_priority_public_missing": list(summary.get("high_priority_public_missing") or []),
     }
+
+
+def _trajectory_local_manifest_summary(data_root: Path, datasets: list[str]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for dataset in datasets:
+        manifest = trajectory_dataset_fetch.read_dataset_manifest(data_root, dataset)
+        if not manifest:
+            continue
+        rows.append(
+            {
+                "dataset": dataset,
+                "repo_id": str(manifest.get("repo_id") or ""),
+                "resolved_revision": str(manifest.get("resolved_revision") or ""),
+                "downloaded_at": str(manifest.get("downloaded_at") or ""),
+                "file_count": int(manifest.get("file_count", 0) or 0),
+            }
+        )
+    return rows
 
 
 def _available_trajectory_datasets(data_root: Path) -> list[str]:
@@ -679,7 +697,10 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "mode": sdk_payload.get("mode"),
         },
         "question_quality": _question_quality_summary(question_quality_payload),
-        "trajectory_dataset_catalog": _trajectory_catalog_summary(trajectory_catalog_payload),
+        "trajectory_dataset_catalog": {
+            **_trajectory_catalog_summary(trajectory_catalog_payload),
+            "local_manifests": _trajectory_local_manifest_summary(args.trajectory_data_root, available_trajectory_datasets),
+        },
         "trajectory_profile": _trajectory_profile_summary(
             trajectory_profile_payload, expected_datasets=available_trajectory_datasets
         ),

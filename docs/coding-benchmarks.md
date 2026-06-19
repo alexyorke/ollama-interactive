@@ -52,7 +52,7 @@ Each result records:
 Run the frequent local suite:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b qwen3:8b granite4.1:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b gemma4:e4b qwen3:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Run A/B feature profiles without changing prompts:
@@ -64,19 +64,19 @@ python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:
 Run agent benchmarks only and require a real model call:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-small --models gemma4:e4b --modes off --feature-profiles all --benchmark-classes agent --jobs 12 --require-llm-for-agent-benchmarks
+python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --feature-profiles all --benchmark-classes agent --jobs 12 --require-llm-for-agent-benchmarks
 ```
 
 Run controller-only routing checks without mixing them into agent numbers:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-full --models gemma4:e4b --modes off --benchmark-classes controller --jobs 12 --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-full --models granite4.1:8b --modes off --benchmark-classes controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Run the fuller local suite for deeper regression checks:
 
 ```bash
-python scripts/coding_benchmark_eval.py --suite local-full --models gemma4:e4b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
+python scripts/coding_benchmark_eval.py --suite local-full --models granite4.1:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
 Compare against a previous run:
@@ -118,13 +118,13 @@ Default gate steps:
 Frequent local release gate:
 
 ```bash
-python scripts/live_model_gate.py --models gemma4:e4b --benchmark-suite local-small --benchmark-jobs 1
+python scripts/live_model_gate.py --models granite4.1:8b --benchmark-suite local-small --benchmark-jobs 1
 ```
 
 Fast proof that skips the longer benchmark step:
 
 ```bash
-python scripts/live_model_gate.py --models gemma4:e4b --skip-benchmarks
+python scripts/live_model_gate.py --models granite4.1:8b --skip-benchmarks
 ```
 
 Artifacts land under:
@@ -151,7 +151,7 @@ python scripts/question_quality_eval.py
 Run the live Ollama-backed clarification scenario with:
 
 ```bash
-python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_clarifying_question_eba
+python scripts/e2e_suite.py --model granite4.1:8b --scenarios scenario_clarifying_question_eba
 ```
 
 Artifacts land under:

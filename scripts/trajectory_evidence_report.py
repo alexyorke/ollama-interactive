@@ -12,7 +12,7 @@ from typing import Any, Iterable
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts import trajectory_error_profile, trajectory_profile
+from scripts import trajectory_dataset_fetch, trajectory_error_profile, trajectory_profile
 
 
 DEFAULT_DATA_ROOT = Path("scratch") / "external" / "datasets"
@@ -645,6 +645,23 @@ def summarize_dataset(dataset: str, adapter: str, rows: Iterable[dict[str, Any]]
     return summary
 
 
+def _attach_manifest(summary: dict[str, Any], data_root: Path) -> None:
+    dataset = str(summary.get("dataset") or "")
+    if not dataset:
+        return
+    manifest = trajectory_dataset_fetch.read_dataset_manifest(data_root, dataset)
+    if not manifest:
+        return
+    summary["source_manifest"] = {
+        "repo_id": manifest.get("repo_id"),
+        "requested_revision": manifest.get("requested_revision"),
+        "resolved_revision": manifest.get("resolved_revision"),
+        "downloaded_at": manifest.get("downloaded_at"),
+        "file_count": manifest.get("file_count"),
+        "manifest_path": trajectory_dataset_fetch.dataset_manifest_path(data_root, dataset).as_posix(),
+    }
+
+
 def _reference_row_pattern_counts(summary: dict[str, Any]) -> dict[str, int]:
     reference_trajectory = summary.get("reference_trajectory_metrics")
     if not isinstance(reference_trajectory, dict):
@@ -806,6 +823,7 @@ def build_report(
     for dataset in datasets:
         adapter, rows = _iter_dataset_rows(data_root, dataset, max_rows)
         summary = summarize_dataset(dataset, adapter, rows)
+        _attach_manifest(summary, data_root)
         _merge_reference_metrics(summary, reference_trajectory=reference_trajectory, reference_error=reference_error)
         summaries.append(summary)
     payload = {
@@ -853,6 +871,14 @@ def format_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- Tool-call events: `{summary.get('tool_call_events', 0)}`")
         lines.append(f"- Message-extracted tool-call records: `{summary.get('message_tool_call_records', 0)}`")
         lines.append(f"- Avg tool calls: `{summary.get('avg_tool_calls', 0)}`")
+        manifest = summary.get("source_manifest")
+        if isinstance(manifest, dict):
+            lines.append(
+                "- Source manifest: "
+                + f"`{manifest.get('repo_id', '')}` "
+                + f"revision=`{manifest.get('resolved_revision') or manifest.get('requested_revision') or '-'}` "
+                + f"files=`{manifest.get('file_count', 0)}`"
+            )
         lines.append(f"- Context-loop rows: `{summary.get('context_loop_rows_pct', 0)}%`")
         lines.append(f"- Edit without prior context: `{summary.get('edit_without_prior_context_pct', 0)}%`")
         lines.append(f"- Edit without later test: `{summary.get('edit_without_later_test_pct', 0)}%`")
