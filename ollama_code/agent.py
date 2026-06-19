@@ -909,17 +909,42 @@ class OllamaCodeAgent:
         for item in reversed(successful_tool_results):
             if item.get("name") not in {"read_file", "find_implementation_target", "implementation_spec", "diagnose_test_failure"}:
                 continue
-            result = item.get("result") if isinstance(item.get("result"), dict) else {}
-            source_path = str(result.get("path") or "").strip().replace("\\", "/")
-            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            source_path = str(result.get("path") or arguments.get("source_path") or arguments.get("path") or "").strip().replace("\\", "/")
-            if not source_path or source_path in seen:
-                continue
-            seen.add(source_path)
-            if not source_path.endswith(".py") or self._path_looks_like_test_file(source_path):
-                continue
-            pairs.append((source_path, source_path))
+            for source_path in self._source_paths_from_tool_result(item):
+                if source_path in seen:
+                    continue
+                seen.add(source_path)
+                pairs.append((source_path, source_path))
         return pairs
+
+    def _source_paths_from_tool_result(self, item: dict[str, Any]) -> list[str]:
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        candidates: list[str] = []
+        direct_path = str(result.get("path") or arguments.get("source_path") or arguments.get("path") or "").strip().replace("\\", "/")
+        if direct_path:
+            candidates.append(direct_path)
+        targets = result.get("targets")
+        if isinstance(targets, list):
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                target_path = str(target.get("path") or target.get("source_path") or "").strip().replace("\\", "/")
+                if target_path:
+                    candidates.append(target_path)
+        paths: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            normalized = candidate.lstrip("./")
+            if (
+                not normalized
+                or normalized in seen
+                or not normalized.endswith(".py")
+                or self._path_looks_like_test_file(normalized)
+            ):
+                continue
+            seen.add(normalized)
+            paths.append(normalized)
+        return paths
 
     def _normalize_audit_text_items(self, items: object) -> list[str]:
         if not isinstance(items, list):
@@ -1936,15 +1961,13 @@ class OllamaCodeAgent:
         paths: list[str] = []
         seen: set[str] = set()
         for item in reversed(successful_tool_results):
-            result = item.get("result") if isinstance(item.get("result"), dict) else {}
-            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            rel = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/")
-            if not rel or rel in seen or not rel.endswith(".py") or self._path_looks_like_test_file(rel):
-                continue
-            seen.add(rel)
-            paths.append(rel)
-            if len(paths) >= 4:
-                break
+            for rel in self._source_paths_from_tool_result(item):
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                paths.append(rel)
+                if len(paths) >= 4:
+                    return list(reversed(paths))
         return list(reversed(paths))
 
     def _recent_test_paths(self, successful_tool_results: list[dict[str, Any]]) -> list[str]:
@@ -1974,6 +1997,76 @@ class OllamaCodeAgent:
             if re.fullmatch(r"[A-Za-z_][\w.]*", query):
                 return query
         return None
+
+    def _parse_code_outline_symbols(self, output: str) -> list[tuple[str, str]]:
+        symbols: list[tuple[str, str]] = []
+        current_path = ""
+        for raw_line in output.splitlines():
+            line = raw_line.rstrip()
+            if not line:
+                continue
+            if not line.startswith(" "):
+                current_path = line.strip().replace("\\", "/").lstrip("./")
+                continue
+            match = re.match(r"^\s+\d+-\d+\s+\w+\s+(?P<qualname>[A-Za-z_][\w.]*)\s*:", line)
+            if not match or not current_path:
+                continue
+            symbols.append((current_path, match.group("qualname").strip()))
+        return symbols
+
+    def _successful_single_outlined_symbol(
+        self,
+        *,
+        path: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> str | None:
+        normalized_path = str(path or "").strip().replace("\\", "/").lstrip("./")
+        if not normalized_path:
+            return None
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "code_outline":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            outline_path = str(result.get("path") or arguments_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if outline_path != normalized_path:
+                continue
+            matches = [
+                qualname
+                for match_path, qualname in self._parse_code_outline_symbols(str(result.get("output") or ""))
+                if match_path == normalized_path
+            ]
+            unique = list(dict.fromkeys(matches))
+            if len(unique) == 1:
+                return unique[0]
+            return None
+        return None
+
+    def _has_successful_read_symbol(
+        self,
+        *,
+        path: str,
+        symbol: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        normalized_path = str(path or "").strip().replace("\\", "/").lstrip("./")
+        normalized_symbol = str(symbol or "").strip()
+        if not normalized_path or not normalized_symbol:
+            return False
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "read_symbol":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            result_path = str(result.get("path") or arguments_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            result_symbol = str(result.get("symbol") or arguments_dict.get("symbol") or "").strip()
+            if result_path == normalized_path and result_symbol == normalized_symbol:
+                return True
+        return False
 
     def _stub_targets_for_paths(self, paths: list[str]) -> list[str]:
         targets = [{"path": path} for path in paths]
@@ -3912,6 +4005,36 @@ class OllamaCodeAgent:
                 and not self._has_successful_tool_named(successful_tool_results, "search_symbols")
             ):
                 return "search_symbols", {"query": recent_identifier_query, "path": latest_source_path}
+            if recent_identifier_query:
+                search_match = self._successful_symbol_search_match(
+                    query=recent_identifier_query,
+                    successful_tool_results=successful_tool_results,
+                )
+                if (
+                    search_match is not None
+                    and search_match[0] == latest_source_path
+                    and "read_symbol" not in forbidden_tool_names
+                    and not self._has_successful_read_symbol(
+                        path=latest_source_path,
+                        symbol=search_match[1],
+                        successful_tool_results=successful_tool_results,
+                    )
+                ):
+                    return "read_symbol", {"path": latest_source_path, "symbol": search_match[1], "include_context": 0}
+            outlined_symbol = self._successful_single_outlined_symbol(
+                path=latest_source_path,
+                successful_tool_results=successful_tool_results,
+            )
+            if (
+                outlined_symbol
+                and "read_symbol" not in forbidden_tool_names
+                and not self._has_successful_read_symbol(
+                    path=latest_source_path,
+                    symbol=outlined_symbol,
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return "read_symbol", {"path": latest_source_path, "symbol": outlined_symbol, "include_context": 0}
             if "code_outline" not in forbidden_tool_names and not self._has_successful_tool_named(successful_tool_results, "code_outline"):
                 return "code_outline", {"path": latest_source_path}
         return None
@@ -3965,6 +4088,16 @@ class OllamaCodeAgent:
                         next_step += ", then run_test"
                     return next_step + ". Next JSON only."
                 return f"Use the code outline for {path}. Continue with a narrower symbol-level read or answer from current evidence. Next JSON only."
+        if probe_name == "read_symbol":
+            path = str(probe_result.get("path") or probe_arguments.get("path") or "").strip()
+            symbol = str(probe_result.get("symbol") or probe_arguments.get("symbol") or "").strip()
+            if path and symbol:
+                if mutation_required or code_mutation_required:
+                    next_step = f"Use the grounded symbol {symbol} in {path}. Edit the exact implementation symbol now"
+                    if test_run_required:
+                        next_step += ", then run_test"
+                    return next_step + ". Next JSON only."
+                return f"Use the grounded symbol {symbol} in {path}. Continue from that narrower symbol target or answer from current evidence. Next JSON only."
         return self._context_guard_retry_message(
             mutation_required=mutation_required,
             code_mutation_required=code_mutation_required,
@@ -4279,12 +4412,45 @@ class OllamaCodeAgent:
         name: str,
         tool_calls: list[dict[str, Any]],
         latest_run_test_failed: bool,
+        successful_tool_results: list[dict[str, Any]],
     ) -> bool:
         if latest_run_test_failed:
             return False
         if name not in BROAD_CONTEXT_GATHERING_TOOL_NAMES:
             return False
-        return self._broad_context_tool_streak(tool_calls) >= 2
+        if self._broad_context_tool_streak(tool_calls) >= 2:
+            return True
+        source_paths = self._recent_source_paths(successful_tool_results)
+        if not source_paths:
+            return False
+        latest_source_path = source_paths[-1]
+        recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
+        if recent_identifier_query:
+            search_match = self._successful_symbol_search_match(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            )
+            if (
+                search_match is not None
+                and search_match[0] == latest_source_path
+                and not self._has_successful_read_symbol(
+                    path=latest_source_path,
+                    symbol=search_match[1],
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return True
+        outlined_symbol = self._successful_single_outlined_symbol(
+            path=latest_source_path,
+            successful_tool_results=successful_tool_results,
+        )
+        if not outlined_symbol:
+            return False
+        return not self._has_successful_read_symbol(
+            path=latest_source_path,
+            symbol=outlined_symbol,
+            successful_tool_results=successful_tool_results,
+        )
 
     def _has_grounding_evidence(
         self,
@@ -4417,6 +4583,47 @@ class OllamaCodeAgent:
                 exact_matches.append(candidate)
             if len(exact_matches) == 1:
                 return exact_matches[0]
+            non_test_exact_matches = [candidate for candidate in exact_matches if not self._path_looks_like_test_file(candidate[0])]
+            if len(non_test_exact_matches) == 1:
+                return non_test_exact_matches[0]
+            return None
+        return None
+
+    def _successful_symbol_search_source_path(
+        self,
+        *,
+        query: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> str | None:
+        normalized_query = str(query or "").strip().lower()
+        if not normalized_query:
+            return None
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "search_symbols":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if str(arguments_dict.get("query") or "").strip().lower() != normalized_query:
+                continue
+            matches = self._parse_search_symbols_matches(str(result.get("output") or ""))
+            if not matches:
+                return None
+            exact_paths: list[str] = []
+            all_paths: list[str] = []
+            for path, qualname in matches:
+                if not self._path_looks_like_test_file(path):
+                    all_paths.append(path)
+                leaf_name = qualname.rsplit(".", 1)[-1].lower()
+                if normalized_query in {leaf_name, qualname.lower()} and not self._path_looks_like_test_file(path):
+                    exact_paths.append(path)
+            unique_exact_paths = list(dict.fromkeys(exact_paths))
+            if len(unique_exact_paths) == 1:
+                return unique_exact_paths[0]
+            unique_all_paths = list(dict.fromkeys(all_paths))
+            if len(unique_all_paths) == 1:
+                return unique_all_paths[0]
             return None
         return None
 
@@ -4481,6 +4688,12 @@ class OllamaCodeAgent:
             if search_match is not None:
                 search_path, matched_symbol = search_match
                 return "read_symbol", {"path": search_path, "symbol": matched_symbol, "include_context": 0}
+            search_source_path = self._successful_symbol_search_source_path(
+                query=symbol_name,
+                successful_tool_results=successful_tool_results,
+            )
+            if search_source_path:
+                return "read_file", {"path": search_source_path}
             if not self._has_successful_symbol_search_query(
                 query=symbol_name,
                 successful_tool_results=successful_tool_results,
@@ -4637,6 +4850,18 @@ class OllamaCodeAgent:
                     f"Search found a unique symbol match for {match_symbol} in {match_path}. "
                     "Read that exact symbol now before editing. Next JSON only."
                 )
+            unique_source_path = self._successful_symbol_search_source_path(
+                query=query,
+                successful_tool_results=[
+                    {
+                        "name": probe_name,
+                        "arguments": probe_arguments,
+                        "result": probe_result,
+                    }
+                ],
+            )
+            if unique_source_path:
+                return f"Search narrowed the likely implementation file to {unique_source_path}. Read that file now before editing. Next JSON only."
             if query and exact_matches:
                 return f"Use the symbol-level matches for {query}. Read the exact implementation symbol now before editing. Next JSON only."
             if query:
@@ -5539,6 +5764,73 @@ class OllamaCodeAgent:
                 tool=str(last_result.get("tool") if last_result else "replace_in_file"),
                 round_number=round_number,
             )
+        test_grounded_return_rewrite = self._test_grounded_symbol_return_rewrite_spec(request_text)
+        if test_grounded_return_rewrite and "find_implementation_target" not in forbidden_tool_names:
+            test_path = test_grounded_return_rewrite["test_path"]
+            symbol = test_grounded_return_rewrite["symbol"]
+            new_expr = test_grounded_return_rewrite["new_expr"]
+            old_expr = test_grounded_return_rewrite["old_expr"]
+            round_number += 1
+            find_args = {"test_path": test_path, "query": symbol, "limit": 6}
+            find_result = self._execute_controller_tool(
+                name="find_implementation_target",
+                arguments=find_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if find_result.get("ok") is not True:
+                return None
+            source_paths = self._source_paths_from_tool_result({"arguments": find_args, "result": find_result})
+            if len(source_paths) != 1:
+                return None
+            symbol_return_ops = self._symbol_return_update_operations_for_target(
+                path=source_paths[0],
+                symbol=symbol,
+                new_expr=new_expr,
+                old_expr=old_expr,
+                request_text=request_text,
+                required_tool_names=required_tool_names,
+            )
+            if not symbol_return_ops:
+                return None
+            if any(tool_name in forbidden_tool_names for tool_name, _ in symbol_return_ops):
+                return None
+            last_result: dict[str, Any] | None = find_result
+            for tool_name, args in symbol_return_ops:
+                round_number += 1
+                last_result = self._execute_controller_tool(
+                    name=tool_name,
+                    arguments=args,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                if last_result.get("ok") is not True:
+                    return None
+            if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+                round_number += 1
+                test_result = self._execute_controller_tool(
+                    name="run_test",
+                    arguments={"command": self.tools.default_test_command},
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                if test_result.get("ok") is not True:
+                    return None
+                return self._record_synthesized_final(f"Updated {source_paths[0]}; tests passed.", tool="run_test", round_number=round_number)
+            return self._record_synthesized_final(
+                f"Updated {source_paths[0]}.",
+                tool=str(last_result.get("tool") if last_result else "replace_in_file"),
+                round_number=round_number,
+            )
         optional_parameter_ops = self._optional_parameter_update_operations(request_text)
         if optional_parameter_ops and "edit_intent" not in forbidden_tool_names:
             last_result: dict[str, Any] | None = None
@@ -5702,18 +5994,39 @@ class OllamaCodeAgent:
             )
         ]
 
-    def _symbol_return_update_operations(self, request_text: str, required_tool_names: set[str]) -> list[tuple[str, dict[str, Any]]] | None:
+    def _test_grounded_symbol_return_rewrite_spec(self, request_text: str) -> dict[str, str] | None:
         match = re.search(
-            r"\b(?P<path>[\w./-]+\.(?:js|jsx|ts|tsx|py))\b(?:(?!\n\n).){0,240}?\bchange\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
+            r"\b(?P<test>[\w./-]+\.py)\b(?:(?!\n\n).){0,260}?\b(?:change|changing|update|updating)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
             request_text,
             flags=re.IGNORECASE | re.DOTALL,
         )
         if not match:
             return None
-        path = match.group("path").strip().rstrip(".,;:")
+        test_path = match.group("test").strip().rstrip(".,;:")
+        if not self._path_looks_like_test_file(test_path):
+            return None
         symbol = match.group("symbol").strip()
         new_expr = self._clean_return_expression(match.group("new"))
         old_expr = self._clean_return_expression(match.group("old"))
+        if not test_path or not symbol or not new_expr or not old_expr:
+            return None
+        return {
+            "test_path": test_path,
+            "symbol": symbol,
+            "new_expr": new_expr,
+            "old_expr": old_expr,
+        }
+
+    def _symbol_return_update_operations_for_target(
+        self,
+        *,
+        path: str,
+        symbol: str,
+        new_expr: str,
+        old_expr: str,
+        request_text: str,
+        required_tool_names: set[str],
+    ) -> list[tuple[str, dict[str, Any]]] | None:
         if not path or not symbol or not new_expr or not old_expr:
             return None
         try:
@@ -5743,6 +6056,27 @@ class OllamaCodeAgent:
             operations.append(("read_symbol", {"path": path, "symbol": symbol, "include_context": 0}))
         operations.append(("replace_in_file", {"path": path, "old": old_line, "new": new_line}))
         return operations
+
+    def _symbol_return_update_operations(self, request_text: str, required_tool_names: set[str]) -> list[tuple[str, dict[str, Any]]] | None:
+        match = re.search(
+            r"\b(?P<path>[\w./-]+\.(?:js|jsx|ts|tsx|py))\b(?:(?!\n\n).){0,240}?\b(?:change|changing|update|updating)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
+            request_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        path = match.group("path").strip().rstrip(".,;:")
+        symbol = match.group("symbol").strip()
+        new_expr = self._clean_return_expression(match.group("new"))
+        old_expr = self._clean_return_expression(match.group("old"))
+        return self._symbol_return_update_operations_for_target(
+            path=path,
+            symbol=symbol,
+            new_expr=new_expr,
+            old_expr=old_expr,
+            request_text=request_text,
+            required_tool_names=required_tool_names,
+        )
 
     def _clean_return_expression(self, expression: str) -> str:
         expression = re.sub(r"\s+", " ", expression).strip()
@@ -8988,6 +9322,7 @@ class OllamaCodeAgent:
                         name=name,
                         tool_calls=tool_calls_this_turn,
                         latest_run_test_failed=latest_run_test_failed,
+                        successful_tool_results=successful_tool_results,
                     )
                 ):
                     prior_tools = [str(item.get("name", "")) for item in tool_calls_this_turn[-4:]]
@@ -9017,6 +9352,7 @@ class OllamaCodeAgent:
                             tool_calls_this_turn=tool_calls_this_turn,
                         )
                         if probe_result.get("ok") is True:
+                            context_planner_prompted = False
                             self.messages.append(
                                 {
                                     "role": "user",
@@ -9303,6 +9639,8 @@ class OllamaCodeAgent:
                     self._store_cached_tool_result(name, arguments, result)
                 self._invalidate_turn_cache_if_needed(name, result)
                 self._record_command_validation_event(name=name, result=result, round_number=round_number, cached=cache_hit)
+                if name not in BROAD_CONTEXT_GATHERING_TOOL_NAMES:
+                    context_planner_prompted = False
                 result_for_feedback = result
                 post_tool_feedback: list[str] = []
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None

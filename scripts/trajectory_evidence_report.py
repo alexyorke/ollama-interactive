@@ -80,7 +80,7 @@ ROW_PATTERN_META: dict[str, dict[str, str]] = {
 PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     "mechanical-router": {
         "status": "partial",
-        "summary": "Deterministic routing exists for read/search/symbol/test/git exact paths, including plain-language symbol return reads and direct implementation-target requests.",
+        "summary": "Deterministic routing exists for read/search/symbol/test/git exact paths, including plain-language symbol return reads, direct implementation-target requests, and test-grounded return rewrites that resolve implementation targets before editing.",
         "references": [
             "ollama_code/controller/navigation_validation.py",
             "ollama_code/agent.py",
@@ -89,7 +89,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "context-planner": {
         "status": "partial",
-        "summary": "Compact context tools exist, the agent can preload context_pack, repeated broad test inspection can auto-map tests to implementation targets, and repeated broad source inspection can auto-switch to search_symbols or code_outline.",
+        "summary": "Compact context tools exist, the agent can preload context_pack, repeated broad test inspection can auto-map tests to implementation targets, grounded implementation targets feed later source narrowing, repeated broad source inspection can auto-switch to search_symbols or code_outline, and grounded search-symbol or single-symbol outline results can auto-promote to read_symbol on later broad relapses.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
@@ -124,12 +124,12 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "ground-before-mutate": {
         "status": "partial",
-        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from recent source or test context, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols before read_symbol.",
+        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from recent source or test context, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols to either a unique symbol or a single non-test source file before editing.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Ambiguous or missing repo-wide symbol matches still need manual disambiguation before pathless mutation can be grounded.",
+        "next_gap": "Multiple non-test source candidates, or repo-wide searches that still do not collapse to one likely source file, still need manual disambiguation before pathless mutation can be grounded.",
     },
     "diagnose-test-failure": {
         "status": "implemented",

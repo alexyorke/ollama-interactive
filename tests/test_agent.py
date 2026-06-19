@@ -181,7 +181,13 @@ class AgentTests(unittest.TestCase):
             root = Path(tmp)
             client = FakeClient(['{"type":"tool","name":"final","arguments":{"message":"done"}}'])
             tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                disable_spec_guided_repair=True,
+            )
 
             result = agent.handle_user("Say done.")
 
@@ -643,6 +649,102 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_calls[:3], ["read_file", "search", "code_outline"])
         self.assertTrue(any("Use the code outline for src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
 
+    def test_context_planner_reuses_grounded_implementation_target_for_later_symbol_narrowing(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        (root / "tests" / "test_pkg.py").write_text(
+            "import unittest\n"
+            "from src.core import wrapped\n\n"
+            "class PackageTests(unittest.TestCase):\n"
+            "    def test_wrapped(self):\n"
+            "        self.assertEqual(wrapped(), 'ok')\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":4}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":4}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect tests/test_pkg.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("find_implementation_target"), 1)
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:6], ["read_file", "search", "find_implementation_target", "search", "read_file", "search_symbols"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the grounded implementation target(s) src/core.py.", feedback)
+        self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
+
+    def test_context_planner_auto_reads_single_outlined_symbol_before_more_broad_reads(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"business logic","path":"src/core.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect src/core.py and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_file", "search", "code_outline", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the code outline for src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_auto_reads_symbol_match_before_more_broad_reads(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped","path":"src/core.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect src/core.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertEqual(tools.execute_counts.get("code_outline"), None)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_file", "search", "search_symbols", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
     def test_trajectory_ground_guard_rejects_ungrounded_mutation_then_allows_after_read(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("def value():\n    return 'old'\n", encoding="utf-8")
@@ -795,6 +897,38 @@ class AgentTests(unittest.TestCase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Search found a unique symbol match for add in app.py. Read that exact symbol now before editing.", feedback)
         self.assertIn("Use the grounded symbol add in app.py to make the edit now.", feedback)
+
+    def test_trajectory_ground_guard_prefers_single_non_test_source_after_ambiguous_repo_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "tests" / "helpers.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"tool","name":"replace_symbol","arguments":{"path":"src/app.py","symbol":"add","content":"def add(left, right):\\n    return left + right\\n"}}',
+                '{"type":"final","message":"Updated src/app.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix add so it returns left + right.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("return left + right", (root / "src" / "app.py").read_text(encoding="utf-8"))
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:2], ["search_symbols", "read_symbol"])
+        self.assertIn(tool_calls[2], {"edit_intent", "replace_symbol"})
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Search found a unique symbol match for add in src/app.py. Read that exact symbol now before editing.", feedback)
+        self.assertIn("Use the grounded symbol add in src/app.py to make the edit now.", feedback)
 
     def test_trajectory_ground_guard_maps_failed_test_to_implementation_before_pathless_edit(self) -> None:
         root = self._workspace_scratch()
@@ -6077,6 +6211,39 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
         self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
         self.assertEqual(len(client.calls), 0)
+
+    def test_agent_deterministically_repairs_test_grounded_return_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "core.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            (root / "tests" / "test_core.py").write_text(
+                "import unittest\n"
+                "from src.core import add\n\n"
+                "class CoreTests(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Fix tests/test_core.py by changing add(left, right) so it returns left + right instead of left - right. Then run tests."
+            )
+            final_text = (root / "src" / "core.py").read_text(encoding="utf-8")
+
+        self.assertIn("tests passed", result.message)
+        self.assertIn("return left + right", final_text)
+        self.assertEqual(tools.execute_counts.get("find_implementation_target"), 1)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["find_implementation_target", "replace_in_file", "run_test"])
 
     def test_agent_preemptively_repairs_string_normalizer_from_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
