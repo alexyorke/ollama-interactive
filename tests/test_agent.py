@@ -625,6 +625,54 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_calls[:3], ["read_file", "search", "search_symbols"])
         self.assertTrue(any("Use the symbol-level matches for wrapped in src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
 
+    def test_context_planner_auto_narrows_identifier_search_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:2], ["search", "search_symbols"])
+        self.assertTrue(any("Use the symbol-level matches for wrapped in src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_context_planner_auto_outlines_narrowed_repo_search_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("# business logic\n\ndef wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"business logic"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"business logic"}}',
+                '{"type":"final","message":"src/core.py contains the relevant implementation."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "src/core.py contains the relevant implementation.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:2], ["search", "code_outline"])
+        self.assertTrue(any("Use the code outline for src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
     def test_context_planner_auto_outlines_recent_source_before_more_broad_reads(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -649,7 +697,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_calls[:3], ["read_file", "search", "code_outline"])
         self.assertTrue(any("Use the code outline for src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
 
-    def test_context_planner_reuses_grounded_implementation_target_for_later_symbol_narrowing(self) -> None:
+    def test_context_planner_auto_reads_grounded_implementation_target_symbol_before_more_broad_reads(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
         (root / "tests").mkdir()
@@ -681,12 +729,55 @@ class AgentTests(unittest.TestCase):
 
         self.assertEqual(result.message, "wrapped is defined in src/core.py.")
         self.assertEqual(tools.execute_counts.get("find_implementation_target"), 1)
-        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertIsNone(tools.execute_counts.get("search_symbols"))
         tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
-        self.assertEqual(tool_calls[:6], ["read_file", "search", "find_implementation_target", "search", "read_file", "search_symbols"])
+        self.assertEqual(tool_calls[:5], ["read_file", "search", "find_implementation_target", "read_symbol", "read_file"])
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Use the grounded implementation target(s) src/core.py.", feedback)
-        self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_uses_recent_identifier_to_pick_symbol_from_grounded_implementation_target(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "core.py").write_text(
+            "def helper():\n    return 'helper'\n\n"
+            "def wrapped():\n    return 'ok'\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_pkg.py").write_text(
+            "import unittest\n"
+            "from src.core import helper, wrapped\n\n"
+            "class PackageTests(unittest.TestCase):\n"
+            "    def test_wrapped(self):\n"
+            "        self.assertEqual(wrapped(), 'ok')\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":5}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":5}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect tests/test_pkg.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("find_implementation_target"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertIsNone(tools.execute_counts.get("search_symbols"))
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_file", "search", "find_implementation_target", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the grounded implementation target(s) src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
 
     def test_context_planner_auto_reads_single_outlined_symbol_before_more_broad_reads(self) -> None:
         root = self._workspace_scratch()
@@ -716,6 +807,34 @@ class AgentTests(unittest.TestCase):
         self.assertIn("Use the code outline for src/core.py.", feedback)
         self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
 
+    def test_context_planner_auto_reads_single_outlined_symbol_after_narrowed_repo_search_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("# business logic\n\ndef wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"business logic"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"business logic"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["search", "code_outline", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the code outline for src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
     def test_context_planner_auto_reads_symbol_match_before_more_broad_reads(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -741,6 +860,34 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("code_outline"), None)
         tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
         self.assertEqual(tool_calls[:4], ["read_file", "search", "search_symbols", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_auto_reads_symbol_match_without_source_context_after_repo_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["search", "search_symbols", "read_symbol"])
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
         self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
@@ -929,6 +1076,435 @@ class AgentTests(unittest.TestCase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Search found a unique symbol match for add in src/app.py. Read that exact symbol now before editing.", feedback)
         self.assertIn("Use the grounded symbol add in src/app.py to make the edit now.", feedback)
+
+    def test_trajectory_ground_guard_prefers_test_affined_source_after_multi_source_repo_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "scripts").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "core.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "scripts" / "add.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_core.py").write_text(
+            "import unittest\n"
+            "from src.core import add\n\n"
+            "class CoreTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"tool","name":"replace_symbol","arguments":{"path":"src/core.py","symbol":"add","content":"def add(left, right):\\n    return left + right\\n"}}',
+                '{"type":"final","message":"Updated src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix add so it returns left + right.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("return left + right", (root / "src" / "core.py").read_text(encoding="utf-8"))
+        self.assertIn("return 0", (root / "scripts" / "add.py").read_text(encoding="utf-8"))
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["search_symbols", "read_symbol", "replace_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the grounded symbol add in src/core.py to make the edit now.", feedback)
+
+    def test_trajectory_ground_guard_prefers_explicit_request_source_path_over_unrelated_recent_source(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "other.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/other.py"}}',
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"tool","name":"replace_symbol","arguments":{"path":"src/core.py","symbol":"add","content":"def add(left, right):\\n    return left + right\\n"}}',
+                '{"type":"final","message":"Updated src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the helper implementation, then fix add in src/core.py.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("return left + right", (root / "src" / "core.py").read_text(encoding="utf-8"))
+        self.assertIn("return 0", (root / "src" / "other.py").read_text(encoding="utf-8"))
+        self.assertIsNone(tools.execute_counts.get("search_symbols"))
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["read_file", "read_symbol", "replace_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("You now have current-turn grounding for src/core.py. Edit the grounded target now.", feedback)
+
+    def test_pathless_mutation_grounding_probe_does_not_auto_pick_when_request_names_multiple_sources(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        probe = agent._pathless_mutation_grounding_probe(
+            name="edit_intent",
+            arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            requested_mutation_paths={"src/alpha.py", "src/beta.py"},
+            successful_tool_results=[],
+        )
+
+        self.assertEqual(probe, ("search_symbols", {"query": "add", "path": "."}))
+
+    def test_pathless_mutation_grounding_probe_prefers_unique_symbol_match_among_multiple_explicit_sources(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def subtract(left, right):\n    return left - right\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        probe = agent._pathless_mutation_grounding_probe(
+            name="edit_intent",
+            arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            requested_mutation_paths={"src/alpha.py", "src/beta.py"},
+            successful_tool_results=[],
+        )
+
+        self.assertEqual(probe, ("read_symbol", {"path": "src/alpha.py", "symbol": "add", "include_context": 0}))
+
+    def test_trajectory_grounding_probe_keeps_ambiguous_multiple_explicit_sources_unresolved_without_context_pack(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        search_result = tools.search_symbols("add", path=".")
+        successful_tool_results = [{"name": "search_symbols", "arguments": {"query": "add", "path": "."}, "result": search_result}]
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+            probe = agent._trajectory_grounding_probe(
+                request_text="Fix add in src/alpha.py and src/beta.py.",
+                name="edit_intent",
+                arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+                required_mutation_paths={"src/alpha.py", "src/beta.py"},
+                forbidden_tool_names=set(),
+                successful_tool_results=successful_tool_results,
+                latest_run_test_failed=False,
+                latest_run_test_failure_output="",
+            )
+
+        self.assertIsNone(probe)
+
+    def test_trajectory_grounding_probe_uses_context_pack_for_ambiguous_multiple_explicit_sources(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        search_result = tools.search_symbols("add", path=".")
+        successful_tool_results = [{"name": "search_symbols", "arguments": {"query": "add", "path": "."}, "result": search_result}]
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack"}):
+            probe = agent._trajectory_grounding_probe(
+                request_text="Fix add in src/alpha.py and src/beta.py.",
+                name="edit_intent",
+                arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+                required_mutation_paths={"src/alpha.py", "src/beta.py"},
+                forbidden_tool_names=set(),
+                successful_tool_results=successful_tool_results,
+                latest_run_test_failed=False,
+                latest_run_test_failure_output="",
+            )
+
+        self.assertEqual(probe, ("context_pack", {"request": "Fix add in src/alpha.py and src/beta.py.", "path": ".", "limit": 6}))
+
+    def test_pathless_mutation_grounding_probe_prefers_test_affined_symbol_match_among_multiple_explicit_sources(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_alpha.py").write_text(
+            "import unittest\n"
+            "from src.alpha import add\n\n"
+            "class AlphaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        probe = agent._pathless_mutation_grounding_probe(
+            name="edit_intent",
+            arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            requested_mutation_paths={"src/alpha.py", "src/beta.py"},
+            successful_tool_results=[],
+        )
+
+        self.assertEqual(probe, ("read_symbol", {"path": "src/alpha.py", "symbol": "add", "include_context": 0}))
+
+    def test_contextual_explicit_source_path_prefers_recent_test_bridge_within_named_sources(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "tests" / "test_alpha.py").write_text(
+            "import unittest\n"
+            "from src.alpha import add\n\n"
+            "class AlphaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "tests/test_alpha.py"},
+                "result": {
+                    "ok": True,
+                    "path": "tests/test_alpha.py",
+                    "output": "from src.alpha import add",
+                },
+            }
+        ]
+
+        self.assertEqual(
+            agent._contextual_explicit_source_path(
+                candidate_paths=["src/alpha.py", "src/beta.py"],
+                successful_tool_results=successful_tool_results,
+            ),
+            "src/alpha.py",
+        )
+
+    def test_pathless_mutation_grounding_probe_prefers_recent_named_source_when_explicit_symbol_matches_tie(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "src/alpha.py"},
+                "result": {
+                    "ok": True,
+                    "path": "src/alpha.py",
+                    "output": "def add(left, right):\n    return left - right\n",
+                },
+            }
+        ]
+
+        probe = agent._pathless_mutation_grounding_probe(
+            name="edit_intent",
+            arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            requested_mutation_paths={"src/alpha.py", "src/beta.py"},
+            successful_tool_results=successful_tool_results,
+        )
+
+        self.assertEqual(probe, ("read_symbol", {"path": "src/alpha.py", "symbol": "add", "include_context": 0}))
+
+    def test_pathless_mutation_grounding_probe_ignores_unrelated_recent_source_when_explicit_symbol_matches_tie(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        (root / "src" / "other.py").write_text("def add(left, right):\n    return 7\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "src/other.py"},
+                "result": {
+                    "ok": True,
+                    "path": "src/other.py",
+                    "output": "def add(left, right):\n    return 7\n",
+                },
+            }
+        ]
+
+        probe = agent._pathless_mutation_grounding_probe(
+            name="edit_intent",
+            arguments={"intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            requested_mutation_paths={"src/alpha.py", "src/beta.py"},
+            successful_tool_results=successful_tool_results,
+        )
+
+        self.assertEqual(probe, ("search_symbols", {"query": "add", "path": "."}))
+
+    def test_explicit_source_path_for_symbol_keeps_ambiguity_when_test_affinity_ties(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "tests" / "test_alpha.py").write_text(
+            "import unittest\n"
+            "from src.alpha import add\n\n"
+            "class AlphaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_beta.py").write_text(
+            "import unittest\n"
+            "from src.beta import add\n\n"
+            "class BetaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        self.assertIsNone(agent._explicit_source_path_for_symbol(candidate_paths=["src/alpha.py", "src/beta.py"], symbol="add"))
+
+    def test_successful_symbol_search_match_keeps_ambiguity_when_test_affinity_ties(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "tests" / "test_alpha.py").write_text(
+            "import unittest\n"
+            "from src.alpha import add\n\n"
+            "class AlphaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_beta.py").write_text(
+            "import unittest\n"
+            "from src.beta import add\n\n"
+            "class BetaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        search_result = tools.search_symbols("add", path=".")
+        successful_tool_results = [{"name": "search_symbols", "arguments": {"query": "add", "path": "."}, "result": search_result}]
+
+        self.assertIsNone(agent._successful_symbol_search_match(query="add", successful_tool_results=successful_tool_results))
+        self.assertIsNone(agent._successful_symbol_search_source_path(query="add", successful_tool_results=successful_tool_results))
+
+    def test_successful_symbol_search_prefers_recent_source_among_tied_repo_candidates(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        search_result = tools.search_symbols("add", path=".")
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "src/alpha.py"},
+                "result": {
+                    "ok": True,
+                    "path": "src/alpha.py",
+                    "output": "def add(left, right):\n    return left - right\n",
+                },
+            },
+            {"name": "search_symbols", "arguments": {"query": "add", "path": "."}, "result": search_result},
+        ]
+
+        self.assertEqual(agent._successful_symbol_search_source_path(query="add", successful_tool_results=successful_tool_results), "src/alpha.py")
+        self.assertEqual(
+            agent._successful_symbol_search_match(query="add", successful_tool_results=successful_tool_results),
+            ("src/alpha.py", "add"),
+        )
+
+    def test_successful_symbol_search_prefers_recent_test_bridge_among_tied_repo_candidates(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_alpha.py").write_text(
+            "import unittest\n"
+            "from src.alpha import add\n\n"
+            "class AlphaTests(unittest.TestCase):\n"
+            "    def test_add(self):\n"
+            "        self.assertEqual(add(1, 2), 3)\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        search_result = tools.search_symbols("add", path=".")
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "tests/test_alpha.py"},
+                "result": {
+                    "ok": True,
+                    "path": "tests/test_alpha.py",
+                    "output": "from src.alpha import add",
+                },
+            },
+            {"name": "search_symbols", "arguments": {"query": "add", "path": "."}, "result": search_result},
+        ]
+
+        self.assertEqual(agent._successful_symbol_search_source_path(query="add", successful_tool_results=successful_tool_results), "src/alpha.py")
+        self.assertEqual(
+            agent._successful_symbol_search_match(query="add", successful_tool_results=successful_tool_results),
+            ("src/alpha.py", "add"),
+        )
+
+    def test_trajectory_ground_probe_retry_message_lists_ambiguous_repo_candidates(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        search_result = tools.search_symbols("add", path=".")
+
+        message = agent._trajectory_ground_probe_retry_message(
+            request_text="Fix add so it returns left + right.",
+            probe_name="search_symbols",
+            probe_arguments={"query": "add", "path": "."},
+            probe_result=search_result,
+            required_mutation_paths=set(),
+            mutated_paths_this_turn=set(),
+            test_run_required=False,
+        )
+
+        self.assertIn("Search found multiple implementation candidates for add: src/alpha.py, src/beta.py.", message)
+        self.assertIn("Read the exact implementation symbol or name the target path before editing.", message)
+
+    def test_trajectory_ground_probe_retry_message_guides_read_after_context_pack(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        message = agent._trajectory_ground_probe_retry_message(
+            request_text="Fix add in src/alpha.py and src/beta.py.",
+            probe_name="context_pack",
+            probe_arguments={"request": "Fix add in src/alpha.py and src/beta.py.", "path": ".", "limit": 6},
+            probe_result={
+                "ok": True,
+                "tool": "context_pack",
+                "path": ".",
+                "suggested_next_tool": "read_symbol",
+                "output": "context_pack:\nsuggested_next_tool=read_symbol",
+            },
+            required_mutation_paths={"src/alpha.py", "src/beta.py"},
+            mutated_paths_this_turn=set(),
+            test_run_required=False,
+        )
+
+        self.assertEqual(
+            message,
+            "Context pack ranked likely implementation matches. Read the most relevant implementation symbol now before editing. Next JSON only.",
+        )
 
     def test_trajectory_ground_guard_maps_failed_test_to_implementation_before_pathless_edit(self) -> None:
         root = self._workspace_scratch()
@@ -4314,6 +4890,38 @@ class AgentTests(unittest.TestCase):
         run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
         self.assertTrue(run_tests)
         self.assertEqual(run_tests[-1].get("arguments", {}).get("command"), pass_command)
+
+    def test_trajectory_final_chance_validation_discovers_repo_test_command_after_empty_targeted_selection(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value():\n    return 0\n", encoding="utf-8")
+        (root / "tests").mkdir()
+        (root / "tests" / "test_app.py").write_text(
+            "import unittest\n\nclass AppTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return 0","new":"return 1"}}',
+            ]
+        )
+        tools = EmptySelectTestsToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Ran validation after the latest edit: passed.")
+        self.assertEqual(tools.execute_counts.get("select_tests"), 1)
+        self.assertEqual(tools.execute_counts.get("discover_validators"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertTrue(run_tests)
+        command = str(run_tests[-1].get("arguments", {}).get("command", ""))
+        self.assertIn("unittest", command)
+        self.assertIn("discover", command)
+        self.assertIn("tests", command)
 
     def test_agent_requires_edits_to_explicitly_named_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

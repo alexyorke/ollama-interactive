@@ -1998,6 +1998,56 @@ class OllamaCodeAgent:
                 return query
         return None
 
+    def _recent_search_code_paths(
+        self,
+        successful_tool_results: list[dict[str, Any]],
+        *,
+        query: str | None = None,
+    ) -> list[str]:
+        expected_query = str(query or "").strip()
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "search":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if expected_query and str(arguments.get("query") or "").strip() != expected_query:
+                continue
+            paths: list[str] = []
+            seen: set[str] = set()
+            for raw_line in str(result.get("output") or "").splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                match = re.match(r"^(?P<path>.+):\d+(?::|-)", line)
+                if not match:
+                    continue
+                candidate = match.group("path").strip().replace("\\", "/")
+                if not candidate:
+                    continue
+                try:
+                    normalized = self.tools.relative_label(self.tools.resolve_path(candidate, allow_missing=False))
+                except Exception:
+                    normalized = candidate.lstrip("./")
+                if (
+                    not normalized
+                    or normalized in seen
+                    or not normalized.endswith(".py")
+                    or self._path_looks_like_test_file(normalized)
+                ):
+                    continue
+                seen.add(normalized)
+                paths.append(normalized)
+            return paths
+        return []
+
+    def _recent_identifier_search_code_paths(self, successful_tool_results: list[dict[str, Any]]) -> list[str]:
+        query = self._recent_identifier_search_query(successful_tool_results)
+        if not query:
+            return []
+        return self._recent_search_code_paths(successful_tool_results, query=query)
+
     def _parse_code_outline_symbols(self, output: str) -> list[tuple[str, str]]:
         symbols: list[tuple[str, str]] = []
         current_path = ""
@@ -2044,6 +2094,48 @@ class OllamaCodeAgent:
             return None
         return None
 
+    def _successful_implementation_target_symbol(
+        self,
+        *,
+        path: str,
+        successful_tool_results: list[dict[str, Any]],
+        query: str | None = None,
+    ) -> str | None:
+        normalized_path = str(path or "").strip().replace("\\", "/").lstrip("./")
+        if not normalized_path:
+            return None
+        normalized_query = str(query or "").strip().lower()
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "find_implementation_target":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            targets = result.get("targets") if isinstance(result.get("targets"), list) else []
+            symbols: list[str] = []
+            for target in targets:
+                if not isinstance(target, dict):
+                    continue
+                target_path = str(target.get("path") or target.get("source_path") or "").strip().replace("\\", "/").lstrip("./")
+                if target_path != normalized_path:
+                    continue
+                symbol = str(target.get("symbol") or "").strip()
+                if symbol and symbol not in symbols:
+                    symbols.append(symbol)
+            if len(symbols) == 1:
+                return symbols[0]
+            if normalized_query:
+                exact = [
+                    symbol
+                    for symbol in symbols
+                    if normalized_query in {symbol.lower(), symbol.rsplit(".", 1)[-1].lower()}
+                ]
+                if len(exact) == 1:
+                    return exact[0]
+            if symbols:
+                return None
+        return None
+
     def _has_successful_read_symbol(
         self,
         *,
@@ -2065,6 +2157,27 @@ class OllamaCodeAgent:
             result_path = str(result.get("path") or arguments_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
             result_symbol = str(result.get("symbol") or arguments_dict.get("symbol") or "").strip()
             if result_path == normalized_path and result_symbol == normalized_symbol:
+                return True
+        return False
+
+    def _has_successful_read_file(
+        self,
+        *,
+        path: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        normalized_path = str(path or "").strip().replace("\\", "/").lstrip("./")
+        if not normalized_path:
+            return False
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "read_file":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            result_path = str(result.get("path") or arguments_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if result_path == normalized_path:
                 return True
         return False
 
@@ -3993,12 +4106,75 @@ class OllamaCodeAgent:
     ) -> tuple[str, dict[str, Any]] | None:
         source_paths = self._recent_source_paths(successful_tool_results)
         test_paths = self._recent_test_paths(successful_tool_results)
+        recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
+        recent_identifier_code_paths = self._recent_identifier_search_code_paths(successful_tool_results)
+        recent_search_code_paths = self._recent_search_code_paths(successful_tool_results)
         if "find_implementation_target" not in forbidden_tool_names and not self._has_successful_tool_named(successful_tool_results, "find_implementation_target"):
             if test_paths and not source_paths:
                 return "find_implementation_target", {"test_path": test_paths[-1], "limit": 6}
+        if (
+            not source_paths
+            and recent_identifier_query
+            and recent_identifier_code_paths
+            and "search_symbols" not in forbidden_tool_names
+            and not self._has_successful_symbol_search_query(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            )
+        ):
+            return "search_symbols", {"query": recent_identifier_query, "path": "."}
+        if not source_paths and recent_identifier_query:
+            search_match = self._successful_symbol_search_match(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            )
+            if (
+                search_match is not None
+                and "read_symbol" not in forbidden_tool_names
+                and not self._has_successful_read_symbol(
+                    path=search_match[0],
+                    symbol=search_match[1],
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return "read_symbol", {"path": search_match[0], "symbol": search_match[1], "include_context": 0}
+            search_source_path = self._successful_symbol_search_source_path(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            )
+            if (
+                search_source_path
+                and "read_file" not in forbidden_tool_names
+                and not self._has_successful_read_file(
+                    path=search_source_path,
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return "read_file", {"path": search_source_path}
+        if (
+            not source_paths
+            and len(recent_search_code_paths) == 1
+            and "code_outline" not in forbidden_tool_names
+            and not self._has_successful_tool_named(successful_tool_results, "code_outline")
+        ):
+            return "code_outline", {"path": recent_search_code_paths[0]}
         if source_paths:
             latest_source_path = source_paths[-1]
-            recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
+            implementation_target_symbol = self._successful_implementation_target_symbol(
+                path=latest_source_path,
+                successful_tool_results=successful_tool_results,
+                query=recent_identifier_query,
+            )
+            if (
+                implementation_target_symbol
+                and "read_symbol" not in forbidden_tool_names
+                and not self._has_successful_read_symbol(
+                    path=latest_source_path,
+                    symbol=implementation_target_symbol,
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return "read_symbol", {"path": latest_source_path, "symbol": implementation_target_symbol, "include_context": 0}
             if (
                 recent_identifier_query
                 and "search_symbols" not in forbidden_tool_names
@@ -4062,7 +4238,7 @@ class OllamaCodeAgent:
                     if isinstance(item, dict) and str(item.get("path") or "").strip()
                 ]
                 if grounded_targets:
-                    target_list = ", ".join(grounded_targets[:3])
+                    target_list = ", ".join(list(dict.fromkeys(grounded_targets))[:3])
                     if mutation_required or code_mutation_required:
                         next_step = "Edit the grounded implementation now"
                         if test_run_required:
@@ -4072,6 +4248,31 @@ class OllamaCodeAgent:
         if probe_name == "search_symbols":
             query = str(probe_arguments.get("query") or "").strip()
             path = str(probe_result.get("path") or probe_arguments.get("path") or "").strip()
+            unique_match = self._successful_symbol_search_match(
+                query=query,
+                successful_tool_results=[
+                    {
+                        "name": probe_name,
+                        "arguments": probe_arguments,
+                        "result": probe_result,
+                    }
+                ],
+            )
+            if unique_match is not None:
+                path = unique_match[0]
+            else:
+                unique_source_path = self._successful_symbol_search_source_path(
+                    query=query,
+                    successful_tool_results=[
+                        {
+                            "name": probe_name,
+                            "arguments": probe_arguments,
+                            "result": probe_result,
+                        }
+                    ],
+                )
+                if unique_source_path:
+                    path = unique_source_path
             if query and path:
                 if mutation_required or code_mutation_required:
                     next_step = f"Use the symbol-level matches for {query} in {path}. Read or edit the exact implementation symbol now"
@@ -4420,11 +4621,53 @@ class OllamaCodeAgent:
             return False
         if self._broad_context_tool_streak(tool_calls) >= 2:
             return True
+        recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
+        recent_identifier_code_paths = self._recent_identifier_search_code_paths(successful_tool_results)
+        recent_search_code_paths = self._recent_search_code_paths(successful_tool_results)
         source_paths = self._recent_source_paths(successful_tool_results)
         if not source_paths:
+            if not recent_identifier_query or not recent_identifier_code_paths:
+                return len(recent_search_code_paths) == 1
+            if not self._has_successful_symbol_search_query(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            ):
+                return True
+            search_match = self._successful_symbol_search_match(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            )
+            if (
+                search_match is not None
+                and not self._has_successful_read_symbol(
+                    path=search_match[0],
+                    symbol=search_match[1],
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return True
+            search_source_path = self._successful_symbol_search_source_path(
+                query=recent_identifier_query,
+                successful_tool_results=successful_tool_results,
+            )
+            if search_source_path:
+                return not self._has_successful_read_file(
+                    path=search_source_path,
+                    successful_tool_results=successful_tool_results,
+                )
             return False
         latest_source_path = source_paths[-1]
-        recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
+        implementation_target_symbol = self._successful_implementation_target_symbol(
+            path=latest_source_path,
+            successful_tool_results=successful_tool_results,
+            query=recent_identifier_query,
+        )
+        if implementation_target_symbol:
+            return not self._has_successful_read_symbol(
+                path=latest_source_path,
+                symbol=implementation_target_symbol,
+                successful_tool_results=successful_tool_results,
+            )
         if recent_identifier_query:
             search_match = self._successful_symbol_search_match(
                 query=recent_identifier_query,
@@ -4481,6 +4724,7 @@ class OllamaCodeAgent:
         request_text: str,
         name: str,
         arguments: dict[str, Any],
+        required_mutation_paths: set[str],
         successful_tool_results: list[dict[str, Any]],
         latest_run_test_failed: bool,
     ) -> bool:
@@ -4499,6 +4743,7 @@ class OllamaCodeAgent:
                 pathless_probe = self._pathless_mutation_grounding_probe(
                     name=name,
                     arguments=arguments,
+                    requested_mutation_paths=required_mutation_paths,
                     successful_tool_results=successful_tool_results,
                 )
                 if pathless_probe is None:
@@ -4506,6 +4751,7 @@ class OllamaCodeAgent:
                 if not self._pathless_mutation_is_grounded(
                     name=name,
                     arguments=arguments,
+                    requested_mutation_paths=required_mutation_paths,
                     successful_tool_results=successful_tool_results,
                 ):
                     return not self._direct_file_creation_allowed(request_text, name, arguments)
@@ -4586,7 +4832,123 @@ class OllamaCodeAgent:
             non_test_exact_matches = [candidate for candidate in exact_matches if not self._path_looks_like_test_file(candidate[0])]
             if len(non_test_exact_matches) == 1:
                 return non_test_exact_matches[0]
+            likely_source_path = self._successful_symbol_search_source_path(
+                query=query,
+                successful_tool_results=successful_tool_results,
+            )
+            if likely_source_path:
+                path_matches = [candidate for candidate in non_test_exact_matches if candidate[0] == likely_source_path]
+                if len(path_matches) == 1:
+                    return path_matches[0]
             return None
+        return None
+
+    def _symbol_search_test_affinity_score(self, *, path: str, symbol: str) -> int:
+        normalized_path = str(path or "").strip().replace("\\", "/").lstrip("./")
+        normalized_symbol = str(symbol or "").strip()
+        if not normalized_path or not normalized_symbol:
+            return 0
+        try:
+            result = self.tools.select_tests([normalized_path], changed_symbols=[normalized_symbol], limit=1)
+        except Exception:
+            return 0
+        tests = result.get("tests") if isinstance(result.get("tests"), list) else []
+        if not tests:
+            return 0
+        first = tests[0] if isinstance(tests[0], dict) else {}
+        score = int(first.get("score") or 0)
+        confidence = str(result.get("confidence") or "").strip().lower()
+        if confidence == "high":
+            score += 2
+        elif confidence == "medium":
+            score += 1
+        return score
+
+    def _best_symbol_search_source_path_from_tests(
+        self,
+        *,
+        candidate_paths: list[str],
+        symbol: str,
+    ) -> str | None:
+        unique_paths = list(dict.fromkeys(str(path or "").strip().replace("\\", "/").lstrip("./") for path in candidate_paths if str(path or "").strip()))
+        if len(unique_paths) < 2 or len(unique_paths) > 4:
+            return None
+        scored: list[tuple[int, str]] = []
+        for path in unique_paths:
+            score = self._symbol_search_test_affinity_score(path=path, symbol=symbol)
+            if score <= 0:
+                continue
+            scored.append((score, path))
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        top_score, top_path = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0
+        if top_score >= 6 and top_score >= second_score + 3:
+            return top_path
+        return None
+
+    def _explicit_source_path_for_symbol(
+        self,
+        *,
+        candidate_paths: list[str],
+        symbol: str,
+    ) -> str | None:
+        normalized_symbol = str(symbol or "").strip()
+        unique_paths = list(
+            dict.fromkeys(
+                str(path or "").strip().replace("\\", "/").lstrip("./")
+                for path in candidate_paths
+                if str(path or "").strip()
+            )
+        )
+        if not normalized_symbol or len(unique_paths) < 2:
+            return None
+        matches: list[str] = []
+        for path in unique_paths:
+            try:
+                result = self.tools.read_symbol(path, normalized_symbol, include_context=0)
+            except Exception:
+                continue
+            if result.get("ok") is not True:
+                continue
+            rel_path = str(result.get("path") or path).strip().replace("\\", "/").lstrip("./")
+            if rel_path and rel_path not in matches:
+                matches.append(rel_path)
+        if len(matches) == 1:
+            return matches[0]
+        likely_match = self._best_symbol_search_source_path_from_tests(
+            candidate_paths=matches,
+            symbol=normalized_symbol.rsplit(".", 1)[-1],
+        )
+        if likely_match:
+            return likely_match
+        return None
+
+    def _contextual_explicit_source_path(
+        self,
+        *,
+        candidate_paths: list[str],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> str | None:
+        unique_paths = list(
+            dict.fromkeys(
+                str(path or "").strip().replace("\\", "/").lstrip("./")
+                for path in candidate_paths
+                if str(path or "").strip()
+            )
+        )
+        if len(unique_paths) < 2:
+            return unique_paths[0] if unique_paths else None
+        bridge = self._test_to_source_bridge(successful_tool_results)
+        if bridge is not None:
+            bridged_source = str(bridge[1] or "").strip().replace("\\", "/").lstrip("./")
+            if bridged_source in unique_paths:
+                return bridged_source
+        for recent_source in reversed(self._recent_source_paths(successful_tool_results)):
+            normalized_recent = str(recent_source or "").strip().replace("\\", "/").lstrip("./")
+            if normalized_recent in unique_paths:
+                return normalized_recent
         return None
 
     def _successful_symbol_search_source_path(
@@ -4618,12 +4980,31 @@ class OllamaCodeAgent:
                 leaf_name = qualname.rsplit(".", 1)[-1].lower()
                 if normalized_query in {leaf_name, qualname.lower()} and not self._path_looks_like_test_file(path):
                     exact_paths.append(path)
+            test_symbol = str(query or "").strip().rsplit(".", 1)[-1]
             unique_exact_paths = list(dict.fromkeys(exact_paths))
             if len(unique_exact_paths) == 1:
                 return unique_exact_paths[0]
+            likely_exact_path = self._best_symbol_search_source_path_from_tests(
+                candidate_paths=unique_exact_paths,
+                symbol=test_symbol,
+            )
+            if likely_exact_path:
+                return likely_exact_path
+            contextual_exact_path = self._contextual_explicit_source_path(
+                candidate_paths=unique_exact_paths,
+                successful_tool_results=successful_tool_results,
+            )
+            if contextual_exact_path:
+                return contextual_exact_path
             unique_all_paths = list(dict.fromkeys(all_paths))
             if len(unique_all_paths) == 1:
                 return unique_all_paths[0]
+            contextual_all_path = self._contextual_explicit_source_path(
+                candidate_paths=unique_all_paths,
+                successful_tool_results=successful_tool_results,
+            )
+            if contextual_all_path:
+                return contextual_all_path
             return None
         return None
 
@@ -4670,14 +5051,30 @@ class OllamaCodeAgent:
         *,
         name: str,
         arguments: dict[str, Any],
+        requested_mutation_paths: set[str] | None = None,
         successful_tool_results: list[dict[str, Any]],
     ) -> tuple[str, dict[str, Any]] | None:
         if self._mutation_has_explicit_path_target(arguments):
             return None
+        explicit_source_paths = self._explicit_source_repair_candidates(requested_mutation_paths)
+        explicit_source_scope = set(explicit_source_paths)
+        symbol_name = self._mutation_requested_symbol_name(name=name, arguments=arguments)
+        explicit_source_path = explicit_source_paths[0] if len(explicit_source_paths) == 1 else ""
+        if not explicit_source_path and len(explicit_source_paths) > 1 and symbol_name:
+            explicit_source_path = self._explicit_source_path_for_symbol(
+                candidate_paths=explicit_source_paths,
+                symbol=symbol_name,
+            ) or ""
+        if not explicit_source_path and len(explicit_source_paths) > 1:
+            explicit_source_path = self._contextual_explicit_source_path(
+                candidate_paths=explicit_source_paths,
+                successful_tool_results=successful_tool_results,
+            ) or ""
         source_paths = self._recent_source_paths(successful_tool_results)
         bridge = self._test_to_source_bridge(successful_tool_results)
-        candidate_source = bridge[1] if bridge is not None else (source_paths[-1] if source_paths else "")
-        symbol_name = self._mutation_requested_symbol_name(name=name, arguments=arguments)
+        candidate_source = explicit_source_path
+        if not candidate_source and not explicit_source_scope:
+            candidate_source = bridge[1] if bridge is not None else (source_paths[-1] if source_paths else "")
         if not candidate_source:
             if not symbol_name:
                 return None
@@ -4687,12 +5084,13 @@ class OllamaCodeAgent:
             )
             if search_match is not None:
                 search_path, matched_symbol = search_match
-                return "read_symbol", {"path": search_path, "symbol": matched_symbol, "include_context": 0}
+                if not explicit_source_scope or search_path in explicit_source_scope:
+                    return "read_symbol", {"path": search_path, "symbol": matched_symbol, "include_context": 0}
             search_source_path = self._successful_symbol_search_source_path(
                 query=symbol_name,
                 successful_tool_results=successful_tool_results,
             )
-            if search_source_path:
+            if search_source_path and (not explicit_source_scope or search_source_path in explicit_source_scope):
                 return "read_file", {"path": search_source_path}
             if not self._has_successful_symbol_search_query(
                 query=symbol_name,
@@ -4709,11 +5107,13 @@ class OllamaCodeAgent:
         *,
         name: str,
         arguments: dict[str, Any],
+        requested_mutation_paths: set[str] | None = None,
         successful_tool_results: list[dict[str, Any]],
     ) -> bool:
         probe = self._pathless_mutation_grounding_probe(
             name=name,
             arguments=arguments,
+            requested_mutation_paths=requested_mutation_paths,
             successful_tool_results=successful_tool_results,
         )
         if probe is None:
@@ -4758,6 +5158,7 @@ class OllamaCodeAgent:
             pathless_probe = self._pathless_mutation_grounding_probe(
                 name=name,
                 arguments=arguments,
+                requested_mutation_paths=required_mutation_paths,
                 successful_tool_results=successful_tool_results,
             )
             if pathless_probe is not None:
@@ -4791,8 +5192,12 @@ class OllamaCodeAgent:
             if not resolved.exists() or not resolved.is_file():
                 continue
             candidate_paths.append(self.tools.relative_label(resolved))
-        if candidate_paths:
+        if len(candidate_paths) == 1:
             return "read_file", {"path": candidate_paths[0]}
+        if len(candidate_paths) > 1:
+            if feature_enabled("context-pack"):
+                return "context_pack", {"request": request_text, "path": ".", "limit": 6}
+            return None
         for raw in sorted(required_mutation_paths):
             normalized = str(raw or "").strip().replace("\\", "/").lstrip("./")
             if not normalized or not normalized.endswith(".py") or not self._path_looks_like_test_file(normalized):
@@ -4817,6 +5222,13 @@ class OllamaCodeAgent:
         mutated_paths_this_turn: set[str],
         test_run_required: bool,
     ) -> str:
+        if probe_name == "context_pack":
+            suggested_next_tool = str(probe_result.get("suggested_next_tool") or "").strip().lower()
+            if suggested_next_tool == "read_symbol":
+                return "Context pack ranked likely implementation matches. Read the most relevant implementation symbol now before editing. Next JSON only."
+            if suggested_next_tool == "read_file":
+                return "Context pack ranked likely implementation files. Read the most relevant implementation file now before editing. Next JSON only."
+            return "Context pack ranked likely repository evidence. Read the most relevant implementation file or symbol now before editing. Next JSON only."
         pending_paths = sorted(required_mutation_paths - mutated_paths_this_turn)
         if pending_paths:
             target_list = ", ".join(pending_paths[:4])
@@ -4862,6 +5274,19 @@ class OllamaCodeAgent:
             )
             if unique_source_path:
                 return f"Search narrowed the likely implementation file to {unique_source_path}. Read that file now before editing. Next JSON only."
+            implementation_candidates = list(
+                dict.fromkeys(
+                    path
+                    for path, _qualname in exact_matches
+                    if not self._path_looks_like_test_file(path)
+                )
+            )
+            if query and len(implementation_candidates) >= 2:
+                candidate_list = ", ".join(implementation_candidates[:3])
+                return (
+                    f"Search found multiple implementation candidates for {query}: {candidate_list}. "
+                    "Read the exact implementation symbol or name the target path before editing. Next JSON only."
+                )
             if query and exact_matches:
                 return f"Use the symbol-level matches for {query}. Read the exact implementation symbol now before editing. Next JSON only."
             if query:
@@ -4875,7 +5300,7 @@ class OllamaCodeAgent:
                     if isinstance(item, dict) and str(item.get("path") or "").strip()
                 ]
                 if grounded_targets:
-                    target_list = ", ".join(grounded_targets[:3])
+                    target_list = ", ".join(list(dict.fromkeys(grounded_targets))[:3])
                     next_step = f"Use the diagnosis above to edit {target_list}"
                     if test_run_required:
                         next_step += ", then run_test"
@@ -4898,7 +5323,7 @@ class OllamaCodeAgent:
                     if isinstance(item, dict) and str(item.get("path") or "").strip()
                 ]
                 if grounded_targets:
-                    target_list = ", ".join(grounded_targets[:3])
+                    target_list = ", ".join(list(dict.fromkeys(grounded_targets))[:3])
                     next_step = "Edit the grounded implementation now"
                     if test_run_required:
                         next_step += ", then run_test"
@@ -5300,6 +5725,9 @@ class OllamaCodeAgent:
                 satisfied_tool_names=satisfied_tool_names,
                 tool_calls_this_turn=tool_calls_this_turn,
             )
+            validation_name = "select_tests"
+            validation_arguments = select_args
+            validation_result = select_result
             commands = select_result.get("test_commands") if select_result.get("ok") is True else None
             if isinstance(commands, list) and commands:
                 targeted_command = str(commands[0]).strip()
@@ -5342,6 +5770,48 @@ class OllamaCodeAgent:
                     satisfied_tool_names=satisfied_tool_names,
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
+            elif "discover_validators" not in forbidden_tool_names:
+                self._record_event(
+                    "auto_validation",
+                    name="discover_validators",
+                    arguments={"path": "."},
+                    reason=f"{reason_prefix}discover validators after empty targeted test selection",
+                    mutation_version=mutation_version,
+                    rounds=round_number,
+                )
+                validation_name = "discover_validators"
+                validation_arguments = {"path": "."}
+                validation_result = self._execute_controller_tool(
+                    name="discover_validators",
+                    arguments=validation_arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                if validation_result.get("ok") is True:
+                    discovered_test_command = self._discover_validators_test_command(validation_result)
+                    if discovered_test_command and "run_test" not in forbidden_tool_names:
+                        self._record_event(
+                            "auto_validation",
+                            name="run_test",
+                            arguments={"command": discovered_test_command},
+                            reason=f"{reason_prefix}test command selected after validator discovery",
+                            mutation_version=mutation_version,
+                            rounds=round_number,
+                        )
+                        validation_name = "run_test"
+                        validation_arguments = {"command": discovered_test_command}
+                        validation_result = self._execute_controller_tool(
+                            name="run_test",
+                            arguments=validation_arguments,
+                            request_text=request_text,
+                            round_number=round_number,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
         return validation_name, validation_arguments, validation_result
 
     def _should_force_post_edit_validation(
@@ -9421,6 +9891,7 @@ class OllamaCodeAgent:
                     request_text=text,
                     name=name,
                     arguments=arguments,
+                    required_mutation_paths=required_mutation_paths,
                     successful_tool_results=successful_tool_results,
                     latest_run_test_failed=latest_run_test_failed,
                 ):

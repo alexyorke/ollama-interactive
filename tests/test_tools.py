@@ -4347,6 +4347,30 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("tox", output)
         self.assertIn("nox", output)
 
+    def test_discover_validators_does_not_suggest_testmon_without_repo_test_signals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertNotIn("pytest --testmon", output)
+
+    def test_discover_validators_does_not_suggest_unittest_for_helper_only_tests_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "helpers.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.discover_validators(limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"])
+        self.assertNotIn("unittest discover -s tests -v", output)
+
     def test_discover_validators_reads_pyproject_tool_sections_without_toml_parser(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

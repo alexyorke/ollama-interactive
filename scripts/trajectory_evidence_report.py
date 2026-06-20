@@ -89,7 +89,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "context-planner": {
         "status": "partial",
-        "summary": "Compact context tools exist, the agent can preload context_pack, repeated broad test inspection can auto-map tests to implementation targets, grounded implementation targets feed later source narrowing, repeated broad source inspection can auto-switch to search_symbols or code_outline, and grounded search-symbol or single-symbol outline results can auto-promote to read_symbol on later broad relapses.",
+        "summary": "Compact context tools exist, the agent can preload context_pack, repeated broad test inspection can auto-map tests to implementation targets, grounded implementation targets feed later source narrowing, grounded implementation-target symbols can auto-promote straight to read_symbol including when a recent identifier query disambiguates multi-symbol targets, repeated broad identifier inspection can auto-switch to repo-wide or source-scoped search_symbols before a source file is read, repeated broad repo search can auto-switch to code_outline when the latest search already narrows to one code file, repeated broad source inspection can auto-switch to search_symbols or code_outline, and grounded search-symbol or single-symbol outline results can auto-promote to read_symbol on later broad relapses.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
@@ -106,12 +106,12 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "post-edit-validation": {
         "status": "partial",
-        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, and non-code edits can route through discover_validators plus a configured test command before extra context gathering or a final answer.",
+        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, empty targeted-test selection can fall back through discover_validators before running repo tests, and non-code edits can route through discover_validators plus a configured or discovered test command before extra context gathering or a final answer.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Repos without a configured or discoverable test command still rely on validator discovery instead of a fully deterministic post-edit follow-up.",
+        "next_gap": "Repos without targeted tests, a configured test command, or a discoverable repo test command still rely on validator-only follow-up instead of a deterministic test run.",
     },
     "failure-compression": {
         "status": "implemented",
@@ -124,12 +124,12 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "ground-before-mutate": {
         "status": "partial",
-        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from recent source or test context, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols to either a unique symbol or a single non-test source file before editing.",
+        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from a single explicitly named source path, from multiple explicitly named source paths when only one defines the requested symbol or one clearly wins focused test affinity, from otherwise ambiguous explicitly named source paths when current-turn source or test evidence points to one of those named files, can escalate unresolved multi-source ambiguity through context_pack instead of arbitrarily grounding the first file, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols to either a unique symbol, a single non-test source file, a clearly test-affined implementation candidate, or a current-turn source/test-context candidate when the tied repo search results already include it.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Multiple non-test source candidates, or repo-wide searches that still do not collapse to one likely source file, still need manual disambiguation before pathless mutation can be grounded.",
+        "next_gap": "Multiple explicitly named source paths that still share the requested symbol after focused test affinity and without current-turn source or test evidence pointing to one named file, multiple non-test source candidates that stay tied even after focused test affinity and without current-turn source or test evidence pointing to one candidate, or repo-wide searches that still do not collapse to one likely source file, still need manual disambiguation before pathless mutation can be grounded.",
     },
     "diagnose-test-failure": {
         "status": "implemented",

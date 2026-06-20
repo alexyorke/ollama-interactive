@@ -10467,9 +10467,9 @@ import string
             add("validate", "repo", python_tool_command_text("pre-commit", "pre_commit", "run", "--all-files"), "pre-commit config found.")
         python_files = ".py" in suffixes
         python_tests = any(
-            name.startswith("test_") or name.endswith("_test.py") or "/tests/" in f"/{rel}/"
-            for name, rel in zip(file_names, rel_paths_lower)
-        ) or (root / "tests").exists()
+            (name.startswith("test") and name.endswith(".py")) or name.endswith("_test.py")
+            for name in file_names
+        )
         pytest_config = (
             (root / "pytest.ini").exists()
             or (root / "pytest.toml").exists()
@@ -10518,7 +10518,7 @@ import string
             coverage_command = self._python_tool_command("coverage", "coverage", "run", "-m", "pytest")
             if coverage_command:
                 add("coverage", "python", command_to_text(tuple(coverage_command)), "coverage.py module or executable found.")
-            if shutil.which("pytest") and importlib.util.find_spec("testmon") is not None:
+            if (python_tests or pytest_config) and shutil.which("pytest") and importlib.util.find_spec("testmon") is not None:
                 add("test", "python", f"{sys.executable} -m pytest --testmon", "pytest-testmon is importable.")
             if (root / "tox.ini").exists() or self._toml_tool_section(pyproject, "tox"):
                 add("test", "python", python_tool_command_text("tox", "tox"), "tox config found.")
