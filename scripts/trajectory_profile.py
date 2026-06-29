@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -160,6 +161,29 @@ def _command_category_from_content(content: str) -> str | None:
         return "read"
     if re.search(r"\b(?:grep|rg|find|ls|tree)\b", lowered):
         return "search"
+    return None
+
+
+def _command_category_from_shell_command(command: str) -> str | None:
+    inferred = _command_category_from_content(command)
+    if inferred:
+        return inferred
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        argv = command.split()
+    if not argv:
+        return None
+    family = Path(argv[0]).name.lower().rstrip(".,:;")
+    lowered = command.lower()
+    if family.startswith("python") and re.search(r"\b(?:pytest|unittest)\b", lowered):
+        return "test"
+    if family in {"rscript", "r"} and any(token in lowered for token in ("test()", "testthat", "devtools::test", "tinytest")):
+        return "test"
+    if family == "make" and any(token.lower() in {"test", "tests", "unit", "check"} for token in argv[1:]):
+        return "test"
+    if family in {"pytest", "runtests.py", "runtests.sh", "run_tests.sh"}:
+        return "test"
     return None
 
 
@@ -415,7 +439,14 @@ def _extract_terminalbench_events(steps: Any) -> list[Event]:
                 if not name:
                     continue
                 payload = _content_text(tool)
-                events.append(Event(role="agent", kind="tool_call", name=name, category=_tool_category(name, payload), content=payload))
+                category = _tool_category(name, payload)
+                if name in SHELL_TOOLS:
+                    command = tool.get("cmd")
+                    if isinstance(command, list):
+                        command = " ".join(str(part) for part in command)
+                    if isinstance(command, str) and command.strip():
+                        category = _command_category_from_shell_command(command) or category
+                events.append(Event(role="agent", kind="tool_call", name=name, category=category, content=payload))
         elif role == "agent":
             content = _content_text(step.get("msg"))
             inferred = _infer_tool_name_from_text(content)
