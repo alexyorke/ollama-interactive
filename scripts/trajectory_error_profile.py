@@ -262,6 +262,28 @@ def classify_shell_error(text: str) -> str | None:
     return "other_shell_error"
 
 
+def _allow_error_class_for_event(error_class: str, event: trajectory_profile.Event) -> bool:
+    if error_class != "timeout":
+        return True
+    if event.category != "read":
+        return True
+    lowered = event.content.lower()
+    strong_timeout_signals = (
+        "timed out",
+        "timeout after",
+        "timeout expired",
+        "operation timed out",
+        "process timed out",
+        "command timed out",
+        "request timed out",
+        "traceback",
+        "exit code",
+        "error:",
+        "killed",
+    )
+    return any(signal in lowered for signal in strong_timeout_signals)
+
+
 def _excerpt(text: str, pattern: re.Pattern[str], limit: int = 360) -> str:
     match = pattern.search(text)
     if not match:
@@ -303,6 +325,10 @@ def summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) -
                         }
                     )
             if not error_class:
+                previous_key = ""
+                run_count = 0
+                continue
+            if not _allow_error_class_for_event(error_class, event):
                 previous_key = ""
                 run_count = 0
                 continue

@@ -24,6 +24,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
                             "58\tsetTimeout(async () => {\n"
                             "59\t    system.setScreen('desktop');\n"
                             "60\t});\n"
+                            "61\tset timeout=3\n"
                             "133\t    kprint(\"WARNING: failed to mount root filesystem\\n\");\n"
                             "109\t    /* Count this as a failed attempt; will retry next tick */\n"
                             "1\tVerify against current code before asserting as fact.\n"
