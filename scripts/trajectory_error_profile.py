@@ -265,9 +265,11 @@ def classify_shell_error(text: str) -> str | None:
 def _allow_error_class_for_event(error_class: str, event: trajectory_profile.Event) -> bool:
     if error_class != "timeout":
         return True
+    lowered = event.content.lower()
+    if "successfully killed shell" in lowered:
+        return False
     if event.category != "read":
         return True
-    lowered = event.content.lower()
     strong_timeout_signals = (
         "timed out",
         "timeout after",

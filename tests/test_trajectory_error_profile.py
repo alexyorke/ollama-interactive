@@ -332,6 +332,22 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["error_counts"]["test_assertion"], 1)
         self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "run_shell:test_assertion")
 
+    def test_terminalbench_killshell_success_is_not_classified_as_timeout(self) -> None:
+        rows = [
+            {
+                "steps": (
+                    '[{"src":"agent","msg":"Executed KillShell toolu_123","tools":[{"fn":"KillShell","cmd":""}],'
+                    '"obs":"{\\"message\\":\\"Successfully killed shell: d657ce (Rscript -e \\\\\\"source(\'ars.R\'); test()\\\\\\")\\",\\"shell_id\\":\\"d657ce\\"}"}]'
+                )
+            }
+        ]
+
+        summary = error_profile.summarize_dataset("sample", "terminalbench", rows)
+
+        self.assertEqual(summary["result_events"], 1)
+        self.assertEqual(summary["error_counts"], {})
+        self.assertEqual(summary["top_tool_errors"], [])
+
     def test_build_profile_skips_terminalbench_null_rows_before_max_rows(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
