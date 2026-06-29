@@ -79,10 +79,30 @@ SHELL_ERROR_PATTERNS: dict[str, re.Pattern[str]] = {
 def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory_profile.Event]:
     events: list[trajectory_profile.Event] = []
     if adapter == "openhands":
-        for message in row.get("trajectory") or []:
-            if not isinstance(message, dict) or str(message.get("role", "")).lower() != "tool":
+        messages = trajectory_profile._openhands_messages(row)
+        pending_tool_name = ""
+        for message in messages if isinstance(messages, list) else []:
+            if not isinstance(message, dict):
                 continue
-            name = str(message.get("name") or "tool")
+            role = str(message.get("role", "")).lower()
+            if role == "assistant":
+                pending_tool_name = ""
+                tool_calls = trajectory_profile._message_tool_calls(message)
+                if isinstance(tool_calls, list) and len(tool_calls) == 1 and isinstance(tool_calls[0], dict):
+                    function = tool_calls[0].get("function")
+                    raw_name = ""
+                    if isinstance(function, dict):
+                        raw_name = str(function.get("name") or "")
+                    if not raw_name:
+                        raw_name = str(tool_calls[0].get("name") or "")
+                    pending_tool_name = trajectory_profile._normalize_tool_name(raw_name)
+                elif trajectory_profile._content_text(message.get("content")).strip():
+                    inferred = trajectory_profile._infer_tool_name_from_text(trajectory_profile._content_text(message.get("content")))
+                    pending_tool_name = inferred or ""
+                continue
+            if role != "tool":
+                continue
+            name = trajectory_profile._normalize_tool_name(str(message.get("name") or "")) or pending_tool_name or "tool"
             content = str(message.get("content") or "")
             events.append(
                 trajectory_profile.Event(
@@ -93,7 +113,13 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
                     content=content,
                 )
             )
+            pending_tool_name = ""
         return events
+    if adapter == "thoughtworks":
+        effective_adapter = trajectory_profile._thoughtworks_row_adapter(row)
+        if effective_adapter == "openhands":
+            return _extract_result_events("openhands", row)
+        return _extract_result_events("smith", {"messages": row.get("messages") or row.get("messages_json")})
     if adapter == "swe_agent":
         previous_ai = ""
         for message in row.get("trajectory") or []:
@@ -122,14 +148,33 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
         messages = trajectory_profile._deserialize_possible_json(row.get("messages"))
         if not isinstance(messages, list):
             return events
+        previous_ai = ""
         for message in messages:
             if not isinstance(message, dict):
                 continue
             role = str(message.get("role") or "").lower()
+            content = trajectory_profile._content_text(message.get("content"))
+            if role == "assistant":
+                previous_ai = content
+                continue
+            if role == "user" and previous_ai:
+                name = trajectory_profile._infer_tool_name_from_text(previous_ai)
+                if name and content.strip():
+                    events.append(
+                        trajectory_profile.Event(
+                            role="user",
+                            kind="observation",
+                            name=name,
+                            category=trajectory_profile._tool_category(name, content),
+                            content=content,
+                        )
+                    )
+                previous_ai = ""
+                continue
             if role != "tool" and not message.get("tool_call_id"):
+                previous_ai = ""
                 continue
             name = str(message.get("name") or "tool")
-            content = str(message.get("content") or "")
             events.append(
                 trajectory_profile.Event(
                     role=role or "tool",
@@ -137,6 +182,34 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
                     name=name,
                     category=trajectory_profile._tool_category(name, content),
                     content=content,
+                )
+            )
+            previous_ai = ""
+        return events
+    if adapter == "terminalbench":
+        steps = trajectory_profile._deserialize_possible_json(row.get("steps"))
+        if not isinstance(steps, list):
+            return events
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            if str(step.get("src") or "").lower() != "agent":
+                continue
+            tools = step.get("tools")
+            observation = trajectory_profile._content_text(step.get("obs"))
+            if not isinstance(tools, list) or not observation.strip():
+                continue
+            first_tool = next((tool for tool in tools if isinstance(tool, dict) and str(tool.get("fn") or "").strip()), None)
+            if first_tool is None:
+                continue
+            name = trajectory_profile._normalize_tool_name(str(first_tool.get("fn") or "tool"))
+            events.append(
+                trajectory_profile.Event(
+                    role="tool",
+                    kind="tool_result",
+                    name=name,
+                    category=trajectory_profile._tool_category(name, observation),
+                    content=observation,
                 )
             )
         return events
@@ -294,7 +367,16 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
     for pattern in spec["paths"]:
         paths.extend(sorted(root.glob(pattern)))
     adapter = str(spec["adapter"])
-    columns = ["messages"] if adapter == "smith" else ["trajectory"]
+    if adapter == "smith":
+        columns = ["messages"]
+    elif adapter == "openhands":
+        columns = ["trajectory", "messages", "messages_json"]
+    elif adapter == "thoughtworks":
+        columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
+    elif adapter == "terminalbench":
+        columns = ["steps"]
+    else:
+        columns = ["trajectory"]
     return adapter, _iter_projected_parquet_rows(paths, columns=columns, max_rows=max_rows)
 
 

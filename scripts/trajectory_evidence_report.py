@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
+import re
+import shlex
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -89,7 +92,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "context-planner": {
         "status": "partial",
-        "summary": "Compact context tools exist, the agent can preload context_pack, repeated broad test inspection can auto-map tests to implementation targets, grounded implementation targets feed later source narrowing, grounded implementation-target symbols can auto-promote straight to read_symbol including when a recent identifier query disambiguates multi-symbol targets, repeated broad identifier inspection can auto-switch to repo-wide or source-scoped search_symbols before a source file is read, repeated broad repo search can auto-switch to code_outline when the latest search already narrows to one code file, repeated broad source inspection can auto-switch to search_symbols or code_outline, and grounded search-symbol or single-symbol outline results can auto-promote to read_symbol on later broad relapses.",
+        "summary": "Compact context tools exist, the agent can preload context_pack, structured context_pack ranking can auto-promote straight to read_file or read_symbol before another broad inspection, simple shell inspection can normalize to read_file, list_files, search, file_search, directory_search, or bounded read_file previews, repeated broad test inspection can auto-map tests to implementation targets, grounded implementation targets feed later source narrowing, grounded implementation-target symbols can auto-promote straight to read_symbol including when a recent identifier query disambiguates multi-symbol targets, repeated broad identifier inspection can auto-switch to repo-wide or source-scoped search_symbols before a source file is read, repeated broad repo search can auto-switch to code_outline when the latest search or list_files output narrows to exactly one non-test code file, repeated broad source inspection can auto-switch to search_symbols or code_outline, and grounded search-symbol or single-symbol outline results can auto-promote to read_symbol on later broad relapses.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
@@ -106,16 +109,16 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "post-edit-validation": {
         "status": "partial",
-        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, empty targeted-test selection can fall back through discover_validators before running repo tests, and non-code edits can route through discover_validators plus a configured or discovered test command before extra context gathering or a final answer.",
+        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, empty targeted-test selection can fall back through discover_validators before running repo tests, code edits can promote discovered check, typecheck, lint, or syntax validators when no runnable tests exist, and non-code edits can promote configured tests, discovered test commands, or discovered non-test validator commands before extra context gathering or a final answer.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
         ],
-        "next_gap": "Repos without targeted tests, a configured test command, or a discoverable repo test command still rely on validator-only follow-up instead of a deterministic test run.",
+        "next_gap": "Non-code validation now promotes available discovered validator commands, but release gating still does not cover enough real doc/config-only edit scenarios.",
     },
     "failure-compression": {
         "status": "implemented",
-        "summary": "Failed run_test output is compacted and repeated unchanged reruns auto-trigger diagnose_test_failure before another model retry.",
+        "summary": "Failed run_test output is compacted, repeated unchanged reruns auto-trigger diagnose_test_failure before another model retry, the first post-failure context-only relapse triggers diagnose_test_failure before more broad inspection, and proactive post-edit validation failures echo compact validator diagnostics before asking the model to repair.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
@@ -124,7 +127,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "ground-before-mutate": {
         "status": "partial",
-        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from a single explicitly named source path, from multiple explicitly named source paths when only one defines the requested symbol or one clearly wins focused test affinity, from otherwise ambiguous explicitly named source paths when current-turn source or test evidence points to one of those named files, can escalate unresolved multi-source ambiguity through context_pack instead of arbitrarily grounding the first file, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols to either a unique symbol, a single non-test source file, a clearly test-affined implementation candidate, or a current-turn source/test-context candidate when the tied repo search results already include it.",
+        "summary": "Grounding guards exist, explicit mutation targets can auto-read the exact file or symbol before retry, failed tests without an explicit edit path can auto-route through find_implementation_target or diagnose_test_failure, pathless edits can auto-ground from a single explicitly named source path, from multiple explicitly named source paths when only one defines the requested symbol or one clearly wins focused test affinity, from otherwise ambiguous explicitly named source paths when current-turn source or test evidence points to one of those named files, can escalate unresolved multi-source ambiguity through context_pack instead of arbitrarily grounding the first file, can reuse structured context_pack ranking to ground directly to a ranked file or symbol before a new repo-wide symbol search, and no-context pathless symbol edits can auto-narrow through repo-wide search_symbols to either a unique symbol, a single non-test source file, a clearly test-affined implementation candidate, or a current-turn source/test-context candidate when the tied repo search results already include it.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
@@ -151,7 +154,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "validated-cli-preflight": {
         "status": "implemented",
-        "summary": "Common shell/test/git command families are validated before execution.",
+        "summary": "Common shell/test/git command families are validated before execution, pre-execution Bash syntax rejections are classified as syntax errors, and repeated inline shell syntax failures are blocked with temp-script or simpler-command guidance.",
         "references": [
             "ollama_code/tools/__init__.py",
             "ollama_code/agent.py",
@@ -214,6 +217,17 @@ MESSAGE_THEME_FIX_MAP: dict[str, tuple[str, ...]] = {
     "large-failure-blob": ("failure-compression",),
 }
 
+SHELL_ERROR_FIX_MAP: dict[str, tuple[str, ...]] = {
+    "bash_unexpected_token": ("validated-cli-preflight",),
+    "bash_unexpected_eof": ("validated-cli-preflight",),
+    "unmatched_quote": ("validated-cli-preflight",),
+    "command_not_found": ("validated-cli-preflight",),
+    "missing_file_or_dir": ("path-repair-guard",),
+    "unrecognized_argument": ("validated-cli-preflight",),
+    "missing_operand": ("validated-cli-preflight",),
+    "permission_denied": ("fail-closed-permission",),
+}
+
 
 @dataclass(frozen=True)
 class MessageRecord:
@@ -227,12 +241,13 @@ class MessageRecord:
     content: str
     content_chars: int
     tool_call_names: tuple[str, ...] = ()
+    tool_arguments: dict[str, Any] | None = None
     error_class: str | None = None
     shell_error: str | None = None
 
 
 def _row_id(row: dict[str, Any], row_number: int) -> str:
-    for key in ("instance_id", "trajectory_id", "traj_id", "target", "repo"):
+    for key in ("instance_id", "trajectory_id", "traj_id", "trial_id", "trial_name", "task_name", "session_id", "source_id", "target", "repo"):
         value = row.get(key)
         if value:
             return str(value)
@@ -240,23 +255,31 @@ def _row_id(row: dict[str, Any], row_number: int) -> str:
 
 
 def _normalize_tool_call_names(raw_calls: Any) -> tuple[str, ...]:
+    return tuple(name for name, _arguments in _normalize_tool_calls(raw_calls))
+
+
+def _normalize_tool_calls(raw_calls: Any) -> list[tuple[str, dict[str, Any]]]:
     normalized = trajectory_profile._deserialize_possible_json(raw_calls)
-    names: list[str] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
     if not isinstance(normalized, list):
-        return ()
+        return []
     for call in normalized:
         if not isinstance(call, dict):
             continue
         function = call.get("function") if isinstance(call.get("function"), dict) else None
         candidate = ""
+        raw_arguments: Any = {}
         if function is not None:
             candidate = str(function.get("name") or "")
+            raw_arguments = function.get("arguments")
         if not candidate:
             candidate = str(call.get("name") or "")
+            raw_arguments = call.get("arguments")
         candidate = trajectory_profile._normalize_tool_name(candidate)
         if candidate:
-            names.append(candidate)
-    return tuple(names)
+            parsed_arguments = trajectory_profile._deserialize_possible_json(raw_arguments)
+            calls.append((candidate, parsed_arguments if isinstance(parsed_arguments, dict) else {}))
+    return calls
 
 
 def _make_message_record(
@@ -270,6 +293,7 @@ def _make_message_record(
     category: str,
     content: str,
     tool_call_names: tuple[str, ...] = (),
+    tool_arguments: dict[str, Any] | None = None,
 ) -> MessageRecord:
     lowered = content.lower()
     looks_like_error = any(
@@ -300,6 +324,7 @@ def _make_message_record(
         content=content,
         content_chars=len(content),
         tool_call_names=tool_call_names,
+        tool_arguments=tool_arguments,
         error_class=error_class,
         shell_error=shell_error,
     )
@@ -308,13 +333,17 @@ def _make_message_record(
 def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
     row_id = _row_id(row, row_number)
     records: list[MessageRecord] = []
-    for index, message in enumerate(list(row.get("trajectory") or [])):
+    messages = trajectory_profile._openhands_messages(row)
+    for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").lower()
         content = trajectory_profile._content_text(message.get("content"))
         display_name = trajectory_profile._normalize_tool_name(str(message.get("name") or ""))
-        tool_call_names = _normalize_tool_call_names(message.get("tool_calls"))
+        tool_calls = _normalize_tool_calls(
+            message.get("tool_calls") if message.get("tool_calls") is not None else message.get("tool_calls_json")
+        )
+        tool_call_names = tuple(name for name, _arguments in tool_calls)
         inferred = ""
         if role in {"assistant", "ai"} and not tool_call_names:
             inferred = trajectory_profile._infer_tool_name_from_text(content) or ""
@@ -334,7 +363,8 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
                 tool_call_names=message_tool_calls,
             )
         )
-        for tool_name in message_tool_calls:
+        record_tool_calls = tool_calls if tool_calls else [(tool_name, {}) for tool_name in message_tool_calls]
+        for tool_name, tool_arguments in record_tool_calls:
             records.append(
                 _make_message_record(
                     dataset=dataset,
@@ -346,6 +376,7 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
                     category=trajectory_profile._tool_category(tool_name, content),
                     content="",
                     tool_call_names=(tool_name,),
+                    tool_arguments=tool_arguments,
                 )
             )
     return records
@@ -354,6 +385,8 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
 def _extract_swe_agent_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
     row_id = _row_id(row, row_number)
     records: list[MessageRecord] = []
+    pending_observation_name = ""
+    pending_observation_category = "other"
     for index, message in enumerate(list(row.get("trajectory") or [])):
         if not isinstance(message, dict):
             continue
@@ -361,6 +394,11 @@ def _extract_swe_agent_messages(dataset: str, row: dict[str, Any], row_number: i
         content = trajectory_profile._content_text(message.get("text") or message.get("system_prompt"))
         inferred = trajectory_profile._infer_tool_name_from_text(content) if role in {"ai", "assistant"} else None
         tool_call_names = (inferred,) if inferred else ()
+        message_name = ""
+        message_category = trajectory_profile._tool_category(inferred or "", content)
+        if role == "user" and pending_observation_name:
+            message_name = pending_observation_name
+            message_category = pending_observation_category
         records.append(
             _make_message_record(
                 dataset=dataset,
@@ -368,13 +406,14 @@ def _extract_swe_agent_messages(dataset: str, row: dict[str, Any], row_number: i
                 message_index=index,
                 role=role,
                 kind="message",
-                name="",
-                category=trajectory_profile._tool_category(inferred or "", content),
+                name=message_name,
+                category=message_category,
                 content=content,
                 tool_call_names=tool_call_names,
             )
         )
         if tool_call_names:
+            tool_arguments = {"command": _inline_shell_command_from_content(content)} if inferred == "run_shell" else None
             records.append(
                 _make_message_record(
                     dataset=dataset,
@@ -386,8 +425,14 @@ def _extract_swe_agent_messages(dataset: str, row: dict[str, Any], row_number: i
                     category=trajectory_profile._tool_category(str(inferred), content),
                     content="",
                     tool_call_names=tool_call_names,
+                    tool_arguments=tool_arguments,
                 )
             )
+            pending_observation_name = str(inferred or "")
+            pending_observation_category = trajectory_profile._tool_category(str(inferred or ""), content)
+        elif role == "user":
+            pending_observation_name = ""
+            pending_observation_category = "other"
     return records
 
 
@@ -397,18 +442,25 @@ def _extract_smith_messages(dataset: str, row: dict[str, Any], row_number: int) 
     messages = trajectory_profile._deserialize_possible_json(row.get("messages"))
     if not isinstance(messages, list):
         return records
+    pending_observation_name = ""
+    pending_observation_category = "other"
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").lower()
         content = trajectory_profile._content_text(message.get("content"))
         display_name = trajectory_profile._normalize_tool_name(str(message.get("name") or ""))
-        tool_call_names = _normalize_tool_call_names(message.get("tool_calls"))
+        tool_calls = _normalize_tool_calls(message.get("tool_calls"))
+        tool_call_names = tuple(name for name, _arguments in tool_calls)
         inferred = ""
         if role in {"assistant", "ai"} and not tool_call_names:
             inferred = trajectory_profile._infer_tool_name_from_text(content) or ""
         message_tool_calls = tool_call_names or ((inferred,) if inferred else ())
         category_name = display_name or (message_tool_calls[0] if len(message_tool_calls) == 1 else "")
+        message_name = display_name if role == "tool" else ""
+        if role == "user" and pending_observation_name:
+            message_name = pending_observation_name
+            category_name = pending_observation_name
         records.append(
             _make_message_record(
                 dataset=dataset,
@@ -416,13 +468,19 @@ def _extract_smith_messages(dataset: str, row: dict[str, Any], row_number: int) 
                 message_index=index,
                 role=role,
                 kind="message",
-                name=display_name if role == "tool" else "",
+                name=message_name,
                 category=trajectory_profile._tool_category(category_name, content),
                 content=content,
                 tool_call_names=message_tool_calls,
             )
         )
-        for tool_name in message_tool_calls:
+        record_tool_calls = tool_calls
+        if not record_tool_calls:
+            record_tool_calls = []
+            for tool_name in message_tool_calls:
+                tool_arguments = {"command": _inline_shell_command_from_content(content)} if tool_name == "run_shell" else {}
+                record_tool_calls.append((tool_name, tool_arguments))
+        for tool_name, tool_arguments in record_tool_calls:
             records.append(
                 _make_message_record(
                     dataset=dataset,
@@ -434,6 +492,88 @@ def _extract_smith_messages(dataset: str, row: dict[str, Any], row_number: int) 
                     category=trajectory_profile._tool_category(tool_name, content),
                     content="",
                     tool_call_names=(tool_name,),
+                    tool_arguments=tool_arguments,
+                )
+            )
+        if role in {"assistant", "ai"} and len(message_tool_calls) == 1:
+            pending_observation_name = message_tool_calls[0]
+            pending_observation_category = trajectory_profile._tool_category(message_tool_calls[0], content)
+        elif role == "user":
+            pending_observation_name = ""
+            pending_observation_category = "other"
+    return records
+
+
+def _extract_terminalbench_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
+    row_id = _row_id(row, row_number)
+    records: list[MessageRecord] = []
+    steps = trajectory_profile._deserialize_possible_json(row.get("steps"))
+    if not isinstance(steps, list):
+        return records
+    for index, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        role = str(step.get("src") or "unknown").lower()
+        content = trajectory_profile._content_text(step.get("msg"))
+        raw_tools = step.get("tools")
+        tools = raw_tools if isinstance(raw_tools, list) else []
+        normalized_tools: list[tuple[str, dict[str, Any]]] = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            name = trajectory_profile._normalize_tool_name(str(tool.get("fn") or ""))
+            if not name:
+                continue
+            arguments = {"command": str(tool.get("cmd") or "").strip()} if str(tool.get("cmd") or "").strip() else {}
+            normalized_tools.append((name, arguments))
+        tool_call_names = tuple(name for name, _arguments in normalized_tools)
+        inferred = ""
+        if role in {"assistant", "agent"} and not tool_call_names:
+            inferred = trajectory_profile._infer_tool_name_from_text(content) or ""
+        message_tool_calls = tool_call_names or ((inferred,) if inferred else ())
+        records.append(
+            _make_message_record(
+                dataset=dataset,
+                row_id=row_id,
+                message_index=index,
+                role=role,
+                kind="message",
+                name="",
+                category=trajectory_profile._tool_category(message_tool_calls[0] if len(message_tool_calls) == 1 else "", content),
+                content=content,
+                tool_call_names=message_tool_calls,
+            )
+        )
+        record_tool_calls = normalized_tools if normalized_tools else [(tool_name, {"command": _inline_shell_command_from_content(content)} if tool_name == "run_shell" else {}) for tool_name in message_tool_calls]
+        for tool_name, tool_arguments in record_tool_calls:
+            records.append(
+                _make_message_record(
+                    dataset=dataset,
+                    row_id=row_id,
+                    message_index=index,
+                    role=role,
+                    kind="tool_call",
+                    name=tool_name,
+                    category=trajectory_profile._tool_category(tool_name, content),
+                    content="",
+                    tool_call_names=(tool_name,),
+                    tool_arguments=tool_arguments,
+                )
+            )
+        observation = trajectory_profile._content_text(step.get("obs"))
+        if observation.strip():
+            observation_name = message_tool_calls[0] if len(message_tool_calls) == 1 else ""
+            observation_category = trajectory_profile._tool_category(observation_name, observation)
+            records.append(
+                _make_message_record(
+                    dataset=dataset,
+                    row_id=row_id,
+                    message_index=index,
+                    role="tool",
+                    kind="message",
+                    name=observation_name,
+                    category=observation_category,
+                    content=observation,
                 )
             )
     return records
@@ -442,10 +582,21 @@ def _extract_smith_messages(dataset: str, row: dict[str, Any], row_number: int) 
 def extract_message_records(dataset: str, adapter: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
     if adapter == "openhands":
         return _extract_openhands_messages(dataset, row, row_number)
+    if adapter == "thoughtworks":
+        effective_adapter = trajectory_profile._thoughtworks_row_adapter(row)
+        if effective_adapter == "openhands":
+            return _extract_openhands_messages(dataset, row, row_number)
+        return _extract_smith_messages(
+            dataset,
+            {"messages": row.get("messages") or row.get("messages_json"), "traj_id": row.get("session_id") or row.get("source_id")},
+            row_number,
+        )
     if adapter == "swe_agent":
         return _extract_swe_agent_messages(dataset, row, row_number)
     if adapter == "smith":
         return _extract_smith_messages(dataset, row, row_number)
+    if adapter == "terminalbench":
+        return _extract_terminalbench_messages(dataset, row, row_number)
     return []
 
 
@@ -454,6 +605,368 @@ def _message_excerpt(text: str, *, limit: int = 220) -> str:
     if len(collapsed) <= limit:
         return collapsed
     return collapsed[: max(0, limit - 16)] + "... truncated ..."
+
+
+def _inline_shell_command_from_content(content: str) -> str:
+    function_match = re.search(
+        r"<function=(?:bash|run_shell|shell)>\s*<parameter=command>(.*?)</parameter>",
+        content,
+        re.IGNORECASE | re.DOTALL,
+    )
+    if function_match:
+        return " ".join(function_match.group(1).split()).strip()
+    fence_match = re.search(r"```(?:bash|sh|shell)?\s*(.*?)```", content, re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        block = fence_match.group(1).strip()
+        if block:
+            first_line = next((line.strip() for line in block.splitlines() if line.strip()), "")
+            return first_line.lstrip("$ ").strip()
+    return ""
+
+
+def _shell_command_from_record(record: MessageRecord) -> str:
+    if record.name not in {"execute_bash", "run_shell", "bash", "shell", "run_shell_command", "bash_command", "execute_ipython_cell"}:
+        return ""
+    arguments = record.tool_arguments if isinstance(record.tool_arguments, dict) else {}
+    for key in ("command", "cmd"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            command = value.strip()
+            focused = _focused_shell_segment(command)
+            try:
+                argv = shlex.split(focused, posix=True)
+            except ValueError:
+                argv = focused.split()
+            if not argv:
+                return ""
+            family = Path(argv[0]).name.lower().rstrip(".,:;")
+            if _is_pseudo_shell_family(family):
+                return ""
+            return command
+    return ""
+
+
+def _is_pseudo_shell_family(family: str) -> bool:
+    return family.startswith("$") or family.startswith("#") or family in {
+        "",
+        "#",
+        "{",
+        "}",
+        "cd",
+        "edit",
+        "submit",
+        "scroll_down",
+        "scroll_up",
+        "create",
+        "goto",
+        "open",
+        "c-c",
+        "ctrl+c",
+        "search_file",
+        "search_dir",
+        "find_file",
+        "read_file",
+        "list_files",
+        "code_outline",
+        "read_symbol",
+        "search_symbols",
+        "if",
+        "then",
+        "else",
+        "elif",
+        "fi",
+        "for",
+        "while",
+        "do",
+        "done",
+        "case",
+        "esac",
+        "function",
+        "q",
+        "c-d",
+        "c-z",
+    }
+
+
+def _is_wrapper_shell_family(family: str) -> bool:
+    return family in {"echo", "printf", "sleep", "wait", "export", "source", "."}
+
+
+def _is_setup_wrapper_segment(family: str, argv: list[str], *, has_more_segments: bool) -> bool:
+    if family == "chmod" and has_more_segments:
+        return True
+    return _is_wrapper_shell_family(family)
+
+
+def _strip_leading_env_assignments(argv: list[str]) -> list[str]:
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            break
+        index += 1
+    return argv[index:]
+
+
+def _split_shell_segments(command: str) -> list[str]:
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escape = False
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if escape:
+            current.append(char)
+            escape = False
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            escape = True
+            index += 1
+            continue
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            current.append(char)
+            quote = char
+            index += 1
+            continue
+        if command.startswith("&&", index) or command.startswith("||", index):
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 2
+            continue
+        if char == ";":
+            segment = "".join(current).strip()
+            if segment:
+                segments.append(segment)
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+    tail = "".join(current).strip()
+    if tail:
+        segments.append(tail)
+    return segments
+
+
+def _focused_shell_segment(command: str) -> str:
+    unwrapped = _unwrap_shell_wrapper(command)
+    if unwrapped != command:
+        return _focused_shell_segment(unwrapped)
+    command = re.sub(r"\\\s*\n\s*", " ", command)
+    segments = _split_shell_segments(command)
+    saw_only_pseudo = False
+    for index, segment in enumerate(segments):
+        try:
+            argv = shlex.split(segment, posix=True)
+        except ValueError:
+            argv = segment.split()
+        argv = _strip_leading_env_assignments(argv)
+        if argv:
+            family = Path(argv[0]).name.lower().rstrip(".,:;")
+            has_more_segments = index < len(segments) - 1
+            if not _is_pseudo_shell_family(family) and not _is_setup_wrapper_segment(family, argv, has_more_segments=has_more_segments):
+                return segment
+            if _is_pseudo_shell_family(family) or _is_setup_wrapper_segment(family, argv, has_more_segments=has_more_segments):
+                saw_only_pseudo = True
+        candidate_lines = [line.strip() for line in segment.splitlines() if line.strip()]
+        for candidate in candidate_lines:
+            if candidate.startswith("#"):
+                saw_only_pseudo = True
+                continue
+            try:
+                argv = shlex.split(candidate, posix=True)
+            except ValueError:
+                argv = candidate.split()
+            argv = _strip_leading_env_assignments(argv)
+            if not argv:
+                continue
+            family = Path(argv[0]).name.lower().rstrip(".,:;")
+            has_more_segments = index < len(segments) - 1
+            if _is_pseudo_shell_family(family):
+                saw_only_pseudo = True
+                continue
+            if _is_setup_wrapper_segment(family, argv, has_more_segments=has_more_segments):
+                saw_only_pseudo = True
+                continue
+            return candidate
+    return "" if saw_only_pseudo else command.strip()
+
+
+def _unwrap_shell_wrapper(command: str) -> str:
+    text = command.strip()
+    if not text.startswith("[") or not text.endswith("]"):
+        return command
+    try:
+        parsed = ast.literal_eval(text)
+    except (SyntaxError, ValueError):
+        return command
+    if not isinstance(parsed, list) or not parsed:
+        return command
+    items = [str(item) for item in parsed if isinstance(item, str)]
+    if not items:
+        return command
+    first = items[0].strip().lower()
+    if first in {"apply_patch"}:
+        if len(items) >= 2 and items[1].strip():
+            return f"{first} {items[1].strip()}"
+        return first
+    if first not in {"bash", "sh", "/bin/bash", "/bin/sh"}:
+        return command
+    for item in reversed(items[1:]):
+        candidate = item.strip()
+        if candidate and not candidate.startswith("-"):
+            return candidate
+    return command
+
+
+def _shell_command_family_and_shape(command: str) -> tuple[str, str]:
+    focused = _focused_shell_segment(command)
+    try:
+        argv = shlex.split(focused, posix=True)
+    except ValueError:
+        argv = focused.split()
+    argv = _strip_leading_env_assignments(argv)
+    if not argv:
+        return "", ""
+    family = Path(argv[0]).name.lower().rstrip(".,:;")
+    if _is_pseudo_shell_family(family):
+        return "", ""
+    shape_parts: list[str] = [family]
+    for arg in argv[1:8]:
+        lowered = arg.lower()
+        if lowered.startswith("-"):
+            shape_parts.append(lowered)
+        elif arg in {"{}", ";"}:
+            shape_parts.append(arg)
+        elif "*" in arg or "?" in arg or "[" in arg:
+            shape_parts.append("GLOB")
+        elif "/" in arg or "\\" in arg or lowered in {".", ".."}:
+            shape_parts.append("PATH")
+        elif re.fullmatch(r"\d+", arg):
+            shape_parts.append("N")
+        else:
+            shape_parts.append("ARG")
+    return family, " ".join(shape_parts)
+
+
+def _shell_command_intent(command: str) -> str:
+    focused = _focused_shell_segment(command)
+    try:
+        argv = shlex.split(focused, posix=True)
+    except ValueError:
+        argv = focused.split()
+    argv = _strip_leading_env_assignments(argv)
+    if not argv:
+        return "unknown"
+    family = Path(argv[0]).name.lower().rstrip(".,:;")
+    if _is_pseudo_shell_family(family):
+        return "unknown"
+    lowered = " ".join(argv).lower()
+    full_lowered = command.lower()
+    if "apt-get install" in full_lowered or "apt install" in full_lowered:
+        return "dependency-install"
+    if "yum install" in full_lowered or "dnf install" in full_lowered or "apk add" in full_lowered:
+        return "dependency-install"
+    if "brew install" in full_lowered or "pip install" in full_lowered or "npm install" in full_lowered:
+        return "dependency-install"
+    if family == "timeout" and len(argv) >= 3:
+        wrapped_command = " ".join(argv[2:])
+        wrapped_intent = _shell_command_intent(wrapped_command)
+        if wrapped_intent != "unknown":
+            return wrapped_intent
+    if "dpkg --configure -a" in full_lowered:
+        return "dependency-recovery"
+    if family == "pkill":
+        if any(
+            marker in full_lowered
+            for marker in (
+                "--version",
+                "command -v",
+                " which ",
+                "which ",
+                "dpkg -l",
+                " ls /usr/lib/",
+                "/usr/bin/r ",
+            )
+        ):
+            return "dependency-probe"
+    if family in {"which", "command"}:
+        return "dependency-probe"
+    if "command -v" in full_lowered and "--version" in full_lowered:
+        return "dependency-probe"
+    if "dpkg -l" in full_lowered and "grep" in full_lowered:
+        return "dependency-probe"
+    if family in {"pip", "pip3"} and " list" in f" {lowered} ":
+        return "dependency-probe"
+    if family == "psql" and "--help" in argv:
+        return "dependency-probe"
+    if family == "man" and len(argv) >= 2:
+        return "dependency-probe"
+    if family in {"apt-get", "apt", "yum", "dnf", "apk", "brew", "pip", "pip3", "npm", "pnpm", "yarn"}:
+        if any(token in argv for token in {"install", "add"}):
+            return "dependency-install"
+    if family.startswith("python"):
+        if re.search(r"\b(?:pytest|unittest)\b", lowered):
+            return "python-test-command"
+        if len(argv) >= 3 and argv[1] == "-c":
+            return "python-inline-probe"
+        if len(argv) >= 2 and argv[1].endswith(".py"):
+            return "python-script-run"
+        return "python-other"
+    if family in {"rscript", "r"}:
+        if any(token in full_lowered for token in ("test()", "testthat", "devtools::test", "tinytest")):
+            return "r-test-command"
+        return "r-other"
+    if family == "make" and any(token in {item.lower() for item in argv[1:]} for token in {"test", "tests", "unit", "check"}):
+        return "test-command"
+    if family in {"runtests.py", "runtests.sh", "run_tests.sh"}:
+        return "test-command"
+    if family in {"pytest"}:
+        return "test-command"
+    if family in {"curl", "wget"} and any(token in {item.lower() for item in argv} for token in {"sed", "head", "tail"}):
+        return "file-inspection"
+    if family in {"curl", "wget"} and "grep" in {item.lower() for item in argv}:
+        return "text-search"
+    if family == "curl" and not any(token in argv for token in {"-o", "-O", "--output", "--remote-name"}):
+        return "file-inspection"
+    if family == "wget" and not any(token in argv for token in {"-O", "--output-document"}):
+        return "file-inspection"
+    if family in {"grep", "rg", "ripgrep"}:
+        return "text-search"
+    if family == "ps":
+        return "process-inspection"
+    if family in {"kill", "killall", "pkill"}:
+        return "process-control"
+    if family == "find":
+        if "-exec" in argv and "grep" in {item.lower() for item in argv}:
+            return "find-grep-search"
+        return "file-discovery"
+    if family == "sed":
+        if "-n" in argv:
+            return "file-inspection"
+        if "-i" in argv:
+            return "file-mutation"
+    if family == "awk":
+        if any("/" in token or "\\" in token for token in argv[1:]):
+            return "file-inspection"
+    if family in {"ls", "dir", "cat", "type", "head", "tail", "wc", "nl", "pwd", "file", "stat"}:
+        return "file-inspection"
+    if family in {"cp", "mv", "rm", "mkdir", "chmod", "apply_patch"}:
+        return "file-mutation"
+    if family == "git":
+        return "git-inspection"
+    return "other-shell"
 
 
 def _example_payload(record: MessageRecord) -> dict[str, Any]:
@@ -520,6 +1033,10 @@ def classify_message_themes(record: MessageRecord) -> list[str]:
     return themes
 
 
+def _is_result_like_message(record: MessageRecord) -> bool:
+    return record.kind == "message" and (record.role == "tool" or bool(record.name))
+
+
 def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> tuple[str, Iterable[dict[str, Any]]]:
     spec = trajectory_profile.DATASET_SPECS[dataset]
     root = data_root / dataset
@@ -527,11 +1044,15 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
     for pattern in spec["paths"]:
         paths.extend(sorted(root.glob(pattern)))
     adapter = str(spec["adapter"])
-    columns = ["trajectory", "instance_id", "trajectory_id", "repo"]
+    columns = ["trajectory", "messages", "messages_json", "instance_id", "trajectory_id", "repo"]
     if adapter == "swe_agent":
         columns = ["trajectory", "instance_id", "target"]
     elif adapter == "smith":
         columns = ["messages", "instance_id", "traj_id"]
+    elif adapter == "thoughtworks":
+        columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
+    elif adapter == "terminalbench":
+        columns = ["steps", "trial_id", "trial_name", "task_name", "agent", "model"]
     return adapter, trajectory_error_profile._iter_projected_parquet_rows(paths, columns=columns, max_rows=max_rows)
 
 
@@ -545,9 +1066,14 @@ def summarize_dataset(dataset: str, adapter: str, rows: Iterable[dict[str, Any]]
     error_counts: Counter[str] = Counter()
     shell_error_counts: Counter[str] = Counter()
     tool_category_counts: Counter[str] = Counter()
+    shell_command_counts: Counter[str] = Counter()
+    shell_command_shape_counts: Counter[str] = Counter()
+    shell_command_intent_counts: Counter[str] = Counter()
     repeated_tool_counts: Counter[str] = Counter()
     row_pattern_counts: Counter[str] = Counter()
     message_theme_examples: dict[str, list[dict[str, Any]]] = {}
+    shell_command_examples: dict[str, list[dict[str, Any]]] = {}
+    shell_command_intent_examples: dict[str, list[dict[str, Any]]] = {}
     error_examples: dict[str, list[dict[str, Any]]] = {}
     row_pattern_examples: dict[str, list[dict[str, Any]]] = {}
     rows_with_edit = 0
@@ -624,10 +1150,22 @@ def summarize_dataset(dataset: str, adapter: str, rows: Iterable[dict[str, Any]]
                     _maybe_store_example(message_theme_examples, theme, _example_payload(record))
             else:
                 message_tool_call_records += 1
-            if record.error_class and record.kind == "message":
+                command = _shell_command_from_record(record)
+                if command:
+                    family, shape = _shell_command_family_and_shape(command)
+                    intent = _shell_command_intent(command)
+                    if family:
+                        shell_command_counts[family] += 1
+                        _maybe_store_example(shell_command_examples, family, {**_example_payload(record), "command": _message_excerpt(command, limit=220), "shape": shape})
+                    if shape:
+                        shell_command_shape_counts[shape] += 1
+                    if intent:
+                        shell_command_intent_counts[intent] += 1
+                        _maybe_store_example(shell_command_intent_examples, intent, {**_example_payload(record), "command": _message_excerpt(command, limit=220), "shape": shape})
+            if record.error_class and _is_result_like_message(record):
                 error_counts[record.error_class] += 1
                 _maybe_store_example(error_examples, record.error_class, _example_payload(record))
-            if record.shell_error and record.kind == "message" and record.role in {"tool", "user"}:
+            if record.shell_error and _is_result_like_message(record):
                 shell_error_counts[record.shell_error] += 1
 
     summary = {
@@ -652,6 +1190,11 @@ def summarize_dataset(dataset: str, adapter: str, rows: Iterable[dict[str, Any]]
         "row_pattern_counts": dict(row_pattern_counts.most_common()),
         "row_pattern_examples": row_pattern_examples,
         "tool_category_counts": dict(tool_category_counts.most_common()),
+        "shell_command_counts": dict(shell_command_counts.most_common(30)),
+        "shell_command_shape_counts": dict(shell_command_shape_counts.most_common(30)),
+        "shell_command_intent_counts": dict(shell_command_intent_counts.most_common(30)),
+        "shell_command_examples": shell_command_examples,
+        "shell_command_intent_examples": shell_command_intent_examples,
         "top_repeated_loops": [{"loop": loop, "count": count} for loop, count in repeated_tool_counts.most_common(20)],
         "recommendations": [],
     }
@@ -735,6 +1278,13 @@ def _fix_evidence_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         grouped_counts[rec_id] += int(count)
         grouped_datasets[rec_id].add(dataset_name)
+    shell_error_counts: dict[str, Any] = dict(summary.get("shell_error_counts") or {})
+    if isinstance(reference_error, dict) and isinstance(reference_error.get("shell_error_counts"), dict):
+        shell_error_counts = dict(reference_error.get("shell_error_counts") or {})
+    for shell_error, count in shell_error_counts.items():
+        for rec_id in SHELL_ERROR_FIX_MAP.get(str(shell_error), ()):
+            grouped_counts[rec_id] += int(count)
+            grouped_datasets[rec_id].add(dataset_name)
     rows: list[dict[str, Any]] = []
     for rec_id, evidence_count in grouped_counts.most_common():
         fix = PRODUCT_FIXES.get(rec_id, {})
@@ -960,6 +1510,27 @@ def format_markdown(payload: dict[str, Any]) -> str:
                 meta = ROW_PATTERN_META.get(pattern_name, {})
                 lines.append(f"| `{pattern_name}` | {count} | {meta.get('description', '')} |")
         lines.append("")
+        lines.append("### Shell Command Shapes")
+        lines.append("")
+        shell_commands = dict(summary.get("shell_command_counts") or {})
+        shell_shapes = dict(summary.get("shell_command_shape_counts") or {})
+        shell_intents = dict(summary.get("shell_command_intent_counts") or {})
+        if not shell_commands and not shell_shapes and not shell_intents:
+            lines.append("(none)")
+        else:
+            if shell_commands:
+                ordered = sorted(shell_commands.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+                lines.append("- Top families: " + ", ".join(f"`{name}`={count}" for name, count in ordered))
+            if shell_intents:
+                ordered = sorted(shell_intents.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+                lines.append("- Top intents: " + ", ".join(f"`{name}`={count}" for name, count in ordered))
+            if shell_shapes:
+                lines.append("")
+                lines.append("| Shape | Count |")
+                lines.append("|---|---:|")
+                for shape, count in sorted(shell_shapes.items(), key=lambda item: (-int(item[1]), item[0]))[:10]:
+                    lines.append(f"| `{shape}` | {count} |")
+        lines.append("")
         lines.append("### Example Citations")
         lines.append("")
         emitted = False
@@ -984,6 +1555,22 @@ def format_markdown(payload: dict[str, Any]) -> str:
                     "  "
                     + f"{example.get('dataset')} / {example.get('row_id')} / msg {example.get('message_index')} / {example.get('role')}: "
                     + f"{example.get('excerpt')}"
+                )
+        shell_intent_examples = dict(summary.get("shell_command_intent_examples") or {})
+        ranked_shell_intents = sorted(
+            shell_intent_examples.items(),
+            key=lambda item: (-int(shell_intents.get(item[0], 0)), item[0]),
+        )[:3]
+        for label, examples in ranked_shell_intents:
+            if not examples:
+                continue
+            emitted = True
+            lines.append(f"- `shell-intent:{label}`:")
+            for example in examples:
+                lines.append(
+                    "  "
+                    + f"{example.get('dataset')} / {example.get('row_id')} / msg {example.get('message_index')} / {example.get('role')}: "
+                    + f"{example.get('command')} [{example.get('shape')}]"
                 )
         if not emitted:
             lines.append("(no examples)")

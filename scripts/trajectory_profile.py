@@ -34,6 +34,18 @@ DATASET_SPECS = {
         "paths": ["data/train-*.parquet"],
         "adapter": "openhands",
     },
+    "coderforge-preview-swe-bench-verified-trajectories": {
+        "paths": ["trajectory/train-*.parquet"],
+        "adapter": "openhands",
+    },
+    "terminalbench-trajectories": {
+        "paths": ["data/train-*.parquet"],
+        "adapter": "terminalbench",
+    },
+    "thoughtworks-agentic-coding-trajectories": {
+        "paths": ["sessions.parquet"],
+        "adapter": "thoughtworks",
+    },
 }
 
 READ_TOOLS = {
@@ -82,10 +94,13 @@ TEST_TOOLS = {
 SHELL_TOOLS = {
     "bash",
     "run_shell",
+    "run_shell_command",
     "shell",
     "command",
     "execute",
     "execute_bash",
+    "bash_command",
+    "execute_ipython_cell",
 }
 GIT_TOOLS = {
     "git",
@@ -98,10 +113,12 @@ SUBMIT_TOOLS = {"submit", "final", "finish"}
 COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("read_file", re.compile(r"\b(?:read_file|open|cat)\b", re.IGNORECASE)),
     ("search", re.compile(r"\b(?:search_file|search_dir|search|grep|find_file|glob|list_files|ls)\b", re.IGNORECASE)),
+    ("edit", re.compile(r"\bedit\s+\d+(?::\d+)?\b", re.IGNORECASE)),
+    ("write_file", re.compile(r"\bcreate\s+\S+", re.IGNORECASE)),
     ("replace_symbols", re.compile(r"\b(?:replace_symbols|replace_symbol|edit_file|str_replace_editor|apply_patch)\b", re.IGNORECASE)),
     ("write_file", re.compile(r"\b(?:write_file|create file|overwrite file|insert)\b", re.IGNORECASE)),
     ("run_test", re.compile(r"\b(?:run_test|pytest|unittest|nose|tox)\b", re.IGNORECASE)),
-    ("run_shell", re.compile(r"\b(?:bash|run_shell|python\s+-m|pip\s+install|make\s+test)\b", re.IGNORECASE)),
+    ("run_shell", re.compile(r"\b(?:bash|run_shell|python\s+-m|python\s+\S+|pip\s+install|make\s+test)\b", re.IGNORECASE)),
     ("git", re.compile(r"\bgit\s+(?:status|diff|commit|apply|checkout)\b", re.IGNORECASE)),
     ("submit", re.compile(r"\b(?:submit|finish)\b", re.IGNORECASE)),
 ]
@@ -165,7 +182,13 @@ def _tool_category(name: str, content: str = "") -> str:
 
 def _normalize_tool_name(name: str) -> str:
     lowered = name.strip().lower()
-    return lowered.replace(" ", "_")
+    normalized = lowered.replace(" ", "_")
+    alias_map = {
+        "bash_command": "run_shell",
+        "run_shell_command": "run_shell",
+        "execute_ipython_cell": "run_shell",
+    }
+    return alias_map.get(normalized, normalized)
 
 
 def _infer_tool_name_from_text(text: str) -> str | None:
@@ -202,13 +225,40 @@ def _deserialize_possible_json(value: Any) -> Any:
         return value
 
 
+def _openhands_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
+    trajectory = _deserialize_possible_json(row.get("trajectory") or row.get("messages") or row.get("messages_json") or [])
+    return trajectory if isinstance(trajectory, list) else []
+
+
+def _message_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    tool_calls = _deserialize_possible_json(message.get("tool_calls"))
+    if isinstance(tool_calls, list):
+        return [call for call in tool_calls if isinstance(call, dict)]
+    tool_calls_json = _deserialize_possible_json(message.get("tool_calls_json"))
+    if isinstance(tool_calls_json, list):
+        return [call for call in tool_calls_json if isinstance(call, dict)]
+    return []
+
+
+def _thoughtworks_row_adapter(row: dict[str, Any]) -> str:
+    framework = str(row.get("agent_framework") or "").strip().lower()
+    if framework == "openhands":
+        return "openhands"
+    if framework in {"swe-agent", "mini-swe-agent"}:
+        return "smith"
+    source_dataset = str(row.get("source_dataset") or "").strip().lower()
+    if "openhands" in source_dataset:
+        return "openhands"
+    return "smith"
+
+
 def _extract_openhands_events(trajectory: list[dict[str, Any]]) -> list[Event]:
     events: list[Event] = []
     for message in trajectory:
         role = str(message.get("role") or "")
         content = _content_text(message.get("content"))
         if role == "assistant":
-            tool_calls = _deserialize_possible_json(message.get("tool_calls"))
+            tool_calls = _message_tool_calls(message)
             if isinstance(tool_calls, list) and tool_calls:
                 for call in tool_calls:
                     function = call.get("function") if isinstance(call, dict) else None
@@ -257,7 +307,7 @@ def _extract_smith_events(messages: Any) -> list[Event]:
         role = str(message.get("role") or "")
         content = _content_text(message.get("content"))
         if role == "assistant":
-            tool_calls = _deserialize_possible_json(message.get("tool_calls"))
+            tool_calls = _message_tool_calls(message)
             if isinstance(tool_calls, list) and tool_calls:
                 for call in tool_calls:
                     function = call.get("function") if isinstance(call, dict) else None
@@ -275,13 +325,47 @@ def _extract_smith_events(messages: Any) -> list[Event]:
     return events
 
 
+def _extract_terminalbench_events(steps: Any) -> list[Event]:
+    events: list[Event] = []
+    normalized = _deserialize_possible_json(steps)
+    if not isinstance(normalized, list):
+        return events
+    for step in normalized:
+        if not isinstance(step, dict):
+            continue
+        role = str(step.get("src") or "unknown").lower()
+        tools = step.get("tools")
+        if role == "agent" and isinstance(tools, list):
+            for tool in tools:
+                if not isinstance(tool, dict):
+                    continue
+                name = _normalize_tool_name(str(tool.get("fn") or ""))
+                if not name:
+                    continue
+                payload = _content_text(tool)
+                events.append(Event(role="agent", kind="tool_call", name=name, category=_tool_category(name, payload), content=payload))
+        elif role == "agent":
+            content = _content_text(step.get("msg"))
+            inferred = _infer_tool_name_from_text(content)
+            if inferred:
+                events.append(Event(role="agent", kind="tool_call", name=inferred, category=_tool_category(inferred, content), content=content))
+    return events
+
+
 def _extract_events(adapter: str, row: dict[str, Any]) -> list[Event]:
     if adapter == "openhands":
-        return _extract_openhands_events(list(row.get("trajectory") or []))
+        return _extract_openhands_events(_openhands_messages(row))
+    if adapter == "thoughtworks":
+        effective_adapter = _thoughtworks_row_adapter(row)
+        if effective_adapter == "openhands":
+            return _extract_openhands_events(_openhands_messages(row))
+        return _extract_smith_events(row.get("messages") or row.get("messages_json"))
     if adapter == "swe_agent":
         return _extract_swe_agent_events(list(row.get("trajectory") or []))
     if adapter == "smith":
         return _extract_smith_events(row.get("messages"))
+    if adapter == "terminalbench":
+        return _extract_terminalbench_events(row.get("steps"))
     return []
 
 

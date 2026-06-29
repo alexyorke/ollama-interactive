@@ -61,6 +61,36 @@ class TrajectoryDatasetFetchTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "huggingface_hub is required"):
                     fetch.fetch_datasets(["nebius-swe-agent-trajectories"], data_root)
 
+    def test_coderforge_dataset_is_supported_with_trajectory_glob(self) -> None:
+        dataset_name = "coderforge-preview-swe-bench-verified-trajectories"
+
+        spec = fetch.SUPPORTED_DATASET_SPECS[dataset_name]
+
+        self.assertEqual(
+            spec["repo_id"],
+            "togethercomputer/CoderForge-Preview-32B-SWE-Bench-Verified-Evaluation-trajectories",
+        )
+        self.assertEqual(spec["adapter"], "openhands")
+        self.assertEqual(spec["path_globs"], ["trajectory/train-*.parquet"])
+
+    def test_terminalbench_dataset_is_supported_with_step_adapter(self) -> None:
+        dataset_name = "terminalbench-trajectories"
+
+        spec = fetch.SUPPORTED_DATASET_SPECS[dataset_name]
+
+        self.assertEqual(spec["repo_id"], "yoonholee/terminalbench-trajectories")
+        self.assertEqual(spec["adapter"], "terminalbench")
+        self.assertEqual(spec["path_globs"], ["data/train-*.parquet"])
+
+    def test_thoughtworks_dataset_is_supported_with_session_parquet(self) -> None:
+        dataset_name = "thoughtworks-agentic-coding-trajectories"
+
+        spec = fetch.SUPPORTED_DATASET_SPECS[dataset_name]
+
+        self.assertEqual(spec["repo_id"], "thoughtworks/agentic-coding-trajectories")
+        self.assertEqual(spec["adapter"], "thoughtworks")
+        self.assertEqual(spec["path_globs"], ["sessions.parquet"])
+
 
 if __name__ == "__main__":
     unittest.main()
