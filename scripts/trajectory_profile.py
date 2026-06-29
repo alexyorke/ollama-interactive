@@ -115,6 +115,13 @@ GIT_TOOLS = {
     "git_commit",
 }
 SUBMIT_TOOLS = {"submit", "final", "finish"}
+HELPER_TOOLS = {
+    "todowrite",
+    "taskoutput",
+    "update_plan",
+    "save_plan",
+    "bashoutput",
+}
 
 COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("read_file", re.compile(r"\b(?:read_file|open|cat)\b", re.IGNORECASE)),
@@ -538,7 +545,7 @@ def _mechanical_turn_category(categories: list[str]) -> str | None:
 
 
 def _trajectory_metrics(events: list[Event]) -> dict[str, Any]:
-    tool_events = [event for event in events if event.kind == "tool_call"]
+    tool_events = [event for event in events if event.kind == "tool_call" and event.name not in HELPER_TOOLS]
     tool_names = [event.name for event in tool_events if event.name]
     categories = [event.category for event in tool_events]
     first_edit = next((idx for idx, event in enumerate(tool_events) if event.category == "edit"), None)

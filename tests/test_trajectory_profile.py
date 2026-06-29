@@ -186,6 +186,26 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual([event.name for event in events], ["run_shell"])
         self.assertEqual([event.category for event in events], ["test"])
 
+    def test_terminalbench_helper_tools_do_not_shift_first_edit_or_hide_context_loop(self) -> None:
+        row = {
+            "steps": (
+                '['
+                '{"src":"agent","msg":"Executed search","tools":[{"fn":"Grep","cmd":"grep -n todo src/app.py"}],"obs":"ok"},'
+                '{"src":"agent","msg":"Executed read","tools":[{"fn":"Read","cmd":"src/app.py"}],"obs":"ok"},'
+                '{"src":"agent","msg":"Executed TodoWrite","tools":[{"fn":"TodoWrite","cmd":""}],"obs":"$1"},'
+                '{"src":"agent","msg":"Executed search","tools":[{"fn":"Grep","cmd":"grep -n main src/app.py"}],"obs":"ok"},'
+                '{"src":"agent","msg":"Executed read","tools":[{"fn":"Read","cmd":"src/lib.py"}],"obs":"ok"},'
+                '{"src":"agent","msg":"Executed write","tools":[{"fn":"Write","cmd":"src/app.py"}],"obs":"ok"}'
+                ']'
+            )
+        }
+
+        metrics = profile._trajectory_metrics(profile._extract_events("terminalbench", row))
+
+        self.assertTrue(metrics["context_loop"])
+        self.assertEqual(metrics["first_edit_index"], 4)
+        self.assertEqual(metrics["tool_names"], ["grep", "read", "grep", "read", "write"])
+
     def test_extract_thoughtworks_events_dispatches_by_agent_framework(self) -> None:
         openhands_row = {
             "agent_framework": "openhands",
