@@ -281,19 +281,15 @@ def _default_compare_path(repo_root: Path, current_run_dir: Path) -> Path | None
     root = repo_root / "scratch" / "nightly-self-improvement"
     if not root.exists():
         return None
-    candidates = []
+    candidates: list[Path] = []
     for path in root.glob("*/report.json"):
         if current_run_dir in path.parents:
             continue
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            continue
-        candidates.append((mtime, path))
+        candidates.append(path)
     if not candidates:
         return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+    candidates.sort(key=lambda item: (item.parent.name, str(item)), reverse=True)
+    return candidates[0]
 
 
 def _normalize_ollama_host(host: str) -> str:
