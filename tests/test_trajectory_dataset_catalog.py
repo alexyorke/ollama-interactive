@@ -8,6 +8,22 @@ from scripts import trajectory_dataset_catalog as catalog
 
 
 class TrajectoryDatasetCatalogTests(unittest.TestCase):
+    def test_default_candidates_include_real_user_and_unified_public_corpora(self) -> None:
+        entries = {str(item["repo_id"]): item for item in catalog.HF_DATASET_CANDIDATES}
+
+        self.assertIn("trace-commons/agent-traces", entries)
+        self.assertEqual(entries["trace-commons/agent-traces"]["slug"], "trace-commons-agent-traces")
+        self.assertEqual(entries["trace-commons/agent-traces"]["priority"], "high")
+        self.assertEqual(entries["trace-commons/agent-traces"]["kind"], "real-user-coding-agent-sessions")
+
+        self.assertIn("thoughtworks/agentic-coding-trajectories", entries)
+        self.assertEqual(
+            entries["thoughtworks/agentic-coding-trajectories"]["slug"],
+            "thoughtworks-agentic-coding-trajectories",
+        )
+        self.assertEqual(entries["thoughtworks/agentic-coding-trajectories"]["priority"], "medium")
+        self.assertEqual(entries["thoughtworks/agentic-coding-trajectories"]["kind"], "unified-agentic-coding-corpus")
+
     def test_build_catalog_reports_local_public_and_gated_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             data_root = Path(tmp)

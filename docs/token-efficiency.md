@@ -16,6 +16,26 @@ Metrics come from Ollama `/api/chat` response fields: `prompt_eval_count`, `eval
 | Median prompt-token change, matched passing debate-on runs | - | -74.9% |
 | Accuracy regressions | - | 0 |
 
+## Cross-Dataset Findings
+
+The current local trajectory corpus is now broad enough to say something useful about real waste patterns, not just one benchmark family. As of June 29, 2026, the repo has local copies of public `nebius/SWE-agent-trajectories`, `nebius/SWE-rebench-openhands-trajectories`, `SWE-bench/SWE-smith-trajectories`, `nvidia/SWE-Hero-openhands-trajectories`, `togethercomputer/CoderForge-Preview-32B-SWE-Bench-Verified-Evaluation-trajectories`, `yoonholee/terminalbench-trajectories`, `trace-commons/agent-traces`, and `thoughtworks/agentic-coding-trajectories`; `SALT-NLP/SWE-chat` is still gated as of June 29, 2026. The project-local summaries in `scratch/external/datasets/trajectory-profile-current.json`, `trajectory-error-profile-current.json`, `trajectory-evidence-report-current.json`, and `trajectory-evidence-report-terminalbench-500.json`, plus the ad hoc June 29 sample review in `scratch/external/datasets/web-discovered-agent-datasets-analysis.json`, point to five stable patterns:
+
+- Search and context loops are still the biggest controller waste in SWE-agent style traces. The current 100-row Nebius SWE-agent sample shows `79.0%` context-loop rows and repeated `search x3/x4` loops as the dominant repeated action family.
+- OpenHands-style traces spend much more budget in edit-shell churn than in pure search loops. The current 100-row samples show `66.05` average tool calls for Nebius OpenHands, `59.83` for SWE-Hero OpenHands, and `71.37` for CoderForge, with repeated `execute_bash x3/x4` and `str_replace_editor x3/x4` loops dominating.
+- Post-edit validation is still the weak spot in terminal-only repair traces. The current 500-row TerminalBench sample shows `96` `edit-without-test-row` hits, `100.0%` edit-without-later-test, and heavy command mix in `file-inspection`, `r-other`, and `r-test-command`, which means the agent often mutates and reprobes without a strong validation gate.
+- Environment bootstrapping is a real source of waste, not just a setup nuisance. After cleaning up shell-intent classification, the remaining high-volume TerminalBench `other-shell` examples are dominated by ad hoc download and install attempts such as `wget` and `curl` fetches for missing R packages or system artifacts, not by normal code navigation.
+- The first real-user donated trace sample points at a different waste shape than the benchmark-heavy corpora. In the current 30-session `trace-commons/agent-traces` local sample, the average session already reaches `142.13` tool calls, `27/30` sessions contain repeated identical tool pairs, all `30/30` sessions lack an explicit test command by simple shell-command matching, and the dominant tool families are `Edit=972`, `Read=847`, `Bash=794`, and `PowerShell=521`. The most expensive sessions also pay very large cache-creation costs before meaningful work starts, which suggests startup prompt bloat and over-broad tool or skill exposure are now measurable token targets, not just style concerns.
+
+The downloaded `thoughtworks/agentic-coding-trajectories` corpus is still benchmark-derived rather than real-user, but it reinforces the same controller priorities. Its unified 15k-session Parquet shows the OpenHands slice as the most expensive family at about `64.16` turns and `51,419` total tokens per session on average, while unresolved sessions are consistently longer and more expensive than resolved ones.
+
+That suggests the next efficiency tranche should stay narrow and evidence-backed:
+
+- First, tighten loop compression around repeated `search/read` relapses and repeated `execute_bash` plus edit churn.
+- Second, keep strengthening mandatory post-edit validation, especially for non-Python or shell-driven repair tasks where the model currently does not naturally converge on tests.
+- Third, add a deterministic dependency/bootstrap recovery path before the model starts improvising package downloads with raw shell commands.
+- Fourth, cut startup-context bloat for greenfield and long-running sessions by narrowing initial skill or tool exposure and avoiding repository-exploration habits when the task is obviously create-from-scratch.
+- Fifth, do not overfit to curated benchmark traces alone; keep rerunning the same checks on `trace-commons/agent-traces` and add `SWE-chat` if it becomes accessible later.
+
 ## Safe Tool-Speed Pass
 
 Latest pass keeps debate, reconciliation, validation, approval gates, and all default-on tools intact. It removes wasted local work around broad scans, prompt palettes, and session writes.
@@ -45,11 +65,36 @@ No-LLM cluttered fixture probe with 2,000 generated files:
 | `context_pack` | 28.95 ms |
 | `discover_validators` | 29.942 ms |
 
+Latest lint cache probe (`scratch/validation/tool-speed-probe-20260628-lint-cache-repeat.json`) keeps cold typechecker cost visible while avoiding repeated unchanged validator runs in the same session:
+
+| Probe | Time | Dominant phase |
+|---|---:|---|
+| `lint_typecheck` | 582.309 ms | `typecheck_ms=539.4` |
+| `lint_typecheck_cached` | 18.925 ms | scan-only cache validation |
+
+The corrected nightly report now also surfaces no-LLM probe bottlenecks directly in `metrics.slowest_probe_tools`; `scratch/nightly-self-improvement/20260629T014614Z/report.json` reports cold `lint_typecheck` at `628.249 ms` and cached `lint_typecheck_cached` at `19.761 ms`. After adding focused unconfigured typechecker skipping, `scratch/validation/tool-speed-probe-20260628-unconfigured-typecheck-skip-v2.json` reports cold `lint_typecheck` at `43.545 ms` and cached `lint_typecheck_cached` at `19.116 ms`. The follow-up nightly `scratch/nightly-self-improvement/20260629T015126Z/report.json` confirms `lint_typecheck` is no longer the slowest no-LLM probe; `fts_refresh` is now first at `75.377 ms`. The FTS incremental pass in `scratch/validation/tool-speed-probe-20260628-fts-incremental-v2.json` keeps cold `fts_refresh` visible at `47.825 ms` and adds an unchanged repeated `fts_refresh_cached` row at `20.859 ms`. The validator-discovery path-label and single-scan pass reduced the focused 2,000-file synthetic discovery check to `169.346 ms` cold and `114.053 ms` repeat in `scratch/validation/discover-validators-synthetic-20260629.json`; deferring command availability checks to only the selected validator slice reduced the same focused check again to `69.858 ms` cold and `64.495 ms` repeat in `scratch/validation/discover-validators-synthetic-after-availability-defer.json`, and caching optional Python tool resolution per executor reduced the repeat row to `25.486 ms` in `scratch/validation/discover-validators-synthetic-after-python-tool-cache.json`. The broader nightly `scratch/nightly-self-improvement/20260629T021813Z/report.json` remains noisy but is green and reports `discover_validators` at `73.502 ms`.
+
+The follow-up broad speed probe in `scratch/validation/tool-speed-probe-after-native-ast-search.json` reduced the common Python function-pattern `ast_search` row from `82.14 ms` to `27.015 ms`, while keeping the dependency fail-closed path for non-installed `ast-grep`.
+
+`scratch/validation/tool-speed-probe-after-lint-lazy-resolve.json` records the current combined no-LLM probe state. Focused unconfigured `lint_typecheck` now avoids resolving basedpyright/pyright commands after typechecking has already been skipped, trimming the cold row from about `38.983 ms` to `36.653 ms` in this noisy local probe while preserving validator output.
+
+The follow-up command-resolution cache targets repeated validator flows rather than cold PATH lookup. `scratch/validation/discover-validators-repeat-after-which-cache.json` shows `discover_validators` on the same executor dropping from `69.387 ms` cold to `2.081 ms`, `2.326 ms`, `1.636 ms`, and `1.611 ms` on repeated calls. The broad probe `scratch/validation/tool-speed-probe-after-which-cache-v2.json` keeps cold `discover_validators` noisy at `85.978 ms`, but reduces cached `lint_typecheck` to `1.923 ms` by reusing resolved command paths.
+
 Implementation notes:
 
 - Broad enumerators now prefer `git ls-files --cached --others --exclude-standard` when usable and fall back to shared generated-directory skip rules.
+- Workspace-relative path labels use a cheap cached-prefix path for normal in-workspace files and fall back to resolved paths only for unusual outside-workspace cases.
+- `discover_validators` scans repo files once and computes relative paths only for files that can affect validator suggestions, instead of formatting every repo file path.
+- `discover_validators` now defers command availability checks until after applying the caller's `limit`, preserving returned `available` fields while skipping PATH probes for validators that will not be shown.
+- Optional Python tool command resolution is cached per `ToolExecutor`, so repeated `discover_validators`, `select_tests`, and fallback validator flows do not re-resolve the same optional CLIs/modules.
+- Command PATH resolution is cached per `ToolExecutor`, so repeated validator discovery and validation flows do not keep re-scanning PATH for the same executables.
+- `ast_search` keeps `ast-grep` as the general structural-search backend, but handles the common Python function-definition pattern natively after confirming `ast-grep` is installed, avoiding CLI startup for symbol-listing probes.
 - `repo_index_search` renders from cached symbols and line snippets instead of rereading and reparsing ranked files.
 - `context_pack` reuses repo-index records for test hints.
+- `fts_refresh` incrementally upserts only changed SQLite FTS rows and deletes stale rows instead of rebuilding the scoped index on every refresh.
+- `lint_typecheck` caches unchanged file/config fingerprints per tool session so repeated post-edit validation of the same targets does not rerun `ruff`, `basedpyright`/`pyright`, or `bash -n`.
+- Focused `lint_typecheck` skips cold `basedpyright`/`pyright` startup when the workspace has no `pyright`/`basedpyright` config; configured projects and explicit whole-repo validation keep typechecking enabled.
+- Focused `lint_typecheck` also skips resolving typechecker commands once the no-config skip has removed all typechecker targets.
 - Primary prompts compact non-current history even in short conversations, while keeping the current request with a larger cap.
 - Transcript autosave batches tool-call/tool-result state instead of rewriting the full session JSON after every event.
 - Ollama chat requests now default to `temperature=0`; explicit per-call options can still override it.
@@ -76,8 +121,15 @@ Additional live smoke:
 | Model | Suite slice | Status |
 |---|---|---|
 | `gemma3:4b` | 18 deterministic/token-efficiency cases | 18/18 pass, 0 LLM calls |
-| `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass |
-| `qwen3:8b` | 8 local coding smoke cases | 8/8 pass on the June 19, 2026 local-small live gate, but higher token cost than Granite so it remains a comparison model rather than the default |
+| `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass on the June 29, 2026 serial local-small live gate; lowest benchmark token total of the three active local coding models (`2040`) so it remains the default |
+| `gemma4:e4b` | 8 local coding smoke cases | 8/8 pass on the June 29, 2026 serial local-small live gate; higher benchmark token total than Granite (`2408`) so it remains a comparison model |
+| `qwen3:8b` | 8 local coding smoke cases | 8/8 pass on the June 29, 2026 serial local-small live gate, but higher token cost than Granite (`2521`) so it remains a comparison model rather than the default |
+
+Current larger-suite check: `granite4.1:8b` passed the June 29, 2026 runtime-profile `all` `local-full` regression sweep (`33/33`) in `scratch/coding-benchmark/local-full-granite-after-target-path-grounding.json`, with `12` total LLM calls and `6847` total tokens. This adds a small safety cost versus `scratch/coding-benchmark/local-full-granite-after-validation-feedback-all.json` (`6828` tokens) after explicit path edits were tightened to require target-path grounding.
+
+Current targeted repair checks: after reusing a recovered test command inside spec-guided repair, `bad_test_command_recovery` stayed passing and dropped from `2023` to `280` total tokens, with LLM calls dropping from `4` to `1`, in `scratch/coding-benchmark/bad-test-command-after-recovered-command-reuse.json`. After narrowing `run_test` command recovery to broken commands instead of application import failures, `nested_package_import_fix` stayed passing and dropped from `2831` to `1261` total tokens, with LLM calls dropping from `2` to `1`, in `scratch/coding-benchmark/nested-package-import-after-run-test-recovery-narrowing.json`. After the CoderForge-backed context-routing pass, `nested_package_import_fix` dropped again to `1112`, `docs_sync_after_api_change` dropped from `1147` to `980`, and `multi_file_refactor` dropped from `1311` to `1184`. After adding first-failed-test diagnosis before more context gathering, `test_repair_task` passed on `granite4.1:8b` with `2` LLM calls and `1978` total tokens in `scratch/coding-benchmark/test-repair-after-first-failure-diagnosis.json`; after promoting discovered non-code validator commands, the same case stayed passing with `2` LLM calls and `1979` total tokens in `scratch/coding-benchmark/test-repair-after-noncode-validation.json`.
+
+Post shell-routing measurement: `scratch/coding-benchmark/context-shell-routing-slice-after-directory-search.json` passed the three context-sensitive cases (`multi_file_refactor`, `docs_sync_after_api_change`, `nested_package_import_fix`) with `3/3` pass, `3` LLM calls, and `3307` total tokens. Versus `scratch/coding-benchmark/local-full-granite-after-target-path-grounding.json`, token deltas were effectively neutral: `+0.6%`, `+1.0%`, and `-0.9%`. The follow-up `scratch/coding-benchmark/local-small-granite-after-shell-routing.json` passed the full `local-small` gate (`8/8`) with `4` LLM calls and `2058` total tokens; only `multi_file_refactor` moved materially at `+0.8%`, so the new shell-inspection routes are not a reason to stack more shell heuristics without a fresh measured failure.
 
 Public benchmark smoke from [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark), Python Exercism tasks `list-ops`, `pig-latin`, `wordy`, `granite4.1:8b`, debate off:
 
@@ -96,9 +148,11 @@ Latest pass targeted reusable waste patterns found from public Aider smoke and l
 - Python writes/edits now report syntax diagnostics immediately; finals and test runs are blocked until known syntax errors are fixed.
 - Edit prompts that also request tests cannot finish until `run_test` succeeds after the latest file mutation.
 - Repeated identical failed `run_test` calls are blocked until a file changes.
+- Repeated `run_shell` syntax/quoting failures are blocked before a third duplicate retry and redirected toward a simpler command, temp script, or `run_test` when the command is validation.
 - Large `write_file`/`replace_in_file` arguments are compacted in assistant history while full raw arguments remain in event logs.
 - Common model waste is normalized: `test`/`pytest`/`unittest` tool aliases route to configured `run_test`, `code_outline` defaults to `.`, and `replace_in_file` strips `read_file` line-number prefixes.
-- Exact unquoted multiword file writes with required trailing newlines are normalized deterministically, and search questions like “which file contains X” synthesize the file answer from tool output.
+- Simple shell inspection proposed by the model routes to structured context tools when safe: `cat`/`type` and simple `head`/`tail` previews to bounded `read_file`, `ls`/`dir` to `list_files`, two-argument `grep`/`rg` to `search`, file-only `find -name` forms to `file_search`, and directory-only `find -name -type d` forms to `directory_search`, unless the user explicitly requested `run_shell`.
+- Exact unquoted multiword file writes with required trailing newlines are normalized deterministically, and search questions like "which file contains X" synthesize the file answer from tool output.
 
 Public Aider smoke baseline before these changes (`granite4.1:8b`, debate off, `list-ops`, `pig-latin`, `wordy`) was `0/3` pass, 24 LLM calls, 34,015 tokens. Later public runs stayed `0/3` or timed out on the same 8B Granite model, so they were used for profiling failure modes rather than accuracy claims.
 
@@ -246,11 +300,11 @@ Generic additions behind these profiles:
 
 - Persistent ignored repo index under `.ollama-code/index/` with paths, mtimes, sizes, hashes, symbols, imports, and term vectors.
 - A quiet background indexer starts with the CLI by default and refreshes these caches initially, on notified mutation paths, and by cheap polling. Disable it with `"indexer": {"enabled": false}` or `--no-indexer`.
-- `file_index_refresh(path='.',limit=50000)`, `file_search(query,path='.',limit=100)`, and optional `fd_search(query,path='.',limit=100,kind='any')` provide fast local file discovery without reading file contents.
+- `file_index_refresh(path='.',limit=50000)`, `file_search(query,path='.',limit=100)`, `directory_search(query,path='.',limit=100)`, and optional `fd_search(query,path='.',limit=100,kind='any')` provide fast local path discovery without reading file contents.
 - `fts_refresh(path='.',limit=2000)` and `fts_search(query,path='.',limit=20,refresh=false)` maintain a repo-local SQLite FTS5 cache over paths, symbols, headings, and compact text snippets.
 - `everything_search(query,path='.',limit=100)` integrates with the native Everything CLI `es.exe` when installed, then filters matches back to the workspace; if `es.exe` is unavailable, use `file_search`.
 - `repo_index_refresh(path='.',limit=1000)` refreshes that index on demand, and `indexed_search(query,path='.',limit=100)` searches cached line snippets without rescanning every file.
-- `semgrep_scan(pattern,path='.',lang?,limit=50)` provides optional syntax-aware structural search when Semgrep is installed; if it is absent, the tool fails closed with an install-needed diagnostic instead of falling back to broad reads.
+- `semgrep_scan(pattern,path='.',lang?,limit=50)` provides optional syntax-aware structural search when Semgrep or Opengrep is installed; if neither is available and Docker-backed Semgrep is disabled, the tool fails closed with install-needed diagnostics instead of falling back to broad reads.
 - `context_pack(request,path='.',limit=8)` ranks compact snippets, likely tests, git state, and a suggested next tool.
 - `systems_lens(request,path='.',evidence?,limit=8)` frames complex tasks as explicit systems questions around boundary, observer/metric, categories, state, history/scale, feedback, delays, stocks/flows, coupling, incentives, model limits, disconfirmation, and intervention effects.
 - `apply_structured_edit` now supports `replace_function_body`, `change_signature`, `add_import_if_missing`, `rename_symbol_project`/`update_callers`, plus existing rename/delete/move/replace ops.
@@ -299,3 +353,6 @@ The contract-guards pass kept 8/8 pass and saved `1,476` total tokens (`-5.7%`) 
 - `scripts/e2e_suite.py --model gemma4:e4b`: all scenarios passed after adding deterministic search synthesis and exact-newline write normalization.
 - `scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles all --strict-accuracy`: 8/8 passed on remote Ollama through the car-detection SSH tunnel.
 - `scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --modes off --reconcile-modes auto --feature-profiles baseline contract-guards all --strict-accuracy`: baseline and contract-guards completed 8/8; the full three-profile run hit the shell timeout after writing usable JSON, so `all` was rerun separately and passed 8/8.
+- `scripts/live_model_gate.py --models granite4.1:8b gemma4:e4b qwen3:8b --benchmark-suite local-small --benchmark-jobs 1 --continue-on-failure --output-dir scratch/live-model-gate-20260629-local-small`: passed on June 29, 2026 for all three models; Granite stayed the default on the tie-break because it used the fewest benchmark tokens.
+- `scripts/coding_benchmark_eval.py --suite local-full --models granite4.1:8b --modes off --feature-profiles all --benchmark-classes agent controller --jobs 1 --strict-accuracy --strict-budget --require-llm-for-agent-benchmarks`: passed `33/33` on June 29, 2026 in `scratch/coding-benchmark/local-full-granite-after-target-path-grounding.json`.
+- `scripts/coding_benchmark_eval.py --suite local-full --cases issue_fix_hidden_tests test_repair_task renamed_simple_expression_hidden bad_test_command_recovery nested_package_import_fix --models granite4.1:8b --modes off --benchmark-classes agent --jobs 1 --feature-profiles all --require-llm-for-agent-benchmarks --strict-accuracy`: passed on June 28, 2026 in `scratch/coding-benchmark/repair-slice-after-recovered-command-reuse.json`.

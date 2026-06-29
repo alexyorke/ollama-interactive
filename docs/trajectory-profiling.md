@@ -8,8 +8,10 @@ Supported local datasets under ignored `scratch/external/datasets/`:
 - `nebius-swe-rebench-openhands-trajectories`
 - `swe-smith-trajectories`
 - `nvidia-swe-hero-openhands-trajectories`
+- `coderforge-preview-swe-bench-verified-trajectories`
+- `terminalbench-trajectories`
 
-`SWE-chat` is intentionally not assumed to be present because the Hugging Face dataset is gated.
+The broader catalog also tracks downloaded-but-not-yet-normalized corpora such as `trace-commons-agent-traces` and `thoughtworks-agentic-coding-trajectories`. `SWE-chat` is still tracked separately because the Hugging Face dataset is gated.
 
 ## Dataset Catalog
 
@@ -38,6 +40,12 @@ Fetch one supported public dataset locally:
 python scripts/trajectory_dataset_fetch.py --datasets nebius-swe-agent-trajectories
 ```
 
+Fetch the CoderForge SWE-bench Verified evaluation traces:
+
+```bash
+python scripts/trajectory_dataset_fetch.py --datasets coderforge-preview-swe-bench-verified-trajectories
+```
+
 Fetch the full supported public set in the current priority order:
 
 ```bash
@@ -45,6 +53,25 @@ python scripts/trajectory_dataset_fetch.py
 ```
 
 The fetcher downloads only the allowed Parquet globs for each supported dataset and writes a small manifest at `scratch/external/datasets/<dataset>/.ollama-interactive-manifest.json`. Treat these local files and the generated JSON under `scratch/` as regenerated evidence, not versioned source artifacts.
+
+The current analysis-ready public set includes SWE-agent, OpenHands, SWE-smith, SWE-Hero, CoderForge SWE-bench Verified, and TerminalBench. TerminalBench uses its own `steps` schema, but the local profile, error, and evidence scripts normalize its tool aliases into the same category model used for the SWE-style corpora.
+
+As of June 29, 2026, the repo also has bounded local downloads of two additional public corpora discovered through the catalog pass:
+
+- `trace-commons/agent-traces`: a small but important real-user donated coding-agent sample with raw prompt, message, and trace fields.
+- `thoughtworks/agentic-coding-trajectories`: a 15k-session derivative Parquet corpus useful for cross-framework workload comparisons, but still mostly benchmark-style agent sessions rather than real-user traces.
+
+Those two datasets are not in the main `trajectory_profile.py` pipeline yet, so keep using the analysis-ready set for controller metrics and use the extra corpora for manual transcript review until a bounded parser lands.
+
+Recent local CoderForge artifacts:
+
+- `scratch/external/datasets/trajectory-dataset-fetch-coderforge.json`
+- `scratch/validation/trajectory-profile-coderforge-500.json`
+- `scratch/validation/trajectory-error-profile-coderforge-500.json`
+- `scratch/validation/trajectory-evidence-coderforge-500.json`
+- `scratch/validation/trajectory-evidence-coderforge-500.md`
+
+The June 29, 2026 CoderForge sample profiled 500 rows at 70.63 average tool calls with 44.4% context-loop rows and 4.8% edit-without-later-test rows. The matching 500-row message evidence sample scanned 71,630 messages and found 14,554 large context blobs, 2,633 large failure blobs, and 1,905 plan-plus-tool-call blobs. It now records shell command families, shapes, and intent directly from tool-call arguments, and the Markdown report cites shell-intent examples so the aggregated counts can be audited against concrete commands. The current top families are `python=9964`, `grep=4749`, `find=1719`, and `git=496`. Intent counts are required because shape-only evidence collapses Python tests, inline probes, and reproduction scripts into similar command families. The next bounded controller tranche should therefore focus on measured context-loop command intents before adding unrelated optional tools or speculative benchmark-specific logic.
 
 Profile a manageable sample from every supported dataset:
 
@@ -103,7 +130,17 @@ Each recommendation now includes:
 
 The JSON also includes `portfolio_recommendations`, which merges repeated recommendation IDs across datasets so the most general improvements rise to the top.
 
-The first controller implementation is the `trajectory-guards` feature profile. It uses generic signals only: repeated context tools, missing grounding before mutation, missing validation after edits, and repeated failed-test output.
+The first controller implementation is the `trajectory-guards` feature profile. It uses generic signals only: repeated context tools, missing grounding before mutation, missing validation after edits, and failed-test output. After the June 29, 2026 first-failure diagnosis pass, a failed `run_test` followed by another context-only action now triggers `diagnose_test_failure` before more broad reads/searches, so large failure blobs are compressed before the next repair decision instead of waiting for a repeated identical test command. The same pass also lets non-code edits promote available discovered validator commands before final answers, instead of stopping at validator discovery when no test command exists.
+
+The follow-up context-loop pass adds a conservative `list_files` narrowing route: if a successful file listing exposes exactly one non-test code file and the model asks for another broad context tool, the controller runs `code_outline` on that file first. This targets repository-tree dump loops found in CoderForge traces without auto-picking a file when multiple implementation candidates are present.
+
+The same shell-heavy context pass normalizes simple inspection commands from model-proposed `run_shell` calls into structured tools: `cat`/`type` becomes `read_file`, `ls`/`dir` becomes `list_files`, two-argument `grep`/`rg` and the measured `grep -n`/`--line-number` shape become `search`, simple `head`/`tail` file previews become bounded `read_file` calls, file-only `find <path> -name <pattern> [-type f]` becomes `file_search`, directory-only `find <path> -name <pattern> -type d` becomes `directory_search`, and the measured `find <path> -name <glob> [-type f] -exec grep -l <query> {} ;` shape becomes `search` with the filename glob preserved. The route applies only when the user did not explicitly request `run_shell` and the command has no unsupported metacharacters or flags. Piped discovery, broad `-exec`, and non-line-number/non-`-l` grep flags remain shell. That makes common CoderForge-style Bash inspection loops cacheable and eligible for the existing context planner without pretending complex shell pipelines are structured searches.
+
+The measured Python command shapes are handled more conservatively. Pytest/unittest-like shell commands now normalize to `run_test` even when no default test command is configured, preserving the original command and cwd/timeout. Exact user requests for `run_shell` still bypass this route. Arbitrary `python script.py` and `python -c ...` snippets remain shell because the CoderForge evidence mixes reproducible checks with exploratory probes.
+
+The same controller tranche now echoes compact validator diagnostics in proactive post-edit validation failure prompts. That keeps lint or contract failures in the immediate repair instruction instead of forcing the model to rediscover the actionable error from prior tool output.
+
+The ground-before-mutate guard now requires explicit path edits to be grounded by evidence for the target path itself. An unrelated prior read, search, or tool-status result is no longer enough to edit `app.py`; the controller first auto-reads or otherwise grounds `app.py`, then retries the mutation. This closes a CoderForge-style edit-without-relevant-context gap without blocking direct creation of new user-named files.
 
 ## Error Profile
 
@@ -135,6 +172,11 @@ Mapped prevention policies:
 - Unknown commands that pass shell syntax checking are still rejected before execution when the first executable cannot be resolved and is not a shell/cmd builtin.
 - Valid recognized commands run as argv with `shell=False`; unknown commands keep the legacy shell path.
 - `trajectory-guards` blocks a third identical tool/error-class failure and forces path discovery, syntax repair, dependency fail-closed, or another non-repeating next step.
+- `trajectory-guards` also diagnoses the first failed test before allowing more context-only inspection when an implementation/test task is still unresolved.
+- `trajectory-guards` promotes available discovered non-test validator commands after non-code edits when no configured test command is available.
+- `trajectory-guards` promotes a single non-test code file from `list_files` to `code_outline` before another broad context step.
+- proactive post-edit validation failure prompts include the compact validator diagnostic before forcing repair.
+- explicit path mutations require target-path grounding rather than unrelated grounding evidence.
 - Path and cwd failures include nearest existing path suggestions when available.
 
 Latest full local run over downloaded supported datasets:
@@ -220,4 +262,4 @@ scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b --fe
   8/8 passed
 ```
 
-On the local-small Granite run, `trajectory-guards` reduced the live model-token total on key non-zero-LLM cases versus the same-session baseline run: `issue_fix_hidden_tests` 6044 -> 4625 tokens, `multi_file_refactor` 18859 fail-closed -> 11458 pass, and `multi_turn_session_task` 4824 -> 4809 tokens. A separate `all` profile run was non-deterministic on `multi_file_refactor`, so promote `trajectory-guards` independently before expanding defaults.
+On the local-small Granite run, `trajectory-guards` reduced the live model-token total on key non-zero-LLM cases versus the same-session baseline run: `issue_fix_hidden_tests` 6044 -> 4625 tokens, `multi_file_refactor` 18859 fail-closed -> 11458 pass, and `multi_turn_session_task` 4824 -> 4809 tokens. That older `all`-profile `multi_file_refactor` instability is no longer the current baseline: later June 19, 2026 targeted reruns passed three consecutive times, and the June 20, 2026 serial live gate kept `multi_file_refactor` green on `granite4.1:8b`, `gemma4:e4b`, and `qwen3:8b`. Keep rechecking that case after controller changes, but it is no longer a reason to hold back the current default profile.
