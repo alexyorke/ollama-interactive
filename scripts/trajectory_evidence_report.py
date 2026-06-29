@@ -582,6 +582,8 @@ def _extract_terminalbench_messages(dataset: str, row: dict[str, Any], row_numbe
 def extract_message_records(dataset: str, adapter: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
     if adapter == "openhands":
         return _extract_openhands_messages(dataset, row, row_number)
+    if adapter == "trace_commons":
+        return _extract_openhands_messages(dataset, row, row_number)
     if adapter == "thoughtworks":
         effective_adapter = trajectory_profile._thoughtworks_row_adapter(row)
         if effective_adapter == "openhands":
@@ -1049,6 +1051,8 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
         columns = ["trajectory", "instance_id", "target"]
     elif adapter == "smith":
         columns = ["messages", "instance_id", "traj_id"]
+    elif adapter == "trace_commons":
+        columns = ["messages", "session_id", "harness", "prompt", "num_tool_calls"]
     elif adapter == "thoughtworks":
         columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
     elif adapter == "terminalbench":

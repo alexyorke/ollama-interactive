@@ -94,6 +94,34 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertTrue(any(record.kind == "tool_call" and record.name == "run_test" for record in records))
         self.assertTrue(any(record.error_class == "test_assertion" for record in records))
 
+    def test_iter_dataset_rows_preserves_trace_commons_messages_column(self) -> None:
+        if pa is None or pq is None:
+            self.skipTest("pyarrow is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            dataset = "trace-commons-agent-traces"
+            path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
+            path.parent.mkdir(parents=True)
+            table = pa.table(
+                {
+                    "session_id": ["tc-1"],
+                    "messages": [
+                        [
+                            '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"Bash","arguments":{"command":"pytest -q tests/test_app.py"}}}]}',
+                            '{"role":"tool","name":"Bash","content":"AssertionError: expected 1"}',
+                        ]
+                    ],
+                }
+            )
+            pq.write_table(table, path)
+
+            adapter, rows = report._iter_dataset_rows(data_root, dataset, max_rows=1)
+            records = report.extract_message_records(dataset, adapter, next(iter(rows)), 0)
+
+        self.assertEqual(adapter, "trace_commons")
+        self.assertTrue(any(record.kind == "tool_call" and record.name == "bash" for record in records))
+        self.assertTrue(any(record.error_class == "test_assertion" for record in records))
+
     def test_extract_openhands_messages_accepts_json_string_messages(self) -> None:
         row = {
             "instance_id": "demo-1",

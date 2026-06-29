@@ -66,6 +66,20 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(events[0].kind, "tool_call")
         self.assertEqual(events[1].kind, "tool_result")
 
+    def test_extract_openhands_events_accepts_message_list_of_json_strings(self) -> None:
+        row = {
+            "messages": [
+                '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"Bash","arguments":{"command":"pytest -q tests/test_app.py"}}}]}',
+                '{"role":"tool","name":"Bash","content":"FAILED tests/test_app.py::test_x\\nE   assert 1 == 2"}',
+            ]
+        }
+
+        events = profile._extract_events("trace_commons", row)
+
+        self.assertEqual([event.name for event in events], ["bash", "bash"])
+        self.assertEqual(events[0].kind, "tool_call")
+        self.assertEqual(events[1].kind, "tool_result")
+
     def test_infer_tool_name_from_plain_swe_agent_edit_and_create_commands(self) -> None:
         self.assertEqual(profile._infer_tool_name_from_text("``` edit 138:138 print('x') ```"), "edit")
         self.assertEqual(profile._infer_tool_name_from_text("``` create ./test.py\nprint(1)\n```"), "write_file")
@@ -257,6 +271,18 @@ class TrajectoryProfileTests(unittest.TestCase):
 
         self.assertEqual(adapter, "thoughtworks")
         self.assertEqual([path.name for path in paths], ["sessions.parquet"])
+
+    def test_resolve_dataset_paths_supports_trace_commons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_root = root / "trace-commons-agent-traces" / "data"
+            dataset_root.mkdir(parents=True)
+            (dataset_root / "train-00000-of-00001.parquet").write_text("stub\n", encoding="utf-8")
+
+            adapter, paths = profile._resolve_dataset_paths(root, "trace-commons-agent-traces")
+
+        self.assertEqual(adapter, "trace_commons")
+        self.assertEqual([path.name for path in paths], ["train-00000-of-00001.parquet"])
 
     def test_iter_parquet_rows_honors_max_rows(self) -> None:
         if pa is None or pq is None:

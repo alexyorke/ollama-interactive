@@ -91,6 +91,15 @@ class TrajectoryDatasetFetchTests(unittest.TestCase):
         self.assertEqual(spec["adapter"], "thoughtworks")
         self.assertEqual(spec["path_globs"], ["sessions.parquet"])
 
+    def test_trace_commons_dataset_is_supported_with_data_parquet(self) -> None:
+        dataset_name = "trace-commons-agent-traces"
+
+        spec = fetch.SUPPORTED_DATASET_SPECS[dataset_name]
+
+        self.assertEqual(spec["repo_id"], "trace-commons/agent-traces")
+        self.assertEqual(spec["adapter"], "trace_commons")
+        self.assertEqual(spec["path_globs"], ["data/train-*.parquet"])
+
 
 if __name__ == "__main__":
     unittest.main()

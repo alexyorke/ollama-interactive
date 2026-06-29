@@ -228,6 +228,34 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["result_events"], 1)
         self.assertEqual(summary["error_counts"]["test_assertion"], 1)
 
+    def test_build_profile_reads_trace_commons_messages_column(self) -> None:
+        if pa is None or pq is None:
+            self.skipTest("pyarrow is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            dataset = "trace-commons-agent-traces"
+            path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
+            path.parent.mkdir(parents=True)
+            table = pa.table(
+                {
+                    "session_id": ["tc-1"],
+                    "messages": [
+                        [
+                            '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"Bash","arguments":{"command":"pytest -q tests/test_app.py"}}}]}',
+                            '{"role":"tool","name":"Bash","content":"FAILED tests/test_app.py::test_x\\nE   assert 1 == 2"}',
+                        ]
+                    ],
+                }
+            )
+            pq.write_table(table, path)
+
+            payload = error_profile.build_profile(data_root, [dataset], max_rows=1)
+
+        summary = payload["datasets"][0]
+        self.assertEqual(summary["rows_profiled"], 1)
+        self.assertEqual(summary["result_events"], 1)
+        self.assertEqual(summary["error_counts"]["test_assertion"], 1)
+
     def test_terminalbench_observation_counts_as_tool_result(self) -> None:
         rows = [
             {

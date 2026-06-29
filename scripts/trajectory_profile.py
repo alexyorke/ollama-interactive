@@ -42,6 +42,10 @@ DATASET_SPECS = {
         "paths": ["data/train-*.parquet"],
         "adapter": "terminalbench",
     },
+    "trace-commons-agent-traces": {
+        "paths": ["data/train-*.parquet"],
+        "adapter": "trace_commons",
+    },
     "thoughtworks-agentic-coding-trajectories": {
         "paths": ["sessions.parquet"],
         "adapter": "thoughtworks",
@@ -227,7 +231,14 @@ def _deserialize_possible_json(value: Any) -> Any:
 
 def _openhands_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
     trajectory = _deserialize_possible_json(row.get("trajectory") or row.get("messages") or row.get("messages_json") or [])
-    return trajectory if isinstance(trajectory, list) else []
+    if not isinstance(trajectory, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for message in trajectory:
+        candidate = _deserialize_possible_json(message)
+        if isinstance(candidate, dict):
+            normalized.append(candidate)
+    return normalized
 
 
 def _message_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -354,6 +365,8 @@ def _extract_terminalbench_events(steps: Any) -> list[Event]:
 
 def _extract_events(adapter: str, row: dict[str, Any]) -> list[Event]:
     if adapter == "openhands":
+        return _extract_openhands_events(_openhands_messages(row))
+    if adapter == "trace_commons":
         return _extract_openhands_events(_openhands_messages(row))
     if adapter == "thoughtworks":
         effective_adapter = _thoughtworks_row_adapter(row)

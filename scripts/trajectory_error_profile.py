@@ -115,6 +115,8 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
             )
             pending_tool_name = ""
         return events
+    if adapter == "trace_commons":
+        return _extract_result_events("openhands", row)
     if adapter == "thoughtworks":
         effective_adapter = trajectory_profile._thoughtworks_row_adapter(row)
         if effective_adapter == "openhands":
@@ -371,6 +373,8 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
         columns = ["messages"]
     elif adapter == "openhands":
         columns = ["trajectory", "messages", "messages_json"]
+    elif adapter == "trace_commons":
+        columns = ["messages", "session_id", "harness", "prompt", "num_tool_calls"]
     elif adapter == "thoughtworks":
         columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
     elif adapter == "terminalbench":
