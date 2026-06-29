@@ -121,6 +121,7 @@ HELPER_TOOLS = {
     "update_plan",
     "save_plan",
     "bashoutput",
+    "killshell",
 }
 
 COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [

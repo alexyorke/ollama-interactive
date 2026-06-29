@@ -206,6 +206,23 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(metrics["first_edit_index"], 4)
         self.assertEqual(metrics["tool_names"], ["grep", "read", "grep", "read", "write"])
 
+    def test_terminalbench_killshell_is_ignored_in_profile_metrics(self) -> None:
+        row = {
+            "steps": (
+                '['
+                '{"src":"agent","msg":"Executed Bash","tools":[{"fn":"Bash","cmd":"Rscript -e \\"source(\'ars.R\'); test()\\""}],"obs":"ok"},'
+                '{"src":"agent","msg":"Executed KillShell","tools":[{"fn":"KillShell","cmd":""}],"obs":"{\\"message\\":\\"Successfully killed shell: abc123\\"}"},'
+                '{"src":"agent","msg":"Executed Write","tools":[{"fn":"Write","cmd":"ars.R"}],"obs":"ok"}'
+                ']'
+            )
+        }
+
+        metrics = profile._trajectory_metrics(profile._extract_events("terminalbench", row))
+
+        self.assertEqual(metrics["tool_names"], ["run_shell", "write"])
+        self.assertEqual(metrics["categories"], ["test", "edit"])
+        self.assertEqual(metrics["first_edit_index"], 1)
+
     def test_extract_thoughtworks_events_dispatches_by_agent_framework(self) -> None:
         openhands_row = {
             "agent_framework": "openhands",
