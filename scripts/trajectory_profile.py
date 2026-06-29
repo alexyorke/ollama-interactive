@@ -161,7 +161,7 @@ class Recommendation:
 
 def _command_category_from_content(content: str) -> str | None:
     lowered = content.lower()
-    if re.search(r"\b(?:pytest|unittest|nose2?|tox|nox|cargo test|go test|npm test|pnpm test|yarn test)\b", lowered):
+    if re.search(r"\b(?:pytest|unittest|nose2?|tox|nox|make test|cargo test|go test|npm test|pnpm test|yarn test)\b", lowered):
         return "test"
     if re.search(r"\bgit\s+(?:status|diff|commit|apply|checkout|restore|add)\b", lowered):
         return "git"

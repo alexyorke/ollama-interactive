@@ -122,6 +122,18 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(events[0].name, "execute_bash")
         self.assertEqual(events[0].category, "test")
 
+    def test_shell_tool_call_with_make_test_is_reclassified_as_test(self) -> None:
+        row = {
+            "messages": [
+                '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"Bash","arguments":{"command":"make test 2>&1"}}}]}'
+            ]
+        }
+
+        events = profile._extract_events("trace_commons", row)
+
+        self.assertEqual(events[0].name, "bash")
+        self.assertEqual(events[0].category, "test")
+
     def test_powershell_tool_call_with_pytest_is_reclassified_as_test(self) -> None:
         row = {
             "messages": [
