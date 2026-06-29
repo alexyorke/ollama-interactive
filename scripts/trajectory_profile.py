@@ -196,6 +196,13 @@ def _normalize_tool_name(name: str) -> str:
     return alias_map.get(normalized, normalized)
 
 
+def _normalize_terminalbench_tool_name(name: str) -> str:
+    normalized = _normalize_tool_name(name)
+    if normalized in {"bash", "shell"}:
+        return "run_shell"
+    return normalized
+
+
 def _infer_tool_name_from_text(text: str) -> str | None:
     snippet = text.strip()
     if not snippet:
@@ -404,7 +411,7 @@ def _extract_terminalbench_events(steps: Any) -> list[Event]:
             for tool in tools:
                 if not isinstance(tool, dict):
                     continue
-                name = _normalize_tool_name(str(tool.get("fn") or ""))
+                name = _normalize_terminalbench_tool_name(str(tool.get("fn") or ""))
                 if not name:
                     continue
                 payload = _content_text(tool)

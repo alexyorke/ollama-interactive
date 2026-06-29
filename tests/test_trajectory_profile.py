@@ -161,6 +161,19 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual([event.name for event in events], ["run_shell", "read"])
         self.assertEqual([event.category for event in events], ["test", "read"])
 
+    def test_extract_terminalbench_events_normalizes_bash_and_shell_to_run_shell(self) -> None:
+        row = {
+            "steps": (
+                '[{"src":"agent","msg":"Executed Bash","tools":[{"fn":"Bash","cmd":"which R"}],"obs":"Exit code 1"},'
+                '{"src":"agent","msg":"Executed shell","tools":[{"fn":"shell","cmd":["bash","-lc","R --version"]}],"obs":"bash: line 1: R: command not found"}]'
+            )
+        }
+
+        events = profile._extract_events("terminalbench", row)
+
+        self.assertEqual([event.name for event in events], ["run_shell", "run_shell"])
+        self.assertEqual([event.category for event in events], ["shell", "shell"])
+
     def test_extract_thoughtworks_events_dispatches_by_agent_framework(self) -> None:
         openhands_row = {
             "agent_framework": "openhands",

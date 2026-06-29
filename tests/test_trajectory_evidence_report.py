@@ -372,6 +372,22 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertEqual(observation.name, "run_shell")
         self.assertEqual(observation.error_class, "test_assertion")
 
+    def test_extract_terminalbench_records_normalize_bash_and_shell_to_run_shell(self) -> None:
+        row = {
+            "trial_id": "trial-1",
+            "steps": (
+                '[{"src":"agent","msg":"Executed Bash","tools":[{"fn":"Bash","cmd":"which R"}],"obs":"Exit code 1"},'
+                '{"src":"agent","msg":"Executed shell","tools":[{"fn":"shell","cmd":["bash","-lc","R --version"]}],"obs":"bash: line 1: R: command not found"}]'
+            ),
+        }
+
+        records = report.extract_message_records("sample", "terminalbench", row, 0)
+
+        tool_calls = [record for record in records if record.kind == "tool_call"]
+        observations = [record for record in records if record.kind == "message" and record.role == "tool"]
+        self.assertEqual([record.name for record in tool_calls], ["run_shell", "run_shell"])
+        self.assertEqual([record.name for record in observations], ["run_shell", "run_shell"])
+
     def test_classify_message_themes_finds_large_failure_blob(self) -> None:
         record = report._make_message_record(
             dataset="sample",

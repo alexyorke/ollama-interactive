@@ -532,7 +532,7 @@ def _extract_terminalbench_messages(dataset: str, row: dict[str, Any], row_numbe
         for tool in tools:
             if not isinstance(tool, dict):
                 continue
-            name = trajectory_profile._normalize_tool_name(str(tool.get("fn") or ""))
+            name = trajectory_profile._normalize_terminalbench_tool_name(str(tool.get("fn") or ""))
             if not name:
                 continue
             arguments = {"command": str(tool.get("cmd") or "").strip()} if str(tool.get("cmd") or "").strip() else {}

@@ -210,7 +210,7 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
             first_tool = next((tool for tool in tools if isinstance(tool, dict) and str(tool.get("fn") or "").strip()), None)
             if first_tool is None:
                 continue
-            name = trajectory_profile._normalize_tool_name(str(first_tool.get("fn") or "tool"))
+            name = trajectory_profile._normalize_terminalbench_tool_name(str(first_tool.get("fn") or "tool"))
             events.append(
                 trajectory_profile.Event(
                     role="tool",
