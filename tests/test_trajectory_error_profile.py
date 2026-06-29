@@ -13,6 +13,33 @@ from scripts import trajectory_error_profile as error_profile
 
 
 class TrajectoryErrorProfileTests(unittest.TestCase):
+    def test_does_not_classify_code_snippets_as_test_or_timeout_errors(self) -> None:
+        rows = [
+            {
+                "trajectory": [
+                    {
+                        "role": "tool",
+                        "name": "read_file",
+                        "content": (
+                            "58\tsetTimeout(async () => {\n"
+                            "59\t    system.setScreen('desktop');\n"
+                            "60\t});\n"
+                            "133\t    kprint(\"WARNING: failed to mount root filesystem\\n\");\n"
+                            "109\t    /* Count this as a failed attempt; will retry next tick */\n"
+                            "1\tVerify against current code before asserting as fact.\n"
+                        ),
+                    }
+                ]
+            }
+        ]
+
+        summary = error_profile.summarize_dataset("sample", "openhands", rows)
+
+        self.assertEqual(summary["result_events"], 1)
+        self.assertEqual(summary["error_counts"], {})
+        self.assertEqual(summary["top_tool_errors"], [])
+        self.assertEqual(summary["top_shell_errors"], [])
+
     def test_classifies_tool_result_errors_without_task_description_matches(self) -> None:
         rows = [
             {
