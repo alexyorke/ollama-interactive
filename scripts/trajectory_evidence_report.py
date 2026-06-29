@@ -334,20 +334,29 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
     row_id = _row_id(row, row_number)
     records: list[MessageRecord] = []
     messages = trajectory_profile._openhands_messages(row)
+    pending_tool_name = ""
+    tool_names_by_id: dict[str, str] = {}
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").lower()
         content = trajectory_profile._content_text(message.get("content"))
-        display_name = trajectory_profile._normalize_tool_name(str(message.get("name") or ""))
+        raw_display_name = str(message.get("name") or "")
+        display_name = trajectory_profile._normalize_tool_name(raw_display_name)
         tool_calls = _normalize_tool_calls(
             message.get("tool_calls") if message.get("tool_calls") is not None else message.get("tool_calls_json")
         )
+        tool_names_by_id.update(trajectory_profile._tool_call_name_by_id(message))
         tool_call_names = tuple(name for name, _arguments in tool_calls)
         inferred = ""
         if role in {"assistant", "ai"} and not tool_call_names:
             inferred = trajectory_profile._infer_tool_name_from_text(content) or ""
         message_tool_calls = tool_call_names or ((inferred,) if inferred else ())
+        if role in {"assistant", "ai"}:
+            pending_tool_name = message_tool_calls[0] if len(message_tool_calls) == 1 else ""
+        elif role == "tool" and trajectory_profile._placeholder_tool_name(raw_display_name):
+            tool_call_id = str(message.get("tool_call_id") or "")
+            display_name = tool_names_by_id.get(tool_call_id) or pending_tool_name or display_name
         category_name = display_name or (message_tool_calls[0] if len(message_tool_calls) == 1 else "")
         category = trajectory_profile._tool_category(category_name, content)
         records.append(
@@ -379,6 +388,8 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
                     tool_arguments=tool_arguments,
                 )
             )
+        if role == "tool":
+            pending_tool_name = ""
     return records
 
 

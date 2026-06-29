@@ -156,6 +156,21 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertEqual(shell_calls[0].tool_arguments, {"command": "pytest -q"})
         self.assertTrue(any(record.error_class == "test_assertion" for record in records))
 
+    def test_extract_openhands_messages_recovers_unknown_tool_name_from_tool_call_id(self) -> None:
+        row = {
+            "session_id": "tc-1",
+            "messages": [
+                '{"role":"assistant","content":"","tool_calls":[{"id":"toolu_123","function":{"name":"Write","arguments":{"file_path":"PROJECT.md","content":"x"}}}]}',
+                '{"role":"tool","tool_call_id":"toolu_123","name":"unknown_tool","content":"File created successfully"}',
+            ],
+        }
+
+        records = report.extract_message_records("sample", "trace_commons", row, 0)
+
+        tool_messages = [record for record in records if record.role == "tool" and record.kind == "message"]
+        self.assertEqual(tool_messages[0].name, "write")
+        self.assertTrue(any(record.kind == "tool_call" and record.name == "write" for record in records))
+
     def test_extract_message_records_preserves_message_and_tool_call(self) -> None:
         row = {
             "trajectory": [

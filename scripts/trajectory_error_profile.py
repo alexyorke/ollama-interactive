@@ -81,12 +81,14 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
     if adapter == "openhands":
         messages = trajectory_profile._openhands_messages(row)
         pending_tool_name = ""
+        tool_names_by_id: dict[str, str] = {}
         for message in messages if isinstance(messages, list) else []:
             if not isinstance(message, dict):
                 continue
             role = str(message.get("role", "")).lower()
             if role == "assistant":
                 pending_tool_name = ""
+                tool_names_by_id.update(trajectory_profile._tool_call_name_by_id(message))
                 tool_calls = trajectory_profile._message_tool_calls(message)
                 if isinstance(tool_calls, list) and len(tool_calls) == 1 and isinstance(tool_calls[0], dict):
                     function = tool_calls[0].get("function")
@@ -102,7 +104,11 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
                 continue
             if role != "tool":
                 continue
-            name = trajectory_profile._normalize_tool_name(str(message.get("name") or "")) or pending_tool_name or "tool"
+            raw_name = str(message.get("name") or "")
+            name = trajectory_profile._normalize_tool_name(raw_name)
+            if trajectory_profile._placeholder_tool_name(raw_name):
+                tool_call_id = str(message.get("tool_call_id") or "")
+                name = tool_names_by_id.get(tool_call_id) or pending_tool_name or name or "tool"
             content = str(message.get("content") or "")
             events.append(
                 trajectory_profile.Event(

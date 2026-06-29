@@ -80,6 +80,20 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(events[0].kind, "tool_call")
         self.assertEqual(events[1].kind, "tool_result")
 
+    def test_extract_openhands_events_recovers_unknown_tool_name_from_tool_call_id(self) -> None:
+        row = {
+            "messages": [
+                '{"role":"assistant","content":"","tool_calls":[{"id":"toolu_123","function":{"name":"Write","arguments":{"file_path":"PROJECT.md","content":"x"}}}]}',
+                '{"role":"tool","tool_call_id":"toolu_123","name":"unknown_tool","content":"File created successfully"}',
+            ]
+        }
+
+        events = profile._extract_events("trace_commons", row)
+
+        self.assertEqual([event.name for event in events], ["write", "write"])
+        self.assertEqual(events[0].kind, "tool_call")
+        self.assertEqual(events[1].kind, "tool_result")
+
     def test_infer_tool_name_from_plain_swe_agent_edit_and_create_commands(self) -> None:
         self.assertEqual(profile._infer_tool_name_from_text("``` edit 138:138 print('x') ```"), "edit")
         self.assertEqual(profile._infer_tool_name_from_text("``` create ./test.py\nprint(1)\n```"), "write_file")

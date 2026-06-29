@@ -263,27 +263,62 @@ def _thoughtworks_row_adapter(row: dict[str, Any]) -> str:
     return "smith"
 
 
+def _placeholder_tool_name(name: str) -> bool:
+    normalized = _normalize_tool_name(name)
+    return normalized in {"", "tool", "unknown_tool"}
+
+
+def _tool_call_name_by_id(message: dict[str, Any]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for call in _message_tool_calls(message):
+        function = call.get("function") if isinstance(call, dict) else None
+        raw_name = ""
+        if isinstance(function, dict):
+            raw_name = str(function.get("name") or "")
+        if not raw_name and isinstance(call, dict):
+            raw_name = str(call.get("name") or "")
+        normalized_name = _normalize_tool_name(raw_name)
+        call_id = str(call.get("id") or "") if isinstance(call, dict) else ""
+        if call_id and normalized_name:
+            mapping[call_id] = normalized_name
+    return mapping
+
+
 def _extract_openhands_events(trajectory: list[dict[str, Any]]) -> list[Event]:
     events: list[Event] = []
+    pending_tool_name = ""
+    tool_names_by_id: dict[str, str] = {}
     for message in trajectory:
         role = str(message.get("role") or "")
         content = _content_text(message.get("content"))
         if role == "assistant":
             tool_calls = _message_tool_calls(message)
+            tool_names_by_id.update(_tool_call_name_by_id(message))
+            pending_tool_name = ""
             if isinstance(tool_calls, list) and tool_calls:
+                tool_names = []
                 for call in tool_calls:
                     function = call.get("function") if isinstance(call, dict) else None
                     name = _normalize_tool_name(str(function.get("name") or call.get("name") or "")) if isinstance(function, dict) or isinstance(call, dict) else ""
                     if name:
+                        tool_names.append(name)
                         payload = _content_text(call)
                         events.append(Event(role="assistant", kind="tool_call", name=name, category=_tool_category(name, payload), content=payload))
+                if len(tool_names) == 1:
+                    pending_tool_name = tool_names[0]
             elif content.strip():
                 inferred = _infer_tool_name_from_text(content)
                 if inferred:
+                    pending_tool_name = inferred
                     events.append(Event(role="assistant", kind="tool_call", name=inferred, category=_tool_category(inferred, content), content=content))
         elif role == "tool":
-            name = _normalize_tool_name(str(message.get("name") or "tool"))
+            raw_name = str(message.get("name") or "")
+            name = _normalize_tool_name(raw_name)
+            if _placeholder_tool_name(raw_name):
+                tool_call_id = str(message.get("tool_call_id") or "")
+                name = tool_names_by_id.get(tool_call_id) or pending_tool_name or name or "tool"
             events.append(Event(role="tool", kind="tool_result", name=name, category=_tool_category(name, content), content=content))
+            pending_tool_name = ""
         elif role == "user" and content.strip():
             inferred = _infer_tool_name_from_text(content)
             if inferred:

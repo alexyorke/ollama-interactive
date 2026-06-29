@@ -82,6 +82,22 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["error_counts"]["test_assertion"], 1)
         self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "execute_bash:test_assertion")
 
+    def test_openhands_unknown_tool_name_uses_tool_call_id_mapping(self) -> None:
+        rows = [
+            {
+                "messages": [
+                    '{"role":"assistant","content":"","tool_calls":[{"id":"toolu_123","function":{"name":"Bash","arguments":{"command":"pytest -q tests/test_app.py"}}}]}',
+                    '{"role":"tool","tool_call_id":"toolu_123","name":"unknown_tool","content":"FAILED tests/test_app.py::test_x\\nE   assert 1 == 2"}',
+                ]
+            }
+        ]
+
+        summary = error_profile.summarize_dataset("sample", "trace_commons", rows)
+
+        self.assertEqual(summary["result_events"], 1)
+        self.assertEqual(summary["error_counts"]["test_assertion"], 1)
+        self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "bash:test_assertion")
+
     def test_openhands_result_events_accept_messages_json_and_tool_calls_json(self) -> None:
         rows = [
             {
