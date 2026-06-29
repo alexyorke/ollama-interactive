@@ -230,6 +230,24 @@ def _deserialize_possible_json(value: Any) -> Any:
         return value
 
 
+def _row_has_trajectory_content(adapter: str, row: dict[str, Any]) -> bool:
+    if adapter != "terminalbench":
+        return True
+    steps = _deserialize_possible_json(row.get("steps"))
+    return isinstance(steps, list) and bool(steps)
+
+
+def _iter_rows_with_trajectory_content(adapter: str, rows: Iterable[dict[str, Any]], max_rows: int | None = None) -> Iterable[dict[str, Any]]:
+    emitted = 0
+    for row in rows:
+        if not _row_has_trajectory_content(adapter, row):
+            continue
+        yield row
+        emitted += 1
+        if max_rows is not None and emitted >= max_rows:
+            return
+
+
 def _openhands_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
     trajectory = _deserialize_possible_json(row.get("trajectory") or row.get("messages") or row.get("messages_json") or [])
     if not isinstance(trajectory, list):
@@ -804,7 +822,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
         max_rows = None if args.max_rows == 0 else args.max_rows
-        summaries.append(_summarize_dataset(dataset_name, adapter, _iter_parquet_rows(paths, max_rows=max_rows)))
+        rows = _iter_rows_with_trajectory_content(adapter, _iter_parquet_rows(paths), max_rows=max_rows)
+        summaries.append(_summarize_dataset(dataset_name, adapter, rows))
 
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),

@@ -122,6 +122,36 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertTrue(any(record.kind == "tool_call" and record.name == "bash" for record in records))
         self.assertTrue(any(record.error_class == "test_assertion" for record in records))
 
+    def test_iter_dataset_rows_skips_terminalbench_null_steps_before_max_rows(self) -> None:
+        if pa is None or pq is None:
+            self.skipTest("pyarrow is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            dataset = "terminalbench-trajectories"
+            path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
+            path.parent.mkdir(parents=True)
+            table = pa.table(
+                {
+                    "steps": [
+                        "null",
+                        '[{"src":"agent","msg":"Executed Bash","tools":[{"fn":"bash_command","cmd":"python -m pytest -q"}],"obs":"Exit code 0"}]',
+                    ],
+                    "trial_id": ["skip", "keep"],
+                    "trial_name": ["skip-trial", "keep-trial"],
+                    "task_name": ["warmup", "real-task"],
+                    "agent": ["agent", "agent"],
+                    "model": ["model", "model"],
+                }
+            )
+            pq.write_table(table, path)
+
+            adapter, rows = report._iter_dataset_rows(data_root, dataset, max_rows=1)
+            row = next(iter(rows))
+
+        self.assertEqual(adapter, "terminalbench")
+        self.assertEqual(row["trial_id"], "keep")
+        self.assertIn("bash_command", row["steps"])
+
     def test_extract_openhands_messages_accepts_json_string_messages(self) -> None:
         row = {
             "instance_id": "demo-1",

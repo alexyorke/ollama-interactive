@@ -1068,7 +1068,8 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
         columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
     elif adapter == "terminalbench":
         columns = ["steps", "trial_id", "trial_name", "task_name", "agent", "model"]
-    return adapter, trajectory_error_profile._iter_projected_parquet_rows(paths, columns=columns, max_rows=max_rows)
+    rows = trajectory_error_profile._iter_projected_parquet_rows(paths, columns=columns)
+    return adapter, trajectory_profile._iter_rows_with_trajectory_content(adapter, rows, max_rows=max_rows)
 
 
 def summarize_dataset(dataset: str, adapter: str, rows: Iterable[dict[str, Any]]) -> dict[str, Any]:

@@ -413,7 +413,8 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
         columns = ["steps"]
     else:
         columns = ["trajectory"]
-    return adapter, _iter_projected_parquet_rows(paths, columns=columns, max_rows=max_rows)
+    rows = _iter_projected_parquet_rows(paths, columns=columns)
+    return adapter, trajectory_profile._iter_rows_with_trajectory_content(adapter, rows, max_rows=max_rows)
 
 
 def build_profile(data_root: Path, datasets: list[str], max_rows: int | None) -> dict[str, Any]:

@@ -332,6 +332,34 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["error_counts"]["test_assertion"], 1)
         self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "run_shell:test_assertion")
 
+    def test_build_profile_skips_terminalbench_null_rows_before_max_rows(self) -> None:
+        if pa is None or pq is None:
+            self.skipTest("pyarrow is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            data_root = Path(tmp)
+            dataset = "terminalbench-trajectories"
+            path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
+            path.parent.mkdir(parents=True)
+            table = pa.table(
+                {
+                    "steps": [
+                        "null",
+                        (
+                            '[{"src":"agent","msg":"Executed Bash","tools":[{"fn":"bash_command","cmd":"pytest -q"}],'
+                            '"obs":"Exit code 1\\nFAILED tests/test_app.py::test_x\\nE   assert 1 == 2"}]'
+                        ),
+                    ]
+                }
+            )
+            pq.write_table(table, path)
+
+            payload = error_profile.build_profile(data_root, [dataset], max_rows=1)
+
+        summary = payload["datasets"][0]
+        self.assertEqual(summary["rows_profiled"], 1)
+        self.assertEqual(summary["result_events"], 1)
+        self.assertEqual(summary["error_counts"]["test_assertion"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -322,6 +322,17 @@ class TrajectoryProfileTests(unittest.TestCase):
 
         self.assertEqual(rows, [{"value": 1}, {"value": 2}])
 
+    def test_iter_rows_with_trajectory_content_skips_terminalbench_null_rows_before_max_rows(self) -> None:
+        rows = [
+            {"steps": "null", "trial_id": "skip-1"},
+            {"steps": '[{"src":"agent","msg":"Executed Bash","tools":[{"fn":"bash_command","cmd":"pytest -q"}],"obs":"ok"}]', "trial_id": "keep-1"},
+            {"steps": '[{"src":"agent","msg":"Executed Bash","tools":[{"fn":"bash_command","cmd":"pytest -q"}],"obs":"ok"}]', "trial_id": "keep-2"},
+        ]
+
+        filtered = list(profile._iter_rows_with_trajectory_content("terminalbench", rows, max_rows=1))
+
+        self.assertEqual([row["trial_id"] for row in filtered], ["keep-1"])
+
 
 if __name__ == "__main__":
     unittest.main()
