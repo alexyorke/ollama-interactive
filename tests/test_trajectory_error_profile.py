@@ -98,6 +98,22 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["error_counts"]["test_assertion"], 1)
         self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "bash:test_assertion")
 
+    def test_powershell_result_is_treated_as_shell_tool_error(self) -> None:
+        rows = [
+            {
+                "messages": [
+                    '{"role":"assistant","content":"","tool_calls":[{"id":"toolu_123","function":{"name":"PowerShell","arguments":{"command":"pytest -q tests/test_app.py"}}}]}',
+                    '{"role":"tool","tool_call_id":"toolu_123","name":"PowerShell","content":"bash: foozle: command not found"}',
+                ]
+            }
+        ]
+
+        summary = error_profile.summarize_dataset("sample", "trace_commons", rows)
+
+        self.assertEqual(summary["result_events"], 1)
+        self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "powershell:command_not_found")
+        self.assertEqual(summary["top_shell_errors"][0]["shell_error"], "command_not_found")
+
     def test_openhands_result_events_accept_messages_json_and_tool_calls_json(self) -> None:
         rows = [
             {

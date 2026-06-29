@@ -122,6 +122,18 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(events[0].name, "execute_bash")
         self.assertEqual(events[0].category, "test")
 
+    def test_powershell_tool_call_with_pytest_is_reclassified_as_test(self) -> None:
+        row = {
+            "messages": [
+                '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"PowerShell","arguments":{"command":"pytest -q tests/test_app.py"}}}]}'
+            ]
+        }
+
+        events = profile._extract_events("trace_commons", row)
+
+        self.assertEqual(events[0].name, "powershell")
+        self.assertEqual(events[0].category, "test")
+
     def test_extract_smith_events_accepts_json_string_messages(self) -> None:
         messages = (
             '[{"role":"assistant","tool_calls":[{"function":{"name":"replace_symbols","arguments":"{}"}}]},'

@@ -638,7 +638,7 @@ def _inline_shell_command_from_content(content: str) -> str:
 
 
 def _shell_command_from_record(record: MessageRecord) -> str:
-    if record.name not in {"execute_bash", "run_shell", "bash", "shell", "run_shell_command", "bash_command", "execute_ipython_cell"}:
+    if record.name not in {"execute_bash", "run_shell", "bash", "powershell", "shell", "run_shell_command", "bash_command", "execute_ipython_cell"}:
         return ""
     arguments = record.tool_arguments if isinstance(record.tool_arguments, dict) else {}
     for key in ("command", "cmd"):

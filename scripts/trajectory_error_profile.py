@@ -290,7 +290,7 @@ def summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) -
             result_events += 1
             error_class = classify_error(event.content)
             shell_error = classify_shell_error(event.content)
-            if shell_error and (event.category in {"shell", "test"} or event.name in {"tool", "observation", "execute_bash", "run_shell", "bash", "shell", "command"}):
+            if shell_error and (event.category in {"shell", "test"} or event.name in {"tool", "observation", "execute_bash", "run_shell", "bash", "powershell", "shell", "command"}):
                 shell_errors[shell_error] += 1
                 shell_tool_errors[f"{event.name}:{shell_error}"] += 1
                 if len(shell_examples[shell_error]) < 3:

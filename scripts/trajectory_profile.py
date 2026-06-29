@@ -97,6 +97,7 @@ TEST_TOOLS = {
 }
 SHELL_TOOLS = {
     "bash",
+    "powershell",
     "run_shell",
     "run_shell_command",
     "shell",

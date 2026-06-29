@@ -171,6 +171,20 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertEqual(tool_messages[0].name, "write")
         self.assertTrue(any(record.kind == "tool_call" and record.name == "write" for record in records))
 
+    def test_shell_command_from_record_accepts_powershell_tool(self) -> None:
+        row = {
+            "session_id": "tc-1",
+            "messages": [
+                '{"role":"assistant","content":"","tool_calls":[{"function":{"name":"PowerShell","arguments":{"command":"pytest -q tests/test_app.py"}}}]}'
+            ],
+        }
+
+        records = report.extract_message_records("sample", "trace_commons", row, 0)
+        tool_call = next(record for record in records if record.kind == "tool_call")
+
+        self.assertEqual(tool_call.name, "powershell")
+        self.assertEqual(report._shell_command_from_record(tool_call), "pytest -q tests/test_app.py")
+
     def test_extract_message_records_preserves_message_and_tool_call(self) -> None:
         row = {
             "trajectory": [
