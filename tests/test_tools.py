@@ -56,6 +56,15 @@ class ToolExecutorTests(unittest.TestCase):
             message = (exc.stderr or exc.stdout or str(exc)).strip()
             self.skipTest(f"git repo init is unavailable in this environment: {message}")
 
+    def init_git_repo_with_commit(self, root: Path, files: dict[str, str], *, message: str = "initial") -> None:
+        self.init_git_repo(root)
+        for relative_path, content in files.items():
+            path = root / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        subprocess.run(["git", "add", *sorted(files)], cwd=root, check=True, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", message], cwd=root, check=True, capture_output=True, text=True)
+
     def test_list_and_read_file(self) -> None:
         with self._temp_tools() as (root, tools):
             (root / "alpha.txt").write_text("line1\nline2\n", encoding="utf-8")
@@ -5941,11 +5950,8 @@ def double(value: int) -> int:
     def test_git_status_and_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.init_git_repo(root)
+            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
             tracked = root / "tracked.txt"
-            tracked.write_text("before\n", encoding="utf-8")
-            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
             tracked.write_text("before\nafter\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
             status = tools.git_status()
@@ -5959,11 +5965,8 @@ def double(value: int) -> int:
     def test_git_branch_and_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.init_git_repo(root)
+            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
             tracked = root / "tracked.txt"
-            tracked.write_text("before\n", encoding="utf-8")
-            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
             subprocess.run(["git", "checkout", "-b", "feature"], cwd=root, check=True, capture_output=True, text=True)
             tracked.write_text("after\n", encoding="utf-8")
             subprocess.run(["git", "commit", "-am", "feature update"], cwd=root, check=True, capture_output=True, text=True)
@@ -5980,11 +5983,8 @@ def double(value: int) -> int:
     def test_git_commit_creates_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.init_git_repo(root)
+            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
             tracked = root / "tracked.txt"
-            tracked.write_text("before\n", encoding="utf-8")
-            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
             tools = ToolExecutor(root, approval_mode="auto")
             tracked.write_text("before\nafter\n", encoding="utf-8")
             result = tools.git_commit("Update tracked file")
@@ -6002,13 +6002,9 @@ def double(value: int) -> int:
     def test_git_commit_add_all_refuses_preexisting_dirty_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.init_git_repo(root)
+            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n", "notes.txt": "draft\n"})
             tracked = root / "tracked.txt"
             unrelated = root / "notes.txt"
-            tracked.write_text("before\n", encoding="utf-8")
-            unrelated.write_text("draft\n", encoding="utf-8")
-            subprocess.run(["git", "add", "tracked.txt", "notes.txt"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
             unrelated.write_text("draft\nlocal-only\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
             tracked.write_text("before\nafter\n", encoding="utf-8")
@@ -6037,11 +6033,8 @@ def double(value: int) -> int:
     def test_read_only_blocks_git_commit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.init_git_repo(root)
+            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
             tracked = root / "tracked.txt"
-            tracked.write_text("before\n", encoding="utf-8")
-            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, check=True, capture_output=True, text=True)
             tracked.write_text("before\nafter\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="read-only")
             result = tools.git_commit("Blocked commit")
