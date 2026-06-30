@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import os
@@ -239,6 +241,23 @@ class AgentTests(unittest.TestCase):
             **kwargs,
         )
 
+    @contextmanager
+    def _temp_agent(
+        self,
+        client: FakeClient | None = None,
+        *,
+        approval_mode: str = "auto",
+        tool_cls: type[ToolExecutor] = ToolExecutor,
+        tool_kwargs: dict[str, object] | None = None,
+        **kwargs: object,
+    ) -> Iterator[tuple[Path, FakeClient, ToolExecutor, OllamaCodeAgent]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            resolved_client = client if client is not None else FakeClient([])
+            tools = tool_cls(root, approval_mode=approval_mode, **(tool_kwargs or {}))
+            agent = OllamaCodeAgent(client=resolved_client, tools=tools, model="fake-model", **kwargs)
+            yield root, resolved_client, tools, agent
+
     def _assert_repo_tool_then_git_status_without_model_loop(
         self,
         request: str,
@@ -246,8 +265,7 @@ class AgentTests(unittest.TestCase):
         first_tool_name: str,
         expected_message_fragment: str,
     ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_agent(debate_enabled=False) as (root, client, _tools, agent):
             self._init_git_repo_or_skip(root)
             (root / "docs").mkdir()
             (root / "src").mkdir()
@@ -256,10 +274,6 @@ class AgentTests(unittest.TestCase):
             subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
             subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
             (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
             result = agent.handle_user(request)
 
         self.assertIn(expected_message_fragment, result.message)
@@ -278,8 +292,7 @@ class AgentTests(unittest.TestCase):
         create_docs_fixture: bool = False,
         test_file_content: str | None = None,
     ) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_agent(debate_enabled=False) as (root, client, _tools, agent):
             if create_docs_fixture:
                 (root / "docs").mkdir()
                 (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
@@ -289,10 +302,6 @@ class AgentTests(unittest.TestCase):
                 or "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
                 encoding="utf-8",
             )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
             result = agent.handle_user(request)
 
         for fragment in expected_message_fragments:
@@ -312,17 +321,14 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
 
     def test_agent_runs_tool_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"The file says hello world."}',
+            ]
+        )
+        with self._temp_agent(client) as (root, _client, _tools, agent):
             (root / "note.txt").write_text("hello world\n", encoding="utf-8")
-            client = FakeClient(
-                [
-                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
-                    '{"type":"final","message":"The file says hello world."}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
             result = agent.handle_user("Summarize note.txt")
 
         self.assertEqual(result.message, "The file says hello world.")
@@ -332,18 +338,8 @@ class AgentTests(unittest.TestCase):
         self.assertIsInstance(tool_result.get("duration_ms"), float)
 
     def test_agent_normalizes_tool_named_final_into_final_answer(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient(['{"type":"tool","name":"final","arguments":{"message":"done"}}'])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(
-                client=client,
-                tools=tools,
-                model="fake-model",
-                debate_enabled=False,
-                disable_spec_guided_repair=True,
-            )
-
+        client = FakeClient(['{"type":"tool","name":"final","arguments":{"message":"done"}}'])
+        with self._temp_agent(client, debate_enabled=False, disable_spec_guided_repair=True) as (_root, _client, _tools, agent):
             result = agent.handle_user("Say done.")
 
         self.assertEqual(result.message, "done")
@@ -361,11 +357,8 @@ class AgentTests(unittest.TestCase):
                     usage=TokenUsage(prompt_tokens=10, output_tokens=2, total_tokens=12, total_duration_ns=100),
                 )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = UsageClient(['{"type":"final","message":"done"}'])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        client = UsageClient(['{"type":"final","message":"done"}'])
+        with self._temp_agent(client, debate_enabled=False) as (_root, _client, _tools, agent):
             result = agent.handle_user("Say done.")
 
         self.assertEqual(result.message, "done")
@@ -4531,16 +4524,11 @@ class AgentTests(unittest.TestCase):
         )
 
     def test_agent_handles_literal_list_files_tool_request_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_agent(debate_enabled=False) as (root, client, _tools, agent):
             (root / "docs").mkdir()
             (root / "notes").mkdir()
             (root / "src").mkdir()
             (root / "src" / "sample.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
             result = agent.handle_user("Use list_files on . with a high enough limit to inspect the workspace. Reply with docs, notes, and src only.")
 
         self.assertIn("docs", result.message)
@@ -4567,18 +4555,14 @@ class AgentTests(unittest.TestCase):
         )
 
     def test_agent_audits_shell_tool_under_debate(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient(
-                [
-                    '{"type":"tool","name":"run_shell","arguments":{"command":"python -c \\"print(123)\\""}}',
-                    '{"type":"final","message":"done"}',
-                    '{"verdict":"accept"}',
-                ]
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"python -c \\"print(123)\\""}}',
+                '{"type":"final","message":"done"}',
+                '{"verdict":"accept"}',
+            ]
+        )
+        with self._temp_agent(client) as (_root, _client, _tools, agent):
             result = agent.handle_user('Use run_shell to execute python -c "print(123)" and then say done.')
 
         self.assertEqual(result.message, "done")
@@ -4587,13 +4571,9 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(audits[0]["tool"], "run_shell")
 
     def test_agent_recovers_exact_shell_command_after_invalid_json(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient(["not json"])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        client = FakeClient(["not json"])
+        with self._temp_agent(client) as (_root, _client, _tools, agent):
             exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
-
             result = agent.handle_user(
                 f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
             )
@@ -4603,13 +4583,9 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_calls[0]["arguments"]["command"], exact_command)
 
     def test_agent_recovers_exact_shell_command_skips_assumption_audit_under_debate(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient(["not json"])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        client = FakeClient(["not json"])
+        with self._temp_agent(client) as (_root, _client, _tools, agent):
             exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
-
             result = agent.handle_user(
                 f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
             )
