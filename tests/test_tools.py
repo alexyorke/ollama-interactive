@@ -32,6 +32,26 @@ class ToolExecutorTests(unittest.TestCase):
             root = Path(tmp)
             yield root, ToolExecutor(root, approval_mode=approval_mode, **kwargs)
 
+    @contextmanager
+    def _temp_python_tools(
+        self,
+        files: dict[str, str],
+        *,
+        approval_mode: str = "auto",
+        test_command: str | None = None,
+        test_discover_args: tuple[str, ...] = ("-p", "*_test.py", "-v"),
+        **kwargs: object,
+    ):
+        resolved_test_command = test_command or subprocess.list2cmdline(
+            [sys.executable, "-m", "unittest", "discover", *test_discover_args]
+        )
+        with self._temp_tools(approval_mode=approval_mode, test_command=resolved_test_command, **kwargs) as (root, tools):
+            for relative_path, content in files.items():
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            yield root, tools, resolved_test_command
+
     def _cross_platform_workspace_alias(self, root: Path) -> str:
         resolved = root.resolve()
         if resolved.drive:
@@ -2306,30 +2326,29 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("'square': move prefix 'squ' to end, append 'ay'", result["output"])
 
     def test_synthesize_prefix_rotation_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pig.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
-            (root / "pig_test.py").write_text(
-                "import unittest\nfrom pig import translate\n\n"
-                "class PigTest(unittest.TestCase):\n"
-                "    def test_word_beginning_with_a_vowel(self):\n"
-                "        self.assertEqual(translate('apple'), 'appleay')\n"
-                "    def test_word_beginning_with_p(self):\n"
-                "        self.assertEqual(translate('pig'), 'igpay')\n"
-                "    def test_word_beginning_with_qu(self):\n"
-                "        self.assertEqual(translate('queen'), 'eenquay')\n"
-                "    def test_word_with_consonant_before_qu(self):\n"
-                "        self.assertEqual(translate('square'), 'aresquay')\n"
-                "    def test_word_beginning_with_xr(self):\n"
-                "        self.assertEqual(translate('xray'), 'xrayay')\n"
-                "    def test_y_after_consonant_cluster(self):\n"
-                "        self.assertEqual(translate('rhythm'), 'ythmrhay')\n"
-                "    def test_phrase(self):\n"
-                "        self.assertEqual(translate('quick fast run'), 'ickquay astfay unray')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "pig.py": "def translate(text):\n    pass\n",
+                "pig_test.py": (
+                    "import unittest\nfrom pig import translate\n\n"
+                    "class PigTest(unittest.TestCase):\n"
+                    "    def test_word_beginning_with_a_vowel(self):\n"
+                    "        self.assertEqual(translate('apple'), 'appleay')\n"
+                    "    def test_word_beginning_with_p(self):\n"
+                    "        self.assertEqual(translate('pig'), 'igpay')\n"
+                    "    def test_word_beginning_with_qu(self):\n"
+                    "        self.assertEqual(translate('queen'), 'eenquay')\n"
+                    "    def test_word_with_consonant_before_qu(self):\n"
+                    "        self.assertEqual(translate('square'), 'aresquay')\n"
+                    "    def test_word_beginning_with_xr(self):\n"
+                    "        self.assertEqual(translate('xray'), 'xrayay')\n"
+                    "    def test_y_after_consonant_cluster(self):\n"
+                    "        self.assertEqual(translate('rhythm'), 'ythmrhay')\n"
+                    "    def test_phrase(self):\n"
+                    "        self.assertEqual(translate('quick fast run'), 'ickquay astfay unray')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_prefix_rotation_candidate("pig.py", "pig_test.py")
             validation = tools.validate_implementation_candidate(
                 "pig.py",
@@ -2343,44 +2362,43 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("squ", synthesized["observed_prefixes"]["move"])
 
     def test_synthesize_word_arithmetic_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "wordy.py").write_text("def answer(question):\n    pass\n", encoding="utf-8")
-            (root / "wordy_test.py").write_text(
-                "import unittest\nfrom wordy import answer\n\n"
-                "class WordyTest(unittest.TestCase):\n"
-                "    def test_just_a_number(self):\n"
-                "        self.assertEqual(answer('What is 5?'), 5)\n"
-                "    def test_addition(self):\n"
-                "        self.assertEqual(answer('What is 1 plus 1?'), 2)\n"
-                "    def test_subtraction(self):\n"
-                "        self.assertEqual(answer('What is 4 minus -12?'), 16)\n"
-                "    def test_multiplication(self):\n"
-                "        self.assertEqual(answer('What is -3 multiplied by 25?'), -75)\n"
-                "    def test_division(self):\n"
-                "        self.assertEqual(answer('What is 33 divided by -3?'), -11)\n"
-                "    def test_multiple_operations(self):\n"
-                "        self.assertEqual(answer('What is 17 minus 6 plus 3?'), 14)\n"
-                "    def test_unknown_operation(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            answer('What is 52 cubed?')\n"
-                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
-                "    def test_syntax_error(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            answer('What is 1 plus?')\n"
-                "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
-                "    def test_empty_question(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            answer('What is?')\n"
-                "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
-                "    def test_non_math_question(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            answer('Who is the President of the United States?')\n"
-                "        self.assertEqual(err.exception.args[0], 'unknown operation')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "wordy.py": "def answer(question):\n    pass\n",
+                "wordy_test.py": (
+                    "import unittest\nfrom wordy import answer\n\n"
+                    "class WordyTest(unittest.TestCase):\n"
+                    "    def test_just_a_number(self):\n"
+                    "        self.assertEqual(answer('What is 5?'), 5)\n"
+                    "    def test_addition(self):\n"
+                    "        self.assertEqual(answer('What is 1 plus 1?'), 2)\n"
+                    "    def test_subtraction(self):\n"
+                    "        self.assertEqual(answer('What is 4 minus -12?'), 16)\n"
+                    "    def test_multiplication(self):\n"
+                    "        self.assertEqual(answer('What is -3 multiplied by 25?'), -75)\n"
+                    "    def test_division(self):\n"
+                    "        self.assertEqual(answer('What is 33 divided by -3?'), -11)\n"
+                    "    def test_multiple_operations(self):\n"
+                    "        self.assertEqual(answer('What is 17 minus 6 plus 3?'), 14)\n"
+                    "    def test_unknown_operation(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            answer('What is 52 cubed?')\n"
+                    "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
+                    "    def test_syntax_error(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            answer('What is 1 plus?')\n"
+                    "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
+                    "    def test_empty_question(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            answer('What is?')\n"
+                    "        self.assertEqual(err.exception.args[0], 'syntax error')\n"
+                    "    def test_non_math_question(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            answer('Who is the President of the United States?')\n"
+                    "        self.assertEqual(err.exception.args[0], 'unknown operation')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_word_arithmetic_candidate("wordy.py", "wordy_test.py")
             validation = tools.validate_implementation_candidate(
                 "wordy.py",
@@ -2395,20 +2413,19 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("unknown operation", synthesized["candidate_source"])
 
     def test_synthesize_simple_expression_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "calc.py").write_text("def add(left: int, right: int) -> int:\n    return left - right\n", encoding="utf-8")
-            (root / "calc_test.py").write_text(
-                "import unittest\nfrom calc import add\n\n"
-                "class CalcTest(unittest.TestCase):\n"
-                "    def test_adds_values(self):\n"
-                "        self.assertEqual(add(2, 3), 5)\n"
-                "    def test_adds_negative_values(self):\n"
-                "        self.assertEqual(add(-2, 5), 3)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "calc.py": "def add(left: int, right: int) -> int:\n    return left - right\n",
+                "calc_test.py": (
+                    "import unittest\nfrom calc import add\n\n"
+                    "class CalcTest(unittest.TestCase):\n"
+                    "    def test_adds_values(self):\n"
+                    "        self.assertEqual(add(2, 3), 5)\n"
+                    "    def test_adds_negative_values(self):\n"
+                    "        self.assertEqual(add(-2, 5), 3)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_simple_expression_candidate("calc.py", "calc_test.py")
             validation = tools.validate_implementation_candidate(
                 "calc.py",
@@ -2422,38 +2439,32 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_simple_expression_candidate_handles_boolean_ranges(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "retry.py").write_text(
-                "def should_retry(status_code: int, attempt: int) -> bool:\n    return status_code >= 500 and attempt > 2\n",
-                encoding="utf-8",
-            )
-            (root / "client.py").write_text(
-                "from retry import should_retry\n\n"
-                "def next_action(status_code: int, attempt: int) -> str:\n"
-                "    return 'retry' if should_retry(status_code, attempt) else 'stop'\n",
-                encoding="utf-8",
-            )
-            (root / "tests").mkdir()
-            (root / "tests" / "test_retry_policy.py").write_text(
-                "import unittest\nfrom retry import should_retry\nfrom client import next_action\n\n"
-                "class RetryPolicyTests(unittest.TestCase):\n"
-                "    def test_retries_initial_attempts(self):\n"
-                "        self.assertTrue(should_retry(503, 0))\n"
-                "    def test_does_not_retry_non_server_error(self):\n"
-                "        self.assertFalse(should_retry(404, 0))\n"
-                "    def test_retries_upper_server_range(self):\n"
-                "        self.assertTrue(should_retry(599, 2))\n"
-                "    def test_does_not_retry_client_error_boundary(self):\n"
-                "        self.assertFalse(should_retry(499, 0))\n"
-                "    def test_client_retry_action(self):\n"
-                "        self.assertEqual(next_action(503, 1), 'retry')\n"
-                "    def test_client_stop_after_budget(self):\n"
-                "        self.assertEqual(next_action(503, 3), 'stop')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "retry.py": "def should_retry(status_code: int, attempt: int) -> bool:\n    return status_code >= 500 and attempt > 2\n",
+                "client.py": (
+                    "from retry import should_retry\n\n"
+                    "def next_action(status_code: int, attempt: int) -> str:\n"
+                    "    return 'retry' if should_retry(status_code, attempt) else 'stop'\n"
+                ),
+                "tests/test_retry_policy.py": (
+                    "import unittest\nfrom retry import should_retry\nfrom client import next_action\n\n"
+                    "class RetryPolicyTests(unittest.TestCase):\n"
+                    "    def test_retries_initial_attempts(self):\n"
+                    "        self.assertTrue(should_retry(503, 0))\n"
+                    "    def test_does_not_retry_non_server_error(self):\n"
+                    "        self.assertFalse(should_retry(404, 0))\n"
+                    "    def test_retries_upper_server_range(self):\n"
+                    "        self.assertTrue(should_retry(599, 2))\n"
+                    "    def test_does_not_retry_client_error_boundary(self):\n"
+                    "        self.assertFalse(should_retry(499, 0))\n"
+                    "    def test_client_retry_action(self):\n"
+                    "        self.assertEqual(next_action(503, 1), 'retry')\n"
+                    "    def test_client_stop_after_budget(self):\n"
+                    "        self.assertEqual(next_action(503, 3), 'stop')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_simple_expression_candidate("retry.py", "tests/test_retry_policy.py")
             validation = tools.validate_implementation_candidate(
                 "retry.py",
@@ -2468,20 +2479,19 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("status_code", synthesized["expression"])
 
     def test_synthesize_string_normalizer_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "slug.py").write_text("def slugify(value: str) -> str:\n    pass\n", encoding="utf-8")
-            (root / "slug_test.py").write_text(
-                "import unittest\nfrom slug import slugify\n\n"
-                "class SlugTest(unittest.TestCase):\n"
-                "    def test_spaces(self):\n"
-                "        self.assertEqual(slugify('Hello Local Model'), 'hello-local-model')\n"
-                "    def test_edges(self):\n"
-                "        self.assertEqual(slugify('  Mixed Case  '), 'mixed-case')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "slug.py": "def slugify(value: str) -> str:\n    pass\n",
+                "slug_test.py": (
+                    "import unittest\nfrom slug import slugify\n\n"
+                    "class SlugTest(unittest.TestCase):\n"
+                    "    def test_spaces(self):\n"
+                    "        self.assertEqual(slugify('Hello Local Model'), 'hello-local-model')\n"
+                    "    def test_edges(self):\n"
+                    "        self.assertEqual(slugify('  Mixed Case  '), 'mixed-case')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_string_normalizer_candidate("slug.py", "slug_test.py")
             validation = tools.validate_implementation_candidate(
                 "slug.py",
