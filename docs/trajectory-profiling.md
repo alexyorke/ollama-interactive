@@ -169,7 +169,7 @@ Each recommendation now includes:
 
 The JSON also includes `portfolio_recommendations`, which merges repeated recommendation IDs across datasets so the most general improvements rise to the top.
 
-The first controller implementation is the `trajectory-guards` feature profile. It uses generic signals only: repeated context tools, missing grounding before mutation, missing validation after edits, and failed-test output. After the June 29, 2026 first-failure diagnosis pass, a failed `run_test` followed by another context-only action now triggers `diagnose_test_failure` before more broad reads/searches, so large failure blobs are compressed before the next repair decision instead of waiting for a repeated identical test command. The same pass also lets non-code edits promote available discovered validator commands before final answers, instead of stopping at validator discovery when no test command exists.
+The first controller implementation is the `trajectory-guards` feature profile. It uses generic signals only: repeated context tools, missing grounding before mutation, missing validation after edits, and failed-test output. After the June 29, 2026 first-failure diagnosis pass, a failed `run_test` followed by another context-only action now triggers `diagnose_test_failure` before more broad reads/searches, so large failure blobs are compressed before the next repair decision instead of waiting for a repeated identical test command. The same pass also lets non-code edits promote available discovered validator commands before final answers, instead of stopping at validator discovery when no test command exists. Requests that say no tests are needed now still keep non-test validation enabled unless validation itself is explicitly disabled.
 
 The follow-up context-loop pass adds a conservative `list_files` narrowing route: if a successful file listing exposes exactly one non-test code file and the model asks for another broad context tool, the controller runs `code_outline` on that file first. This targets repository-tree dump loops found in CoderForge traces without auto-picking a file when multiple implementation candidates are present.
 
@@ -212,7 +212,7 @@ Mapped prevention policies:
 - Valid recognized commands run as argv with `shell=False`; unknown commands keep the legacy shell path.
 - `trajectory-guards` blocks a third identical tool/error-class failure and forces path discovery, syntax repair, dependency fail-closed, or another non-repeating next step.
 - `trajectory-guards` also diagnoses the first failed test before allowing more context-only inspection when an implementation/test task is still unresolved.
-- `trajectory-guards` promotes available discovered non-test validator commands after non-code edits when no configured test command is available.
+- `trajectory-guards` promotes available discovered non-test validator commands after non-code edits when no configured test command is available, and a no-tests request only suppresses test commands rather than all validation.
 - `trajectory-guards` promotes a single non-test code file from `list_files` to `code_outline` before another broad context step.
 - proactive post-edit validation failure prompts include the compact validator diagnostic before forcing repair.
 - explicit path mutations require target-path grounding rather than unrelated grounding evidence.

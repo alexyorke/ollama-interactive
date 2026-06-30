@@ -109,7 +109,7 @@ PRODUCT_FIXES: dict[str, dict[str, Any]] = {
     },
     "post-edit-validation": {
         "status": "partial",
-        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, empty targeted-test selection can fall back through discover_validators before running repo tests, code edits can promote discovered check, typecheck, lint, or syntax validators when no runnable tests exist, and non-code edits can promote configured tests, discovered test commands, or discovered non-test validator commands before extra context gathering or a final answer.",
+        "summary": "After a successful edit, trajectory-guards proactively force lint_typecheck, contract_check, select_tests, and run_test for code changes, empty targeted-test selection can fall back through discover_validators before running repo tests, code edits can promote discovered check, typecheck, lint, or syntax validators when no runnable tests exist, and requests that say no tests are needed now still keep non-test validation enabled unless validation itself was explicitly disabled.",
         "references": [
             "ollama_code/agent.py",
             "ollama_code/tools/__init__.py",
