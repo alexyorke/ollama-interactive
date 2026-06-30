@@ -7,10 +7,13 @@ from scripts import local_validation
 
 
 class LocalValidationTests(unittest.TestCase):
-    def test_auto_runner_prefers_pytest_with_capped_xdist_for_agent(self) -> None:
+    def _tier_commands_with_pytest(self, tier: str, *, cpu_count: int = 32, runner: str = "auto", jobs: str = "auto") -> list[tuple[str, list[str]]]:
         with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
-            with patch.object(local_validation.os, "cpu_count", return_value=32):
-                commands = local_validation._tier_commands("agent", runner="auto", jobs="auto")
+            with patch.object(local_validation.os, "cpu_count", return_value=cpu_count):
+                return local_validation._tier_commands(tier, runner=runner, jobs=jobs)
+
+    def test_auto_runner_prefers_pytest_with_capped_xdist_for_agent(self) -> None:
+        commands = self._tier_commands_with_pytest("agent")
 
         self.assertEqual(len(commands), 1)
         name, command = commands[0]
@@ -19,9 +22,7 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn("tests/test_tools.py", command)
 
     def test_auto_jobs_turn_off_xdist_on_single_cpu(self) -> None:
-        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
-            with patch.object(local_validation.os, "cpu_count", return_value=1):
-                commands = local_validation._tier_commands("agent", runner="auto", jobs="auto")
+        commands = self._tier_commands_with_pytest("agent", cpu_count=1)
 
         _name, command = commands[0]
         self.assertEqual(command[:4], [sys.executable, "-m", "pytest", "-q"])
@@ -38,17 +39,14 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn("tests.test_live_model_gate", command)
 
     def test_jobs_off_disables_xdist(self) -> None:
-        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
-            commands = local_validation._tier_commands("agent", runner="pytest", jobs="off")
+        commands = self._tier_commands_with_pytest("agent", runner="pytest", jobs="off")
 
         _name, command = commands[0]
         self.assertEqual(command[:4], [sys.executable, "-m", "pytest", "-q"])
         self.assertNotIn("-n", command)
 
     def test_full_tier_prefers_pytest_broad_final_gate(self) -> None:
-        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
-            with patch.object(local_validation.os, "cpu_count", return_value=32):
-                commands = local_validation._tier_commands("full", runner="auto", jobs="auto")
+        commands = self._tier_commands_with_pytest("full")
 
         self.assertEqual([name for name, _ in commands], ["smoke", "agent", "full-suite"])
         self.assertEqual(commands[-1][1][:6], [sys.executable, "-m", "pytest", "-q", "-n", "16"])

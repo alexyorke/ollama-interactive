@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import tempfile
 import unittest
 import os
@@ -12,6 +13,12 @@ from ollama_code.tools import ToolExecutor
 
 
 class ToolDependencyTests(unittest.TestCase):
+    @contextmanager
+    def _temp_tools(self, *, approval_mode: str = "auto", input_func=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            yield root, ToolExecutor(root, approval_mode=approval_mode, input_func=input_func)
+
     def test_registry_resolves_requested_integrations(self) -> None:
         for tool_id in (
             "py-tree-sitter",
@@ -98,10 +105,8 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertIn("tree_sitter_language_pack", status["missing_modules"])
 
     def test_missing_dependency_result_includes_install_hints(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch("ollama_code.tools.shutil.which", return_value=None):
                 result = tools.ast_search("def $F($$$A): $$$B", lang="python")
 
@@ -112,8 +117,7 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertIn("dependency_purpose", result)
 
     def test_tool_install_is_plan_only_without_confirm(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch("ollama_code.tool_dependencies.shutil.which", return_value=None):
                 with patch("ollama_code.tool_dependencies.importlib.util.find_spec", return_value=None):
                     with patch("ollama_code.tool_dependencies._resolve_executable", return_value=None):
@@ -163,8 +167,7 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertEqual(docker_host_kind("unix:///var/run/docker.sock"), "local")
 
     def test_dependency_status_detects_isolated_venv_executable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, _tools):
             scripts = root / ".ollama-code" / "tool-envs" / "semgrep" / ("Scripts" if os.name == "nt" else "bin")
             scripts.mkdir(parents=True)
             executable = scripts / ("semgrep.exe" if os.name == "nt" else "semgrep")
@@ -256,8 +259,7 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertEqual(resolved, expected)
 
     def test_tool_install_denies_read_only_even_when_confirmed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="read-only", input_func=lambda _prompt: "y")
+        with self._temp_tools(approval_mode="read-only", input_func=lambda _prompt: "y") as (_root, tools):
             with patch("ollama_code.tool_dependencies.shutil.which", return_value=None):
                 result = tools.tool_install("ruff", confirm=True)
 
@@ -265,10 +267,8 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertIn("read-only", result["summary"])
 
     def test_tree_sitter_syntax_reports_missing_python_bindings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch("ollama_code.tool_dependencies.importlib.util.find_spec", return_value=None):
                 result = tools.tree_sitter_syntax("app.py")
 
@@ -277,8 +277,7 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertEqual(result["tool_id"], "py-tree-sitter")
 
     def test_dependency_diagnosis_adds_install_hints_for_known_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch("ollama_code.tool_dependencies.shutil.which", return_value=None):
                 result = tools.diagnose_dependency_error("executable not found: pytest")
 

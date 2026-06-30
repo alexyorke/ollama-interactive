@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import gc
 import os
 import json
@@ -24,6 +25,12 @@ class ToolExecutorTests(unittest.TestCase):
         root.mkdir(parents=True, exist_ok=True)
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         return root
+
+    @contextmanager
+    def _temp_tools(self, *, approval_mode: str = "auto", **kwargs: object):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            yield root, ToolExecutor(root, approval_mode=approval_mode, **kwargs)
 
     def _cross_platform_workspace_alias(self, root: Path) -> str:
         resolved = root.resolve()
@@ -50,10 +57,8 @@ class ToolExecutorTests(unittest.TestCase):
             self.skipTest(f"git repo init is unavailable in this environment: {message}")
 
     def test_list_and_read_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "alpha.txt").write_text("line1\nline2\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             listed = tools.list_files()
             read = tools.read_file("alpha.txt", start=2, end=2)
 
@@ -73,11 +78,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("ast_search", groups)
 
     def test_non_git_tasks_work_when_git_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "alpha.txt").write_text("line1\n", encoding="utf-8")
             with patch("ollama_code.tools.shutil.which", return_value=None):
-                tools = ToolExecutor(root, approval_mode="auto")
                 listed = tools.list_files()
                 git_status = tools.git_status()
 
@@ -87,11 +90,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("git is not installed", git_status["summary"])
 
     def test_read_toml_extracts_tool_sections_when_no_toml_module(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             config = root / "pyproject.toml"
             config.write_text("[tool.example]\nname='demo'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch("ollama_code.tools.tomllib", None):
                 payload = tools._read_toml(config)
 
@@ -124,9 +125,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("##", status["output"])
 
     def test_write_and_replace_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             write = tools.write_file("nested/file.txt", "hello\n")
             replace = tools.replace_in_file("nested/file.txt", "hello", "goodbye")
             final_text = (root / "nested" / "file.txt").read_text(encoding="utf-8")
@@ -143,19 +142,15 @@ class ToolExecutorTests(unittest.TestCase):
             def notify_paths(self, paths: object) -> None:
                 self.paths.extend(str(path) for path in paths)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            indexer = FakeIndexer()
-            tools = ToolExecutor(root, approval_mode="auto", indexer=indexer)
+        indexer = FakeIndexer()
+        with self._temp_tools(indexer=indexer) as (_root, tools):
             result = tools.execute("write_file", {"path": "note.txt", "content": "hello\n"})
 
         self.assertTrue(result["ok"])
         self.assertIn("note.txt", indexer.paths)
 
     def test_write_file_reports_python_syntax_error_without_blocking_write(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             result = tools.write_file("bad.py", "def f():\nreturn 1\n")
             final_text = (root / "bad.py").read_text(encoding="utf-8")
 
@@ -166,9 +161,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, "def f():\nreturn 1\n")
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             result = tools.write_file("fixed.py", "    def f():\n        return 1\n")
             final_text = (root / "fixed.py").read_text(encoding="utf-8")
 
@@ -178,9 +171,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, "def f():\n    return 1\n")
 
     def test_write_file_strips_markdown_quote_prefixes_for_python(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             result = tools.write_file("quoted.py", "> def f():\n>     return 1\n")
             final_text = (root / "quoted.py").read_text(encoding="utf-8")
 
@@ -189,9 +180,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, "def f():\n    return 1\n")
 
     def test_write_file_strips_single_leading_markdown_quote_for_python(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             result = tools.write_file("quoted.py", "> import re\n\ndef f():\n    return re.escape('x')\n")
             final_text = (root / "quoted.py").read_text(encoding="utf-8")
 
@@ -200,9 +189,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, "import re\n\ndef f():\n    return re.escape('x')\n")
 
     def test_write_file_repairs_common_join_string_typo_when_parseable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             result = tools.write_file("joiner.py", "def f(items):\n    return '.join(items)\n")
             final_text = (root / "joiner.py").read_text(encoding="utf-8")
 
@@ -211,14 +198,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, 'def f(items):\n    return " ".join(items)\n')
 
     def test_write_file_rejects_partial_python_overwrite_that_drops_symbols(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             target = root / "list_ops.py"
             target.write_text(
                 "def append(a, b):\n    return a + b\n\n\ndef reverse(items):\n    return list(reversed(items))\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.write_file("list_ops.py", "def append(a, b):\n    return a + b\n")
 
         self.assertFalse(result["ok"])
@@ -226,18 +211,14 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("reverse", result["summary"])
 
     def test_write_file_rejects_generated_cache_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             result = tools.write_file("__pycache__/sample.pyc", "")
 
         self.assertFalse(result["ok"])
         self.assertIn("generated/cache", result["summary"])
 
     def test_write_file_rejects_omitted_context_marker(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             result = tools.write_file("sample.py", "[omitted 500 chars from prior content; do not copy]")
 
         self.assertFalse(result["ok"])
