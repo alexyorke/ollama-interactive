@@ -363,32 +363,26 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["count"], 1)
 
     def test_search_uses_python_fallback_when_rg_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "beta.txt").write_text("needle here\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch.object(shutil, "which", return_value=None):
                 result = tools.search("needle")
         self.assertTrue(result["ok"])
         self.assertIn("beta.txt:1:needle here", result["output"])
 
     def test_search_limits_rg_output_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "many.txt").write_text("\n".join("needle" for _ in range(20)), encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.search("needle", limit=3)
 
         self.assertTrue(result["ok"])
         self.assertLessEqual(len(result["output"].splitlines()), 3)
 
     def test_search_rg_output_is_workspace_relative(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             target = root / "src" / "app.py"
             target.parent.mkdir(parents=True)
             target.write_text("needle\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             completed = subprocess.CompletedProcess(
                 args=[],
                 returncode=0,
@@ -403,22 +397,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["output"], "src/app.py:1:needle")
 
     def test_search_falls_back_to_literal_when_rg_regex_is_invalid(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "pricing.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.search("total(", limit=5)
 
         self.assertTrue(result["ok"])
         self.assertIn("total(prices)", str(result["output"]))
 
     def test_search_accepts_filename_glob_filter(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             (root / "src" / "app.py").write_text("needle in python\n", encoding="utf-8")
             (root / "src" / "notes.md").write_text("needle in docs\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
 
             result = tools.search("needle", path="src", file_glob="*.py")
 
@@ -428,8 +418,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("notes.md", result["output"])
 
     def test_code_outline_returns_python_symbols_without_bodies(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             (root / "src" / "service.py").write_text(
                 "import math\n\n"
@@ -441,7 +430,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "    return math.ceil(value)\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.code_outline("src/service.py")
 
         self.assertTrue(result["ok"])
@@ -452,10 +440,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("hidden_body_marker", result["output"])
 
     def test_code_outline_defaults_to_workspace_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "app.py").write_text("def meaning():\n    return 42\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.execute("code_outline", {})
 
         self.assertTrue(result["ok"])
@@ -463,8 +449,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("meaning", result["output"])
 
     def test_search_symbols_and_read_symbol_target_large_python_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             filler = "\n\n".join(f"def filler_{index}():\n    return {index}" for index in range(120))
             target_body = (
@@ -474,7 +459,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "    return max(0, subtotal - discount)\n"
             )
             (root / "src" / "pricing.py").write_text(f"{filler}\n\n{target_body}\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
 
             search = tools.search_symbols("calculate_discount", path="src")
             read = tools.read_symbol("src/pricing.py", "calculate_discount", include_context=0)
@@ -488,13 +472,11 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertLess(len(read["output"]), 400)
 
     def test_symbol_search_prunes_dependency_directories(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             (root / "node_modules" / "pkg").mkdir(parents=True)
             (root / "src" / "app.py").write_text("def real_target():\n    return 1\n", encoding="utf-8")
             (root / "node_modules" / "pkg" / "bad.py").write_text("def real_target_dependency():\n    return 2\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.search_symbols("real_target")
 
         self.assertTrue(result["ok"])
@@ -502,8 +484,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("node_modules", result["output"])
 
     def test_symbol_tools_tolerate_whitespace_only_python_docstrings(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "pkg").mkdir()
             (root / "pkg" / "mod.py").write_text(
                 "def outer():\n"
@@ -512,7 +493,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "    return 1\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
 
             search = tools.search_symbols("outer")
             repo = tools.repo_index_search("outer")
@@ -526,8 +506,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("outer", outline["output"])
 
     def test_symbol_tools_scan_beyond_first_two_hundred_code_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             src = root / "src"
             src.mkdir()
             for index in range(260):
@@ -542,7 +521,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "    return 'needle_symbol'\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
 
             search = tools.search_symbols("separability_matrix")
             repo = tools.repo_index_search("separability_matrix")
@@ -553,8 +531,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("src/zz_target.py", repo["output"])
 
     def test_read_symbol_reports_ambiguous_names(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "models.py").write_text(
                 "class Alpha:\n"
                 "    def save(self):\n"
@@ -564,7 +541,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        return 'b'\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
 
             ambiguous = tools.read_symbol("models.py", "save")
             precise = tools.read_symbol("models.py", "Beta.save", include_context=0)
