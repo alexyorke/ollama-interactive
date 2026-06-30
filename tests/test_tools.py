@@ -1691,11 +1691,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return text + 'ay'", final_text)
 
     def test_replace_body_routes_import_plus_matching_function_without_nested_def(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "wordy.py"
             sample.write_text("def answer(question):\n    return None\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "wordy.py",
                 "replace_body",
@@ -1714,12 +1712,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return int(match.group(0))", final_text)
 
     def test_replace_body_full_mismatched_function_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "pig_latin.py"
             original = "def translate(text):\n    return None\n"
             sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "pig_latin.py",
                 "replace_body",
@@ -1734,12 +1730,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, original)
 
     def test_apply_structured_edit_replace_body_full_function_guard(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "app.py"
             original = "def add(left, right):\n    return None\n"
             sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             ok = tools.apply_structured_edit(
                 {"op": "replace_function_body", "path": "app.py", "symbol": "add", "body": "def add(left, right):\n    return left + right\n"}
             )
@@ -1757,11 +1751,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return left + right", final_text)
 
     def test_edit_intent_repairs_common_join_typo_in_body_edit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "joiner.py"
             sample.write_text("def join_items(items):\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent("joiner.py", "replace_body", "join_items", "return '.join(items)")
 
             final_text = sample.read_text(encoding="utf-8")
@@ -1770,11 +1762,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn('return " ".join(items)', final_text)
 
     def test_edit_intent_dedents_body_even_with_unindented_comments(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             sample.write_text("def keep(values):\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "ops.py",
                 "replace_body",
@@ -1789,12 +1779,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("\n        return [value", final_text)
 
     def test_edit_intent_rejects_calling_shadowed_builtin_parameter(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             original = "def map_values(function, list):\n    pass\n"
             sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "ops.py",
                 "replace_body",
@@ -1810,12 +1798,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, original)
 
     def test_edit_intent_rejects_ignoring_initial_parameter(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             original = "def foldr(function, list, initial):\n    pass\n"
             sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "ops.py",
                 "replace_body",
@@ -1831,12 +1817,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, original)
 
     def test_edit_intent_rejects_reversed_foldr_reducer_arguments(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             original = "def foldr(function, list, initial):\n    pass\n"
             sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "ops.py",
                 "replace_body",
@@ -1852,11 +1836,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, original)
 
     def test_replace_symbols_normalizes_reversed_recursive_foldr_reducer_arguments(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             sample.write_text("def foldr(function, list, initial):\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_symbols(
                 "ops.py",
                 [
@@ -1880,11 +1862,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("accumulator = function(accumulator, item)", final_text)
 
     def test_replace_symbol_normalizes_helper_recursive_reversed_foldr_reducer_arguments(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             sample.write_text("def foldr(function, list, initial):\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_symbol(
                 "ops.py",
                 "foldr",
@@ -1906,12 +1886,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("accumulator = function(accumulator, item)", final_text)
 
     def test_replace_symbol_rejects_accidental_signature_change(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "ops.py"
             original = "def foldl(function, list, initial):\n    pass\n"
             sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_symbol(
                 "ops.py",
                 "foldl",
@@ -1932,11 +1910,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, original)
 
     def test_edit_intent_routes_fix_like_full_function_to_symbol_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "calculator.py"
             sample.write_text("def add(left: int, right: int) -> int:\n    return left - right\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "calculator.py",
                 "fix_function_body",
@@ -1952,11 +1928,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("def def", final_text)
 
     def test_edit_intent_surfacing_syntax_errors_as_failed_tool(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "billing.py"
             sample.write_text('def invoice_label(user_id: int) -> str:\n    return f"{user_id}"\n', encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "billing.py",
                 "replace_text",
@@ -1971,11 +1945,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Python syntax error", result["summary"])
 
     def test_edit_intent_routes_symbol_name_replacement_to_file_rename(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "pricing.py"
             sample.write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "pricing.py",
                 "replace_symbol",
@@ -1992,8 +1964,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("def total(", final_text)
 
     def test_test_spec_extract_parses_unittest_examples_and_raises(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "wordy.py").write_text("def answer(question):\n    pass\n\n\ndef keep(function, values):\n    pass\n", encoding="utf-8")
             (root / "wordy_test.py").write_text(
                 "import unittest\nfrom wordy import answer, keep as wordy_keep\n\n"
@@ -2009,7 +1980,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertRaises(ValueError, answer, 'What is?')\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.test_spec_extract("wordy_test.py", source_path="wordy.py", limit=10)
 
         self.assertTrue(result["ok"], result)
