@@ -218,7 +218,9 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         cases = {case.name: case for case in bench.selected_cases("local-full")}
 
         self.assertIn("bad_test_command_recovery", cases)
+        self.assertIn("docs_sync_without_tests_still_validates", cases)
         self.assertEqual(cases["bad_test_command_recovery"].benchmark_kind, "coding_accuracy")
+        self.assertEqual(cases["docs_sync_without_tests_still_validates"].benchmark_kind, "coding_accuracy")
         for name in (
             "renamed_simple_expression_hidden",
             "renamed_prefix_rotation_hidden",
@@ -227,6 +229,58 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         ):
             self.assertIn(name, cases)
             self.assertEqual(cases[name].benchmark_kind, "coding_accuracy")
+
+    def test_docs_sync_without_tests_still_validates_requires_non_test_validation(self) -> None:
+        cases = {case.name: case for case in bench.selected_cases("local-full")}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            case = cases["docs_sync_without_tests_still_validates"]
+            assert case.prepare is not None
+            case.prepare(root)
+            (root / "src" / "api.py").write_text(
+                "def fetch_user(user_id: str, include_orders: bool = False) -> dict[str, str]:\n    return {'id': user_id}\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "api.md").write_text(
+                "`fetch_user(user_id, include_orders=False)` returns a user dict.\n",
+                encoding="utf-8",
+            )
+            passing = bench.BenchmarkContext(
+                workspace=root,
+                session={
+                    "events": [
+                        {"type": "tool_call", "name": "lint_typecheck", "arguments": {"paths": ["src/api.py"]}},
+                        {"type": "tool_result", "name": "lint_typecheck", "result": {"ok": True}},
+                        {"type": "tool_call", "name": "contract_check", "arguments": {"changed_files": ["src/api.py"]}},
+                        {"type": "tool_result", "name": "contract_check", "result": {"ok": True}},
+                    ]
+                },
+                stdout="",
+                stderr="",
+                returncodes=(),
+                results=(),
+                case=case,
+            )
+            failing = bench.BenchmarkContext(
+                workspace=root,
+                session={
+                    "events": [
+                        {"type": "tool_call", "name": "lint_typecheck", "arguments": {"paths": ["src/api.py"]}},
+                        {"type": "tool_result", "name": "lint_typecheck", "result": {"ok": True}},
+                        {"type": "tool_call", "name": "run_test", "arguments": {"command": "python -m unittest discover -s tests"}},
+                        {"type": "tool_result", "name": "run_test", "result": {"ok": True}},
+                    ]
+                },
+                stdout="",
+                stderr="",
+                returncodes=(),
+                results=(),
+                case=case,
+            )
+
+            self.assertEqual(case.validate(passing), "pass")
+            self.assertEqual(case.validate(failing), "fail")
 
     def test_renamed_hidden_case_validators_enforce_hidden_behavior(self) -> None:
         cases = {case.name: case for case in bench.selected_cases("local-full")}

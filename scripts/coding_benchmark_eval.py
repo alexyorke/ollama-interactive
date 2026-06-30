@@ -562,6 +562,25 @@ def validate_docs_sync_after_api_change(ctx: BenchmarkContext) -> str:
     return "pass" if "include_orders" in source and "include_orders" in docs else "fail"
 
 
+def prepare_docs_sync_without_tests_still_validates(workspace: Path) -> None:
+    prepare_docs_sync_after_api_change(workspace)
+
+
+def validate_docs_sync_without_tests_still_validates(ctx: BenchmarkContext) -> str:
+    source = (ctx.workspace / "src" / "api.py").read_text(encoding="utf-8")
+    docs = (ctx.workspace / "docs" / "api.md").read_text(encoding="utf-8")
+    calls = tool_calls(ctx.session)
+    return _status_or_fail_closed(
+        ctx,
+        "include_orders" in source
+        and "include_orders" in docs
+        and _tool_success(ctx.session, "lint_typecheck")
+        and _tool_success(ctx.session, "contract_check")
+        and "run_test" not in calls
+        and "select_tests" not in calls,
+    )
+
+
 def prepare_nested_package_import_fix(workspace: Path) -> None:
     _write(workspace / "src" / "pkg" / "__init__.py", "")
     _write(workspace / "src" / "pkg" / "core.py", "from helpers import label\n\ndef wrapped() -> str:\n    return label('ok')\n")
@@ -950,6 +969,15 @@ LOCAL_CASES: list[BenchmarkCase] = [
         turns=("Add an optional include_orders: bool = False parameter to fetch_user in src/api.py and update docs/api.md with that parameter. No tests are needed.",),
         prepare=prepare_docs_sync_after_api_change,
         validate=validate_docs_sync_after_api_change,
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="docs_sync_without_tests_still_validates",
+        suite="local-full",
+        turns=("Add an optional include_orders: bool = False parameter to fetch_user in src/api.py and update docs/api.md with that parameter, but do not run tests.",),
+        prepare=prepare_docs_sync_without_tests_still_validates,
+        validate=validate_docs_sync_without_tests_still_validates,
         budget_off=SMALL_BUDGET_OFF,
         budget_on=SMALL_BUDGET_ON,
     ),
