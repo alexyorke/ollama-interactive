@@ -277,6 +277,30 @@ class AgentTests(unittest.TestCase):
                 root, client, approval_mode=approval_mode, tool_cls=tool_cls, tool_kwargs=tool_kwargs, **kwargs
             )
 
+    @contextmanager
+    def _temp_python_agent(
+        self,
+        files: dict[str, str],
+        client: FakeClient | None = None,
+        *,
+        tool_cls: type[ToolExecutor] = ToolExecutor,
+        test_command: str | None = None,
+        test_discover_args: tuple[str, ...] = ("-p", "*_test.py", "-v"),
+        tool_kwargs: dict[str, object] | None = None,
+        **kwargs: object,
+    ) -> Iterator[tuple[Path, FakeClient, ToolExecutor, OllamaCodeAgent]]:
+        resolved_tool_kwargs = dict(tool_kwargs or {})
+        resolved_tool_kwargs.setdefault(
+            "test_command",
+            test_command or subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", *test_discover_args]),
+        )
+        with self._temp_agent(client, tool_cls=tool_cls, tool_kwargs=resolved_tool_kwargs, **kwargs) as (root, resolved_client, tools, agent):
+            for relative_path, content in files.items():
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            yield root, resolved_client, tools, agent
+
     def _assert_repo_tool_then_git_status_without_model_loop(
         self,
         request: str,
@@ -6726,33 +6750,31 @@ class AgentTests(unittest.TestCase):
         self.assertIn("mechanical_candidate_validation", phases)
 
     def test_structured_test_repair_recovers_bad_configured_test_command_before_repair(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "inventory.py").write_text(
-                "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n",
-                encoding="utf-8",
-            )
-            (root / "tests" / "test_inventory.py").write_text(
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "src/inventory.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "tests/test_inventory.py"}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": "pytesst -q"}}),
+            ]
+        )
+        with self._temp_python_agent(
+            {
+                "src/inventory.py": "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n",
+                "tests/test_inventory.py": (
                 "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
                 + "from inventory import *\nimport unittest\n\n"
                 + "class InventoryTests(unittest.TestCase):\n"
                 + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
                 + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n"
-                + "if __name__ == '__main__':\n    unittest.main()\n",
-                encoding="utf-8",
-            )
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "src/inventory.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "tests/test_inventory.py"}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": "pytesst -q"}}),
-                ]
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command="pytesst -q")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                + "if __name__ == '__main__':\n    unittest.main()\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            test_command="pytesst -q",
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Run tests, fix src/inventory.py so total_units is correct, rerun tests, and summarize briefly.")
             final_text = (root / "src" / "inventory.py").read_text(encoding="utf-8")
 
@@ -6773,30 +6795,30 @@ class AgentTests(unittest.TestCase):
         self.assertIn("unittest discover", str(last_result.get("command", "")))
 
     def test_spec_guided_repair_runs_for_small_single_non_stub_module_with_one_direct_example(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "balance.py").write_text("def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n", encoding="utf-8")
-            (root / "tests" / "test_balance_credit.py").write_text(
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "src/balance.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "tests/test_balance_credit.py"}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+            ]
+        )
+        with self._temp_python_agent(
+            {
+                "src/balance.py": "def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n",
+                "tests/test_balance_credit.py": (
                 "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom balance import *\nimport unittest\n\n"
                 "class BalanceTest(unittest.TestCase):\n"
                 "    def test_apply_credit(self):\n"
                 "        self.assertEqual(apply_credit(10, 3), 13)\n"
-                "\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "src/balance.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "tests/test_balance_credit.py"}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
-                ]
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            test_discover_args=("-s", "tests", "-v"),
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Bug in src/balance.py: apply_credit(amount, credit) returns the wrong value. Read source and tests, fix it, run tests, and summarize briefly.")
             final_text = (root / "src" / "balance.py").read_text(encoding="utf-8")
 
@@ -6808,25 +6830,24 @@ class AgentTests(unittest.TestCase):
         self.assertIn("mechanical_candidate_validation", phases)
 
     def test_structured_test_repair_skips_preemptive_spec_guided_for_import_bug_request(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src" / "pkg").mkdir(parents=True)
-            (root / "tests").mkdir()
-            (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
-            (root / "src" / "pkg" / "core.py").write_text("from helpers import label\n\ndef wrapped() -> str:\n    return label('ok')\n", encoding="utf-8")
-            (root / "src" / "pkg" / "helpers.py").write_text("def label(value: str) -> str:\n    return f'[{value}]'\n", encoding="utf-8")
-            (root / "tests" / "test_pkg.py").write_text(
+        with self._temp_python_agent(
+            {
+                "src/pkg/__init__.py": "",
+                "src/pkg/core.py": "from helpers import label\n\ndef wrapped() -> str:\n    return label('ok')\n",
+                "src/pkg/helpers.py": "def label(value: str) -> str:\n    return f'[{value}]'\n",
+                "tests/test_pkg.py": (
                 "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
                 "import unittest\nfrom pkg.core import wrapped\n\n"
                 "class PackageTests(unittest.TestCase):\n"
                 "    def test_wrapped(self):\n"
-                "        self.assertEqual(wrapped(), '[ok]')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "        self.assertEqual(wrapped(), '[ok]')\n"
+                ),
+            },
+            tool_cls=CountingToolExecutor,
+            test_discover_args=("-s", "tests", "-v"),
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent._try_structured_test_driven_repair(
                 request_text="Run tests, fix the package import bug in src/pkg/core.py, rerun tests, and summarize.",
                 session_memory_request=False,
@@ -6844,26 +6865,24 @@ class AgentTests(unittest.TestCase):
         self.assertIsNone(tools.execute_counts.get("run_test"))
 
     def test_structured_test_repair_skips_multi_file_refactor_request(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "docs").mkdir()
-            (root / "src" / "pricing.py").write_text("def total(prices: list[int]) -> int:\n    return sum(prices)\n", encoding="utf-8")
-            (root / "src" / "checkout.py").write_text("from pricing import total\n\n\ndef checkout_total(prices: list[int]) -> int:\n    return total(prices)\n", encoding="utf-8")
-            (root / "tests" / "test_checkout_refactor.py").write_text(
+        with self._temp_python_agent(
+            {
+                "src/pricing.py": "def total(prices: list[int]) -> int:\n    return sum(prices)\n",
+                "src/checkout.py": "from pricing import total\n\n\ndef checkout_total(prices: list[int]) -> int:\n    return total(prices)\n",
+                "tests/test_checkout_refactor.py": (
                 "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
                 "from pricing import total\nfrom checkout import checkout_total\nimport unittest\n\n"
                 "class CheckoutRefactorTests(unittest.TestCase):\n"
                 "    def test_total(self):\n"
-                "        self.assertEqual(total([2, 3]), 5)\n",
-                encoding="utf-8",
-            )
-            (root / "docs" / "pricing.md").write_text("Call `total(prices)`.\n", encoding="utf-8")
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "        self.assertEqual(total([2, 3]), 5)\n"
+                ),
+                "docs/pricing.md": "Call `total(prices)`.\n",
+            },
+            tool_cls=CountingToolExecutor,
+            test_discover_args=("-s", "tests", "-v"),
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent._try_structured_test_driven_repair(
                 request_text="Refactor the pricing API from total(prices) to cart_total(prices). Update src/pricing.py, src/checkout.py, tests, and docs/pricing.md. Run tests and summarize briefly.",
                 session_memory_request=False,
@@ -7280,15 +7299,40 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(normalized[0].get("normalized_name"), "edit_intent")
 
     def test_spec_guided_repair_uses_verifier_model_after_candidate_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text(
+        bad_candidate = (
+            "def add(left, right):\n"
+            "    return left - right\n\n"
+            "def sub(left, right):\n"
+            "    return left - right\n\n"
+            "def double(value):\n"
+            "    return value * 2\n"
+        )
+        good_candidate = (
+            "def add(left, right):\n"
+            "    return left + right\n\n"
+            "def sub(left, right):\n"
+            "    return left - right\n\n"
+            "def double(value):\n"
+            "    return value * 2\n"
+        )
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                bad_candidate,
+                good_candidate,
+            ],
+            models=["fake-model", "strong-model"],
+        )
+        with self._temp_python_agent(
+            {
+                "ops.py": (
                 "def add(left, right):\n    pass\n\n"
                 "def sub(left, right):\n    pass\n\n"
-                "def double(value):\n    pass\n",
-                encoding="utf-8",
-            )
-            (root / "ops_test.py").write_text(
+                "def double(value):\n    pass\n"
+                ),
+                "ops_test.py": (
                 "import unittest\nfrom ops import add, sub, double\n\n"
                 "class OpsTest(unittest.TestCase):\n"
                 "    def test_add_one(self):\n"
@@ -7302,46 +7346,15 @@ class AgentTests(unittest.TestCase):
                 "    def test_double_one(self):\n"
                 "        self.assertEqual(double(4), 8)\n"
                 "    def test_double_two(self):\n"
-                "        self.assertEqual(double(-3), -6)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            bad_candidate = (
-                "def add(left, right):\n"
-                "    return left - right\n\n"
-                "def sub(left, right):\n"
-                "    return left - right\n\n"
-                "def double(value):\n"
-                "    return value * 2\n"
-            )
-            good_candidate = (
-                "def add(left, right):\n"
-                "    return left + right\n\n"
-                "def sub(left, right):\n"
-                "    return left - right\n\n"
-                "def double(value):\n"
-                "    return value * 2\n"
-            )
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
-                    bad_candidate,
-                    good_candidate,
-                ],
-                models=["fake-model", "strong-model"],
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(
-                client=client,
-                tools=tools,
-                model="fake-model",
-                verifier_model="strong-model",
-                debate_enabled=False,
-                max_tool_rounds=8,
-            )
-
+                "        self.assertEqual(double(-3), -6)\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            debate_enabled=False,
+            verifier_model="strong-model",
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Implement this Python exercise and run tests.")
             validation_models = [
                 event.get("model")
@@ -7355,10 +7368,22 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(validation_models, ["fake-model", "strong-model"])
 
     def test_spec_guided_repair_fails_closed_after_candidate_failures(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
-            (root / "ops_test.py").write_text(
+        bad_candidate = "def add(left, right):\n    return left - right\n"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                bad_candidate,
+                bad_candidate,
+                bad_candidate,
+            ],
+            models=["fake-model"],
+        )
+        with self._temp_python_agent(
+            {
+                "ops.py": "def add(left, right):\n    pass\n",
+                "ops_test.py": (
                 "import unittest\nfrom ops import add\n\n"
                 "class OpsTest(unittest.TestCase):\n"
                 "    def test_add_one(self):\n"
@@ -7372,25 +7397,14 @@ class AgentTests(unittest.TestCase):
                 "    def test_add_five(self):\n"
                 "        self.assertEqual(add(2, 2), 4)\n"
                 "    def test_add_six(self):\n"
-                "        self.assertEqual(add(-3, -4), -7)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            bad_candidate = "def add(left, right):\n    return left - right\n"
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
-                    bad_candidate,
-                    bad_candidate,
-                    bad_candidate,
-                ],
-                models=["fake-model"],
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "        self.assertEqual(add(-3, -4), -7)\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             with patch.object(
                 tools,
                 "synthesize_simple_expression_candidate",
@@ -7425,10 +7439,22 @@ class AgentTests(unittest.TestCase):
                     raise TimeoutError("candidate timed out")
                 return super().chat(**kwargs)  # type: ignore[arg-type]
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def wrap(text):\n    pass\n", encoding="utf-8")
-            (root / "ops_test.py").write_text(
+        candidate = "def wrap(text):\n    return '[' + text + ']'\n"
+        client = TimeoutCandidateClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "ops.py", "content": candidate}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                json.dumps({"type": "final", "message": "done"}),
+            ],
+            models=["fake-model"],
+        )
+        with self._temp_python_agent(
+            {
+                "ops.py": "def wrap(text):\n    pass\n",
+                "ops_test.py": (
                 "import unittest\nfrom ops import wrap\n\n"
                 "class OpsTest(unittest.TestCase):\n"
                 "    def test_one(self):\n"
@@ -7442,25 +7468,14 @@ class AgentTests(unittest.TestCase):
                 "    def test_five(self):\n"
                 "        self.assertEqual(wrap('ab!'), '[ab!]')\n"
                 "    def test_six(self):\n"
-                "        self.assertEqual(wrap('Z9?'), '[Z9?]')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            candidate = "def wrap(text):\n    return '[' + text + ']'\n"
-            client = TimeoutCandidateClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
-                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "ops.py", "content": candidate}}),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
-                    json.dumps({"type": "final", "message": "done"}),
-                ],
-                models=["fake-model"],
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
-
+                "        self.assertEqual(wrap('Z9?'), '[Z9?]')\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            debate_enabled=False,
+            max_tool_rounds=10,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Implement this Python exercise and run tests.")
             final_text = (root / "ops.py").read_text(encoding="utf-8")
 
@@ -7472,10 +7487,25 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("failed_closed", phases)
 
     def test_spec_guided_repair_runs_after_malformed_edit_with_tests_read(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
-            (root / "ops_test.py").write_text(
+        candidate = "def add(left, right):\n    return left + right\n"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {"intent": "replace_body", "path": "ops.py", "symbol": "add", "body": "return \""},
+                    }
+                ),
+                candidate,
+            ]
+        )
+        with self._temp_python_agent(
+            {
+                "ops.py": "def add(left, right):\n    pass\n",
+                "ops_test.py": (
                 "import unittest\nfrom ops import add\n\n"
                 "class OpsTest(unittest.TestCase):\n"
                 "    def test_add_one(self):\n"
@@ -7489,28 +7519,14 @@ class AgentTests(unittest.TestCase):
                 "    def test_add_five(self):\n"
                 "        self.assertEqual(add(2, 2), 4)\n"
                 "    def test_add_six(self):\n"
-                "        self.assertEqual(add(-3, -4), -7)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            candidate = "def add(left, right):\n    return left + right\n"
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
-                    json.dumps(
-                        {
-                            "type": "tool",
-                            "name": "edit_intent",
-                            "arguments": {"intent": "replace_body", "path": "ops.py", "symbol": "add", "body": "return \""},
-                        }
-                    ),
-                    candidate,
-                ]
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "        self.assertEqual(add(-3, -4), -7)\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Implement this Python exercise and run tests.")
             final_text = (root / "ops.py").read_text(encoding="utf-8")
 
@@ -7528,10 +7544,25 @@ class AgentTests(unittest.TestCase):
             self.assertNotIn('return "', candidate_prompt)
 
     def test_spec_guided_repair_runs_after_post_edit_probe_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
-            (root / "ops_test.py").write_text(
+        fixed_candidate = "def add(left, right):\n    return left + right\n"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {"intent": "replace_body", "path": "ops.py", "symbol": "add", "body": "return left - right"},
+                    }
+                ),
+                fixed_candidate,
+            ]
+        )
+        with self._temp_python_agent(
+            {
+                "ops.py": "def add(left, right):\n    pass\n",
+                "ops_test.py": (
                 "import unittest\nfrom ops import add\n\n"
                 "class OpsTest(unittest.TestCase):\n"
                 "    def test_add_one(self):\n"
@@ -7545,28 +7576,14 @@ class AgentTests(unittest.TestCase):
                 "    def test_add_five(self):\n"
                 "        self.assertEqual(add(2, 2), 4)\n"
                 "    def test_add_six(self):\n"
-                "        self.assertEqual(add(-3, -4), -7)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            fixed_candidate = "def add(left, right):\n    return left + right\n"
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "ops_test.py"}}),
-                    json.dumps(
-                        {
-                            "type": "tool",
-                            "name": "edit_intent",
-                            "arguments": {"intent": "replace_body", "path": "ops.py", "symbol": "add", "body": "return left - right"},
-                        }
-                    ),
-                    fixed_candidate,
-                ]
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "        self.assertEqual(add(-3, -4), -7)\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Implement this Python exercise and run tests.")
             final_text = (root / "ops.py").read_text(encoding="utf-8")
 
@@ -7578,10 +7595,17 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(any(phase in {"candidate_validation", "mechanical_candidate_validation"} for phase in phases))
 
     def test_spec_guided_repair_applies_mechanical_prefix_rotation_candidate(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pig.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
-            (root / "pig_test.py").write_text(
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "pig.py"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "pig_test.py"}}),
+                json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "pig.py", "intent": "replace_body", "target": "translate", "replacement": "return text"}}),
+            ]
+        )
+        with self._temp_python_agent(
+            {
+                "pig.py": "def translate(text):\n    pass\n",
+                "pig_test.py": (
                 "import unittest\nfrom pig import translate\n\n"
                 "class PigTest(unittest.TestCase):\n"
                 "    def test_word_beginning_with_a_vowel(self):\n"
@@ -7597,20 +7621,14 @@ class AgentTests(unittest.TestCase):
                 "    def test_y_after_consonant_cluster(self):\n"
                 "        self.assertEqual(translate('rhythm'), 'ythmrhay')\n"
                 "    def test_phrase(self):\n"
-                "        self.assertEqual(translate('quick fast run'), 'ickquay astfay unray')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            client = FakeClient(
-                [
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "pig.py"}}),
-                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "pig_test.py"}}),
-                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "pig.py", "intent": "replace_body", "target": "translate", "replacement": "return text"}}),
-                ]
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
-
+                "        self.assertEqual(translate('quick fast run'), 'ickquay astfay unray')\n"
+                ),
+            },
+            client,
+            tool_cls=CountingToolExecutor,
+            debate_enabled=False,
+            max_tool_rounds=8,
+        ) as (root, _client, tools, agent):
             result = agent.handle_user("Implement this Python exercise and run tests.")
             final_text = (root / "pig.py").read_text(encoding="utf-8")
 
