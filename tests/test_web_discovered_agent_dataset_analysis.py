@@ -16,6 +16,13 @@ from scripts import web_discovered_agent_dataset_analysis as analysis
 
 
 class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
+    @staticmethod
+    def _write_jsonl_rows(path: Path, rows: list[object]) -> None:
+        def render(row: object) -> str:
+            return row if isinstance(row, str) else json.dumps(row)
+
+        path.write_text("".join(render(row) + "\n" for row in rows), encoding="utf-8")
+
     def test_analyze_dataclaw_dataset_summarizes_tokens_and_tools(self) -> None:
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
@@ -48,9 +55,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     "stats": {"tool_uses": 1, "input_tokens": 500, "output_tokens": 40},
                 },
             ]
-            with shard.open("w", encoding="utf-8") as handle:
-                for row in rows:
-                    handle.write(json.dumps(row) + "\n")
+            self._write_jsonl_rows(shard, rows)
 
             summary = analysis.analyze_dataclaw_dataset(
                 "personal-codex-dataclaw",
@@ -457,9 +462,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     "metadata": {"tool_call_count": 1, "tool_output_count": 0, "model_name": "gpt-5.2-codex"},
                 },
             ]
-            with (dataset_dir / "train.jsonl").open("w", encoding="utf-8") as handle:
-                for row in rows:
-                    handle.write(json.dumps(row) + "\n")
+            self._write_jsonl_rows(dataset_dir / "train.jsonl", rows)
 
             summary = analysis.analyze_share_codex(dataset_dir, max_rows=10, examples_per_family=2)
 
@@ -481,9 +484,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     "metadata": {"tool_call_count": 0, "tool_output_count": 0},
                 }
             ]
-            with (dataset_dir / "train.jsonl").open("w", encoding="utf-8") as handle:
-                for row in rows:
-                    handle.write(json.dumps(row) + "\n")
+            self._write_jsonl_rows(dataset_dir / "train.jsonl", rows)
             export_manifest = {
                 "dataset_statistics": {
                     "model_data_volume": [
@@ -533,9 +534,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     ],
                 },
             ]
-            with (dataset_dir / "sessions.jsonl").open("w", encoding="utf-8") as handle:
-                for row in rows:
-                    handle.write(json.dumps(row) + "\n")
+            self._write_jsonl_rows(dataset_dir / "sessions.jsonl", rows)
 
             summary = analysis.analyze_message_bundle_dataset(
                 "ranga-coding-sessions",
@@ -583,9 +582,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     ],
                 }
             ]
-            with (dataset_dir / "sessions.jsonl").open("w", encoding="utf-8") as handle:
-                for row in rows:
-                    handle.write(json.dumps(row) + "\n")
+            self._write_jsonl_rows(dataset_dir / "sessions.jsonl", rows)
 
             summary = analysis.analyze_message_bundle_dataset(
                 "ranga-coding-sessions",
@@ -602,28 +599,23 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             session = dataset_dir / "sample.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "model_change", "modelId": "gpt-5.2-codex"}),
-                        json.dumps({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "Fix the CLI parser bug."}]}}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "read"},
-                                        {"type": "toolCall", "name": "edit"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "model_change", "modelId": "gpt-5.2-codex"},
+                    {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "Fix the CLI parser bug."}]}},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "read"},
+                                {"type": "toolCall", "name": "edit"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_mono(dataset_dir, max_files=10, examples_per_family=2)
@@ -639,27 +631,22 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             session = dataset_dir / "sample.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "model_change", "modelId": "claude-opus-4-6"}),
-                        json.dumps({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "Build a browser NES emulator UI."}]}}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "read"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "model_change", "modelId": "claude-opus-4-6"},
+                    {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "Build a browser NES emulator UI."}]}},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "read"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -678,41 +665,34 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             session = dataset_dir / "sample.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "model_change", "modelId": "claude-opus-4-5"}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "text",
-                                            "text": "write a script to compare two xls files and summarize changed cells.",
-                                        }
-                                    ],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "read"},
-                                        {"type": "toolCall", "name": "edit"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "model_change", "modelId": "claude-opus-4-5"},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": "write a script to compare two xls files and summarize changed cells.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "read"},
+                                {"type": "toolCall", "name": "edit"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -735,37 +715,30 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             trace_dir = dataset_dir / "_upload_staging"
             trace_dir.mkdir()
             session = trace_dir / "sample.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "session", "id": "s1"}),
-                        json.dumps({"type": "model_change", "modelId": "kimi-k2.5:cloud"}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "user",
-                                    "content": [{"type": "text", "text": "Build a Bun dashboard for Ollama model routing."}],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "bash"},
-                                        {"type": "toolCall", "name": "edit"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "session", "id": "s1"},
+                    {"type": "model_change", "modelId": "kimi-k2.5:cloud"},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Build a Bun dashboard for Ollama model routing."}],
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "bash"},
+                                {"type": "toolCall", "name": "edit"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -790,61 +763,47 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             claude_dir.mkdir(parents=True)
             codex_dir.mkdir(parents=True)
 
-            (claude_dir / "trace.jsonl").write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": "Fix the parser crash and rerun the tests.",
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "assistant",
-                                "message": {
-                                    "role": "assistant",
-                                    "model": "claude-opus-4-6",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "tool_use", "name": "Bash"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                claude_dir / "trace.jsonl",
+                [
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": "Fix the parser crash and rerun the tests.",
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-opus-4-6",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "tool_use", "name": "Bash"},
+                            ],
+                        },
+                    },
+                ],
             )
 
-            (codex_dir / "trace.jsonl").write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "event_msg",
-                                "payload": {
-                                    "type": "user_message",
-                                    "message": "Research Hugging Face buckets in detail.",
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "web_search_call",
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                codex_dir / "trace.jsonl",
+                [
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "user_message",
+                            "message": "Research Hugging Face buckets in detail.",
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "web_search_call",
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_mixed_agent_session_dataset(
@@ -867,33 +826,26 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             codex_dir = dataset_dir / "sessions" / "codex"
             codex_dir.mkdir(parents=True)
 
-            (codex_dir / "image-only.jsonl").write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [{"type": "input_text", "text": "[Image #1] what do you see?"}],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "message",
-                                    "role": "assistant",
-                                    "content": [{"type": "output_text", "text": "I see a chart."}],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                codex_dir / "image-only.jsonl",
+                [
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "[Image #1] what do you see?"}],
+                        },
+                    },
+                    {
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "I see a chart."}],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_mixed_agent_session_dataset(
@@ -912,34 +864,27 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             trace_dir = dataset_dir / "pi-traces"
             trace_dir.mkdir()
             session = trace_dir / "sample.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "session", "id": "s1"}),
-                        json.dumps({"type": "model_change", "modelId": "claude-fable-5"}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {"role": "user", "content": [{"type": "text", "text": "Build a multiplayer FPS prototype with graphics settings."}]},
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "Read"},
-                                        {"type": "toolCall", "name": "Edit"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "session", "id": "s1"},
+                    {"type": "model_change", "modelId": "claude-fable-5"},
+                    {
+                        "type": "message",
+                        "message": {"role": "user", "content": [{"type": "text", "text": "Build a multiplayer FPS prototype with graphics settings."}]},
+                    },
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "Read"},
+                                {"type": "toolCall", "name": "Edit"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -960,42 +905,35 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             dataset_dir = Path(tmp)
             caveman_dir = dataset_dir / "caveman"
             caveman_dir.mkdir()
-            (caveman_dir / "manifest.jsonl").write_text(
-                json.dumps({"dataset": "prayagmatic-agent-traces"}) + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                caveman_dir / "manifest.jsonl",
+                [{"dataset": "prayagmatic-agent-traces"}],
             )
             session = caveman_dir / "sample.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "session", "id": "s1"}),
-                        json.dumps({"type": "model_change", "modelId": "gpt-5.3-codex"}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "user",
-                                    "content": [{"type": "text", "text": "Read justfile and add a just update recipe."}],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "read"},
-                                        {"type": "toolCall", "name": "edit"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "session", "id": "s1"},
+                    {"type": "model_change", "modelId": "gpt-5.3-codex"},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": "Read justfile and add a just update recipe."}],
+                        },
+                    },
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "read"},
+                                {"type": "toolCall", "name": "edit"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -1020,33 +958,26 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             trace_dir = dataset_dir / "data"
             trace_dir.mkdir()
             session = trace_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {"role": "user", "content": "Fix the parser crash and rerun the tests."},
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "assistant",
-                                "message": {
-                                    "role": "assistant",
-                                    "model": "claude-opus-4-6",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "tool_use", "name": "Bash"},
-                                        {"type": "tool_use", "name": "Read"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "Fix the parser crash and rerun the tests."},
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-opus-4-6",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "tool_use", "name": "Bash"},
+                                {"type": "tool_use", "name": "Read"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_claude_code_dataset(
@@ -1532,75 +1463,62 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             trace_dir = dataset_dir / "traces" / "2026" / "03" / "30"
             trace_dir.mkdir(parents=True)
             session = trace_dir / "rollout.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "timestamp": "2026-03-30T12:32:32.089Z",
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "message",
-                                    "role": "developer",
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "<permissions instructions>danger-full-access</permissions instructions>",
-                                        }
-                                    ],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "timestamp": "2026-03-30T12:32:32.092Z",
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>Use LF.</INSTRUCTIONS>",
-                                        }
-                                    ],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "timestamp": "2026-03-30T12:32:40.000Z",
-                                "type": "response_item",
-                                "payload": {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [
-                                        {
-                                            "type": "input_text",
-                                            "text": "Please fix all issues reported by `make check-repo`.",
-                                        }
-                                    ],
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "timestamp": "2026-03-30T12:32:50.000Z",
-                                "type": "response_item",
-                                "payload": {"type": "function_call", "name": "exec_command"},
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "timestamp": "2026-03-30T12:32:55.000Z",
-                                "type": "response_item",
-                                "payload": {"type": "function_call", "name": "update_plan"},
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {
+                        "timestamp": "2026-03-30T12:32:32.089Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "<permissions instructions>danger-full-access</permissions instructions>",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "timestamp": "2026-03-30T12:32:32.092Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>Use LF.</INSTRUCTIONS>",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "timestamp": "2026-03-30T12:32:40.000Z",
+                        "type": "response_item",
+                        "payload": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": "Please fix all issues reported by `make check-repo`.",
+                                }
+                            ],
+                        },
+                    },
+                    {
+                        "timestamp": "2026-03-30T12:32:50.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "function_call", "name": "exec_command"},
+                    },
+                    {
+                        "timestamp": "2026-03-30T12:32:55.000Z",
+                        "type": "response_item",
+                        "payload": {"type": "function_call", "name": "update_plan"},
+                    },
+                ],
             )
 
             summary = analysis.analyze_raw_codex_session_dataset(
@@ -2011,36 +1929,29 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             trace_dir = dataset_dir / "session" / "algorithms"
             trace_dir.mkdir(parents=True)
             session = trace_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "mode", "mode": "normal"}),
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": "Implement Kahn's algorithm for topological sort and write comprehensive test cases including edge cases.",
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "assistant",
-                                "message": {
-                                    "role": "assistant",
-                                    "model": "mimo-v2.5-pro",
-                                    "content": [
-                                        {"type": "text", "text": "Let me inspect the existing implementation."},
-                                        {"type": "tool_use", "name": "Read"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {"type": "mode", "mode": "normal"},
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": "Implement Kahn's algorithm for topological sort and write comprehensive test cases including edge cases.",
+                        },
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "mimo-v2.5-pro",
+                            "content": [
+                                {"type": "text", "text": "Let me inspect the existing implementation."},
+                                {"type": "tool_use", "name": "Read"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_claude_code_dataset(
@@ -2062,33 +1973,26 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             session_dir = dataset_dir / "sessions" / "claude_code"
             session_dir.mkdir(parents=True)
             session = session_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {"role": "user", "content": "Fix the parser crash and rerun the tests."},
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "assistant",
-                                "message": {
-                                    "role": "assistant",
-                                    "model": "claude-sonnet-4-6",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "tool_use", "name": "Bash"},
-                                        {"type": "tool_use", "name": "Read"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "Fix the parser crash and rerun the tests."},
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-sonnet-4-6",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "tool_use", "name": "Bash"},
+                                {"type": "tool_use", "name": "Read"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_trace_commons_dataset(
@@ -2110,58 +2014,47 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             trace_dir = dataset_dir / "data"
             trace_dir.mkdir()
             session = trace_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": (
-                                        "<command-message>comparia-model-writer</command-message>\n"
-                                        "<command-name>/comparia-model-writer</command-name>\n"
-                                        "<command-args>https://example.com</command-args>"
-                                    ),
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {
-                                    "role": "user",
-                                    "content": (
-                                        "Base directory for this skill: /tmp/skill\n\n"
-                                        "# Example skill\n\n"
-                                        "Read STYLE_GUIDE.md before writing anything."
-                                    ),
-                                },
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "message": {"role": "user", "content": "add it to models.json."},
-                            }
-                        ),
-                        json.dumps(
-                            {
-                                "type": "assistant",
-                                "message": {
-                                    "role": "assistant",
-                                    "model": "claude-opus-4-6",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "tool_use", "name": "Read"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                session,
+                [
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "<command-message>comparia-model-writer</command-message>\n"
+                                "<command-name>/comparia-model-writer</command-name>\n"
+                                "<command-args>https://example.com</command-args>"
+                            ),
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": (
+                                "Base directory for this skill: /tmp/skill\n\n"
+                                "# Example skill\n\n"
+                                "Read STYLE_GUIDE.md before writing anything."
+                            ),
+                        },
+                    },
+                    {
+                        "type": "user",
+                        "message": {"role": "user", "content": "add it to models.json."},
+                    },
+                    {
+                        "type": "assistant",
+                        "message": {
+                            "role": "assistant",
+                            "model": "claude-opus-4-6",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "tool_use", "name": "Read"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_claude_code_dataset(
@@ -2226,7 +2119,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     ]
                 ),
             }
-            (dataset_dir / "sessions.jsonl").write_text(json.dumps(session_row) + "\n", encoding="utf-8")
+            self._write_jsonl_rows(dataset_dir / "sessions.jsonl", [session_row])
 
             summary = analysis.analyze_codex_sessions(
                 dataset_dir,
@@ -2289,7 +2182,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                     ]
                 ),
             }
-            (dataset_dir / "sessions.jsonl").write_text(json.dumps(session_row) + "\n", encoding="utf-8")
+            self._write_jsonl_rows(dataset_dir / "sessions.jsonl", [session_row])
 
             summary = analysis.analyze_codex_sessions(
                 dataset_dir,
@@ -2310,51 +2203,41 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             incomplete = dataset_dir / "incomplete.jsonl"
-            incomplete.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "In quick config, I actually want"}]}}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {
-                                            "type": "thinking",
-                                            "thinking": "The user seems to have started a sentence but didn't finish it. Let me wait for them to complete their thought.",
-                                        }
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                incomplete,
+                [
+                    {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "In quick config, I actually want"}]}},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": "thinking",
+                                    "thinking": "The user seems to have started a sentence but didn't finish it. Let me wait for them to complete their thought.",
+                                }
+                            ],
+                        },
+                    },
+                ],
             )
             real = dataset_dir / "real.jsonl"
-            real.write_text(
-                "\n".join(
-                    [
-                        json.dumps({"type": "model_change", "modelId": "gpt-5.2-codex"}),
-                        json.dumps({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "Fix the CLI parser bug."}]}}),
-                        json.dumps(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "role": "assistant",
-                                    "content": [
-                                        {"type": "thinking", "thinking": "inspect"},
-                                        {"type": "toolCall", "name": "read"},
-                                    ],
-                                },
-                            }
-                        ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+            self._write_jsonl_rows(
+                real,
+                [
+                    {"type": "model_change", "modelId": "gpt-5.2-codex"},
+                    {"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": "Fix the CLI parser bug."}]}},
+                    {
+                        "type": "message",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": "inspect"},
+                                {"type": "toolCall", "name": "read"},
+                            ],
+                        },
+                    },
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -2372,9 +2255,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             residue = dataset_dir / "residue.jsonl"
-            residue.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                residue,
+                [
                         json.dumps({"type": "model_change", "modelId": "claude-fable-5"}),
                         json.dumps(
                             {
@@ -2395,15 +2278,12 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
             real = dataset_dir / "real.jsonl"
-            real.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                real,
+                [
                         json.dumps({"type": "model_change", "modelId": "claude-fable-5"}),
                         json.dumps(
                             {
@@ -2427,10 +2307,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_pi_dataset(
@@ -2447,9 +2324,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             session = dataset_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                session,
+                [
                         json.dumps({"type": "last-prompt", "leafUuid": "x", "sessionId": "s1"}),
                         json.dumps(
                             {
@@ -2470,10 +2347,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_claude_code_dataset(
@@ -2494,9 +2368,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             main_session = dataset_dir / "main.jsonl"
-            main_session.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                main_session,
+                [
                         json.dumps({"type": "session", "id": "s1", "agent": "cursor"}),
                         json.dumps(
                             {
@@ -2520,15 +2394,12 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
             subagent_session = dataset_dir / "main__subagent__helper.jsonl"
-            subagent_session.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                subagent_session,
+                [
                         json.dumps({"type": "session", "id": "s2", "agent": "cursor"}),
                         json.dumps(
                             {
@@ -2539,10 +2410,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_nested_message_session_dataset(
@@ -2565,9 +2433,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             sessions_dir = dataset_dir / "sessions" / "2026-05-01"
             sessions_dir.mkdir(parents=True)
             session = sessions_dir / "demo.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                session,
+                [
                         json.dumps(
                             {
                                 "type": "user",
@@ -2590,10 +2458,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_claude_code_dataset(
@@ -2616,8 +2481,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
             data_dir = dataset_dir / "data" / "demo-user"
             data_dir.mkdir(parents=True)
             shard = data_dir / "shard.jsonl"
-            shard.write_text(
-                json.dumps(
+            self._write_jsonl_rows(
+                shard,
+                [
                     {
                         "id": "session-1",
                         "model": "claude-opus-4-5-20251101",
@@ -2637,9 +2503,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                             },
                         ],
                     }
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_claudeset_community_dataset(
@@ -2832,9 +2696,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             session = dataset_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                session,
+                [
                         json.dumps({"type": "session", "id": "abc", "cwd": "/tmp"}),
                         json.dumps(
                             {
@@ -2860,10 +2724,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_nested_message_session_dataset(
@@ -2882,9 +2743,9 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
             session = dataset_dir / "trace.jsonl"
-            session.write_text(
-                "\n".join(
-                    [
+            self._write_jsonl_rows(
+                session,
+                [
                         json.dumps({"type": "session", "id": "abc", "cwd": "/tmp"}),
                         json.dumps(
                             {
@@ -2904,10 +2765,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                                 },
                             }
                         ),
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
+                ],
             )
 
             summary = analysis.analyze_nested_message_session_dataset(

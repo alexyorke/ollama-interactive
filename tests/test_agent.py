@@ -199,6 +199,118 @@ class AgentTests(unittest.TestCase):
             message = (exc.stderr or exc.stdout or str(exc)).strip()
             self.skipTest(f"git repo init is unavailable in this environment: {message}")
 
+    def _primary_tools_for_request(
+        self,
+        request: str,
+        *,
+        requires_tools: bool = True,
+        mutation_allowed: bool = False,
+        mutation_required: bool = False,
+        test_run_required: bool = False,
+    ) -> set[str]:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(
+            client=FakeClient([]),
+            tools=ToolExecutor(root, approval_mode="auto"),
+            model="fake-model",
+        )
+        return agent._primary_tool_names_for_request(
+            request,
+            requires_tools=requires_tools,
+            session_memory_request=False,
+            mutation_allowed=mutation_allowed,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+        )
+
+    def _cwd_agent(
+        self,
+        client: FakeClient | None = None,
+        *,
+        approval_mode: str = "auto",
+        **kwargs: object,
+    ) -> OllamaCodeAgent:
+        return OllamaCodeAgent(
+            client=client if client is not None else FakeClient([]),
+            tools=ToolExecutor(Path.cwd(), approval_mode=approval_mode),
+            model="fake-model",
+            **kwargs,
+        )
+
+    def _assert_repo_tool_then_git_status_without_model_loop(
+        self,
+        request: str,
+        *,
+        first_tool_name: str,
+        expected_message_fragment: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(request)
+
+        self.assertIn(expected_message_fragment, result.message)
+        self.assertIn("src/app.py", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, [first_tool_name, "git_status"])
+
+    def _assert_follow_up_tool_chain_without_model_loop(
+        self,
+        request: str,
+        *,
+        expected_tool_names: list[str],
+        expected_message_fragments: list[str],
+        acceptable_follow_up_fragments: list[str] | None = None,
+        create_docs_fixture: bool = False,
+        test_file_content: str | None = None,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if create_docs_fixture:
+                (root / "docs").mkdir()
+                (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                test_file_content
+                or "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(request)
+
+        for fragment in expected_message_fragments:
+            self.assertIn(fragment, result.message)
+        if acceptable_follow_up_fragments is not None:
+            self.assertTrue(any(fragment in result.message for fragment in acceptable_follow_up_fragments))
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, expected_tool_names)
+
+    def _assert_single_turn_done_payload(self, payload: str) -> None:
+        client = FakeClient([payload])
+        agent = self._cwd_agent(client, debate_enabled=False)
+        result = agent.handle_user("Say done.")
+        self.assertEqual(result.message, "done")
+        self.assertEqual(result.rounds, 1)
+        self.assertEqual(len(client.calls), 1)
+
     def test_agent_runs_tool_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2274,6 +2386,132 @@ class AgentTests(unittest.TestCase):
         auto_validation_names = [event.get("name") for event in agent.events if event.get("type") == "auto_validation"]
         self.assertEqual(auto_validation_names[:2], ["discover_validators", "run_test"])
 
+    def test_post_edit_validation_runs_non_test_validator_when_request_skips_tests(self) -> None:
+        root = self._workspace_scratch()
+        (root / "docs").mkdir()
+        (root / "docs" / "guide.md").write_text("Old guide text.\n", encoding="utf-8")
+        lint_command = subprocess.list2cmdline([sys.executable, "-c", "print('markdown lint ok')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"docs/guide.md"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"docs/guide.md","old":"Old guide text.","new":"Updated guide text."}}',
+                '{"type":"final","message":"Updated docs/guide.md."}',
+                '{"type":"final","message":"Updated docs/guide.md."}',
+            ]
+        )
+        tools = EmptySelectTestsLintFallbackToolExecutor(
+            root,
+            approval_mode="auto",
+            fallback_command=lint_command,
+            test_command=f"{sys.executable} -m unittest discover -s tests",
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Update docs/guide.md to use the new wording. No tests are needed.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Updated docs/guide.md.")
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:4], ["read_file", "replace_in_file", "discover_validators", "run_test"])
+        run_test_events = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertEqual(run_test_events[0].get("arguments", {}).get("command"), lint_command)
+        auto_validation_names = [event.get("name") for event in agent.events if event.get("type") == "auto_validation"]
+        self.assertEqual(auto_validation_names[:2], ["discover_validators", "run_test"])
+
+    def test_post_edit_validation_runs_code_sanity_when_request_skips_tests(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "docs").mkdir()
+        (root / "src" / "api.py").write_text(
+            "def fetch_user(user_id: str) -> dict[str, str]:\n    return {'id': user_id}\n",
+            encoding="utf-8",
+        )
+        (root / "docs" / "api.md").write_text("`fetch_user(user_id)` returns a user dict.\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/api.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"docs/api.md"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"src/api.py","old":"def fetch_user(user_id: str) -> dict[str, str]:","new":"def fetch_user(user_id: str, include_orders: bool = False) -> dict[str, str]:"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"docs/api.md","old":"`fetch_user(user_id)` returns a user dict.","new":"`fetch_user(user_id, include_orders=False)` returns a user dict."}}',
+                '{"type":"final","message":"Updated src/api.py and docs/api.md."}',
+                '{"type":"final","message":"Updated src/api.py and docs/api.md."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Add include_orders to src/api.py, update docs/api.md, and do not run tests.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Updated src/api.py and docs/api.md.")
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertIn("lint_typecheck", tool_names)
+        self.assertIn("contract_check", tool_names)
+        self.assertNotIn("select_tests", tool_names)
+        self.assertNotIn("run_test", tool_names)
+        auto_validation_names = [event.get("name") for event in agent.events if event.get("type") == "auto_validation"]
+        self.assertEqual(auto_validation_names[:2], ["lint_typecheck", "contract_check"])
+
+    def test_post_edit_validation_respects_explicit_skip_validation_request(self) -> None:
+        root = self._workspace_scratch()
+        (root / "docs").mkdir()
+        (root / "docs" / "guide.md").write_text("Old guide text.\n", encoding="utf-8")
+        lint_command = subprocess.list2cmdline([sys.executable, "-c", "print('markdown lint ok')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"docs/guide.md"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"docs/guide.md","old":"Old guide text.","new":"Updated guide text."}}',
+                '{"type":"final","message":"Updated docs/guide.md."}',
+            ]
+        )
+        tools = EmptySelectTestsLintFallbackToolExecutor(
+            root,
+            approval_mode="auto",
+            fallback_command=lint_command,
+            test_command=f"{sys.executable} -m unittest discover -s tests",
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Update docs/guide.md to use the new wording, but skip validation.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Updated docs/guide.md.")
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:2], ["read_file", "replace_in_file"])
+        self.assertNotIn("discover_validators", tool_names)
+        self.assertNotIn("run_test", tool_names)
+        self.assertNotIn("lint_typecheck", tool_names)
+
+    def test_synthesized_final_runs_post_edit_validation_for_no_test_request(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "docs").mkdir()
+        (root / "src" / "api.py").write_text(
+            "def fetch_user(user_id: str) -> dict[str, str]:\n    return {'id': user_id}\n",
+            encoding="utf-8",
+        )
+        (root / "docs" / "api.md").write_text("`fetch_user(user_id)` returns a user dict.\n", encoding="utf-8")
+        client = FakeClient([])
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user(
+                "Add an optional include_orders: bool = False parameter to fetch_user in src/api.py "
+                "and update docs/api.md with that parameter, but do not run tests."
+            )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Updated docs/api.md, src/api.py.")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:4], ["edit_intent", "replace_in_file", "lint_typecheck", "contract_check"])
+        self.assertNotIn("run_test", tool_names)
+        self.assertNotIn("select_tests", tool_names)
+
     def test_tool_error_guard_blocks_third_duplicate_path_failure(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(
@@ -2927,40 +3165,15 @@ class AgentTests(unittest.TestCase):
         self.assertIn("syntactically complete", prompt)
 
     def test_primary_tools_include_systems_lens_for_complex_tasks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             "Profile the slow edit pipeline and debug the controller design.",
-            requires_tools=True,
-            session_memory_request=False,
-            mutation_allowed=False,
-            mutation_required=False,
-            test_run_required=False,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
         self.assertIn("systems_lens", selected)
         self.assertNotIn("systems_lens", GROUNDING_EVIDENCE_TOOL_NAMES)
 
     def test_primary_tools_keep_specialty_tools_out_of_generic_code_prompt(self) -> None:
-        root = self._workspace_scratch()
-        client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             "Find the implementation of calculate_discount in this repo.",
-            requires_tools=True,
-            session_memory_request=False,
-            mutation_allowed=False,
-            mutation_required=False,
-            test_run_required=False,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
 
         self.assertIn("repo_index_search", selected)
@@ -2973,20 +3186,8 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("verified_function_search", selected)
 
     def test_primary_tools_add_specialty_tools_by_intent(self) -> None:
-        root = self._workspace_scratch()
-        client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             "Use LSP references and ast-grep structural search to inspect this symbol.",
-            requires_tools=True,
-            session_memory_request=False,
-            mutation_allowed=False,
-            mutation_required=False,
-            test_run_required=False,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
 
         self.assertIn("lsp_references", selected)
@@ -2995,40 +3196,16 @@ class AgentTests(unittest.TestCase):
         self.assertIn("semgrep_scan", selected)
 
     def test_primary_tools_add_python_sdk_search_by_intent(self) -> None:
-        root = self._workspace_scratch()
-        client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             "Find the current Python stdlib API for parsing JSON strings.",
-            requires_tools=True,
-            session_memory_request=False,
-            mutation_allowed=False,
-            mutation_required=False,
-            test_run_required=False,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
 
         self.assertIn("python_sdk_search", selected)
         self.assertIn("inspect_library_source", selected)
 
     def test_primary_tools_add_verified_function_tools_by_intent(self) -> None:
-        root = self._workspace_scratch()
-        client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             "Find a verified reusable function card and compose it; do not invent code.",
-            requires_tools=True,
-            session_memory_request=False,
-            mutation_allowed=False,
-            mutation_required=False,
-            test_run_required=False,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
 
         self.assertIn("verified_function_search", selected)
@@ -3037,42 +3214,21 @@ class AgentTests(unittest.TestCase):
         self.assertIn("promote_verified_function", selected)
 
     def test_git_recovery_request_requires_tools_and_git_surface(self) -> None:
-        root = self._workspace_scratch()
-        client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
         request = "I checked out master and can't find my changes. Help me merge them back."
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             request,
-            requires_tools=agent._request_requires_tools(request),
-            session_memory_request=False,
-            mutation_allowed=False,
-            mutation_required=False,
-            test_run_required=False,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
 
-        self.assertTrue(agent._request_requires_tools(request))
+        self.assertTrue(self._cwd_agent()._request_requires_tools(request))
         self.assertIn("git_status", selected)
         self.assertIn("git_diff", selected)
 
     def test_primary_tools_include_todos_for_complex_work(self) -> None:
-        root = self._workspace_scratch()
-        client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
-
-        selected = agent._primary_tool_names_for_request(
+        selected = self._primary_tools_for_request(
             "Implement todo list support, update tests, and run the suite.",
-            requires_tools=True,
-            session_memory_request=False,
             mutation_allowed=True,
             mutation_required=True,
             test_run_required=True,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
         )
 
         self.assertIn("todo_read", selected)
@@ -3702,8 +3858,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"Path escapes the workspace: ../outside.txt"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
 
         result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
 
@@ -3717,8 +3872,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"tool","name":"read_file","arguments":{"path":"../outside.txt"}}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent(client)
 
         result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
 
@@ -3805,8 +3959,7 @@ class AgentTests(unittest.TestCase):
 
     def test_agent_allows_explanatory_implementation_question_without_mutation(self) -> None:
         client = FakeClient(['{"type":"final","message":"explain plan"}'])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
 
         result = agent.handle_user("How should I implement this feature?")
 
@@ -4020,8 +4173,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"listed workspace"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
 
         result = agent.handle_user("Inspect the workspace with a tool.")
 
@@ -4038,8 +4190,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"listed workspace"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
 
         result = agent.handle_user("List files in the workspace. Do not use read_file.")
 
@@ -4079,8 +4230,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"CONTINUE_TOKEN_99"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
         agent.messages.append({"role": "user", "content": "Remember the exact token CONTINUE_TOKEN_99 for this session."})
 
         result = agent.handle_user("What token did I ask you to remember earlier in this session? Reply with the token only.")
@@ -4090,8 +4240,7 @@ class AgentTests(unittest.TestCase):
 
     def test_agent_skips_verification_for_session_memory_question(self) -> None:
         client = FakeClient(['{"type":"final","message":"CONTINUE_TOKEN_99"}'], script_verification=True)
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent(client)
         agent.messages.append({"role": "user", "content": "Remember the exact token CONTINUE_TOKEN_99 for this session."})
 
         result = agent.handle_user("What token did I ask you to remember earlier in this session? Reply with the token only.")
@@ -4338,138 +4487,48 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_names, ["discover_validators"])
 
     def test_agent_chains_search_then_run_test_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "docs").mkdir()
-            (root / "tests").mkdir()
-            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
-            (root / "tests" / "test_sample.py").write_text(
-                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(6 * 7, 42)\n",
-                encoding="utf-8",
-            )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("Search for TOKEN_42 in the repo, then run tests and tell me whether tests passed.")
-
-        self.assertIn("docs/guide.md contains the match.", result.message)
-        self.assertIn("Tests passed: yes", result.message)
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["search", "run_test"])
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "Search for TOKEN_42 in the repo, then run tests and tell me whether tests passed.",
+            expected_tool_names=["search", "run_test"],
+            expected_message_fragments=["docs/guide.md contains the match.", "Tests passed: yes"],
+            create_docs_fixture=True,
+            test_file_content="import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(6 * 7, 42)\n",
+        )
 
     def test_agent_chains_discover_validators_then_run_test_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text(
-                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
-                encoding="utf-8",
-            )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("Discover the test commands for this repo, then run tests and tell me whether they passed.")
-
-        self.assertIn("test python:", result.message)
-        self.assertIn("Tests passed: yes", result.message)
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["discover_validators", "run_test"])
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "Discover the test commands for this repo, then run tests and tell me whether they passed.",
+            expected_tool_names=["discover_validators", "run_test"],
+            expected_message_fragments=["test python:", "Tests passed: yes"],
+        )
 
     def test_agent_chains_search_then_git_status_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._init_git_repo_or_skip(root)
-            (root / "docs").mkdir()
-            (root / "src").mkdir()
-            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("Search for TOKEN_42 in the repo, then show git status.")
-
-        self.assertIn("docs/guide.md contains the match.", result.message)
-        self.assertIn("src/app.py", result.message)
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["search", "git_status"])
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "Search for TOKEN_42 in the repo, then show git status.",
+            first_tool_name="search",
+            expected_message_fragment="docs/guide.md contains the match.",
+        )
 
     def test_agent_chains_search_and_git_status_without_then(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._init_git_repo_or_skip(root)
-            (root / "docs").mkdir()
-            (root / "src").mkdir()
-            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("Search for TOKEN_42 in the repo and show git status.")
-
-        self.assertIn("docs/guide.md contains the match.", result.message)
-        self.assertIn("src/app.py", result.message)
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["search", "git_status"])
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "Search for TOKEN_42 in the repo and show git status.",
+            first_tool_name="search",
+            expected_message_fragment="docs/guide.md contains the match.",
+        )
 
     def test_agent_chains_search_after_that_git_status_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._init_git_repo_or_skip(root)
-            (root / "docs").mkdir()
-            (root / "src").mkdir()
-            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("Search for TOKEN_42 in the repo, after that show git status.")
-
-        self.assertIn("docs/guide.md contains the match.", result.message)
-        self.assertIn("src/app.py", result.message)
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["search", "git_status"])
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "Search for TOKEN_42 in the repo, after that show git status.",
+            first_tool_name="search",
+            expected_message_fragment="docs/guide.md contains the match.",
+        )
 
     def test_agent_chains_list_files_and_git_status_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self._init_git_repo_or_skip(root)
-            (root / "docs").mkdir()
-            (root / "src").mkdir()
-            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
-            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
-            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
-            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("List files in the workspace and show git status.")
-
-        self.assertIn("docs/guide.md", result.message)
-        self.assertIn("src/app.py", result.message)
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["list_files", "git_status"])
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "List files in the workspace and show git status.",
+            first_tool_name="list_files",
+            expected_message_fragment="docs/guide.md",
+        )
 
     def test_agent_handles_literal_list_files_tool_request_without_model_loop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4492,52 +4551,20 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_names, ["list_files"])
 
     def test_agent_chains_discover_validators_then_lint_without_model_loop(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text(
-                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
-                encoding="utf-8",
-            )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("List the test and validation commands for this repo, then run lint.")
-
-        self.assertIn("lint python:", result.message)
-        self.assertTrue(
-            "All checks passed!" in result.message
-            or "Lint/typecheck passed." in result.message
-            or "syntax ok:" in result.message
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "List the test and validation commands for this repo, then run lint.",
+            expected_tool_names=["discover_validators", "lint_typecheck"],
+            expected_message_fragments=["lint python:"],
+            acceptable_follow_up_fragments=["All checks passed!", "Lint/typecheck passed.", "syntax ok:"],
         )
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["discover_validators", "lint_typecheck"])
 
     def test_agent_chains_discover_validators_and_lint_without_then(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text(
-                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
-                encoding="utf-8",
-            )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            result = agent.handle_user("List the test and validation commands for this repo and run lint.")
-
-        self.assertIn("lint python:", result.message)
-        self.assertTrue(
-            "All checks passed!" in result.message
-            or "Lint/typecheck passed." in result.message
-            or "syntax ok:" in result.message
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "List the test and validation commands for this repo and run lint.",
+            expected_tool_names=["discover_validators", "lint_typecheck"],
+            expected_message_fragments=["lint python:"],
+            acceptable_follow_up_fragments=["All checks passed!", "Lint/typecheck passed.", "syntax ok:"],
         )
-        self.assertEqual(len(client.calls), 0)
-        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["discover_validators", "lint_typecheck"])
 
     def test_agent_audits_shell_tool_under_debate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5014,8 +5041,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"readme loaded"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
 
         result = agent.handle_user("Read README.md and summarize it.")
 
@@ -5032,8 +5058,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"readme loaded"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
 
         result = agent.handle_user("Read README.md and summarize it.")
 
@@ -5051,8 +5076,7 @@ class AgentTests(unittest.TestCase):
                 '{"type":"final","message":"README loaded from file"}',
             ]
         )
-        tools = ToolExecutor(Path.cwd(), approval_mode="read-only")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, approval_mode="read-only", debate_enabled=False)
 
         result = agent.handle_user("Read README.md and summarize it.")
 
@@ -5138,32 +5162,10 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 2)
 
     def test_agent_prefers_last_agent_payload_in_mixed_model_output(self) -> None:
-        client = FakeClient(
-            [
-                'Context {"foo":1}\n{"type":"final","message":"done"}',
-            ]
-        )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-        result = agent.handle_user("Say done.")
-
-        self.assertEqual(result.message, "done")
-        self.assertEqual(result.rounds, 1)
-        self.assertEqual(len(client.calls), 1)
+        self._assert_single_turn_done_payload('Context {"foo":1}\n{"type":"final","message":"done"}')
 
     def test_agent_accepts_singleton_array_wrapped_final_payload(self) -> None:
-        client = FakeClient(
-            [
-                '[{"type":"final","message":"done"}]',
-            ]
-        )
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-        result = agent.handle_user("Say done.")
-
-        self.assertEqual(result.message, "done")
-        self.assertEqual(result.rounds, 1)
-        self.assertEqual(len(client.calls), 1)
+        self._assert_single_turn_done_payload('[{"type":"final","message":"done"}]')
 
     def test_relative_transcript_paths_use_workspace_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5612,9 +5614,7 @@ class AgentTests(unittest.TestCase):
         self.assertIn("line 79 TOKEN_FULL_EVENT", tool_call["arguments"]["content"])
 
     def test_agent_compacts_run_test_output_to_actionable_failure(self) -> None:
-        client = FakeClient([])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent()
         noisy_status = "\n".join(f"test_noise_{index} (suite.Case.test_noise_{index}) ... FAIL" for index in range(80))
         output = (
             noisy_status
@@ -5641,9 +5641,7 @@ class AgentTests(unittest.TestCase):
         self.assertLessEqual(len(compact), 700)
 
     def test_agent_run_test_feedback_points_at_syntax_file_not_import_guess(self) -> None:
-        client = FakeClient([])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent()
         output = (
             "ERROR: sample_test (unittest.loader._FailedTest.sample_test)\n"
             "Traceback (most recent call last):\n"
@@ -5695,9 +5693,7 @@ class AgentTests(unittest.TestCase):
             self.assertIn("foldr(lambda acc, el: el + acc", feedback)
 
     def test_agent_failed_omitted_context_write_points_to_partial_edit_tools(self) -> None:
-        client = FakeClient([])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent()
 
         feedback = agent._tool_result_feedback_message(
             "write_file",
@@ -8294,9 +8290,7 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
 
     def test_request_requires_mutation_when_only_tests_are_read_only(self) -> None:
-        client = FakeClient([])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent()
         prompt = (
             "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
             "do not edit tests, replace stubs with complete code, run tests with configured test command."
@@ -8305,15 +8299,22 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(agent._request_requires_mutation(prompt))
 
     def test_request_requires_mutation_for_issue_report_prompt(self) -> None:
-        client = FakeClient([])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent()
         prompt = (
             "Modeling's `separability_matrix` does not compute separability correctly for nested CompoundModels. "
             "See `astropy/astropy/modeling/separable.py`. This feels like a bug to me."
         )
 
         self.assertTrue(agent._request_requires_mutation(prompt))
+
+    def test_request_requires_test_run_when_only_test_edits_are_forbidden(self) -> None:
+        agent = self._cwd_agent()
+        prompt = (
+            "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
+            "do not edit tests, replace stubs with complete code, run tests with configured test command."
+        )
+
+        self.assertTrue(agent._request_requires_test_run(prompt))
 
     def test_agent_rejects_explanatory_final_for_issue_report_prompt_until_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -8528,8 +8529,7 @@ class AgentTests(unittest.TestCase):
 
     def test_agent_compacts_primary_context_without_dropping_current_request(self) -> None:
         client = FakeClient(['{"type":"final","message":"done"}'])
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        agent = self._cwd_agent(client, debate_enabled=False)
         for index in range(30):
             agent.messages.append(
                 {
@@ -8552,8 +8552,7 @@ class AgentTests(unittest.TestCase):
 
     def test_agent_keeps_full_context_for_session_memory_requests(self) -> None:
         client = FakeClient(['{"type":"final","message":"MEMORY_TOKEN_77"}'], script_verification=True)
-        tools = ToolExecutor(Path.cwd(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        agent = self._cwd_agent(client)
         for index in range(20):
             agent.messages.append({"role": "user", "content": f"memory chunk {index} " + ("x" * 1000)})
         agent.messages.append({"role": "user", "content": "Remember MEMORY_TOKEN_77."})
@@ -8816,7 +8815,8 @@ class AgentTests(unittest.TestCase):
         self.assertIn("return n * 2;", final_text)
         self.assertEqual(len(client.calls), 0)
         tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(tool_names, ["search_symbols", "read_symbol", "replace_in_file"])
+        self.assertEqual(tool_names[:3], ["search_symbols", "read_symbol", "replace_in_file"])
+        self.assertEqual(tool_names[3:], ["lint_typecheck", "select_tests", "discover_validators"])
 
 
 def _extract_agent_tests(names: tuple[str, ...]) -> dict[str, object]:
@@ -8864,6 +8864,10 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_runs_before_extra_context_read",
         "test_post_edit_validation_runs_after_non_code_edit_before_final",
         "test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests",
+        "test_post_edit_validation_runs_non_test_validator_when_request_skips_tests",
+        "test_post_edit_validation_runs_code_sanity_when_request_skips_tests",
+        "test_post_edit_validation_respects_explicit_skip_validation_request",
+        "test_synthesized_final_runs_post_edit_validation_for_no_test_request",
         "test_post_edit_validation_feedback_includes_validator_diagnostic",
         "test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request",
         "test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests",

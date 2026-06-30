@@ -2584,63 +2584,96 @@ class OllamaCodeAgent:
             ]
         )
 
-    def _requested_exact_file_line(self, text: str) -> str | None:
-        patterns = [
-            r"exactly the text ['\"]([^'\"]+)['\"] followed by a newline",
-            r"exactly the single line ['\"]([^'\"]+)['\"] followed by a newline",
-            r"exactly the text ([^\n.]+?) followed by a newline",
-            r"exactly the single line ([^\n.]+?) followed by a newline",
-            r"exactly the single line ([A-Za-z0-9_.:/@+-]+) followed by a newline",
-        ]
+    def _clean_match_group(
+        self,
+        match: re.Match[str],
+        group: int | str = 1,
+        *,
+        default: str = "",
+        strip_suffix: str = "",
+    ) -> str:
+        try:
+            raw_value = match.group(group)
+        except IndexError:
+            raw_value = default
+        value = str(raw_value or default).strip()
+        if strip_suffix:
+            value = value.rstrip(strip_suffix)
+        return value
+
+    def _first_request_match(
+        self,
+        text: str,
+        patterns: list[str],
+        *,
+        group: int | str = 1,
+        flags: int = re.IGNORECASE,
+        strip_suffix: str = "",
+    ) -> str | None:
         for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                value = match.group(1).strip()
-                if value:
-                    return value
+            match = re.search(pattern, text, flags=flags)
+            if not match:
+                continue
+            value = self._clean_match_group(match, group, strip_suffix=strip_suffix)
+            if value:
+                return value
         return None
+
+    def _first_search_output_label(self, output: str) -> str | None:
+        for line in output.splitlines():
+            match = re.match(r"(?P<path>.+):\d+:", line)
+            if not match:
+                continue
+            raw_path = self._clean_match_group(match, "path")
+            try:
+                path = Path(raw_path)
+                return self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
+            except (OSError, ValueError):
+                return raw_path.replace("\\", "/")
+        return None
+
+    def _requested_exact_file_line(self, text: str) -> str | None:
+        return self._first_request_match(
+            text,
+            [
+                r"exactly the text ['\"]([^'\"]+)['\"] followed by a newline",
+                r"exactly the single line ['\"]([^'\"]+)['\"] followed by a newline",
+                r"exactly the text ([^\n.]+?) followed by a newline",
+                r"exactly the single line ([^\n.]+?) followed by a newline",
+                r"exactly the single line ([A-Za-z0-9_.:/@+-]+) followed by a newline",
+            ],
+        )
 
     def _requested_exact_single_line_file_write(self, text: str) -> ExactFileWriteSpec | None:
         line = self._requested_exact_file_line(text)
         if line is None:
             return None
-        patterns = [
-            r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the single line\b",
-            r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the text\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                path = match.group("path").strip()
-                if path:
-                    return ExactFileWriteSpec(path=path, line=line)
-        return None
+        path = self._first_request_match(
+            text,
+            [
+                r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the single line\b",
+                r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the text\b",
+            ],
+            group="path",
+        )
+        return ExactFileWriteSpec(path=path, line=line) if path else None
 
     def _requested_loose_file_create_path(self, text: str) -> str | None:
-        patterns = [
-            r"\b(?:create|write)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            path = match.group("path").strip().rstrip(".,;:")
-            if path:
-                return path
-        return None
+        return self._first_request_match(
+            text,
+            [r"\b(?:create|write)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\b"],
+            group="path",
+            strip_suffix=".,;:",
+        )
 
     def _requested_exact_reply_text(self, text: str) -> str | None:
-        patterns = [
-            r"\b(?:reply|respond)\s+with\s+['\"]([^'\"]+)['\"]\s+only\b",
-            r"\b(?:reply|respond)\s+with\s+(?:exactly\s+)?([A-Z0-9_.:/@+-]+)\s+only\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                value = match.group(1).strip()
-                if value:
-                    return value
-        return None
+        return self._first_request_match(
+            text,
+            [
+                r"\b(?:reply|respond)\s+with\s+['\"]([^'\"]+)['\"]\s+only\b",
+                r"\b(?:reply|respond)\s+with\s+(?:exactly\s+)?([A-Z0-9_.:/@+-]+)\s+only\b",
+            ],
+        )
 
     def _latest_read_confirms_exact_line(
         self,
@@ -3028,6 +3061,8 @@ class OllamaCodeAgent:
 
     def _request_requires_test_run(self, text: str) -> bool:
         lowered = text.lower()
+        if self._request_forbids_tests(lowered):
+            return False
         patterns = [
             r"\brun (?:the )?tests?\b",
             r"\brerun (?:the )?tests?\b",
@@ -3444,31 +3479,26 @@ class OllamaCodeAgent:
         return None
 
     def _requested_read_file_path(self, text: str) -> str | None:
-        patterns = [
-            r"\bread_file\s+on\s+(?P<path>[\w./\\:-]+)",
-            r"\bread_file\s+(?P<path>[\w./\\:-]+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                path = match.group("path").strip().rstrip(".,;:")
-                if path:
-                    return path
-        return None
+        return self._first_request_match(
+            text,
+            [
+                r"\bread_file\s+on\s+(?P<path>[\w./\\:-]+)",
+                r"\bread_file\s+(?P<path>[\w./\\:-]+)",
+            ],
+            group="path",
+            strip_suffix=".,;:",
+        )
 
     def _requested_natural_read_file_path(self, text: str) -> str | None:
-        patterns = [
-            r"\bwhat does\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:say|contain)\b",
-            r"\btell me what\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:says|contains)\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            path = match.group("path").strip().rstrip(".,;:")
-            if path:
-                return path
-        return None
+        return self._first_request_match(
+            text,
+            [
+                r"\bwhat does\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:say|contain)\b",
+                r"\btell me what\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:says|contains)\b",
+            ],
+            group="path",
+            strip_suffix=".,;:",
+        )
 
     def _requested_mutation_paths(self, text: str) -> set[str]:
         if not self._request_requires_mutation(text):
@@ -3481,35 +3511,33 @@ class OllamaCodeAgent:
         return paths
 
     def _requested_git_tool_path(self, text: str) -> str | None:
-        patterns = [
-            r"\bgit_status\s+on\s+(?P<path>[\w./\\:-]+)",
-            r"\bgit_diff\s+on\s+(?P<path>[\w./\\:-]+)",
-            r"\bgit\s+diff\s+(?P<path>[\w./\\:-]+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                path = match.group("path").strip().rstrip(".,;:")
-                if path:
-                    return path
-        return None
+        return self._first_request_match(
+            text,
+            [
+                r"\bgit_status\s+on\s+(?P<path>[\w./\\:-]+)",
+                r"\bgit_diff\s+on\s+(?P<path>[\w./\\:-]+)",
+                r"\bgit\s+diff\s+(?P<path>[\w./\\:-]+)",
+            ],
+            group="path",
+            strip_suffix=".,;:",
+        )
 
     def _requested_list_files_path(self, text: str) -> str | None:
         lowered = text.lower().strip()
         if lowered in {"ls", "dir", "list files", "list the files", "show files", "show the files", "list_files", "use list_files"}:
             return "."
-        patterns = [
-            r"\b(?:list|show)\s+(?:the\s+)?files\s+(?:in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
-            r"\b(?:use\s+)?list_files\s+(?:on|in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
-            r"\b(?:ls|dir)\s+(?P<path>[\w./\\:-]+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if not match:
-                continue
-            path = match.group("path").strip().rstrip(".,;:")
-            if path:
-                return "." if path.lower() in {"the", "workspace", "repo", "repository", "project", "directory", "folder"} else path
+        path = self._first_request_match(
+            text,
+            [
+                r"\b(?:list|show)\s+(?:the\s+)?files\s+(?:in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
+                r"\b(?:use\s+)?list_files\s+(?:on|in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
+                r"\b(?:ls|dir)\s+(?P<path>[\w./\\:-]+)",
+            ],
+            group="path",
+            strip_suffix=".,;:",
+        )
+        if path:
+            return "." if path.lower() in {"the", "workspace", "repo", "repository", "project", "directory", "folder"} else path
         if re.search(r"\b(?:list|show)\s+(?:the\s+)?files\b|\blist_files\b", lowered):
             return "."
         return None
@@ -3566,7 +3594,7 @@ class OllamaCodeAgent:
                 continue
             query = match.group("query").strip().strip("`'\" ")
             query = re.sub(r"\s+in\s+(?:the\s+)?(?:repo|repository|workspace|project)\s*$", "", query, flags=re.IGNORECASE)
-            path = (match.groupdict().get("path") or ".").strip().rstrip(".,;:")
+            path = self._clean_match_group(match, "path", default=".", strip_suffix=".,;:")
             if query and len(query) <= 160:
                 return {"query": query, "path": path or ".", "limit": 20}
         return None
@@ -3654,33 +3682,32 @@ class OllamaCodeAgent:
 
     def _requested_code_outline_path(self, text: str) -> str | None:
         path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
-        patterns = [
-            rf"\bcode_outline\b\s+(?:on|for|in)?\s*(?P<path>{path_pattern})",
-            rf"\buse\s+code_outline\s+(?:on|for|in)\s+(?P<path>{path_pattern})",
-            rf"\boutline\s+(?:the\s+)?code\s+(?:in|for)\s+(?P<path>{path_pattern})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE)
-            if match:
-                return match.group("path").strip().rstrip(".,;:")
-        return None
+        return self._first_request_match(
+            text,
+            [
+                rf"\bcode_outline\b\s+(?:on|for|in)?\s*(?P<path>{path_pattern})",
+                rf"\buse\s+code_outline\s+(?:on|for|in)\s+(?P<path>{path_pattern})",
+                rf"\boutline\s+(?:the\s+)?code\s+(?:in|for)\s+(?P<path>{path_pattern})",
+            ],
+            group="path",
+            strip_suffix=".,;:",
+        )
 
     def _requested_find_implementation_target_spec(self, text: str) -> dict[str, Any] | None:
         path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
-        patterns = [
-            rf"\bfind_implementation_target\b.*?\b(?:for|on|path|test_path)\s+(?P<path>{path_pattern})",
-            rf"\b(?:identify|find|show)\s+(?:the\s+)?(?:relevant\s+|likely\s+)?implementation\s+(?:target|file|path)(?:s)?\s+(?:for|from)\s+(?P<path>{path_pattern})",
-            rf"\bwhich\s+implementation\s+(?:file|path)\s+(?:corresponds\s+to|matches|goes\s+with|for)\s+(?P<path>{path_pattern})",
-            rf"\bwhat\s+is\s+the\s+(?:relevant\s+|likely\s+)?implementation\s+(?:file|path)\s+for\s+(?P<path>{path_pattern})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            if not match:
-                continue
-            path = match.group("path").strip().rstrip(".,;:")
-            if path:
-                return {"test_path": path}
-        return None
+        path = self._first_request_match(
+            text,
+            [
+                rf"\bfind_implementation_target\b.*?\b(?:for|on|path|test_path)\s+(?P<path>{path_pattern})",
+                rf"\b(?:identify|find|show)\s+(?:the\s+)?(?:relevant\s+|likely\s+)?implementation\s+(?:target|file|path)(?:s)?\s+(?:for|from)\s+(?P<path>{path_pattern})",
+                rf"\bwhich\s+implementation\s+(?:file|path)\s+(?:corresponds\s+to|matches|goes\s+with|for)\s+(?P<path>{path_pattern})",
+                rf"\bwhat\s+is\s+the\s+(?:relevant\s+|likely\s+)?implementation\s+(?:file|path)\s+for\s+(?P<path>{path_pattern})",
+            ],
+            group="path",
+            flags=re.IGNORECASE | re.DOTALL,
+            strip_suffix=".,;:",
+        )
+        return {"test_path": path} if path else None
 
     def _requested_search_symbols_spec(self, text: str) -> dict[str, Any] | None:
         symbol_pattern = r"[A-Za-z_][\w.]*"
@@ -3694,8 +3721,8 @@ class OllamaCodeAgent:
             match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
             if not match:
                 continue
-            symbol = match.group("symbol").strip().rstrip(".,;:")
-            path = match.group("path").strip().rstrip(".,;:")
+            symbol = self._clean_match_group(match, "symbol", strip_suffix=".,;:")
+            path = self._clean_match_group(match, "path", strip_suffix=".,;:")
             if symbol and path:
                 return {"query": symbol, "path": path}
         return None
@@ -3706,7 +3733,7 @@ class OllamaCodeAgent:
             match = re.search(r"\bread\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", text, flags=re.IGNORECASE | re.DOTALL)
         if not match:
             return None
-        path = match.group("path").strip().rstrip(".,;:")
+        path = self._clean_match_group(match, "path", strip_suffix=".,;:")
         try:
             line = int(match.group("line"))
         except ValueError:
@@ -3766,7 +3793,7 @@ class OllamaCodeAgent:
                     for match in re.finditer(pattern, text, flags=re.IGNORECASE | re.DOTALL):
                         query = match.group("query").strip().strip("`'\" ")
                         query = re.sub(r"\s+in\s+(?:the\s+)?(?:repo|repository|workspace|project)\s*$", "", query, flags=re.IGNORECASE)
-                        path = (match.groupdict().get("path") or ".").strip().rstrip(".,;:")
+                        path = self._clean_match_group(match, "path", default=".", strip_suffix=".,;:")
                         if query and len(query) <= 160:
                             register(match.start(), match.end(), MechanicalToolSpec("search", {"query": query, "path": path or ".", "limit": 20}))
 
@@ -3778,7 +3805,7 @@ class OllamaCodeAgent:
             ]
             for pattern in list_patterns:
                 for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                    raw_path = (match.groupdict().get("path") or ".").strip().rstrip(".,;:")
+                    raw_path = self._clean_match_group(match, "path", default=".", strip_suffix=".,;:")
                     path = "." if raw_path.lower() in {"", "the", "workspace", "repo", "repository", "project", "directory", "folder"} else raw_path
                     register(match.start(), match.end(), MechanicalToolSpec("list_files", {"path": path}))
 
@@ -3834,7 +3861,7 @@ class OllamaCodeAgent:
             ]
             for pattern in git_status_patterns:
                 for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                    raw_path = (match.groupdict().get("path") or "").strip().rstrip(".,;:")
+                    raw_path = self._clean_match_group(match, "path", strip_suffix=".,;:")
                     arguments = {"path": raw_path} if raw_path else {}
                     register(match.start(), match.end(), MechanicalToolSpec("git_status", arguments))
 
@@ -3847,7 +3874,7 @@ class OllamaCodeAgent:
             ]
             for pattern in git_diff_patterns:
                 for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                    raw_path = (match.groupdict().get("path") or "").strip().rstrip(".,;:")
+                    raw_path = self._clean_match_group(match, "path", strip_suffix=".,;:")
                     arguments: dict[str, Any] = {"path": raw_path} if raw_path else {}
                     mode = self._requested_git_diff_mode(match.group(0))
                     if mode == "staged":
@@ -3885,8 +3912,8 @@ class OllamaCodeAgent:
             match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
             if not match:
                 continue
-            path = match.group("path").strip().rstrip(".,;:")
-            symbol = match.group("symbol").strip().rstrip(".,;:")
+            path = self._clean_match_group(match, "path", strip_suffix=".,;:")
+            symbol = self._clean_match_group(match, "symbol", strip_suffix=".,;:")
             if path and symbol:
                 return SymbolReadSpec(path=path, symbol=symbol)
         return None
@@ -6217,9 +6244,34 @@ class OllamaCodeAgent:
             rounds=round_number,
         )
 
+    def _request_forbids_tests(self, text: str) -> bool:
+        lowered = text.lower()
+        explicit_skip_patterns = [
+            r"\b(?:do not|don't|dont|skip)\s+(?:run|rerun|execute)(?:\s+the)?\s+(?:tests?|test suite)\b",
+            r"\b(?:do not|don't|dont|skip)\s+(?:use\s+)?(?:pytest|unittest)\b",
+            r"\bwithout\s+(?:running\s+)?(?:tests?|test suite)\b",
+            r"\bwithout\s+(?:using\s+)?(?:pytest|unittest)\b",
+            r"\bno tests?(?:\s+(?:needed|required|necessary))?\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in explicit_skip_patterns)
+
     def _request_forbids_validation(self, text: str) -> bool:
         lowered = text.lower()
-        return bool(re.search(r"\b(?:do not|don't|dont|skip|without|no)\b[^.?!\n]{0,80}\b(?:test|tests|pytest|unittest|validation|validate)\b", lowered))
+        return bool(
+            re.search(
+                r"\b(?:do not|don't|dont|skip|without|no)\b[^.?!\n]{0,80}\b(?:validation|validate|validator|validators|lint|linter|typecheck|type\s+check|sanity\s+check)\b",
+                lowered,
+            )
+        )
+
+    def _validation_preferences(self, text: str) -> tuple[bool, bool]:
+        forbid_validation = self._request_forbids_validation(text)
+        forbid_tests = forbid_validation or self._request_forbids_tests(text)
+        return not forbid_tests, not forbid_validation
+
+    def _request_allows_any_validation(self, text: str) -> bool:
+        allow_tests, allow_non_test_validation = self._validation_preferences(text)
+        return allow_tests or allow_non_test_validation
 
     def _post_edit_validation_enabled(self) -> bool:
         return True
@@ -6229,18 +6281,20 @@ class OllamaCodeAgent:
         *,
         mutated_paths: set[str],
         forbidden_tool_names: set[str],
+        allow_tests: bool,
+        allow_non_test_validation: bool,
     ) -> tuple[str, dict[str, Any], str] | None:
         code_paths = sorted(path for path in mutated_paths if Path(path).suffix.lower() in CODE_EDIT_SUFFIXES)
         python_paths = sorted(path for path in code_paths if path.endswith(".py"))
-        if code_paths and "lint_typecheck" not in forbidden_tool_names:
+        if code_paths and allow_non_test_validation and "lint_typecheck" not in forbidden_tool_names:
             return "lint_typecheck", {"paths": code_paths}, "syntax check changed code file(s)"
-        if python_paths and "contract_check" not in forbidden_tool_names:
+        if python_paths and allow_non_test_validation and "contract_check" not in forbidden_tool_names:
             return "contract_check", {"changed_files": python_paths}, "contract check changed Python function(s)"
-        if code_paths and "select_tests" not in forbidden_tool_names:
+        if code_paths and allow_tests and "select_tests" not in forbidden_tool_names:
             return "select_tests", {"changed_files": code_paths}, "select targeted tests for changed file(s)"
-        if mutated_paths and "discover_validators" not in forbidden_tool_names:
+        if mutated_paths and allow_non_test_validation and "discover_validators" not in forbidden_tool_names:
             return "discover_validators", {"path": "."}, "discover validators for non-code edit"
-        if self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+        if allow_tests and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
 
@@ -6249,16 +6303,19 @@ class OllamaCodeAgent:
         validation_result: dict[str, Any],
         *,
         forbidden_tool_names: set[str],
+        allow_tests: bool,
         allow_non_test_validators: bool,
         run_non_test_validators_as_commands: bool = False,
     ) -> tuple[str, dict[str, Any], str] | None:
         configured = str(self.tools.default_test_command or "").strip()
-        if configured and "run_test" not in forbidden_tool_names:
+        if allow_tests and configured and "run_test" not in forbidden_tool_names:
             return "run_test", {"command": configured}, "test command selected after validator discovery"
         validators = validation_result.get("validators")
         if not isinstance(validators, list):
             return None
-        priority_order = [("test", "run_test", "test command selected after validator discovery")]
+        priority_order: list[tuple[str, str, str]] = []
+        if allow_tests:
+            priority_order.append(("test", "run_test", "test command selected after validator discovery"))
         if allow_non_test_validators:
             non_test_tool_name = "run_test" if run_non_test_validators_as_commands else "lint_typecheck"
             non_test_reason_suffix = "validator command selected after validator discovery" if run_non_test_validators_as_commands else "validator selected after validator discovery"
@@ -6298,29 +6355,46 @@ class OllamaCodeAgent:
         mutation_version: int,
         reason_prefix: str = "",
     ) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+        allow_tests, allow_non_test_validation = self._validation_preferences(request_text)
+        if not allow_tests and not allow_non_test_validation:
+            return None, None, None
         validation_plan = self._auto_validation_plan(
             mutated_paths=mutated_paths,
             forbidden_tool_names=forbidden_tool_names,
+            allow_tests=allow_tests,
+            allow_non_test_validation=allow_non_test_validation,
         )
         if validation_plan is None:
             return None, None, None
+
+        def apply_validation_step(name: str, arguments: dict[str, Any], reason: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+            self._record_event(
+                "auto_validation",
+                name=name,
+                arguments=arguments,
+                reason=f"{reason_prefix}{reason}",
+                mutation_version=mutation_version,
+                rounds=round_number,
+            )
+            return (
+                name,
+                arguments,
+                self._execute_controller_tool(
+                    name=name,
+                    arguments=arguments,
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                ),
+            )
+
         validation_name, validation_arguments, validation_reason = validation_plan
-        self._record_event(
-            "auto_validation",
-            name=validation_name,
-            arguments=validation_arguments,
-            reason=f"{reason_prefix}{validation_reason}",
-            mutation_version=mutation_version,
-            rounds=round_number,
-        )
-        validation_result = self._execute_controller_tool(
-            name=validation_name,
-            arguments=validation_arguments,
-            request_text=request_text,
-            round_number=round_number,
-            successful_tool_results=successful_tool_results,
-            satisfied_tool_names=satisfied_tool_names,
-            tool_calls_this_turn=tool_calls_this_turn,
+        validation_name, validation_arguments, validation_result = apply_validation_step(
+            validation_name,
+            validation_arguments,
+            validation_reason,
         )
         validation_promoted_from_discovery = False
         validator_executed_before_select = False
@@ -6329,73 +6403,32 @@ class OllamaCodeAgent:
             commands = validation_result.get("test_commands")
             if isinstance(commands, list) and commands and "run_test" not in forbidden_tool_names:
                 targeted_command = str(commands[0]).strip()
-                self._record_event(
-                    "auto_validation",
-                    name="run_test",
-                    arguments={"command": targeted_command},
-                    reason=f"{reason_prefix}targeted test selected from changed files",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    "run_test",
+                    {"command": targeted_command},
+                    "targeted test selected from changed files",
                 )
-                validation_name = "run_test"
-                validation_arguments = {"command": targeted_command}
-                validation_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-            elif self.tools.default_test_command and "run_test" not in forbidden_tool_names:
-                self._record_event(
-                    "auto_validation",
-                    name="run_test",
-                    arguments={"command": self.tools.default_test_command},
-                    reason=f"{reason_prefix}fallback to configured test command after empty targeted selection",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
-                )
-                validation_name = "run_test"
-                validation_arguments = {"command": self.tools.default_test_command}
-                validation_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
+            elif allow_tests and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    "run_test",
+                    {"command": self.tools.default_test_command},
+                    "fallback to configured test command after empty targeted selection",
                 )
         if validation_name == "discover_validators" and validation_result.get("ok") is True:
             discovered_followup = self._discover_validators_followup(
                 validation_result,
                 forbidden_tool_names=forbidden_tool_names,
+                allow_tests=allow_tests,
                 allow_non_test_validators=bool(mutated_paths),
                 run_non_test_validators_as_commands=not bool(code_validation_paths),
             )
             if discovered_followup is not None:
                 followup_name, followup_arguments, followup_reason = discovered_followup
-                self._record_event(
-                    "auto_validation",
-                    name=followup_name,
-                    arguments=followup_arguments,
-                    reason=f"{reason_prefix}{followup_reason}",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
-                )
                 validation_promoted_from_discovery = True
-                validation_name = followup_name
-                validation_arguments = followup_arguments
-                validation_result = self._execute_controller_tool(
-                    name=followup_name,
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    followup_name,
+                    followup_arguments,
+                    followup_reason,
                 )
         if (
             not validation_promoted_from_discovery
@@ -6406,121 +6439,53 @@ class OllamaCodeAgent:
         ):
             contract_args = {"changed_files": sorted(path for path in mutated_paths if path.endswith(".py"))}
             if contract_args["changed_files"]:
-                self._record_event(
-                    "auto_validation",
-                    name="contract_check",
-                    arguments=contract_args,
-                    reason=f"{reason_prefix}contract check changed Python functions",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
-                )
-                validation_name = "contract_check"
-                validation_arguments = contract_args
-                validation_result = self._execute_controller_tool(
-                    name="contract_check",
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    "contract_check",
+                    contract_args,
+                    "contract check changed Python functions",
                 )
         if (
             not validation_promoted_from_discovery
             and validation_result.get("ok") is True
             and validation_name in {"lint_typecheck", "contract_check"}
+            and allow_tests
             and "select_tests" not in forbidden_tool_names
             and "run_test" not in forbidden_tool_names
             and code_validation_paths
         ):
             select_args = {"changed_files": code_validation_paths}
             validator_executed_before_select = validation_name in {"lint_typecheck", "contract_check"}
-            self._record_event(
-                "auto_validation",
-                name="select_tests",
-                arguments=select_args,
-                reason=f"{reason_prefix}select targeted tests after syntax check",
-                mutation_version=mutation_version,
-                rounds=round_number,
+            validation_name, validation_arguments, select_result = apply_validation_step(
+                "select_tests",
+                select_args,
+                "select targeted tests after syntax check",
             )
-            select_result = self._execute_controller_tool(
-                name="select_tests",
-                arguments=select_args,
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            validation_name = "select_tests"
-            validation_arguments = select_args
             validation_result = select_result
             commands = select_result.get("test_commands") if select_result.get("ok") is True else None
             if isinstance(commands, list) and commands:
                 targeted_command = str(commands[0]).strip()
-                self._record_event(
-                    "auto_validation",
-                    name="run_test",
-                    arguments={"command": targeted_command},
-                    reason=f"{reason_prefix}targeted test selected from changed files",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    "run_test",
+                    {"command": targeted_command},
+                    "targeted test selected from changed files",
                 )
-                validation_name = "run_test"
-                validation_arguments = {"command": targeted_command}
-                validation_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
+            elif allow_tests and self.tools.default_test_command:
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    "run_test",
+                    {"command": self.tools.default_test_command},
+                    "fallback to configured test command after empty targeted selection",
                 )
-            elif self.tools.default_test_command:
-                self._record_event(
-                    "auto_validation",
-                    name="run_test",
-                    arguments={"command": self.tools.default_test_command},
-                    reason=f"{reason_prefix}fallback to configured test command after empty targeted selection",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
-                )
-                validation_name = "run_test"
-                validation_arguments = {"command": self.tools.default_test_command}
-                validation_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-            elif "discover_validators" not in forbidden_tool_names:
-                self._record_event(
-                    "auto_validation",
-                    name="discover_validators",
-                    arguments={"path": "."},
-                    reason=f"{reason_prefix}discover validators after empty targeted test selection",
-                    mutation_version=mutation_version,
-                    rounds=round_number,
-                )
-                validation_name = "discover_validators"
-                validation_arguments = {"path": "."}
-                validation_result = self._execute_controller_tool(
-                    name="discover_validators",
-                    arguments=validation_arguments,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
+            elif allow_non_test_validation and "discover_validators" not in forbidden_tool_names:
+                validation_name, validation_arguments, validation_result = apply_validation_step(
+                    "discover_validators",
+                    {"path": "."},
+                    "discover validators after empty targeted test selection",
                 )
                 if validation_result.get("ok") is True:
                     discovered_followup = self._discover_validators_followup(
                         validation_result,
                         forbidden_tool_names=forbidden_tool_names,
+                        allow_tests=allow_tests,
                         allow_non_test_validators=True,
                         run_non_test_validators_as_commands=False,
                     )
@@ -6528,25 +6493,11 @@ class OllamaCodeAgent:
                         followup_name, followup_arguments, followup_reason = discovered_followup
                         if followup_name == "lint_typecheck" and validator_executed_before_select:
                             return validation_name, validation_arguments, validation_result
-                        self._record_event(
-                            "auto_validation",
-                            name=followup_name,
-                            arguments=followup_arguments,
-                            reason=f"{reason_prefix}{followup_reason}",
-                            mutation_version=mutation_version,
-                            rounds=round_number,
-                        )
                         validation_promoted_from_discovery = True
-                        validation_name = followup_name
-                        validation_arguments = followup_arguments
-                        validation_result = self._execute_controller_tool(
-                            name=followup_name,
-                            arguments=validation_arguments,
-                            request_text=request_text,
-                            round_number=round_number,
-                            successful_tool_results=successful_tool_results,
-                            satisfied_tool_names=satisfied_tool_names,
-                            tool_calls_this_turn=tool_calls_this_turn,
+                        validation_name, validation_arguments, validation_result = apply_validation_step(
+                            followup_name,
+                            followup_arguments,
+                            followup_reason,
                         )
         return validation_name, validation_arguments, validation_result
 
@@ -6568,7 +6519,7 @@ class OllamaCodeAgent:
             return False
         if not mutation_verified_this_turn or last_successful_validation_version == mutation_version:
             return False
-        if self._request_forbids_validation(request_text):
+        if not self._request_allows_any_validation(request_text):
             return False
         if candidate_tool_name in MUTATING_TOOL_NAMES or candidate_tool_name in VALIDATION_TOOL_NAMES:
             return False
@@ -6755,31 +6706,9 @@ class OllamaCodeAgent:
 
         if name == "search" and result.get("ok") is True:
             lowered = request_text.lower()
-            if self._request_requires_test_run(request_text):
-                output = str(result.get("output", ""))
-                for line in output.splitlines():
-                    match = re.match(r"(?P<path>.+):\d+:", line)
-                    if not match:
-                        continue
-                    raw_path = match.group("path").strip()
-                    try:
-                        path = Path(raw_path)
-                        label = self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
-                    except (OSError, ValueError):
-                        label = raw_path.replace("\\", "/")
-                    return f"{label} contains the match."
-            if "which file" in lowered or "file contains" in lowered or "files contain" in lowered:
-                output = str(result.get("output", ""))
-                for line in output.splitlines():
-                    match = re.match(r"(?P<path>.+):\d+:", line)
-                    if not match:
-                        continue
-                    raw_path = match.group("path").strip()
-                    try:
-                        path = Path(raw_path)
-                        label = self.tools.relative_label(path) if path.is_absolute() else raw_path.replace("\\", "/")
-                    except (OSError, ValueError):
-                        label = raw_path.replace("\\", "/")
+            if self._request_requires_test_run(request_text) or "which file" in lowered or "file contains" in lowered or "files contain" in lowered:
+                label = self._first_search_output_label(str(result.get("output", "")))
+                if label:
                     return f"{label} contains the match."
             output = str(result.get("output") or result.get("summary") or "").strip()
             if output and mechanical_tool_name == name:
@@ -6865,6 +6794,71 @@ class OllamaCodeAgent:
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
 
+    def _mutated_paths_from_successful_results(self, successful_tool_results: list[dict[str, Any]]) -> set[str]:
+        mutated_paths: set[str] = set()
+        for item in successful_tool_results:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name not in MUTATING_TOOL_NAMES:
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            path = str(result.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if path:
+                mutated_paths.add(path)
+        return mutated_paths
+
+    def _validated_synthesized_final(
+        self,
+        *,
+        request_text: str,
+        message: str,
+        tool: str,
+        round_number: int,
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        if self._request_requires_test_run(request_text) or "tests passed" in message.lower():
+            return self._record_synthesized_final(message, tool=tool, round_number=round_number)
+        mutated_paths = self._mutated_paths_from_successful_results(successful_tool_results)
+        if mutated_paths and self._post_edit_validation_enabled() and self._request_allows_any_validation(request_text):
+            validation_name, _validation_arguments, validation_result = self._execute_auto_validation_plan(
+                request_text=request_text,
+                round_number=round_number,
+                mutated_paths=mutated_paths,
+                forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+                mutation_version=1,
+                reason_prefix="synthesized ",
+            )
+            if validation_name is None or validation_result is None:
+                if not any(Path(path).suffix.lower() in CODE_EDIT_SUFFIXES for path in mutated_paths):
+                    return self._record_synthesized_final(message, tool=tool, round_number=round_number)
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": "Validation was required after synthesized edits but no validator is configured. Choose an available validator or report the limitation exactly. Next JSON only.",
+                    }
+                )
+                return None
+            if validation_result.get("ok") is not True:
+                validation_summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
+                validation_feedback = "Post-edit validation failed before more tool use."
+                if validation_summary:
+                    validation_feedback += " " + self._truncate_text(validation_summary, limit=520)
+                validation_feedback += " Fix the reported issue now instead of gathering more context. Next JSON only."
+                self.messages.append({"role": "user", "content": validation_feedback})
+                return None
+            if validation_name == "run_test" and "tests passed" not in message.lower():
+                message = message.rstrip(".") + "; tests passed."
+        return self._record_synthesized_final(message, tool=tool, round_number=round_number)
+
     def _assistant_payload_content(self, payload: dict[str, Any]) -> str:
         if payload.get("type") != "tool":
             return json.dumps(payload, ensure_ascii=True)
@@ -6932,6 +6926,74 @@ class OllamaCodeAgent:
         self._autosave()
         return result
 
+    def _execute_tool_operations(
+        self,
+        *,
+        operations: list[tuple[str, dict[str, Any]]],
+        request_text: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> tuple[int, dict[str, Any] | None]:
+        last_result: dict[str, Any] | None = None
+        for tool_name, arguments in operations:
+            round_number += 1
+            last_result = self._execute_controller_tool(
+                name=tool_name,
+                arguments=arguments,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if last_result.get("ok") is not True:
+                return round_number, None
+        return round_number, last_result
+
+    def _finalize_mutation_result(
+        self,
+        *,
+        request_text: str,
+        message: str,
+        tool: str,
+        round_number: int,
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+        tests_passed_message: str | None = None,
+    ) -> AgentResult | None:
+        if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
+            round_number += 1
+            test_result = self._execute_controller_tool(
+                name="run_test",
+                arguments={"command": self.tools.default_test_command},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if test_result.get("ok") is not True:
+                return None
+            return self._record_synthesized_final(
+                tests_passed_message or (message.rstrip(".") + "; tests passed."),
+                tool="run_test",
+                round_number=round_number,
+            )
+        return self._validated_synthesized_final(
+            request_text=request_text,
+            message=message,
+            tool=tool,
+            round_number=round_number,
+            forbidden_tool_names=forbidden_tool_names,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+
     def _try_handle_simple_source_rewrite(
         self,
         *,
@@ -6950,25 +7012,26 @@ class OllamaCodeAgent:
         if symbol_return_ops:
             if any(tool_name in forbidden_tool_names for tool_name, _ in symbol_return_ops):
                 return None
-            last_result: dict[str, Any] | None = None
-            for tool_name, args in symbol_return_ops:
-                round_number += 1
-                last_result = self._execute_controller_tool(
-                    name=tool_name,
-                    arguments=args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                if last_result.get("ok") is not True:
-                    return None
+            round_number, last_result = self._execute_tool_operations(
+                operations=symbol_return_ops,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if last_result is None:
+                return None
             edited_paths = sorted({str(args.get("path", "")) for _, args in symbol_return_ops if args.get("path")})
-            return self._record_synthesized_final(
-                f"Updated {', '.join(edited_paths)}.",
+            return self._validated_synthesized_final(
+                request_text=request_text,
+                message=f"Updated {', '.join(edited_paths)}.",
                 tool=str(last_result.get("tool") if last_result else "replace_in_file"),
                 round_number=round_number,
+                forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
             )
         test_grounded_return_rewrite = self._test_grounded_symbol_return_rewrite_spec(request_text)
         if test_grounded_return_rewrite and "find_implementation_target" not in forbidden_tool_names:
@@ -7004,38 +7067,26 @@ class OllamaCodeAgent:
                 return None
             if any(tool_name in forbidden_tool_names for tool_name, _ in symbol_return_ops):
                 return None
-            last_result: dict[str, Any] | None = find_result
-            for tool_name, args in symbol_return_ops:
-                round_number += 1
-                last_result = self._execute_controller_tool(
-                    name=tool_name,
-                    arguments=args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                if last_result.get("ok") is not True:
-                    return None
-            if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
-                round_number += 1
-                test_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments={"command": self.tools.default_test_command},
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                if test_result.get("ok") is not True:
-                    return None
-                return self._record_synthesized_final(f"Updated {source_paths[0]}; tests passed.", tool="run_test", round_number=round_number)
-            return self._record_synthesized_final(
-                f"Updated {source_paths[0]}.",
+            round_number, last_result = self._execute_tool_operations(
+                operations=symbol_return_ops,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if last_result is None:
+                return None
+            return self._finalize_mutation_result(
+                request_text=request_text,
+                message=f"Updated {source_paths[0]}.",
                 tool=str(last_result.get("tool") if last_result else "replace_in_file"),
                 round_number=round_number,
+                forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+                tests_passed_message=f"Updated {source_paths[0]}; tests passed.",
             )
         optional_parameter_ops = self._optional_parameter_update_operations(request_text)
         if optional_parameter_ops and "edit_intent" not in forbidden_tool_names:
@@ -7050,30 +7101,36 @@ class OllamaCodeAgent:
             ]
             if not pending_optional_parameter_ops:
                 edited_paths = sorted({str(args.get("path", "")) for _, args in optional_parameter_ops if args.get("path")})
-                return self._record_synthesized_final(
-                    f"Updated {', '.join(edited_paths)}.",
+                return self._finalize_mutation_result(
+                    request_text=request_text,
+                    message=f"Updated {', '.join(edited_paths)}.",
                     tool="edit_intent",
                     round_number=round_number,
-                )
-            last_result: dict[str, Any] | None = None
-            for tool_name, args in pending_optional_parameter_ops:
-                round_number += 1
-                last_result = self._execute_controller_tool(
-                    name=tool_name,
-                    arguments=args,
-                    request_text=request_text,
-                    round_number=round_number,
+                    forbidden_tool_names=forbidden_tool_names,
                     successful_tool_results=successful_tool_results,
                     satisfied_tool_names=satisfied_tool_names,
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
-                if last_result.get("ok") is not True:
-                    return None
+            round_number, last_result = self._execute_tool_operations(
+                operations=pending_optional_parameter_ops,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if last_result is None:
+                return None
             edited_paths = sorted({str(args.get("path", "")) for _, args in optional_parameter_ops if args.get("path")})
-            return self._record_synthesized_final(
-                f"Updated {', '.join(edited_paths)}.",
+            return self._finalize_mutation_result(
+                request_text=request_text,
+                message=f"Updated {', '.join(edited_paths)}.",
                 tool=str(last_result.get("tool") if last_result else "edit_intent"),
                 round_number=round_number,
+                forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
             )
         rename_ops = self._project_function_rename_operations(request_text)
         if rename_ops and "edit_intent" not in forbidden_tool_names:
@@ -7083,34 +7140,27 @@ class OllamaCodeAgent:
                 successful_tool_results=successful_tool_results,
             )
             if not rename_already_satisfied:
-                for tool_name, args in rename_ops:
-                    round_number += 1
-                    last_result = self._execute_controller_tool(
-                        name=tool_name,
-                        arguments=args,
-                        request_text=request_text,
-                        round_number=round_number,
-                        successful_tool_results=successful_tool_results,
-                        satisfied_tool_names=satisfied_tool_names,
-                        tool_calls_this_turn=tool_calls_this_turn,
-                    )
-                    if last_result.get("ok") is not True:
-                        return None
-            if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
-                round_number += 1
-                test_result = self._execute_controller_tool(
-                    name="run_test",
-                    arguments={"command": self.tools.default_test_command},
+                round_number, last_result = self._execute_tool_operations(
+                    operations=rename_ops,
                     request_text=request_text,
                     round_number=round_number,
                     successful_tool_results=successful_tool_results,
                     satisfied_tool_names=satisfied_tool_names,
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
-                if test_result.get("ok") is not True:
+                if last_result is None:
                     return None
-                return self._record_synthesized_final("Renamed symbol project-wide; tests passed.", tool="run_test", round_number=round_number)
-            return self._record_synthesized_final("Renamed symbol project-wide.", tool=str(last_result.get("tool") if last_result else "edit_intent"), round_number=round_number)
+            return self._finalize_mutation_result(
+                request_text=request_text,
+                message="Renamed symbol project-wide.",
+                tool=str(last_result.get("tool") if last_result else "edit_intent"),
+                round_number=round_number,
+                forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+                tests_passed_message="Renamed symbol project-wide; tests passed.",
+            )
         operation: tuple[str, dict[str, Any]] | None = None
         if (
             "src/formatter.py" in lowered
@@ -7162,34 +7212,27 @@ class OllamaCodeAgent:
         if operation is None:
             return None
         tool_name, args = operation
-        round_number += 1
-        result = self._execute_controller_tool(
-            name=tool_name,
-            arguments=args,
+        round_number, result = self._execute_tool_operations(
+            operations=[(tool_name, args)],
             request_text=request_text,
             round_number=round_number,
             successful_tool_results=successful_tool_results,
             satisfied_tool_names=satisfied_tool_names,
             tool_calls_this_turn=tool_calls_this_turn,
         )
-        if result.get("ok") is not True:
+        if result is None:
             return None
-        if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
-            round_number += 1
-            test_args = {"command": self.tools.default_test_command}
-            test_result = self._execute_controller_tool(
-                name="run_test",
-                arguments=test_args,
-                request_text=request_text,
-                round_number=round_number,
-                successful_tool_results=successful_tool_results,
-                satisfied_tool_names=satisfied_tool_names,
-                tool_calls_this_turn=tool_calls_this_turn,
-            )
-            if test_result.get("ok") is not True:
-                return None
-            return self._record_synthesized_final(f"Updated {args.get('path')}; tests passed.", tool="run_test", round_number=round_number)
-        return self._record_synthesized_final(f"Updated {args.get('path')}.", tool=tool_name, round_number=round_number)
+        return self._finalize_mutation_result(
+            request_text=request_text,
+            message=f"Updated {args.get('path')}.",
+            tool=tool_name,
+            round_number=round_number,
+            forbidden_tool_names=forbidden_tool_names,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+            tests_passed_message=f"Updated {args.get('path')}; tests passed.",
+        )
 
     def _project_function_rename_operations(self, request_text: str) -> list[tuple[str, dict[str, Any]]] | None:
         lowered = request_text.lower()
@@ -7283,7 +7326,7 @@ class OllamaCodeAgent:
         )
         if not match:
             return None
-        test_path = match.group("test").strip().rstrip(".,;:")
+        test_path = self._clean_match_group(match, "test", strip_suffix=".,;:")
         if not self._path_looks_like_test_file(test_path):
             return None
         symbol = match.group("symbol").strip()
@@ -7346,7 +7389,7 @@ class OllamaCodeAgent:
         )
         if not match:
             return None
-        path = match.group("path").strip().rstrip(".,;:")
+        path = self._clean_match_group(match, "path", strip_suffix=".,;:")
         symbol = match.group("symbol").strip()
         new_expr = self._clean_return_expression(match.group("new"))
         old_expr = self._clean_return_expression(match.group("old"))
@@ -10116,7 +10159,7 @@ class OllamaCodeAgent:
                     self._post_edit_validation_enabled()
                     and mutation_verified_this_turn
                     and last_successful_validation_version != mutation_version
-                    and not self._request_forbids_validation(text)
+                    and self._request_allows_any_validation(text)
                 ):
                     validation_name, _validation_arguments, validation_result = self._execute_auto_validation_plan(
                         request_text=text,
@@ -11587,17 +11630,19 @@ class OllamaCodeAgent:
                     expected_exact_reply_text=expected_exact_reply_text,
                 )
                 if synthesized_final:
-                    synthesized_payload = {"type": "final", "message": synthesized_final}
-                    self.messages.append({"role": "assistant", "content": json.dumps(synthesized_payload, ensure_ascii=True)})
-                    self._record_event(
-                        "assistant_synthesized",
-                        content=synthesized_final,
+                    synthesized_result = self._validated_synthesized_final(
+                        request_text=text,
+                        message=synthesized_final,
                         tool=name,
-                        rounds=round_number,
+                        round_number=round_number,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
                     )
-                    self._record_event("assistant", content=synthesized_final, rounds=round_number)
-                    self._flush_llm_call_events()
-                    return AgentResult(message=synthesized_final, rounds=round_number, completed=True)
+                    if synthesized_result is not None:
+                        return synthesized_result
+                    continue
                 if (
                     self._request_expects_exact_tool_error(text)
                     and self._failure_result_counts_for_request(text, name, result)
@@ -11685,7 +11730,7 @@ class OllamaCodeAgent:
             self._post_edit_validation_enabled()
             and mutation_verified_this_turn
             and last_successful_validation_version != mutation_version
-            and not self._request_forbids_validation(text)
+            and self._request_allows_any_validation(text)
         ):
             validation_name, _validation_arguments, validation_result = self._execute_auto_validation_plan(
                 request_text=text,
