@@ -225,10 +225,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("omitted-context marker", result["summary"])
 
     def test_replace_in_file_reports_python_syntax_error_without_blocking_edit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "sample.py").write_text("def f():\n    return 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file("sample.py", "    return 1", "return 1")
 
         self.assertTrue(result["ok"])
@@ -236,39 +234,32 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Python syntax error", result["summary"])
 
     def test_replace_rejects_ambiguous_short_snippet(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "sample.txt").write_text("live smoke ok\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file("sample.txt", "ok", "passed", replace_all=True)
         self.assertFalse(result["ok"])
         self.assertIn("ambiguous", result["summary"])
 
     def test_replace_can_match_whole_word(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "sample.txt"
             sample.write_text("live smoke ok\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file("sample.txt", "ok", "passed", match_whole_word=True)
             final_text = sample.read_text(encoding="utf-8")
         self.assertTrue(result["ok"])
         self.assertEqual(final_text, "live smoke passed\n")
 
     def test_replace_tolerates_leading_whitespace_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "sample.py"
             sample.write_text("def f():\n    return 'old'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file("sample.py", "   return 'old'", "    return 'new'")
             final_text = sample.read_text(encoding="utf-8")
         self.assertTrue(result["ok"])
         self.assertEqual(final_text, "def f():\n    return 'new'\n")
 
     def test_replace_in_file_identifier_call_rename_ignores_embedded_matches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "test_pricing.py"
             sample.write_text(
                 "def test_cart_total():\n"
@@ -276,7 +267,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "    assert total([2]) == 2\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file("test_pricing.py", "total(", "cart_total(")
             final_text = sample.read_text(encoding="utf-8")
 
@@ -287,11 +277,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("cart_cart_total", final_text)
 
     def test_replace_strips_read_file_line_number_prefixes(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "sample.py"
             sample.write_text("def f():\n    return 'old'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file(
                 "sample.py",
                 "   1 | def f():\n   2 |     return 'old'",
@@ -302,11 +290,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, "def f():\n    return 'new'\n")
 
     def test_replace_regex_fallback_inserts_backslashes_literally(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             sample = root / "sample.py"
             sample.write_text("def f(value):\n    return value.strip().lower()\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.replace_in_file(
                 "sample.py",
                 "   return value.strip().lower()",
@@ -317,16 +303,13 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("r'\\s+'", final_text)
 
     def test_read_only_blocks_mutations(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="read-only")
+        with self._temp_tools(approval_mode="read-only") as (_root, tools):
             result = tools.write_file("blocked.txt", "data")
         self.assertFalse(result["ok"])
         self.assertIn("read-only", result["summary"])
 
     def test_path_escape_is_blocked(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             result = tools.execute("read_file", {"path": "../escape.txt"})
         self.assertFalse(result["ok"])
         self.assertIn("escapes the workspace", result["summary"])
@@ -344,12 +327,10 @@ class ToolExecutorTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name != "nt", "POSIX only")
     def test_read_file_normalizes_backslash_relative_path_on_posix(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             target = root / "nested" / "file.txt"
             target.parent.mkdir(parents=True)
             target.write_text("hello\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
 
             result = tools.read_file(r"nested\file.txt", start=1, end=1)
 
@@ -358,11 +339,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("hello", result["output"])
 
     def test_read_file_accepts_numeric_string_line_bounds(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             target = root / "sample.txt"
             target.write_text("one\ntwo\nthree\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
 
             result = tools.execute("read_file", {"path": "sample.txt", "start": "2", "end": "2"})
 
@@ -373,12 +352,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("one", result["output"])
 
     def test_list_files_accepts_numeric_string_limits(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "nested").mkdir()
             (root / "nested" / "child.txt").write_text("x\n", encoding="utf-8")
             (root / "top.txt").write_text("x\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
 
             result = tools.execute("list_files", {"max_depth": "0", "limit": "1"})
 
