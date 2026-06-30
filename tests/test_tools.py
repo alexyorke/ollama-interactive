@@ -1181,10 +1181,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(run_process.call_args.args[0][0], "opengrep")
 
     def test_semgrep_scan_can_run_through_remote_docker(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             payload = {
                 "results": [
                     {
@@ -1242,10 +1240,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("DOCKER_HOST", env)
 
     def test_semgrep_scan_reports_cli_error_output(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             completed = subprocess.CompletedProcess(args=[], returncode=2, stdout="", stderr="semgrep parse error")
             with patch("ollama_code.tools.shutil.which", return_value="semgrep"):
                 with patch.object(tools, "_run_process", return_value=completed):
@@ -1255,9 +1251,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("semgrep parse error", result["output"])
 
     def test_new_default_tools_are_registered(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
-
+        with self._temp_tools() as (_root, tools):
             for name in {
                 "todo_read",
                 "todo_write",
@@ -1288,9 +1282,7 @@ class ToolExecutorTests(unittest.TestCase):
                 self.assertIn(name, tools.available_tool_names())
 
     def test_todo_tools_store_validate_and_render_session_tasks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="read-only")
-
+        with self._temp_tools(approval_mode="read-only") as (_root, tools):
             written = tools.execute(
                 "todo_write",
                 {
@@ -1310,9 +1302,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(read["items"][0]["id"], "inspect")
 
     def test_todo_write_rejects_multiple_in_progress_items(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
-
+        with self._temp_tools() as (_root, tools):
             result = tools.execute(
                 "todo_write",
                 {"items": [{"content": "one", "status": "in_progress"}, {"content": "two", "status": "doing"}]},
@@ -1322,9 +1312,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("one todo item", result["summary"].lower())
 
     def test_disabled_tool_is_hidden_and_blocked(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto", disabled_tools=["browser_smoke"])
-
+        with self._temp_tools(disabled_tools=["browser_smoke"]) as (_root, tools):
             self.assertNotIn("browser_smoke", tools.available_tool_names())
             result = tools.execute("browser_smoke", {"url": "http://127.0.0.1"})
 
@@ -1332,9 +1320,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("disabled", result["summary"])
 
     def test_enabled_tools_allowlist_hides_other_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto", enabled_tools=["run_test", "read_file"])
-
+        with self._temp_tools(enabled_tools=["run_test", "read_file"]) as (_root, tools):
             self.assertEqual(tools.available_tool_names(), {"run_test", "read_file"})
             blocked = tools.execute("run_shell", {"command": "echo hi"})
 
@@ -1342,13 +1328,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("disabled", blocked["summary"])
 
     def test_enabled_tools_allowlist_allows_dynamic_mcp_tool_names_via_mcp_call(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(
-                Path(tmp),
-                approval_mode="auto",
-                enabled_tools=["mcp_call"],
-                mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
-            )
+        with self._temp_tools(
+            enabled_tools=["mcp_call"],
+            mcp_servers={"demo": {"command": ["python", "-c", "pass"]}},
+        ) as (_root, tools):
             with patch.object(tools, "_approve_shell", return_value=(True, "")):
                 with patch.object(
                     tools,
@@ -1365,10 +1348,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(request_mock.call_args.args[0], "demo")
 
     def test_systems_lens_frames_complex_task_without_grounding_edit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
-            tools = ToolExecutor(root, approval_mode="auto")
 
             result = tools.execute(
                 "systems_lens",
@@ -1403,8 +1384,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("What exactly is inside the system", result["questions"][0])
 
     def test_inspect_library_source_reads_python_source_and_builtin_diagnostics(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             source = tools.execute("inspect_library_source", {"target": "json.loads", "max_lines": 40})
             builtin = tools.inspect_library_source("builtins.len")
 
@@ -1419,8 +1399,7 @@ class ToolExecutorTests(unittest.TestCase):
 
     def test_inspect_library_source_reports_missing_module(self) -> None:
         missing_name = f"missing_package_{uuid4().hex}"
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             result = tools.inspect_library_source(f"{missing_name}.helper")
 
         self.assertFalse(result["ok"])
@@ -1428,8 +1407,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["error_class"], "missing_dependency")
 
     def test_python_sdk_search_finds_current_stdlib_api(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             refresh = tools.python_sdk_refresh(limit=200)
             result = tools.python_sdk_search("parse json string loads", limit=5)
 
@@ -1439,8 +1417,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Deserialize", result["output"])
 
     def test_python_sdk_refresh_skips_ast_scan_when_imported_entries_fill_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             entry = tools._python_sdk_entry(
                 kind="function",
                 module="json",
