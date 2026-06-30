@@ -30,8 +30,8 @@ HF_DATASET_CANDIDATES: tuple[dict[str, Any], ...] = (
         "priority": "high",
         "kind": "real-user-coding-agent-sessions",
         "reason": "Public donated coding-agent sessions from real open-source work, preserved with raw prompts, tool calls, and trace metadata.",
-        "adapter_hint": None,
-        "path_globs": (),
+        "adapter_hint": "trace_commons",
+        "path_globs": ("data/train-*.parquet",),
     },
     {
         "repo_id": "thoughtworks/agentic-coding-trajectories",
@@ -39,8 +39,17 @@ HF_DATASET_CANDIDATES: tuple[dict[str, Any], ...] = (
         "priority": "medium",
         "kind": "unified-agentic-coding-corpus",
         "reason": "Public 15k-session derivative corpus that unifies several coding-agent trajectory sources into one tokenized Parquet workload.",
-        "adapter_hint": None,
-        "path_globs": (),
+        "adapter_hint": "thoughtworks",
+        "path_globs": ("sessions.parquet",),
+    },
+    {
+        "repo_id": "davanstrien/agent-race-traces",
+        "slug": "agent-race-traces",
+        "priority": "medium",
+        "kind": "same-task-cross-harness-comparison",
+        "reason": "Small public same-task corpus that holds the prompt constant across Claude Code, Pi, and ml-intern so harness-driven waste is easier to isolate.",
+        "adapter_hint": "agent_race",
+        "path_globs": ("*.jsonl",),
     },
     {
         "repo_id": "nebius/SWE-agent-trajectories",
@@ -79,6 +88,33 @@ HF_DATASET_CANDIDATES: tuple[dict[str, Any], ...] = (
         "path_globs": ("data/train-*.parquet",),
     },
     {
+        "repo_id": "nvidia/SWE-Zero-openhands-trajectories",
+        "slug": "nvidia-swe-zero-openhands-trajectories",
+        "priority": "medium",
+        "kind": "openhands-trajectories",
+        "reason": "Public OpenHands-format synthetic SWE traces that add a large failure-heavy comparison set beyond SWE-Hero and Open-SWE.",
+        "adapter_hint": "openhands",
+        "path_globs": ("data/train-*.parquet",),
+    },
+    {
+        "repo_id": "nvidia/Open-SWE-Traces",
+        "slug": "open-swe-traces-openhands",
+        "priority": "high",
+        "kind": "openhands-trajectories",
+        "reason": "Public OpenHands-format SWE traces with newer model families and raw trajectory lists under the trajectory field.",
+        "adapter_hint": "openhands",
+        "path_globs": ("data/*_openhands_trajectories/train-*.parquet",),
+    },
+    {
+        "repo_id": "nvidia/Open-SWE-Traces",
+        "slug": "open-swe-traces-sweagent",
+        "priority": "high",
+        "kind": "openhands-trajectories",
+        "reason": "Public SWE-agent labeled traces that still serialize as tool-call chat trajectories and can be analyzed with the OpenHands message parser.",
+        "adapter_hint": "openhands",
+        "path_globs": ("data/*_sweagent_trajectories/train-*.parquet",),
+    },
+    {
         "repo_id": "togethercomputer/CoderForge-Preview-32B-SWE-Bench-Verified-Evaluation-trajectories",
         "slug": "coderforge-preview-swe-bench-verified-trajectories",
         "priority": "high",
@@ -93,8 +129,17 @@ HF_DATASET_CANDIDATES: tuple[dict[str, Any], ...] = (
         "priority": "medium",
         "kind": "terminal-agent-trajectories",
         "reason": "Public terminal-agent trajectories that can reveal shell-loop and tool-budget patterns beyond SWE-style issue repair.",
-        "adapter_hint": None,
+        "adapter_hint": "terminalbench",
         "path_globs": ("data/train-*.parquet",),
+    },
+    {
+        "repo_id": "zai-org/CC-Bench-trajectories",
+        "slug": "cc-bench-trajectories",
+        "priority": "medium",
+        "kind": "interactive-coding-agent-trajectories",
+        "reason": "Public interactive coding-agent traces with per-task token totals, tool-call counts, and mixed frontend, app-dev, data, and deployment workloads.",
+        "adapter_hint": "cc_bench",
+        "path_globs": ("train.parquet",),
     },
     {
         "repo_id": "Contextbench/Tracebench",
@@ -105,17 +150,89 @@ HF_DATASET_CANDIDATES: tuple[dict[str, Any], ...] = (
         "adapter_hint": None,
         "path_globs": (),
     },
+    {
+        "repo_id": "NJU-LINK/CodeTraceBench",
+        "slug": "codetracebench",
+        "priority": "high",
+        "kind": "trajectory-diagnosis-benchmark",
+        "reason": "Human-verified incorrect-step benchmark for coding-agent trajectories, useful for premature-done, fake-validation, and timeout-loop analysis.",
+        "adapter_hint": None,
+        "path_globs": ("bench_manifest.parquet", "bench_manifest.verified.parquet"),
+    },
+    {
+        "repo_id": "AlienKevin/SWE-ZERO-12M-trajectories",
+        "slug": "swe-zero-12m-trajectories",
+        "priority": "medium",
+        "kind": "execution-free-agentic-coding-trajectories",
+        "reason": "Large public execution-free coding-agent corpus that is useful for manual review of prompt, shell-command, and completion-claim efficiency, but not yet normalized into the local controller metrics pipeline.",
+        "adapter_hint": None,
+        "path_globs": ("data/train-*.parquet",),
+    },
+    {
+        "repo_id": "peteromallet/my-personal-codex-data",
+        "slug": "personal-codex-dataclaw",
+        "priority": "medium",
+        "kind": "real-user-coding-agent-sessions",
+        "reason": "Public DataClaw export of real Codex CLI work with per-session token and tool-use totals.",
+        "adapter_hint": None,
+        "path_globs": ("codex/*.jsonl", ".dataclaw/manifest.json"),
+    },
+    {
+        "repo_id": "misterkerns/my-personal-claude-code-data",
+        "slug": "personal-claude-code-dataclaw",
+        "priority": "medium",
+        "kind": "real-user-coding-agent-sessions",
+        "reason": "Public DataClaw export of real Claude Code work with per-session token and tool-use totals.",
+        "adapter_hint": None,
+        "path_globs": ("conversations.jsonl", "metadata.json"),
+    },
+    {
+        "repo_id": "ultralazr/claude-code-traces",
+        "slug": "ultralazr-claude-code-traces",
+        "priority": "medium",
+        "kind": "real-user-coding-agent-sessions",
+        "reason": "Public redacted Claude Code session files exported in native JSONL trace format via cc-share-hf.",
+        "adapter_hint": None,
+        "path_globs": ("data/*.jsonl", "manifest.jsonl"),
+    },
+    {
+        "repo_id": "Glint-Research/Fable-5-traces",
+        "slug": "fable-5-traces",
+        "priority": "medium",
+        "kind": "agent-trace-corpus",
+        "reason": "Public Pi-style converted coding-agent traces intended for inspection and reasoning or action distillation.",
+        "adapter_hint": None,
+        "path_globs": ("pi-traces/*.jsonl",),
+    },
+    {
+        "repo_id": "badlogicgames/pi-mono",
+        "slug": "pi-mono",
+        "priority": "medium",
+        "kind": "real-user-coding-agent-sessions",
+        "reason": "Public redacted pi coding-agent sessions from real monorepo development, useful for first-turn orientation and shell-loop review.",
+        "adapter_hint": None,
+        "path_globs": ("*.jsonl", "manifest.jsonl"),
+    },
+    {
+        "repo_id": "nmuendler/share-codex",
+        "slug": "share-codex",
+        "priority": "high",
+        "kind": "real-user-coding-agent-sessions",
+        "reason": "Public exported Codex and Claude Code sessions with prompts, tool calls, and tool outputs from local repo work.",
+        "adapter_hint": None,
+        "path_globs": ("train.jsonl", "export_manifest.json"),
+    },
 )
 
 EXTERNAL_CANDIDATES: tuple[dict[str, Any], ...] = (
     {
-        "id": "microsoft/code-agent-state-trajectories",
+        "id": "agentlens/process-quality-paper",
         "slug": "agentlens-bench",
         "priority": "high",
         "kind": "process-level-trajectory-eval",
-        "reason": "AgentLens publishes process-level quality labels, waste signals, and divergence references for coding-agent trajectories.",
-        "source": "github",
-        "url": "https://github.com/microsoft/code-agent-state-trajectories/",
+        "reason": "AgentLens describes process-level quality labels, waste signals, and divergence references for coding-agent trajectories, but the paper says the project site and release are still planned.",
+        "source": "paper",
+        "url": "https://arxiv.org/abs/2605.12925",
         "paper_url": "https://arxiv.org/abs/2605.12925",
     },
 )
@@ -240,6 +357,30 @@ def _build_external_entry(spec: dict[str, Any], data_root: Path) -> dict[str, An
 
 
 def _summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    def _unique_ids(rows: list[dict[str, Any]]) -> list[str]:
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for item in rows:
+            value = str(item["id"])
+            if value in seen:
+                continue
+            seen.add(value)
+            ordered.append(value)
+        return ordered
+
+    def _unique_high_priority_missing(rows: list[dict[str, Any]]) -> list[dict[str, str]]:
+        seen: set[str] = set()
+        ordered: list[dict[str, str]] = []
+        for item in rows:
+            if str(item.get("priority") or "") != "high":
+                continue
+            value = str(item["id"])
+            if value in seen:
+                continue
+            seen.add(value)
+            ordered.append({"id": value, "reason": str(item.get("reason") or "")})
+        return ordered
+
     local_entries = [item for item in entries if item.get("local_dir")]
     analysis_ready = [item for item in entries if item.get("analysis_ready")]
     public_missing = [
@@ -248,21 +389,17 @@ def _summary(entries: list[dict[str, Any]]) -> dict[str, Any]:
         if item.get("source") == "huggingface" and item.get("access_status") == "public" and not item.get("local_dir")
     ]
     gated = [item for item in entries if item.get("access_status") == "gated"]
-    high_priority_public_missing = [
-        {"id": str(item["id"]), "reason": str(item.get("reason") or "")}
-        for item in public_missing
-        if str(item.get("priority") or "") == "high"
-    ]
+    high_priority_public_missing = _unique_high_priority_missing(public_missing)
     return {
         "entries": len(entries),
         "local_entries": len(local_entries),
         "analysis_ready_local_entries": len(analysis_ready),
         "public_missing_entries": len(public_missing),
         "gated_entries": len(gated),
-        "local_ids": [str(item["id"]) for item in local_entries],
-        "analysis_ready_local_ids": [str(item["id"]) for item in analysis_ready],
-        "public_missing_ids": [str(item["id"]) for item in public_missing],
-        "gated_ids": [str(item["id"]) for item in gated],
+        "local_ids": _unique_ids(local_entries),
+        "analysis_ready_local_ids": _unique_ids(analysis_ready),
+        "public_missing_ids": _unique_ids(public_missing),
+        "gated_ids": _unique_ids(gated),
         "high_priority_public_missing": high_priority_public_missing[:4],
     }
 

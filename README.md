@@ -110,7 +110,7 @@ Create `.ollama-code/config.json` in your workspace to keep the app defaults in 
   "max_tool_rounds": 100,
   "max_agent_depth": 2,
   "timeout": 300,
-  "test_cmd": "python -m unittest -v",
+  "test_cmd": "python -m unittest discover -s tests -v",
   "tools": {
     "default_enabled": true,
     "disabled": []
@@ -156,6 +156,18 @@ Check first-use setup before asking it to edit code:
 
 ```bash
 python -m ollama_code --doctor
+```
+
+Run the fast local readiness tier before broader edits or benchmarks:
+
+```bash
+python scripts/local_validation.py --tier smoke
+```
+
+Run the fuller local validation stack before merging larger controller or tooling changes:
+
+```bash
+python scripts/local_validation.py --tier full
 ```
 
 One-shot prompt:
@@ -302,6 +314,16 @@ python scripts/trajectory_dataset_fetch.py --datasets nebius-swe-agent-trajector
 ```
 
 The fetcher downloads only the supported public Parquet globs for each requested dataset, writes a per-dataset manifest at `scratch/external/datasets/<dataset>/.ollama-interactive-manifest.json`, and records a summary at `scratch/external/datasets/trajectory-dataset-fetch.json`. Treat those local files and the generated JSON under `scratch/` as regenerated evidence, not versioned source data.
+
+The supported fetch set includes Agent Race, Trace Commons, Thoughtworks, SWE-agent, OpenHands, SWE-smith, SWE-Hero, Open-SWE, CoderForge SWE-bench Verified, CC-Bench, and TerminalBench trajectory corpora. The catalog also tracks manual-review datasets such as `NJU-LINK/CodeTraceBench`, `AlienKevin/SWE-ZERO-12M-trajectories`, `badlogicgames/pi-mono`, `thomasmustier/pi-mono-sessions`, `thomasmustier/pi-nes-sessions`, `nmuendler/share-codex`, `peteromallet/my-personal-codex-data`, `misterkerns/my-personal-claude-code-data`, `ultralazr/claude-code-traces`, and `Glint-Research/Fable-5-traces`, plus gated sets such as `SWE-chat`. Use `python scripts/trajectory_dataset_catalog.py` to see which corpora are local, public-missing, or gated, and see `docs/trajectory-profiling.md` for current evidence artifact paths.
+
+For the web-discovered real-user session corpora, regenerate the bounded local review with:
+
+```bash
+python scripts/web_discovered_agent_dataset_analysis.py
+```
+
+The current web-discovered pass pulls bounded local samples from the Pi-family public traces such as `pi-mono`, `pi-mono-sessions`, `pi-sessions-viewer`, `gradio-pi-sessions`, and `Prayagmatic/agent-traces`, plus `share-codex`, `peteromallet/my-personal-codex-data`, `misterkerns/my-personal-claude-code-data`, raw Codex Desktop session exports such as `nielsr/add-sam-3-lite-text-agent-traces`, and larger parquet-backed slices such as `nlile/misc-merged-claude-code-traces-v1`, then summarizes task families, tool usage, prompt examples, and where available token totals. The newer DataClaw exports are useful because they expose direct `input_tokens`, `output_tokens`, and `tool_uses` counts for real coding-agent sessions, which makes context blow-up per tool loop measurable instead of anecdotal. The merged Claude Code parquet adds a larger public real-user slice, but only after filtering helper rows and reading `<tool_use>` blocks from `assistant_response` instead of mistaking `tools_json` for executed calls. The raw Codex Desktop exports are useful for measuring first-turn instruction bloat because they preserve the developer wrapper and executed `function_call` events directly from `.codex/sessions`.
 
 ### Python SDK Retrieval
 
@@ -463,5 +485,7 @@ git push origin v0.1.0
 - Nested agents can be started through the `run_agent` tool, with a configurable depth cap.
 - `todo_read` and `todo_write` give the model a Claude Code-style in-session checklist for complex tasks. Todo state is saved in session transcripts, does not touch workspace files, and is shown to the model only when the current request benefits from it.
 - The recommended default coding model is `granite4.1:8b`; install it with `ollama pull granite4.1:8b`.
+- On the latest June 29, 2026 serial live gate, `granite4.1:8b`, `gemma4:e4b`, and `qwen3:8b` all passed `local-small`, and Granite stayed the default because it used the fewest benchmark tokens (`2048` vs `2436` and `2532`).
+- `scratch/live-model-gate/live-model-gate-summary.json` is the canonical release artifact. It now records `benchmark_suite`, `selected_default_model`, `selection_reason`, and per-model gate rows so the chosen default does not need to be reconstructed from separate benchmark files.
 - The recommended serial eval order is `granite4.1:8b`, `gemma4:e4b`, then `qwen3:8b`.
-- If you do not pass `--model` and the default Gemma 4 tag is not installed, the CLI falls back only to a known preferred local model and prints the pull command. Custom `hf.co/...` or vendor tags are never selected implicitly; pass `--model` for those.
+- If you do not pass `--model` and the default Granite tag is not installed, the CLI falls back only to a known preferred local model and prints the pull command. Custom `hf.co/...` or vendor tags are never selected implicitly; pass `--model` for those.

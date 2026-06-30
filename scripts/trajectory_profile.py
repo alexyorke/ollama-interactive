@@ -19,6 +19,10 @@ except ModuleNotFoundError:
 DEFAULT_DATA_ROOT = Path("scratch") / "external" / "datasets"
 
 DATASET_SPECS = {
+    "agent-race-traces": {
+        "paths": ["*.jsonl"],
+        "adapter": "agent_race",
+    },
     "nebius-swe-agent-trajectories": {
         "paths": ["data/*.parquet"],
         "adapter": "swe_agent",
@@ -35,6 +39,18 @@ DATASET_SPECS = {
         "paths": ["data/train-*.parquet"],
         "adapter": "openhands",
     },
+    "nvidia-swe-zero-openhands-trajectories": {
+        "paths": ["data/train-*.parquet"],
+        "adapter": "openhands",
+    },
+    "open-swe-traces-openhands": {
+        "paths": ["data/*_openhands_trajectories/train-*.parquet"],
+        "adapter": "openhands",
+    },
+    "open-swe-traces-sweagent": {
+        "paths": ["data/*_sweagent_trajectories/train-*.parquet"],
+        "adapter": "openhands",
+    },
     "coderforge-preview-swe-bench-verified-trajectories": {
         "paths": ["trajectory/train-*.parquet"],
         "adapter": "openhands",
@@ -42,6 +58,10 @@ DATASET_SPECS = {
     "terminalbench-trajectories": {
         "paths": ["data/train-*.parquet"],
         "adapter": "terminalbench",
+    },
+    "cc-bench-trajectories": {
+        "paths": ["train.parquet"],
+        "adapter": "cc_bench",
     },
     "trace-commons-agent-traces": {
         "paths": ["data/train-*.parquet"],
@@ -116,12 +136,27 @@ GIT_TOOLS = {
 }
 SUBMIT_TOOLS = {"submit", "final", "finish"}
 HELPER_TOOLS = {
+    "plan_tool",
     "todowrite",
     "taskoutput",
+    "taskcreate",
+    "taskget",
+    "tasklist",
+    "taskupdate",
+    "task_tracker",
     "update_plan",
     "save_plan",
     "bashoutput",
     "killshell",
+    "toolsearch",
+    "askuserquestion",
+    "webfetch",
+    "websearch",
+    "skill",
+    "agent",
+    "taskstop",
+    "mcp__claude-in-chrome__computer",
+    "mcp__claude-in-chrome__navigate",
 }
 
 COMMAND_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -165,9 +200,10 @@ def _command_category_from_content(content: str) -> str | None:
         return "test"
     if re.search(r"\bgit\s+(?:status|diff|commit|apply|checkout|restore|add)\b", lowered):
         return "git"
-    if re.search(r"\b(?:cat|sed\s+-n|head|tail)\b", lowered):
+    command_context = r"(?:```(?:bash|sh)?\s*|`|<command>|[\"']command[\"']\s*:\s*[\"'])"
+    if re.search(command_context + r"(?:cat|sed\s+-n|head|tail)\b", lowered):
         return "read"
-    if re.search(r"\b(?:grep|rg|find|ls|tree)\b", lowered):
+    if re.search(command_context + r"(?:grep|rg|find|ls|tree)\b", lowered):
         return "search"
     return None
 
@@ -184,6 +220,41 @@ def _command_category_from_shell_command(command: str) -> str | None:
         return None
     family = Path(argv[0]).name.lower().rstrip(".,:;")
     lowered = command.lower()
+    compound_tokens = re.findall(r"(?:^|&&|\|\||;)\s*([a-zA-Z0-9_.-]+)", lowered)
+    normalized_tokens = [Path(token).name.lower().rstrip(".,:;") for token in compound_tokens]
+    if re.search(r"\bnode\b[^\n;&|]*\s--test\b", lowered):
+        return "test"
+    if "node cdp-eval.mjs" in lowered:
+        return "test"
+    if re.search(r"\bnpm\s+run\b[^\n;&|]*\b(?:test|typecheck|check)\b", lowered):
+        return "test"
+    if "./build-apk.sh" in lowered:
+        return "test"
+    if re.search(r"\bgradle(?:w)?\b[^\n;&|]*\b(?:assemble|build|test|check|wrapper)\b", lowered):
+        return "test"
+    if "gh workflow run" in lowered or "gh run watch" in lowered or "gh run view" in lowered:
+        return "test"
+    if "gh run list" in lowered and "--workflow" in lowered:
+        return "test"
+    if "adb" in lowered and (
+        " install " in lowered
+        or " shell am start" in lowered
+        or " logcat" in lowered
+        or "exec-out screencap" in lowered
+    ):
+        return "test"
+    if family == "git" and len(argv) >= 2:
+        subcommand = argv[1].lower().rstrip(".,:;")
+        if subcommand in {"status", "diff", "commit", "apply", "checkout", "restore", "add", "remote", "branch", "log", "show", "merge"}:
+            return "git"
+    if any(token in {"cat", "head", "tail", "sed", "awk", "nl", "wc", "stat"} for token in normalized_tokens):
+        return "read"
+    if any(token in {"grep", "rg", "find", "ls", "tree", "fd"} for token in normalized_tokens):
+        return "search"
+    if family in {"cat", "head", "tail", "sed", "awk", "nl", "wc", "stat"}:
+        return "read"
+    if family in {"grep", "rg", "find", "ls", "tree", "fd"}:
+        return "search"
     if family.startswith("python") and re.search(r"\b(?:pytest|unittest)\b", lowered):
         return "test"
     if family in {"rscript", "r"} and any(token in lowered for token in ("test()", "testthat", "devtools::test", "tinytest")):
@@ -249,6 +320,26 @@ def _infer_tool_name_from_text(text: str) -> str | None:
     return None
 
 
+def _should_infer_openhands_user_observation(content: str) -> bool:
+    lowered = content.lower()
+    if "<issue_description>" in lowered or "consider the following issue description" in lowered:
+        return False
+    if "<uploaded_files>" in lowered and "issue description" in lowered:
+        return False
+    strong_signals = (
+        "use ",
+        "run ",
+        "open ",
+        "read_file",
+        "search_symbols",
+        "run_test",
+        "pytest",
+        "```",
+        "`",
+    )
+    return any(signal in lowered for signal in strong_signals)
+
+
 def _content_text(value: Any) -> str:
     if value is None:
         return ""
@@ -269,11 +360,34 @@ def _deserialize_possible_json(value: Any) -> Any:
         return value
 
 
+def _first_non_empty_deserialized(*raw_values: Any) -> Any:
+    fallback: Any = []
+    for raw_value in raw_values:
+        candidate = _deserialize_possible_json(raw_value)
+        if isinstance(candidate, list):
+            if candidate:
+                return candidate
+            fallback = candidate
+            continue
+        if candidate is not None and candidate != "":
+            return candidate
+    return fallback
+
+
 def _row_has_trajectory_content(adapter: str, row: dict[str, Any]) -> bool:
-    if adapter != "terminalbench":
-        return True
-    steps = _deserialize_possible_json(row.get("steps"))
-    return isinstance(steps, list) and bool(steps)
+    if adapter == "agent_race":
+        events = _deserialize_possible_json(row.get("events"))
+        return isinstance(events, list) and bool(events)
+    if adapter == "terminalbench":
+        steps = _deserialize_possible_json(row.get("steps"))
+        return isinstance(steps, list) and bool(steps)
+    if adapter == "trace_commons":
+        trajectory = _first_non_empty_deserialized(row.get("messages"), row.get("messages_json"))
+        return (isinstance(trajectory, list) and bool(trajectory)) or bool(_trace_commons_fallback_messages(row))
+    if adapter in {"openhands", "cc_bench", "thoughtworks", "smith", "swe_agent"}:
+        trajectory = _first_non_empty_deserialized(row.get("trajectory"), row.get("messages"), row.get("messages_json"))
+        return isinstance(trajectory, list) and bool(trajectory)
+    return True
 
 
 def _iter_rows_with_trajectory_content(adapter: str, rows: Iterable[dict[str, Any]], max_rows: int | None = None) -> Iterable[dict[str, Any]]:
@@ -288,15 +402,136 @@ def _iter_rows_with_trajectory_content(adapter: str, rows: Iterable[dict[str, An
 
 
 def _openhands_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
-    trajectory = _deserialize_possible_json(row.get("trajectory") or row.get("messages") or row.get("messages_json") or [])
+    trajectory = _first_non_empty_deserialized(row.get("trajectory"), row.get("messages"), row.get("messages_json"))
     if not isinstance(trajectory, list):
         return []
     normalized: list[dict[str, Any]] = []
     for message in trajectory:
         candidate = _deserialize_possible_json(message)
-        if isinstance(candidate, dict):
+        if not isinstance(candidate, dict):
+            continue
+        if candidate.get("role"):
             normalized.append(candidate)
+            continue
+        message_payload = candidate.get("message")
+        if isinstance(message_payload, dict) and candidate.get("type") in {"user", "assistant", "tool"}:
+            content_items = message_payload.get("content")
+            if candidate.get("type") == "user" and isinstance(content_items, list):
+                tool_results = [
+                    item for item in content_items if isinstance(item, dict) and str(item.get("type") or "").lower() == "tool_result"
+                ]
+                if tool_results and len(tool_results) == len(content_items):
+                    for item in tool_results:
+                        normalized.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": item.get("tool_use_id"),
+                                "name": item.get("name"),
+                                "content": item.get("content"),
+                            }
+                        )
+                    continue
+            remapped = dict(message_payload)
+            remapped["role"] = candidate.get("type")
+            if candidate.get("toolUseResult") is not None and "tool_use_result" not in remapped:
+                remapped["tool_use_result"] = candidate.get("toolUseResult")
+            normalized.append(remapped)
     return normalized
+
+
+def _trace_commons_fallback_messages(row: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_trace = _deserialize_possible_json(row.get("trace"))
+    trace_items: list[Any]
+    if isinstance(raw_trace, list):
+        trace_items = raw_trace
+    elif raw_trace is None:
+        return []
+    else:
+        trace_items = [raw_trace]
+    normalized: list[dict[str, Any]] = []
+    for item in trace_items:
+        candidate = _deserialize_possible_json(item)
+        if not isinstance(candidate, dict):
+            continue
+        nested_message = candidate.get("message")
+        role = str(candidate.get("role") or "").lower()
+        row_type = str(candidate.get("type") or "").lower()
+        if isinstance(nested_message, dict) and role:
+            message_payload = dict(nested_message)
+            message_payload.setdefault("role", role)
+            normalized.append(message_payload)
+            continue
+        if isinstance(nested_message, dict) and row_type in {"user", "assistant", "tool", "system"}:
+            message_payload = dict(nested_message)
+            message_payload.setdefault("role", row_type)
+            normalized.append(message_payload)
+            continue
+        structured_messages = candidate.get("messages")
+        if not isinstance(structured_messages, list):
+            continue
+        for structured in structured_messages:
+            if not isinstance(structured, dict):
+                continue
+            info = structured.get("info")
+            parts = structured.get("parts")
+            structured_role = str(info.get("role") or "").lower() if isinstance(info, dict) else ""
+            if not structured_role or not isinstance(parts, list):
+                continue
+            content_parts: list[dict[str, Any]] = []
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                part_type = str(part.get("type") or "").lower()
+                if part_type in {"text", "reasoning"}:
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        content_parts.append({"type": "text", "text": text})
+                elif part_type == "tool":
+                    tool_name = str(part.get("tool") or "").strip()
+                    if not tool_name:
+                        continue
+                    state = part.get("state")
+                    input_payload = state.get("input") if isinstance(state, dict) else None
+                    tool_call: dict[str, Any] = {"type": "tool_use", "name": tool_name}
+                    if isinstance(input_payload, dict):
+                        tool_call["input"] = input_payload
+                    content_parts.append(tool_call)
+            if content_parts:
+                normalized.append({"role": structured_role, "content": content_parts})
+    return normalized
+
+
+def _openhands_message_content(message: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("content", "reasoning_content"):
+        value = message.get(key)
+        if isinstance(value, list):
+            list_parts: list[str] = []
+            for item in value:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").lower()
+                if item_type == "text":
+                    text_value = item.get("text")
+                    if isinstance(text_value, str) and text_value.strip():
+                        list_parts.append(text_value.strip())
+                        continue
+                if item_type == "tool_result":
+                    result_value = item.get("content")
+                    if isinstance(result_value, str) and result_value.strip():
+                        list_parts.append(result_value.strip())
+                        continue
+                if item_type in {"tool_use", "toolcall"}:
+                    continue
+                item_text = _content_text(item).strip()
+                if item_text:
+                    list_parts.append(item_text)
+            text = "\n".join(part for part in list_parts if part).strip()
+        else:
+            text = _content_text(value).strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def _message_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -306,6 +541,15 @@ def _message_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
     tool_calls_json = _deserialize_possible_json(message.get("tool_calls_json"))
     if isinstance(tool_calls_json, list):
         return [call for call in tool_calls_json if isinstance(call, dict)]
+    content = message.get("content")
+    if isinstance(content, list):
+        embedded_calls = [
+            item
+            for item in content
+            if isinstance(item, dict) and str(item.get("type") or "").lower() in {"tool_use", "toolcall"}
+        ]
+        if embedded_calls:
+            return embedded_calls
     return []
 
 
@@ -348,7 +592,7 @@ def _extract_openhands_events(trajectory: list[dict[str, Any]]) -> list[Event]:
     tool_names_by_id: dict[str, str] = {}
     for message in trajectory:
         role = str(message.get("role") or "")
-        content = _content_text(message.get("content"))
+        content = _openhands_message_content(message)
         if role == "assistant":
             tool_calls = _message_tool_calls(message)
             tool_names_by_id.update(_tool_call_name_by_id(message))
@@ -357,11 +601,30 @@ def _extract_openhands_events(trajectory: list[dict[str, Any]]) -> list[Event]:
                 tool_names = []
                 for call in tool_calls:
                     function = call.get("function") if isinstance(call, dict) else None
-                    name = _normalize_tool_name(str(function.get("name") or call.get("name") or "")) if isinstance(function, dict) or isinstance(call, dict) else ""
+                    raw_name = ""
+                    arguments: Any = None
+                    if isinstance(function, dict):
+                        raw_name = str(function.get("name") or "")
+                        arguments = function.get("arguments")
+                    if not raw_name and isinstance(call, dict):
+                        raw_name = str(call.get("name") or "")
+                    if arguments is None and isinstance(call, dict):
+                        arguments = call.get("input")
+                    if isinstance(arguments, str):
+                        arguments = _deserialize_possible_json(arguments)
+                    name = _normalize_tool_name(raw_name) if raw_name else ""
                     if name:
                         tool_names.append(name)
                         payload = _content_text(call)
-                        events.append(Event(role="assistant", kind="tool_call", name=name, category=_tool_category(name, payload), content=payload))
+                        events.append(
+                            Event(
+                                role="assistant",
+                                kind="tool_call",
+                                name=name,
+                                category=_category_for_tool_call(name, arguments, payload),
+                                content=payload,
+                            )
+                        )
                 if len(tool_names) == 1:
                     pending_tool_name = tool_names[0]
             elif content.strip():
@@ -378,6 +641,8 @@ def _extract_openhands_events(trajectory: list[dict[str, Any]]) -> list[Event]:
             events.append(Event(role="tool", kind="tool_result", name=name, category=_tool_category(name, content), content=content))
             pending_tool_name = ""
         elif role == "user" and content.strip():
+            if not _should_infer_openhands_user_observation(content):
+                continue
             inferred = _infer_tool_name_from_text(content)
             if inferred:
                 events.append(Event(role="user", kind="observation", name=inferred, category=_tool_category(inferred, content), content=content))
@@ -463,20 +728,153 @@ def _extract_terminalbench_events(steps: Any) -> list[Event]:
     return events
 
 
+def _category_for_tool_call(name: str, arguments: Any, payload: str) -> str:
+    category = _tool_category(name, payload)
+    if name in SHELL_TOOLS and isinstance(arguments, dict):
+        command = arguments.get("command") or arguments.get("cmd")
+        if isinstance(command, list):
+            command = " ".join(str(part) for part in command)
+        if isinstance(command, str) and command.strip():
+            category = _command_category_from_shell_command(command) or category
+    return category
+
+
+def _extract_agent_race_events(raw_events: Any) -> list[Event]:
+    normalized = _deserialize_possible_json(raw_events)
+    if not isinstance(normalized, list):
+        return []
+    events: list[Event] = []
+    tool_names_by_id: dict[str, str] = {}
+    for raw_event in normalized:
+        if not isinstance(raw_event, dict):
+            continue
+        message = raw_event.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").lower()
+        content = message.get("content")
+        if role == "assistant":
+            tool_items = content if isinstance(content, list) else []
+            text_parts: list[str] = []
+            saw_tool_call = False
+            for item in tool_items:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").lower()
+                if item_type not in {"tool_use", "toolcall"}:
+                    text = item.get("text")
+                    if isinstance(text, str) and text.strip():
+                        text_parts.append(text)
+                    continue
+                name = _normalize_tool_name(str(item.get("name") or ""))
+                if not name:
+                    continue
+                saw_tool_call = True
+                tool_id = str(item.get("id") or "")
+                if tool_id:
+                    tool_names_by_id[tool_id] = name
+                arguments = item.get("input")
+                if not isinstance(arguments, dict):
+                    arguments = item.get("arguments")
+                payload = _content_text(item)
+                events.append(
+                    Event(
+                        role="assistant",
+                        kind="tool_call",
+                        name=name,
+                        category=_category_for_tool_call(name, arguments, payload),
+                        content=payload,
+                    )
+                )
+            if not saw_tool_call:
+                combined = "\n".join(text_parts).strip() if text_parts else _content_text(content)
+                inferred = _infer_tool_name_from_text(combined)
+                if inferred:
+                    events.append(
+                        Event(
+                            role="assistant",
+                            kind="tool_call",
+                            name=inferred,
+                            category=_tool_category(inferred, combined),
+                            content=combined,
+                        )
+                    )
+            continue
+        if role == "toolresult":
+            raw_name = str(message.get("toolName") or "")
+            name = _normalize_tool_name(raw_name)
+            tool_call_id = str(message.get("toolCallId") or "")
+            if not name:
+                name = tool_names_by_id.get(tool_call_id, "tool")
+            payload = _content_text(content)
+            events.append(
+                Event(
+                    role="tool",
+                    kind="tool_result",
+                    name=name,
+                    category=_tool_category(name, payload),
+                    content=payload,
+                )
+            )
+            continue
+        if role != "user":
+            continue
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type") or "").lower()
+                if item_type != "tool_result":
+                    continue
+                tool_call_id = str(item.get("tool_use_id") or "")
+                name = tool_names_by_id.get(tool_call_id, "tool")
+                payload = _content_text(item.get("content"))
+                events.append(
+                    Event(
+                        role="tool",
+                        kind="tool_result",
+                        name=name,
+                        category=_tool_category(name, payload),
+                        content=payload,
+                    )
+                )
+            continue
+        prompt = _content_text(content)
+        inferred = _infer_tool_name_from_text(prompt)
+        if inferred:
+            events.append(
+                Event(
+                    role="user",
+                    kind="observation",
+                    name=inferred,
+                    category=_tool_category(inferred, prompt),
+                    content=prompt,
+                )
+            )
+    return events
+
+
 def _extract_events(adapter: str, row: dict[str, Any]) -> list[Event]:
+    if adapter == "agent_race":
+        return _extract_agent_race_events(row.get("events"))
     if adapter == "openhands":
         return _extract_openhands_events(_openhands_messages(row))
-    if adapter == "trace_commons":
+    if adapter == "cc_bench":
         return _extract_openhands_events(_openhands_messages(row))
+    if adapter == "trace_commons":
+        messages = _openhands_messages(row)
+        if messages:
+            return _extract_openhands_events(messages)
+        return _extract_openhands_events(_trace_commons_fallback_messages(row))
     if adapter == "thoughtworks":
         effective_adapter = _thoughtworks_row_adapter(row)
         if effective_adapter == "openhands":
             return _extract_openhands_events(_openhands_messages(row))
-        return _extract_smith_events(row.get("messages") or row.get("messages_json"))
+        return _extract_smith_events(_first_non_empty_deserialized(row.get("messages"), row.get("messages_json")))
     if adapter == "swe_agent":
         return _extract_swe_agent_events(list(row.get("trajectory") or []))
     if adapter == "smith":
-        return _extract_smith_events(row.get("messages"))
+        return _extract_smith_events(_first_non_empty_deserialized(row.get("messages"), row.get("messages_json")))
     if adapter == "terminalbench":
         return _extract_terminalbench_events(row.get("steps"))
     return []
@@ -494,6 +892,46 @@ def _iter_parquet_rows(paths: Iterable[Path], max_rows: int | None = None) -> It
                 emitted += 1
                 if max_rows is not None and emitted >= max_rows:
                     return
+
+
+def _iter_agent_race_rows(paths: Iterable[Path], max_rows: int | None = None) -> Iterable[dict[str, Any]]:
+    emitted = 0
+    for path in paths:
+        raw_events: list[dict[str, Any]] = []
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip()
+                if not text:
+                    continue
+                payload = _deserialize_possible_json(text)
+                if isinstance(payload, dict):
+                    raw_events.append(payload)
+        if not raw_events:
+            continue
+        session_id = ""
+        for event in raw_events:
+            if not isinstance(event, dict):
+                continue
+            session_id = str(event.get("sessionId") or event.get("session_id") or event.get("id") or "")
+            if session_id:
+                break
+        yield {
+            "events": raw_events,
+            "session_id": session_id or path.stem,
+            "source_file": path.name,
+        }
+        emitted += 1
+        if max_rows is not None and emitted >= max_rows:
+            return
+
+
+def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> tuple[str, Iterable[dict[str, Any]]]:
+    adapter, paths = _resolve_dataset_paths(data_root, dataset)
+    if adapter == "agent_race":
+        rows = _iter_agent_race_rows(paths, max_rows=max_rows)
+        return adapter, _iter_rows_with_trajectory_content(adapter, rows, max_rows=max_rows)
+    rows = _iter_parquet_rows(paths)
+    return adapter, _iter_rows_with_trajectory_content(adapter, rows, max_rows=max_rows)
 
 
 def _detect_repeated_tool_runs(names: list[str]) -> list[tuple[str, int]]:
@@ -816,6 +1254,15 @@ def _resolve_dataset_paths(root: Path, dataset_name: str) -> tuple[str, list[Pat
 def _format_report(payload: dict[str, Any]) -> str:
     lines = []
     for dataset in payload["datasets"]:
+        if dataset.get("status") == "missing":
+            lines.append(
+                f"[trajectory-profile] dataset={dataset['dataset']} rows={dataset.get('rows_profiled', 0)} status=missing"
+            )
+            recommendations = dataset.get("recommendations") or []
+            for recommendation in recommendations:
+                if isinstance(recommendation, str):
+                    lines.append(f"  note {recommendation}")
+            continue
         lines.append(
             f"[trajectory-profile] dataset={dataset['dataset']} rows={dataset['rows_profiled']} "
             f"avg_tool_calls={dataset['avg_tool_calls']} context_loop_pct={dataset['context_loop_rows_pct']} "
@@ -868,7 +1315,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             continue
         max_rows = None if args.max_rows == 0 else args.max_rows
-        rows = _iter_rows_with_trajectory_content(adapter, _iter_parquet_rows(paths), max_rows=max_rows)
+        adapter, rows = _iter_dataset_rows(root, dataset_name, max_rows)
         summaries.append(_summarize_dataset(dataset_name, adapter, rows))
 
     payload = {

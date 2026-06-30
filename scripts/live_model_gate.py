@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import shutil
+import statistics
 import subprocess
 import sys
 import time
@@ -23,6 +24,7 @@ DEFAULT_E2E_SCENARIOS = ("scenario_transcripted_tool_use", "scenario_run_test")
 DEFAULT_BENCHMARK_FEATURE_PROFILES = ("all",)
 DEFAULT_BENCHMARK_CLASSES = ("agent", "controller")
 DEFAULT_BENCHMARK_MODES = ("off",)
+DEFAULT_SELECTION_MODEL = "granite4.1:8b"
 
 
 @dataclass(frozen=True)
@@ -38,15 +40,151 @@ def _slug_model(model: str) -> str:
     return model.replace(":", "-").replace("/", "-").replace("\\", "-")
 
 
+def _load_json_object(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _benchmark_median_latency_s(payload: dict[str, Any]) -> float | None:
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return None
+    latencies = [
+        parsed
+        for parsed in (_safe_float(item.get("latency_s")) for item in results if isinstance(item, dict))
+        if parsed is not None
+    ]
+    if not latencies:
+        return None
+    return round(float(statistics.median(latencies)), 3)
+
+
+def _step_outcome_by_prefix(step_results: list[dict[str, Any]], prefix: str, model: str) -> dict[str, Any] | None:
+    target = f"{prefix}:{model}"
+    for row in step_results:
+        if isinstance(row, dict) and str(row.get("name") or "") == target:
+            return row
+    return None
+
+
+def build_model_rows(models: list[str], step_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for model in models:
+        e2e = _step_outcome_by_prefix(step_results, "e2e", model)
+        verification = _step_outcome_by_prefix(step_results, "verification", model)
+        benchmark = _step_outcome_by_prefix(step_results, "benchmark", model)
+        benchmark_artifact = Path(str(benchmark.get("artifact"))) if isinstance(benchmark, dict) and benchmark.get("artifact") else None
+        benchmark_payload = _load_json_object(benchmark_artifact)
+        benchmark_summary = benchmark_payload.get("summary") if isinstance(benchmark_payload.get("summary"), dict) else {}
+        rows.append(
+            {
+                "model": model,
+                "e2e_ok": e2e.get("ok") if isinstance(e2e, dict) else None,
+                "verification_ok": verification.get("ok") if isinstance(verification, dict) else None,
+                "benchmark_ok": benchmark.get("ok") if isinstance(benchmark, dict) else None,
+                "benchmark_passes": _safe_int(benchmark_summary.get("pass")),
+                "benchmark_runs": _safe_int(benchmark_summary.get("runs")),
+                "benchmark_total_tokens": _safe_int(benchmark_summary.get("total_tokens")),
+                "benchmark_total_llm_calls": _safe_int(benchmark_summary.get("total_llm_calls")),
+                "benchmark_median_latency_s": _benchmark_median_latency_s(benchmark_payload),
+                "benchmark_artifact": str(benchmark_artifact) if benchmark_artifact else None,
+            }
+        )
+    return rows
+
+
+def choose_default_model(model_rows: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    eligible = [
+        row
+        for row in model_rows
+        if _safe_int(row.get("benchmark_passes")) is not None and _safe_int(row.get("benchmark_runs")) is not None
+    ]
+    if not eligible:
+        return None, None
+
+    def sort_key(row: dict[str, Any]) -> tuple[int, float, float, int]:
+        passes = _safe_int(row.get("benchmark_passes"))
+        tokens = _safe_int(row.get("benchmark_total_tokens"))
+        latency = _safe_float(row.get("benchmark_median_latency_s"))
+        return (
+            -(passes if passes is not None else -1),
+            float(tokens if tokens is not None else 10**18),
+            float(latency if latency is not None else 10**18),
+            0 if str(row.get("model") or "") == DEFAULT_SELECTION_MODEL else 1,
+        )
+
+    selected = min(eligible, key=sort_key)
+    selected_model = str(selected.get("model") or "")
+    top_passes = max(_safe_int(row.get("benchmark_passes")) or 0 for row in eligible)
+    top_pass_rows = [row for row in eligible if (_safe_int(row.get("benchmark_passes")) or 0) == top_passes]
+    selected_passes = _safe_int(selected.get("benchmark_passes")) or 0
+    selected_runs = _safe_int(selected.get("benchmark_runs")) or 0
+    if len(top_pass_rows) == 1:
+        return selected_model, f"Selected {selected_model} because it had the highest benchmark pass count ({selected_passes}/{selected_runs})."
+
+    token_candidates = [row for row in top_pass_rows if _safe_int(row.get("benchmark_total_tokens")) is not None]
+    if token_candidates:
+        lowest_tokens = min(_safe_int(row.get("benchmark_total_tokens")) or 0 for row in token_candidates)
+        lowest_token_rows = [row for row in token_candidates if (_safe_int(row.get("benchmark_total_tokens")) or 0) == lowest_tokens]
+        if len(lowest_token_rows) == 1:
+            token_values = ", ".join(
+                str(_safe_int(row.get("benchmark_total_tokens")) or 0)
+                for row in top_pass_rows
+            )
+            return (
+                selected_model,
+                f"Selected {selected_model} because benchmark pass count tied at {selected_passes}/{selected_runs} and it used the fewest benchmark tokens ({token_values}).",
+            )
+    latency_candidates = [row for row in top_pass_rows if _safe_float(row.get("benchmark_median_latency_s")) is not None]
+    if latency_candidates:
+        lowest_latency = min(_safe_float(row.get("benchmark_median_latency_s")) or 0.0 for row in latency_candidates)
+        lowest_latency_rows = [
+            row for row in latency_candidates if (_safe_float(row.get("benchmark_median_latency_s")) or 0.0) == lowest_latency
+        ]
+        if len(lowest_latency_rows) == 1:
+            return (
+                selected_model,
+                f"Selected {selected_model} because benchmark pass count and token totals tied, and it had the lowest benchmark median latency ({lowest_latency:.3f}s).",
+            )
+    if selected_model == DEFAULT_SELECTION_MODEL:
+        return selected_model, f"Selected {selected_model} because benchmark pass count, total tokens, and median latency tied, so the configured Granite default won the tie-break."
+    return selected_model, f"Selected {selected_model} as the best available benchmark tie-break winner among the requested models."
+
+
 def resolve_requested_models(requested: list[str], available: set[str]) -> list[str]:
     resolved: list[str] = []
+    seen: set[str] = set()
     for model in requested:
+        candidate: str | None = None
         if model in available:
-            resolved.append(model)
+            candidate = model
+        else:
+            latest = f"{model}:latest"
+            if latest in available:
+                candidate = latest
+        if not candidate or candidate in seen:
             continue
-        latest = f"{model}:latest"
-        if latest in available:
-            resolved.append(latest)
+        seen.add(candidate)
+        resolved.append(candidate)
     return resolved
 
 
@@ -240,17 +378,23 @@ def run_gate(
             if not continue_on_failure:
                 break
     elapsed = round(time.perf_counter() - started, 2)
+    model_rows = build_model_rows(resolved_models, step_results)
+    selected_default_model, selection_reason = choose_default_model(model_rows)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root.resolve(strict=False)),
         "output_dir": str(output_dir.resolve(strict=False)),
+        "benchmark_suite": benchmark_suite,
         "preflight": preflight_result,
         "requested_models": requested_models,
         "resolved_models": resolved_models,
+        "selected_default_model": selected_default_model,
+        "selection_reason": selection_reason,
         "steps_requested": [step.name for step in steps],
         "steps_completed": [step["name"] for step in step_results],
         "elapsed_s": elapsed,
         "ok": not failed,
+        "models": model_rows,
         "step_results": step_results,
     }
 
@@ -301,13 +445,17 @@ def main(argv: list[str] | None = None) -> int:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "repo_root": str(repo_root.resolve(strict=False)),
             "output_dir": str(args.output_dir.resolve(strict=False)),
+            "benchmark_suite": args.benchmark_suite,
             "requested_models": list(args.models),
             "resolved_models": [],
+            "selected_default_model": None,
+            "selection_reason": None,
             "steps_requested": [],
             "steps_completed": [],
             "elapsed_s": 0.0,
             "ok": False,
             "preflight_error": str(exc),
+            "models": [],
             "step_results": [],
         }
     summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -318,9 +466,12 @@ def main(argv: list[str] | None = None) -> int:
         "[live-model-gate]"
         + f" host={host}"
         + f" resolved_models={','.join(payload.get('resolved_models', []))}"
+        + f" selected_default_model={payload.get('selected_default_model') or '-'}"
         + f" ok={payload['ok']}"
         + f" elapsed_s={payload['elapsed_s']}"
     )
+    if payload.get("selection_reason"):
+        print(f"[live-model-gate] selection_reason={payload['selection_reason']}")
     if payload.get("preflight_error"):
         print(f"[live-model-gate] preflight_error={payload['preflight_error']}")
     for row in payload["step_results"]:

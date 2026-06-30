@@ -306,6 +306,8 @@ def _make_message_record(
             "failed",
             "syntax",
             "timeout",
+            "timed out",
+            "deadline exceeded",
             "permission denied",
             "no such file",
             "command not found",
@@ -313,6 +315,21 @@ def _make_message_record(
     )
     error_class = trajectory_error_profile.classify_error(content) if looks_like_error else None
     shell_error = trajectory_error_profile.classify_shell_error(content) if looks_like_error else None
+    if kind == "message" and not (role == "tool" or bool(name)):
+        error_class = None
+        shell_error = None
+    elif kind == "message":
+        event = trajectory_profile.Event(
+            role=role,
+            kind="tool_result" if role == "tool" else "observation",
+            name=name,
+            category=category,
+            content=content,
+        )
+        if error_class and not trajectory_error_profile._allow_error_class_for_event(error_class, event):
+            error_class = None
+        if shell_error and not trajectory_error_profile.allow_shell_error_for_event(shell_error, event):
+            shell_error = None
     return MessageRecord(
         dataset=dataset,
         row_id=row_id,
@@ -330,6 +347,46 @@ def _make_message_record(
     )
 
 
+def _agent_race_content_text(value: Any) -> str:
+    if isinstance(value, list):
+        text_parts: list[str] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text)
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                text_parts.append(content)
+        if text_parts:
+            return "\n".join(text_parts)
+    return trajectory_profile._content_text(value)
+
+
+def _sanitize_terminalbench_user_content(text: str, task_name: str) -> str:
+    stripped = text.strip()
+    if not stripped:
+        return task_name.strip()
+    if re.fullmatch(r"\$\d+", stripped):
+        return task_name.strip() or stripped
+    sanitized = re.sub(
+        r"(?is)^\s*<environment_context>.*?</environment_context>\s*",
+        "",
+        stripped,
+        count=1,
+    ).strip()
+    if sanitized.lower() == "warmup":
+        return task_name.strip() or sanitized
+    if sanitized:
+        return sanitized
+    collapsed = " ".join(stripped.split()).lower()
+    if collapsed.startswith("<environment_context>") and collapsed.endswith("</environment_context>"):
+        return task_name.strip()
+    return stripped
+
+
 def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
     row_id = _row_id(row, row_number)
     records: list[MessageRecord] = []
@@ -340,12 +397,13 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
         if not isinstance(message, dict):
             continue
         role = str(message.get("role") or "unknown").lower()
-        content = trajectory_profile._content_text(message.get("content"))
+        content = trajectory_profile._openhands_message_content(message)
         raw_display_name = str(message.get("name") or "")
         display_name = trajectory_profile._normalize_tool_name(raw_display_name)
-        tool_calls = _normalize_tool_calls(
-            message.get("tool_calls") if message.get("tool_calls") is not None else message.get("tool_calls_json")
-        )
+        raw_tool_calls = message.get("tool_calls") if message.get("tool_calls") is not None else message.get("tool_calls_json")
+        tool_calls = _normalize_tool_calls(raw_tool_calls)
+        if not tool_calls:
+            tool_calls = _normalize_tool_calls(trajectory_profile._message_tool_calls(message))
         tool_names_by_id.update(trajectory_profile._tool_call_name_by_id(message))
         tool_call_names = tuple(name for name, _arguments in tool_calls)
         inferred = ""
@@ -391,6 +449,15 @@ def _extract_openhands_messages(dataset: str, row: dict[str, Any], row_number: i
         if role == "tool":
             pending_tool_name = ""
     return records
+
+
+def _extract_trace_commons_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
+    messages = trajectory_profile._openhands_messages(row)
+    if messages:
+        return _extract_openhands_messages(dataset, row, row_number)
+    fallback_row = dict(row)
+    fallback_row["messages"] = trajectory_profile._trace_commons_fallback_messages(row)
+    return _extract_openhands_messages(dataset, fallback_row, row_number)
 
 
 def _extract_swe_agent_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
@@ -450,7 +517,7 @@ def _extract_swe_agent_messages(dataset: str, row: dict[str, Any], row_number: i
 def _extract_smith_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
     row_id = _row_id(row, row_number)
     records: list[MessageRecord] = []
-    messages = trajectory_profile._deserialize_possible_json(row.get("messages"))
+    messages = trajectory_profile._first_non_empty_deserialized(row.get("messages"), row.get("messages_json"))
     if not isinstance(messages, list):
         return records
     pending_observation_name = ""
@@ -519,6 +586,7 @@ def _extract_terminalbench_messages(dataset: str, row: dict[str, Any], row_numbe
     row_id = _row_id(row, row_number)
     records: list[MessageRecord] = []
     steps = trajectory_profile._deserialize_possible_json(row.get("steps"))
+    task_name = str(row.get("task_name") or "").strip()
     if not isinstance(steps, list):
         return records
     for index, step in enumerate(steps):
@@ -526,6 +594,8 @@ def _extract_terminalbench_messages(dataset: str, row: dict[str, Any], row_numbe
             continue
         role = str(step.get("src") or "unknown").lower()
         content = trajectory_profile._content_text(step.get("msg"))
+        if role == "user":
+            content = _sanitize_terminalbench_user_content(content, task_name)
         raw_tools = step.get("tools")
         tools = raw_tools if isinstance(raw_tools, list) else []
         normalized_tools: list[tuple[str, dict[str, Any]]] = []
@@ -590,18 +660,186 @@ def _extract_terminalbench_messages(dataset: str, row: dict[str, Any], row_numbe
     return records
 
 
+def _extract_agent_race_messages(dataset: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
+    row_id = _row_id(row, row_number)
+    records: list[MessageRecord] = []
+    raw_events = trajectory_profile._deserialize_possible_json(row.get("events"))
+    if not isinstance(raw_events, list):
+        return records
+    tool_names_by_id: dict[str, str] = {}
+    for index, raw_event in enumerate(raw_events):
+        if not isinstance(raw_event, dict):
+            continue
+        message = raw_event.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "unknown").lower()
+        content = message.get("content")
+        text_content = _agent_race_content_text(content)
+        if role == "assistant":
+            tool_calls: list[tuple[str, dict[str, Any]]] = []
+            text_parts: list[str] = []
+            if isinstance(content, list):
+                for item in content:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").lower()
+                    if item_type in {"tool_use", "toolcall"}:
+                        name = trajectory_profile._normalize_tool_name(str(item.get("name") or ""))
+                        if not name:
+                            continue
+                        tool_id = str(item.get("id") or "")
+                        if tool_id:
+                            tool_names_by_id[tool_id] = name
+                        raw_arguments = item.get("input")
+                        if raw_arguments is None:
+                            raw_arguments = item.get("arguments")
+                        parsed_arguments = trajectory_profile._deserialize_possible_json(raw_arguments)
+                        tool_calls.append((name, parsed_arguments if isinstance(parsed_arguments, dict) else {}))
+                    else:
+                        text = item.get("text")
+                        if isinstance(text, str) and text.strip():
+                            text_parts.append(text)
+            message_tool_calls = tuple(name for name, _arguments in tool_calls)
+            inferred = ""
+            if not message_tool_calls:
+                combined = "\n".join(text_parts).strip() if text_parts else text_content
+                inferred = trajectory_profile._infer_tool_name_from_text(combined) or ""
+            tool_call_names = message_tool_calls or ((inferred,) if inferred else ())
+            records.append(
+                _make_message_record(
+                    dataset=dataset,
+                    row_id=row_id,
+                    message_index=index,
+                    role=role,
+                    kind="message",
+                    name="",
+                    category=trajectory_profile._tool_category(tool_call_names[0] if len(tool_call_names) == 1 else "", text_content),
+                    content=text_content,
+                    tool_call_names=tool_call_names,
+                )
+            )
+            record_tool_calls = tool_calls if tool_calls else [
+                (tool_name, {"command": _inline_shell_command_from_content(text_content)} if tool_name == "run_shell" else {})
+                for tool_name in tool_call_names
+            ]
+            for tool_name, tool_arguments in record_tool_calls:
+                records.append(
+                    _make_message_record(
+                        dataset=dataset,
+                        row_id=row_id,
+                        message_index=index,
+                        role=role,
+                        kind="tool_call",
+                        name=tool_name,
+                        category=trajectory_profile._tool_category(tool_name, text_content),
+                        content="",
+                        tool_call_names=(tool_name,),
+                        tool_arguments=tool_arguments,
+                    )
+                )
+            continue
+        if role == "toolresult":
+            raw_name = str(message.get("toolName") or "")
+            display_name = trajectory_profile._normalize_tool_name(raw_name)
+            tool_call_id = str(message.get("toolCallId") or "")
+            if not display_name:
+                display_name = tool_names_by_id.get(tool_call_id, "tool")
+            records.append(
+                _make_message_record(
+                    dataset=dataset,
+                    row_id=row_id,
+                    message_index=index,
+                    role="tool",
+                    kind="message",
+                    name=display_name,
+                    category=trajectory_profile._tool_category(display_name, text_content),
+                    content=text_content,
+                )
+            )
+            continue
+        if role == "user" and isinstance(content, list):
+            wrapper_parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    if str(item.get("type") or "").lower() == "tool_result":
+                        continue
+                    item_text = _agent_race_content_text(item)
+                    if item_text.strip():
+                        wrapper_parts.append(item_text)
+                    continue
+                item_text = _agent_race_content_text(item)
+                if item_text.strip():
+                    wrapper_parts.append(item_text)
+            wrapper_content = "\n".join(part for part in wrapper_parts if part.strip()).strip()
+            if wrapper_content:
+                records.append(
+                    _make_message_record(
+                        dataset=dataset,
+                        row_id=row_id,
+                        message_index=index,
+                        role=role,
+                        kind="message",
+                        name="",
+                        category="other",
+                        content=wrapper_content,
+                    )
+                )
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").lower() != "tool_result":
+                    continue
+                tool_call_id = str(item.get("tool_use_id") or "")
+                display_name = tool_names_by_id.get(tool_call_id, "tool")
+                item_content = _agent_race_content_text(item.get("content"))
+                records.append(
+                    _make_message_record(
+                        dataset=dataset,
+                        row_id=row_id,
+                        message_index=index,
+                        role="tool",
+                        kind="message",
+                        name=display_name,
+                        category=trajectory_profile._tool_category(display_name, item_content),
+                        content=item_content,
+                    )
+                )
+            continue
+        records.append(
+            _make_message_record(
+                dataset=dataset,
+                row_id=row_id,
+                message_index=index,
+                role=role,
+                kind="message",
+                name="",
+                category="other",
+                content=text_content,
+            )
+        )
+    return records
+
+
 def extract_message_records(dataset: str, adapter: str, row: dict[str, Any], row_number: int) -> list[MessageRecord]:
+    if adapter == "agent_race":
+        return _extract_agent_race_messages(dataset, row, row_number)
     if adapter == "openhands":
         return _extract_openhands_messages(dataset, row, row_number)
-    if adapter == "trace_commons":
+    if adapter == "cc_bench":
         return _extract_openhands_messages(dataset, row, row_number)
+    if adapter == "trace_commons":
+        return _extract_trace_commons_messages(dataset, row, row_number)
     if adapter == "thoughtworks":
         effective_adapter = trajectory_profile._thoughtworks_row_adapter(row)
         if effective_adapter == "openhands":
             return _extract_openhands_messages(dataset, row, row_number)
         return _extract_smith_messages(
             dataset,
-            {"messages": row.get("messages") or row.get("messages_json"), "traj_id": row.get("session_id") or row.get("source_id")},
+            {
+                "messages": trajectory_profile._first_non_empty_deserialized(row.get("messages"), row.get("messages_json")),
+                "traj_id": row.get("session_id") or row.get("source_id"),
+            },
             row_number,
         )
     if adapter == "swe_agent":
@@ -1057,13 +1295,18 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
     for pattern in spec["paths"]:
         paths.extend(sorted(root.glob(pattern)))
     adapter = str(spec["adapter"])
+    if adapter == "agent_race":
+        rows = trajectory_profile._iter_agent_race_rows(paths, max_rows=max_rows)
+        return adapter, trajectory_profile._iter_rows_with_trajectory_content(adapter, rows, max_rows=max_rows)
     columns = ["trajectory", "messages", "messages_json", "instance_id", "trajectory_id", "repo"]
     if adapter == "swe_agent":
         columns = ["trajectory", "instance_id", "target"]
     elif adapter == "smith":
         columns = ["messages", "instance_id", "traj_id"]
+    elif adapter == "cc_bench":
+        columns = ["trajectory", "task_id", "id", "task_category", "model_name"]
     elif adapter == "trace_commons":
-        columns = ["messages", "session_id", "harness", "prompt", "num_tool_calls"]
+        columns = ["messages", "messages_json", "trace", "session_id", "harness", "prompt", "num_tool_calls"]
     elif adapter == "thoughtworks":
         columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
     elif adapter == "terminalbench":
@@ -1235,17 +1478,49 @@ def _attach_manifest(summary: dict[str, Any], data_root: Path) -> None:
     }
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sorted_count_items(mapping: dict[str, Any], *, limit: int | None = None) -> list[tuple[str, int]]:
+    rows: list[tuple[str, int]] = []
+    for key, value in mapping.items():
+        parsed = _safe_int(value)
+        if parsed is None:
+            continue
+        rows.append((str(key), parsed))
+    rows.sort(key=lambda item: (-item[1], item[0]))
+    if limit is not None:
+        return rows[:limit]
+    return rows
+
+
 def _reference_row_pattern_counts(summary: dict[str, Any]) -> dict[str, int]:
     reference_trajectory = summary.get("reference_trajectory_metrics")
     if not isinstance(reference_trajectory, dict):
         return dict(summary.get("row_pattern_counts") or {})
-    rows_profiled = int(reference_trajectory.get("rows_profiled") or 0)
-    rows_with_edit = round(rows_profiled * (float(reference_trajectory.get("rows_with_edit_pct") or 0.0) / 100.0))
+    rows_profiled = _safe_int(reference_trajectory.get("rows_profiled") or 0) or 0
+    rows_with_edit_pct = _safe_float(reference_trajectory.get("rows_with_edit_pct") or 0.0) or 0.0
+    rows_with_edit = round(rows_profiled * (rows_with_edit_pct / 100.0))
+    mechanical_turn_candidates_pct = _safe_float(reference_trajectory.get("mechanical_turn_candidates_pct") or 0.0) or 0.0
+    context_loop_rows_pct = _safe_float(reference_trajectory.get("context_loop_rows_pct") or 0.0) or 0.0
+    edit_without_prior_context_pct = _safe_float(reference_trajectory.get("edit_without_prior_context_pct") or 0.0) or 0.0
+    edit_without_later_test_pct = _safe_float(reference_trajectory.get("edit_without_later_test_pct") or 0.0) or 0.0
     return {
-        "mechanical-turn-row": round(rows_profiled * (float(reference_trajectory.get("mechanical_turn_candidates_pct") or 0.0) / 100.0)),
-        "context-loop-row": round(rows_profiled * (float(reference_trajectory.get("context_loop_rows_pct") or 0.0) / 100.0)),
-        "edit-without-context-row": round(rows_with_edit * (float(reference_trajectory.get("edit_without_prior_context_pct") or 0.0) / 100.0)),
-        "edit-without-test-row": round(rows_with_edit * (float(reference_trajectory.get("edit_without_later_test_pct") or 0.0) / 100.0)),
+        "mechanical-turn-row": round(rows_profiled * (mechanical_turn_candidates_pct / 100.0)),
+        "context-loop-row": round(rows_profiled * (context_loop_rows_pct / 100.0)),
+        "edit-without-context-row": round(rows_with_edit * (edit_without_prior_context_pct / 100.0)),
+        "edit-without-test-row": round(rows_with_edit * (edit_without_later_test_pct / 100.0)),
     }
 
 
@@ -1292,14 +1567,20 @@ def _fix_evidence_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
         rec_id = trajectory_error_profile.RECOMMENDATIONS.get(str(error_class))
         if not rec_id:
             continue
-        grouped_counts[rec_id] += int(count)
+        parsed_count = _safe_int(count)
+        if parsed_count is None:
+            continue
+        grouped_counts[rec_id] += parsed_count
         grouped_datasets[rec_id].add(dataset_name)
     shell_error_counts: dict[str, Any] = dict(summary.get("shell_error_counts") or {})
     if isinstance(reference_error, dict) and isinstance(reference_error.get("shell_error_counts"), dict):
         shell_error_counts = dict(reference_error.get("shell_error_counts") or {})
     for shell_error, count in shell_error_counts.items():
         for rec_id in SHELL_ERROR_FIX_MAP.get(str(shell_error), ()):
-            grouped_counts[rec_id] += int(count)
+            parsed_count = _safe_int(count)
+            if parsed_count is None:
+                continue
+            grouped_counts[rec_id] += parsed_count
             grouped_datasets[rec_id].add(dataset_name)
     rows: list[dict[str, Any]] = []
     for rec_id, evidence_count in grouped_counts.most_common():
@@ -1323,7 +1604,10 @@ def _portfolio(payload: dict[str, Any]) -> list[dict[str, Any]]:
     dataset_map: dict[str, set[str]] = defaultdict(set)
     for summary in payload.get("datasets", []):
         for row in _fix_evidence_rows(summary):
-            counts[row["id"]] += int(row["evidence_count"])
+            evidence_count = _safe_int(row.get("evidence_count"))
+            if evidence_count is None:
+                continue
+            counts[row["id"]] += evidence_count
             dataset_map[row["id"]].update(row["datasets"])
     rows: list[dict[str, Any]] = []
     for rec_id, evidence_count in counts.most_common():
@@ -1406,11 +1690,12 @@ def build_report(
     reference_trajectory_path: Path | None = None,
     reference_error_path: Path | None = None,
 ) -> dict[str, Any]:
+    effective_max_rows = None if max_rows == 0 else max_rows
     reference_trajectory = _load_reference_map(reference_trajectory_path)
     reference_error = _load_reference_map(reference_error_path)
     summaries: list[dict[str, Any]] = []
     for dataset in datasets:
-        adapter, rows = _iter_dataset_rows(data_root, dataset, max_rows)
+        adapter, rows = _iter_dataset_rows(data_root, dataset, effective_max_rows)
         summary = summarize_dataset(dataset, adapter, rows)
         _attach_manifest(summary, data_root)
         _merge_reference_metrics(summary, reference_trajectory=reference_trajectory, reference_error=reference_error)
@@ -1418,7 +1703,7 @@ def build_report(
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "data_root": data_root.as_posix(),
-        "max_rows_per_dataset": max_rows,
+        "max_rows_per_dataset": effective_max_rows,
         "datasets": summaries,
         "reference_trajectory_profile": reference_trajectory_path.as_posix() if reference_trajectory_path and reference_trajectory_path.exists() else None,
         "reference_error_profile": reference_error_path.as_posix() if reference_error_path and reference_error_path.exists() else None,
@@ -1487,7 +1772,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
         if isinstance(reference_error, dict):
             top_errors = dict(reference_error.get("error_counts") or {})
             if top_errors:
-                ordered = sorted(top_errors.items(), key=lambda item: (-int(item[1]), item[0]))[:5]
+                ordered = _sorted_count_items(top_errors, limit=5)
                 lines.append("- Full-corpus top errors: " + ", ".join(f"`{name}`={count}" for name, count in ordered))
         lines.append("")
         lines.append("### Message Themes")
@@ -1498,7 +1783,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
         else:
             lines.append("| Theme | Count | Meaning |")
             lines.append("|---|---:|---|")
-            for theme, count in sorted(theme_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:10]:
+            for theme, count in _sorted_count_items(theme_counts, limit=10):
                 meta = MESSAGE_THEME_META.get(theme, {})
                 lines.append(f"| `{theme}` | {count} | {meta.get('description', '')} |")
         lines.append("")
@@ -1510,7 +1795,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
         else:
             lines.append("| Error | Count | Fix |")
             lines.append("|---|---:|---|")
-            for error_name, count in sorted(error_counts.items(), key=lambda item: (-int(item[1]), item[0]))[:10]:
+            for error_name, count in _sorted_count_items(error_counts, limit=10):
                 fix = trajectory_error_profile.RECOMMENDATIONS.get(error_name, "")
                 lines.append(f"| `{error_name}` | {count} | `{fix}` |")
         lines.append("")
@@ -1522,7 +1807,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
         else:
             lines.append("| Pattern | Count | Meaning |")
             lines.append("|---|---:|---|")
-            for pattern_name, count in sorted(row_patterns.items(), key=lambda item: (-int(item[1]), item[0])):
+            for pattern_name, count in _sorted_count_items(row_patterns):
                 meta = ROW_PATTERN_META.get(pattern_name, {})
                 lines.append(f"| `{pattern_name}` | {count} | {meta.get('description', '')} |")
         lines.append("")
@@ -1535,16 +1820,16 @@ def format_markdown(payload: dict[str, Any]) -> str:
             lines.append("(none)")
         else:
             if shell_commands:
-                ordered = sorted(shell_commands.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+                ordered = _sorted_count_items(shell_commands, limit=10)
                 lines.append("- Top families: " + ", ".join(f"`{name}`={count}" for name, count in ordered))
             if shell_intents:
-                ordered = sorted(shell_intents.items(), key=lambda item: (-int(item[1]), item[0]))[:10]
+                ordered = _sorted_count_items(shell_intents, limit=10)
                 lines.append("- Top intents: " + ", ".join(f"`{name}`={count}" for name, count in ordered))
             if shell_shapes:
                 lines.append("")
                 lines.append("| Shape | Count |")
                 lines.append("|---|---:|")
-                for shape, count in sorted(shell_shapes.items(), key=lambda item: (-int(item[1]), item[0]))[:10]:
+                for shape, count in _sorted_count_items(shell_shapes, limit=10):
                     lines.append(f"| `{shape}` | {count} |")
         lines.append("")
         lines.append("### Example Citations")
@@ -1575,7 +1860,7 @@ def format_markdown(payload: dict[str, Any]) -> str:
         shell_intent_examples = dict(summary.get("shell_command_intent_examples") or {})
         ranked_shell_intents = sorted(
             shell_intent_examples.items(),
-            key=lambda item: (-int(shell_intents.get(item[0], 0)), item[0]),
+            key=lambda item: (-(_safe_int(shell_intents.get(item[0], 0)) or 0), item[0]),
         )[:3]
         for label, examples in ranked_shell_intents:
             if not examples:
@@ -1605,7 +1890,23 @@ def format_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def main(argv: list[str] | None = None) -> int:
+def _resolve_output_paths(
+    *,
+    output: Path | None,
+    output_json: Path | None,
+    output_md: Path | None,
+) -> tuple[Path, Path]:
+    if output is None:
+        return output_json or DEFAULT_JSON_OUTPUT, output_md or DEFAULT_MARKDOWN_OUTPUT
+    suffix = output.suffix.lower()
+    if suffix == ".json":
+        return output_json or output, output_md or output.with_suffix(".md")
+    if suffix == ".md":
+        return output_json or output.with_suffix(".json"), output_md or output
+    return output_json or output.with_suffix(".json"), output_md or output.with_suffix(".md")
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Scan every local trajectory message and emit grouped evidence tied to current product fixes.")
     parser.add_argument(
         "--datasets",
@@ -1616,8 +1917,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT, help="Root directory containing downloaded trajectory datasets.")
     parser.add_argument("--max-rows", type=int, default=None, help="Optional per-dataset row cap for faster sampling.")
-    parser.add_argument("--output-json", type=Path, default=DEFAULT_JSON_OUTPUT, help="Where to write raw JSON.")
-    parser.add_argument("--output-md", type=Path, default=DEFAULT_MARKDOWN_OUTPUT, help="Where to write the markdown report.")
+    parser.add_argument("--output", type=Path, default=None, help="Base output path or explicit .json/.md path; writes both JSON and Markdown siblings.")
+    parser.add_argument("--output-json", type=Path, default=None, help="Where to write raw JSON.")
+    parser.add_argument("--output-md", type=Path, default=None, help="Where to write the markdown report.")
     parser.add_argument(
         "--reference-trajectory-profile",
         type=Path,
@@ -1630,7 +1932,17 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_REFERENCE_ERROR_PROFILE,
         help="Optional full-corpus trajectory-error-profile JSON to merge into the report.",
     )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
+    output_json, output_md = _resolve_output_paths(
+        output=args.output,
+        output_json=args.output_json,
+        output_md=args.output_md,
+    )
 
     payload = build_report(
         args.data_root,
@@ -1639,14 +1951,14 @@ def main(argv: list[str] | None = None) -> int:
         reference_trajectory_path=args.reference_trajectory_profile,
         reference_error_path=args.reference_error_profile,
     )
-    args.output_json.parent.mkdir(parents=True, exist_ok=True)
-    args.output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     markdown = format_markdown(payload)
-    args.output_md.parent.mkdir(parents=True, exist_ok=True)
-    args.output_md.write_text(markdown, encoding="utf-8")
+    output_md.parent.mkdir(parents=True, exist_ok=True)
+    output_md.write_text(markdown, encoding="utf-8")
 
-    print(f"Wrote JSON: {args.output_json}")
-    print(f"Wrote Markdown: {args.output_md}")
+    print(f"Wrote JSON: {output_json}")
+    print(f"Wrote Markdown: {output_md}")
     for summary in payload.get("datasets", []):
         print(
             f"{summary.get('dataset')}: rows={summary.get('rows_profiled')} messages={summary.get('messages_profiled')} "

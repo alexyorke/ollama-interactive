@@ -368,8 +368,11 @@ def ollama_host() -> str:
 
 def installed_models() -> list[str]:
     request = urllib.request.Request(f"{ollama_host()}/api/tags")
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return []
     models = payload.get("models") if isinstance(payload, dict) else []
     names: list[str] = []
     for item in models:
@@ -380,13 +383,19 @@ def installed_models() -> list[str]:
 
 def resolve_requested_models(requested: list[str], available: set[str]) -> list[str]:
     resolved: list[str] = []
+    seen: set[str] = set()
     for model in requested:
+        candidate: str | None = None
         if model in available:
-            resolved.append(model)
+            candidate = model
+        else:
+            latest = f"{model}:latest"
+            if latest in available:
+                candidate = latest
+        if not candidate or candidate in seen:
             continue
-        latest = f"{model}:latest"
-        if latest in available:
-            resolved.append(latest)
+        seen.add(candidate)
+        resolved.append(candidate)
     return resolved
 
 

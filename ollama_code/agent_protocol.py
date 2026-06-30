@@ -125,6 +125,7 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "read_file",
     "search",
     "file_search",
+    "directory_search",
     "fd_search",
     "file_index_refresh",
     "everything_search",
@@ -163,8 +164,8 @@ READ_ONLY_CACHEABLE_TOOL_NAMES = {
     "git_status",
     "git_diff",
 }
-READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "python_sdk_search", "python_sdk_refresh", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "tool_status", "semgrep_scan", "ast_search", "tree_sitter_syntax", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "implementation_spec", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
-CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "python_sdk_search", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
+READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "directory_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "python_sdk_search", "python_sdk_refresh", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "tool_status", "semgrep_scan", "ast_search", "tree_sitter_syntax", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "find_implementation_target", "implementation_spec", "diagnose_dependency_error", "call_graph", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "mcp_list_tools"}
+CORE_READ_ONLY_WORKSPACE_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "directory_search", "fd_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "python_sdk_search", "repo_index_search", "fts_search", "indexed_search", "find_implementation_target", "diagnose_dependency_error"}
 INDEX_REFRESH_TOOL_NAMES = {"file_index_refresh", "fts_refresh", "repo_index_refresh", "verified_function_index", "python_sdk_refresh"}
 STRUCTURAL_SEARCH_TOOL_NAMES = {"semgrep_scan", "ast_search", "structural_rewrite", "tree_sitter_syntax"}
 LSP_TOOL_NAMES = {"lsp_diagnostics", "lsp_definition", "lsp_references"}
@@ -175,12 +176,13 @@ TEST_TOOL_NAMES = {"run_test", "diagnose_test_failure", "test_spec_extract", "im
 SHELL_TOOL_NAMES = {"run_shell", "run_function_probe"}
 GIT_TOOL_NAMES = {"git_status", "git_diff", "git_branch", "git_log", "git_commit"}
 AGENT_TOOL_NAMES = {"run_agent"}
-CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "python_sdk_search", "python_sdk_refresh", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "tool_status", "semgrep_scan", "ast_search", "tree_sitter_syntax", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "implementation_spec", "mcp_list_tools"}
+CONTEXT_GATHERING_TOOL_NAMES = {"list_files", "read_file", "search", "file_search", "directory_search", "fd_search", "file_index_refresh", "everything_search", "search_symbols", "code_outline", "read_symbol", "inspect_library_source", "python_sdk_search", "python_sdk_refresh", "repo_index_search", "fts_search", "fts_refresh", "indexed_search", "repo_index_refresh", "tool_status", "semgrep_scan", "ast_search", "tree_sitter_syntax", "lsp_diagnostics", "lsp_definition", "lsp_references", "context_pack", "systems_lens", "contract_graph", "verified_function_index", "verified_function_search", "verified_function_show", "compose_verified_functions", "discover_validators", "test_spec_extract", "implementation_spec", "mcp_list_tools"}
 BROAD_CONTEXT_GATHERING_TOOL_NAMES = {
     "list_files",
     "read_file",
     "search",
     "file_search",
+    "directory_search",
     "fd_search",
     "file_index_refresh",
     "everything_search",
@@ -195,7 +197,7 @@ BROAD_CONTEXT_GATHERING_TOOL_NAMES = {
     "tree_sitter_syntax",
     "discover_validators",
 }
-GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "python_sdk_search", "context_pack", "repo_index_search", "fts_search", "indexed_search", "tool_status", "semgrep_scan", "ast_search", "tree_sitter_syntax", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "implementation_spec", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
+GROUNDING_EVIDENCE_TOOL_NAMES = {"read_file", "file_search", "directory_search", "fd_search", "everything_search", "read_symbol", "inspect_library_source", "python_sdk_search", "context_pack", "repo_index_search", "fts_search", "indexed_search", "tool_status", "semgrep_scan", "ast_search", "tree_sitter_syntax", "lsp_diagnostics", "lsp_definition", "lsp_references", "find_implementation_target", "diagnose_test_failure", "implementation_spec", "diagnose_dependency_error", "contract_graph", "verified_function_search", "verified_function_show", "compose_verified_functions"}
 VALIDATION_TOOL_NAMES = {"run_test", "run_function_probe", "lint_typecheck", "contract_check", "verify_function_contract", "select_tests", "discover_validators", "diagnose_dependency_error", "lsp_diagnostics", "tree_sitter_syntax"}
 RISKY_VERIFICATION_TOOL_NAMES = {"search", "git_status", "git_diff", "run_shell", "run_test", "run_agent"}
 CODE_EDIT_SUFFIXES = {".py", ".js", ".jsx", ".ts", ".tsx", ".go", ".rs", ".java", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs", ".rb", ".php", ".swift", ".kt", ".kts", ".sh", ".bash"}
@@ -204,6 +206,7 @@ MODEL_TOOL_RESULT_LIMITS = {
     "read_file": 1000,
     "search": 700,
     "file_search": 700,
+    "directory_search": 700,
     "fd_search": 700,
     "file_index_refresh": 400,
     "everything_search": 700,

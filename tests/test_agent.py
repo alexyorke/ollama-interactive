@@ -111,6 +111,16 @@ class CountingToolExecutor(ToolExecutor):
         return super().execute(name, arguments)
 
 
+class RawImplementationSpecCountingToolExecutor(CountingToolExecutor):
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.raw_implementation_spec_calls = 0
+
+    def implementation_spec(self, source_path: str, test_path: str | None = None, limit: int = 40) -> dict[str, object]:
+        self.raw_implementation_spec_calls += 1
+        return super().implementation_spec(source_path, test_path, limit)
+
+
 class EmptySelectTestsToolExecutor(CountingToolExecutor):
     def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
         self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
@@ -120,6 +130,39 @@ class EmptySelectTestsToolExecutor(CountingToolExecutor):
                 "tool": "select_tests",
                 "summary": "No targeted tests found.",
                 "test_commands": [],
+            }
+        return ToolExecutor.execute(self, name, arguments)
+
+
+class EmptySelectTestsLintFallbackToolExecutor(EmptySelectTestsToolExecutor):
+    def __init__(self, *args: object, fallback_command: str, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.fallback_command = fallback_command
+
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
+        if name == "select_tests":
+            return {
+                "ok": True,
+                "tool": "select_tests",
+                "summary": "No targeted tests found.",
+                "test_commands": [],
+            }
+        if name == "discover_validators":
+            return {
+                "ok": True,
+                "tool": "discover_validators",
+                "validators": [
+                    {
+                        "kind": "lint",
+                        "lang": "custom",
+                        "command": self.fallback_command,
+                        "available": True,
+                        "reason": "custom lint fallback",
+                    }
+                ],
+                "summary": "Discovered lint fallback command.",
+                "output": f"lint custom: {self.fallback_command} available=True reason=custom lint fallback",
             }
         return ToolExecutor.execute(self, name, arguments)
 
@@ -229,7 +272,7 @@ class AgentTests(unittest.TestCase):
     def test_agent_uses_schema_and_num_predict_feature_profile(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(['{"type":"final","message":"ok"}'])
-        tools = ToolExecutor(root, approval_mode="auto")
+        tools = ToolExecutor(root, approval_mode="auto", test_command="python -m unittest discover -s tests -v")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "schema,num-predict-caps"}):
@@ -243,7 +286,7 @@ class AgentTests(unittest.TestCase):
     def test_primary_think_defaults_off_for_broad_coding_prompt(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
+        tools = ToolExecutor(root, approval_mode="auto", test_command="python -m unittest discover -s tests -v")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
 
         think = agent._primary_think_override(
@@ -277,8 +320,12 @@ class AgentTests(unittest.TestCase):
     def test_context_pack_preload_requires_path_for_focused_edit_prompt(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient([])
-        tools = ToolExecutor(root, approval_mode="auto")
+        tools = ToolExecutor(root, approval_mode="auto", test_command="python -m unittest discover -s tests -v")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+        (root / "src").mkdir(exist_ok=True)
+        (root / "docs").mkdir(exist_ok=True)
+        (root / "src" / "client.py").write_text("def fetch_data(url: str) -> dict:\n    return {}\n", encoding="utf-8")
+        (root / "docs" / "client.md").write_text("Call `fetch_data(url)` to fetch data.\n", encoding="utf-8")
 
         with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack"}):
             should_preload = agent._should_preload_context_pack(
@@ -297,9 +344,42 @@ class AgentTests(unittest.TestCase):
                 required_tool_names=set(),
                 forbidden_tool_names=set(),
             )
+            should_skip_project_rename = agent._should_preload_context_pack(
+                request_text=(
+                    "Refactor the pricing API from total(prices) to cart_total(prices). "
+                    "Update src/pricing.py, tests, and docs/pricing.md. Run tests."
+                ),
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip_optional_parameter_docs = agent._should_preload_context_pack(
+                request_text=(
+                    "Add an optional timeout: int = None parameter to fetch_data in src/client.py, update docs/client.md, "
+                    "and run tests."
+                ),
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip_import_repair = agent._should_preload_context_pack(
+                request_text="Fix the import bug in src/app.py because it uses from .helpers import slugify when run as a script, then run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
 
         self.assertTrue(should_preload)
         self.assertFalse(should_skip)
+        self.assertFalse(should_skip_project_rename)
+        self.assertFalse(should_skip_optional_parameter_docs)
+        self.assertFalse(should_skip_import_repair)
 
     def test_clarification_planner_asks_after_local_evidence(self) -> None:
         root = self._workspace_scratch()
@@ -649,6 +729,58 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tool_calls[:2], ["search", "search_symbols"])
         self.assertTrue(any("Use the symbol-level matches for wrapped in src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
 
+    def test_context_planner_blocks_for_unique_context_pack_target_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "context_pack",
+                "arguments": {"request": "Fix calculate_discount", "path": ".", "limit": 8},
+                "result": {
+                    "ok": True,
+                    "tool": "context_pack",
+                    "suggested_next_tool": "read_symbol",
+                    "ranked_paths": ["src/pricing.py"],
+                    "ranked_symbols": [{"path": "src/pricing.py", "qualname": "calculate_discount"}],
+                    "output": "context_pack:\nsuggested_next_tool=read_symbol",
+                },
+            }
+        ]
+
+        self.assertTrue(
+            agent._context_planner_blocks(
+                name="search",
+                tool_calls=[],
+                latest_run_test_failed=False,
+                successful_tool_results=successful_tool_results,
+            )
+        )
+
+    def test_context_planner_probe_prefers_unique_context_pack_symbol_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "context_pack",
+                "arguments": {"request": "Fix calculate_discount", "path": ".", "limit": 8},
+                "result": {
+                    "ok": True,
+                    "tool": "context_pack",
+                    "suggested_next_tool": "read_symbol",
+                    "ranked_paths": ["src/pricing.py"],
+                    "ranked_symbols": [{"path": "src/pricing.py", "qualname": "calculate_discount"}],
+                    "output": "context_pack:\nsuggested_next_tool=read_symbol",
+                },
+            }
+        ]
+
+        probe = agent._context_planner_probe(
+            successful_tool_results=successful_tool_results,
+            forbidden_tool_names=set(),
+        )
+
+        self.assertEqual(probe, ("read_symbol", {"path": "src/pricing.py", "symbol": "calculate_discount", "include_context": 0}))
+
     def test_context_planner_auto_outlines_narrowed_repo_search_without_source_context(self) -> None:
         root = self._workspace_scratch()
         (root / "README.md").write_text("overview\n", encoding="utf-8")
@@ -672,6 +804,328 @@ class AgentTests(unittest.TestCase):
         tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
         self.assertEqual(tool_calls[:2], ["search", "code_outline"])
         self.assertTrue(any("Use the code outline for src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_context_planner_auto_outlines_single_code_file_from_list_files(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "app.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"list_files","arguments":{"path":"."}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"app.py contains the relevant implementation."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "app.py contains the relevant implementation.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:2], ["list_files", "code_outline"])
+        self.assertTrue(any("Use the code outline for app.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_shell_cat_inspection_normalizes_to_read_file(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("hello from docs\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"cat README.md"}}',
+                '{"type":"final","message":"hello from docs"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect README.md and summarize it.")
+
+        self.assertEqual(result.message, "hello from docs")
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("original_name"), "run_shell")
+        self.assertEqual(normalized[0].get("normalized_name"), "read_file")
+
+    def test_shell_ls_inspection_normalizes_to_list_files(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"ls ."}}',
+                '{"type":"final","message":"README.md exists"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the project files and summarize them.")
+
+        self.assertEqual(result.message, "README.md exists")
+        self.assertEqual(tools.execute_counts.get("list_files"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("original_name"), "run_shell")
+        self.assertEqual(normalized[0].get("normalized_name"), "list_files")
+
+    def test_shell_grep_inspection_normalizes_to_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("alpha\nneedle phrase\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"grep \\"needle phrase\\" README.md"}}',
+                '{"type":"final","message":"needle phrase is in README.md"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect README.md for the needle phrase and summarize.")
+
+        self.assertEqual(result.message, "needle phrase is in README.md")
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("original_name"), "run_shell")
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle phrase", "path": "README.md"})
+
+    def test_shell_grep_with_flags_does_not_normalize_to_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("needle\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"rg -i needle README.md"}}',
+                '{"type":"final","message":"searched with grep"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the project with a shell-style lookup if useful and summarize.")
+
+        self.assertEqual(result.message, "searched with grep")
+        self.assertEqual(tools.execute_counts.get("run_shell"), 1)
+        self.assertIsNone(tools.execute_counts.get("search"))
+        self.assertFalse(any(event.get("type") == "tool_normalized" for event in agent.events))
+
+    def test_shell_grep_line_number_inspection_normalizes_to_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("alpha\nneedle\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"grep -n needle README.md"}}',
+                '{"type":"final","message":"needle found"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect README.md for needle and summarize.")
+
+        self.assertEqual(result.message, "needle found")
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle", "path": "README.md"})
+
+    def test_shell_head_inspection_normalizes_to_bounded_read_file(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"head -n 2 README.md"}}',
+                '{"type":"final","message":"read the first two lines"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Preview README.md and summarize it.")
+
+        self.assertEqual(result.message, "read the first two lines")
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "read_file")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"path": "README.md", "start": 1, "end": 2})
+
+    def test_shell_tail_inspection_normalizes_to_bounded_read_file(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"tail -2 README.md"}}',
+                '{"type":"final","message":"read the last two lines"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Preview README.md and summarize it.")
+
+        self.assertEqual(result.message, "read the last two lines")
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "read_file")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"path": "README.md", "start": 3, "end": 4})
+
+    def test_shell_head_with_unsupported_flags_does_not_normalize(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("needle\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        normalized_name, normalized_arguments, reason = agent._normalize_shell_inspection_call(
+            "run_shell",
+            {"command": "head -q README.md"},
+            request_text="Inspect README.md and summarize it.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(normalized_name, "run_shell")
+        self.assertEqual(normalized_arguments, {"command": "head -q README.md"})
+        self.assertIsNone(reason)
+
+    def test_shell_find_file_inspection_normalizes_to_file_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "debug.py").write_text("VALUE = 1\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"find src -name \\"debug.py\\" -type f"}}',
+                '{"type":"final","message":"debug.py exists"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Find the debug.py file and summarize it.")
+
+        self.assertEqual(result.message, "debug.py exists")
+        self.assertEqual(tools.execute_counts.get("file_search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "file_search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "debug.py", "path": "src", "limit": 100})
+
+    def test_shell_find_directory_inspection_normalizes_to_directory_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests" / "mysql").mkdir(parents=True)
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"find tests -name \\"*mysql*\\" -type d"}}',
+                '{"type":"final","message":"mysql test directory exists"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Find matching test directories.")
+
+        self.assertEqual(result.message, "mysql test directory exists")
+        self.assertEqual(tools.execute_counts.get("directory_search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "directory_search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "*mysql*", "path": "tests", "limit": 100})
+
+    def test_shell_find_exec_grep_inspection_normalizes_to_filtered_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("needle\n", encoding="utf-8")
+        (root / "README.md").write_text("needle\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"find . -name \\"*.py\\" -exec grep -l needle {} ;"}}',
+                '{"type":"final","message":"needle found in Python files"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Find Python files containing needle and summarize.")
+
+        self.assertIn("app.py", result.message)
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle", "path": ".", "file_glob": "*.py"})
+
+    def test_shell_find_exec_grep_with_type_file_normalizes_to_filtered_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("needle\n", encoding="utf-8")
+        (root / "README.md").write_text("needle\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"find . -name \\"*.py\\" -type f -exec grep -l needle {} ;"}}',
+                '{"type":"final","message":"needle found in Python files"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Find Python files containing needle and summarize.")
+
+        self.assertIn("app.py", result.message)
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle", "path": ".", "file_glob": "*.py"})
+
+    def test_shell_find_exec_grep_with_unsupported_flags_does_not_normalize(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("needle\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        normalized_name, normalized_arguments, reason = agent._normalize_shell_inspection_call(
+            "run_shell",
+            {"command": 'find . -name "*.py" -exec grep -i needle {} ;'},
+            request_text="Find Python files containing needle.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(normalized_name, "run_shell")
+        self.assertEqual(normalized_arguments, {"command": 'find . -name "*.py" -exec grep -i needle {} ;'})
+        self.assertIsNone(reason)
+
+    def test_context_planner_does_not_auto_outline_ambiguous_list_files_code_paths(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def app():\n    return 'app'\n", encoding="utf-8")
+        (root / "worker.py").write_text("def worker():\n    return 'worker'\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "list_files",
+                "arguments": {"path": "."},
+                "result": {"ok": True, "tool": "list_files", "path": ".", "output": "app.py\nworker.py\nREADME.md"},
+            }
+        ]
+
+        self.assertFalse(
+            agent._context_planner_blocks(
+                name="read_file",
+                tool_calls=[],
+                latest_run_test_failed=False,
+                successful_tool_results=successful_tool_results,
+            )
+        )
+        self.assertIsNone(agent._context_planner_probe(successful_tool_results=successful_tool_results, forbidden_tool_names=set()))
 
     def test_context_planner_auto_outlines_recent_source_before_more_broad_reads(self) -> None:
         root = self._workspace_scratch()
@@ -937,6 +1391,32 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("read_file"), 1)
         self.assertTrue(any("Use the grounded file app.py to make the edit now." in message["content"] for message in agent.messages if message["role"] == "user"))
 
+    def test_trajectory_ground_guard_requires_target_path_grounding_after_unrelated_read(self) -> None:
+        root = self._workspace_scratch()
+        (root / "notes.txt").write_text("todo\n", encoding="utf-8")
+        (root / "app.py").write_text("def value():\n    return 'old'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"notes.txt"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return \'old\'","new":"return \'new\'"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return \'old\'","new":"return \'new\'"}}',
+                '{"type":"final","message":"Updated app.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=7)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read notes, then fix app.py by changing old to new.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("return 'new'", (root / "app.py").read_text(encoding="utf-8"))
+        self.assertEqual(tools.execute_counts.get("read_file"), 2)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["read_file", "read_file", "replace_in_file"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the grounded file app.py to make the edit now.", feedback)
+
     def test_trajectory_ground_guard_auto_reads_symbol_before_symbol_edit_retry(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
@@ -1160,6 +1640,33 @@ class AgentTests(unittest.TestCase):
         )
 
         self.assertEqual(probe, ("search_symbols", {"query": "add", "path": "."}))
+
+    def test_pathless_mutation_grounding_probe_uses_unique_context_pack_symbol_before_repo_search(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "context_pack",
+                "arguments": {"request": "Fix calculate_discount", "path": ".", "limit": 8},
+                "result": {
+                    "ok": True,
+                    "tool": "context_pack",
+                    "suggested_next_tool": "read_symbol",
+                    "ranked_paths": ["src/pricing.py"],
+                    "ranked_symbols": [{"path": "src/pricing.py", "qualname": "calculate_discount"}],
+                    "output": "context_pack:\nsuggested_next_tool=read_symbol",
+                },
+            }
+        ]
+
+        probe = agent._pathless_mutation_grounding_probe(
+            name="edit_intent",
+            arguments={"intent": "replace_body", "target": "calculate_discount", "replacement": "return 0"},
+            requested_mutation_paths=set(),
+            successful_tool_results=successful_tool_results,
+        )
+
+        self.assertEqual(probe, ("read_symbol", {"path": "src/pricing.py", "symbol": "calculate_discount", "include_context": 0}))
 
     def test_pathless_mutation_grounding_probe_prefers_unique_symbol_match_among_multiple_explicit_sources(self) -> None:
         root = self._workspace_scratch()
@@ -1703,6 +2210,70 @@ class AgentTests(unittest.TestCase):
         auto_validation_names = [event.get("name") for event in agent.events if event.get("type") == "auto_validation"]
         self.assertEqual(auto_validation_names[:2], ["discover_validators", "run_test"])
 
+    def test_placeholder_completion_reprompts_after_stub_like_code_edit_without_failed_tests(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "math_utils.py").write_text(
+            "def add(left, right):\n    return left - right\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/math_utils.py"}}',
+                '{"type":"tool","name":"edit_intent","arguments":{"path":"src/math_utils.py","intent":"replace_body","target":"add","replacement":"pass"}}',
+                '{"type":"final","message":"Implemented src/math_utils.py successfully."}',
+                '{"type":"tool","name":"edit_intent","arguments":{"path":"src/math_utils.py","intent":"replace_body","target":"add","replacement":"return left + right"}}',
+                '{"type":"final","message":"Implemented src/math_utils.py successfully."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Implement add in src/math_utils.py so it returns the sum.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Implemented src/math_utils.py successfully.")
+        self.assertIn("return left + right", (root / "src" / "math_utils.py").read_text(encoding="utf-8"))
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "placeholder-completion-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("still a stub/comment/pass-style placeholder", feedback)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 2)
+
+    def test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests(self) -> None:
+        root = self._workspace_scratch()
+        (root / "docs").mkdir()
+        (root / "docs" / "guide.md").write_text("Old guide text.\n", encoding="utf-8")
+        lint_command = subprocess.list2cmdline([sys.executable, "-c", "print('lint ok')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"docs/guide.md"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"docs/guide.md","old":"Old guide text.","new":"Updated guide text."}}',
+                '{"type":"final","message":"Updated docs/guide.md."}',
+                '{"type":"final","message":"Updated docs/guide.md."}',
+            ]
+        )
+        tools = EmptySelectTestsLintFallbackToolExecutor(root, approval_mode="auto", fallback_command=lint_command)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Update docs/guide.md to use the new wording.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Updated docs/guide.md.")
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:4], ["read_file", "replace_in_file", "discover_validators", "run_test"])
+        self.assertEqual(tools.execute_counts.get("discover_validators"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertIsNone(tools.execute_counts.get("lint_typecheck"))
+        auto_validation_names = [event.get("name") for event in agent.events if event.get("type") == "auto_validation"]
+        self.assertEqual(auto_validation_names[:2], ["discover_validators", "run_test"])
+
     def test_tool_error_guard_blocks_third_duplicate_path_failure(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(
@@ -1761,6 +2332,443 @@ class AgentTests(unittest.TestCase):
         controller_guards = [event for event in agent.events if event.get("type") == "controller_guard" and event.get("guard") == "dependency-or-import-guard"]
         self.assertEqual(len(controller_guards), 1)
         self.assertTrue(any("Use the diagnosis above to report the exact missing dependency/import" in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_tool_error_guard_blocks_repeated_shell_syntax_failure(self) -> None:
+        root = self._workspace_scratch()
+        command = "if true; then echo hi"
+        syntax_result = subprocess.CompletedProcess(
+            args=["bash", "-n", "-c", command],
+            returncode=2,
+            stdout="",
+            stderr="bash: -c: line 2: syntax error: unexpected end of file\n",
+        )
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command}}),
+                json.dumps({"type": "final", "message": "Shell syntax is invalid."}),
+                json.dumps({"type": "final", "message": "Shell syntax is invalid."}),
+                json.dumps({"type": "final", "message": "Shell syntax is invalid."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch("ollama_code.tools.shutil.which", return_value="bash"):
+                with patch("ollama_code.tools.subprocess.run", return_value=syntax_result):
+                    result = agent.handle_user("Try the shell command if useful, but do not loop on shell syntax failures.")
+
+        self.assertIn("Shell syntax is invalid.", result.message)
+        tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_shell"]
+        self.assertEqual(len(tool_calls), 2)
+        guard_events = [event for event in agent.events if event.get("type") == "tool_error_guard"]
+        self.assertEqual(len(guard_events), 1)
+        self.assertEqual(guard_events[0].get("error_class"), "syntax_error")
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not retry the same inline shell", feedback)
+        self.assertIn("temporary script", feedback)
+
+    def test_tool_error_guard_blocks_repeated_timeout_failure_with_service_guidance(self) -> None:
+        root = self._workspace_scratch()
+        command = "python -m http.server 8000"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command, "timeout": 1}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command, "timeout": 1}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command, "timeout": 1}}),
+                json.dumps({"type": "final", "message": "The command timed out."}),
+                json.dumps({"type": "final", "message": "The command timed out."}),
+                json.dumps({"type": "final", "message": "The command timed out."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        timeout_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Command timed out after 1 seconds.",
+            "output": "Command timed out after 1 seconds.\nServing HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...",
+            "error_class": "timeout",
+            "timed_out": True,
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", return_value=timeout_result):
+                result = agent.handle_user("Try the service command if useful, but do not loop on timeouts.")
+
+        self.assertIn("timed out", result.message.lower())
+        tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_shell"]
+        self.assertEqual(len(tool_calls), 2)
+        guard_events = [event for event in agent.events if event.get("type") == "tool_error_guard"]
+        self.assertEqual(len(guard_events), 1)
+        self.assertEqual(guard_events[0].get("error_class"), "timeout")
+        controller_guards = [event for event in agent.events if event.get("type") == "controller_guard" and event.get("guard") == "bounded-command-validation"]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("long-running service", feedback)
+        self.assertIn("short probe", feedback)
+
+    def test_tool_error_guard_blocks_ad_hoc_verification_script_after_timeout(self) -> None:
+        root = self._workspace_scratch()
+        service_command = "python -m http.server 8000"
+        verification_command = f'{sys.executable} verify_server.py'
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": service_command, "timeout": 1}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "verify_server.py", "content": "print('verified')\n"}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": verification_command}}),
+                json.dumps({"type": "final", "message": "The real service path still needs a bounded probe or different launch strategy."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        timeout_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Command timed out after 1 seconds.",
+            "output": "Command timed out after 1 seconds.\nServing HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...",
+            "error_class": "timeout",
+            "timed_out": True,
+        }
+        verification_result = {
+            "ok": True,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Verification helper printed verified.",
+            "output": "verified\n",
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        def fake_run_shell(command: str, cwd: str = ".", timeout: int = 30) -> dict[str, object]:
+            if "http.server" in command:
+                return timeout_result
+            return verification_result
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", side_effect=fake_run_shell):
+                result = agent.handle_user("Start the service and verify it works, but do not loop on timeouts.")
+
+        self.assertIn("bounded probe", result.message)
+        self.assertEqual(tools.execute_counts.get("run_shell"), 1)
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "fail-closed-timeout-verification"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("verification script", feedback)
+        self.assertIn("original timed-out command path", feedback)
+
+    def test_timeout_verification_guard_clears_after_successful_changed_strategy(self) -> None:
+        root = self._workspace_scratch()
+        service_command = "python -m http.server 8000"
+        background_launch_command = f'{sys.executable} -c "print(\'server launched in background\')"'
+        verification_command = f'{sys.executable} verify_server.py'
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": service_command, "timeout": 1}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": background_launch_command}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": verification_command}}),
+                json.dumps({"type": "final", "message": "Background launch succeeded and verification passed."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        timeout_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Command timed out after 1 seconds.",
+            "output": "Command timed out after 1 seconds.\nServing HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...",
+            "error_class": "timeout",
+            "timed_out": True,
+        }
+        success_result = {
+            "ok": True,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Background-safe launch succeeded.",
+            "output": "server launched in background\n",
+        }
+        verification_result = {
+            "ok": True,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Verification probe succeeded.",
+            "output": "verified\n",
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        def fake_run_shell(command: str, cwd: str = ".", timeout: int = 30) -> dict[str, object]:
+            if "http.server" in command:
+                return timeout_result
+            if "server launched in background" in command:
+                return success_result
+            return verification_result
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", side_effect=fake_run_shell):
+                result = agent.handle_user("Start the service, switch to a safe launch strategy if needed, then verify it works.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("verification passed", result.message.lower())
+        self.assertEqual(tools.execute_counts.get("run_shell"), 3)
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "fail-closed-timeout-verification"
+        ]
+        self.assertEqual(controller_guards, [])
+
+    def test_timeout_verification_guard_allows_preexisting_probe_script_after_timeout(self) -> None:
+        root = self._workspace_scratch()
+        (root / "verify_server.py").write_text("print('verified')\n", encoding="utf-8")
+        service_command = "python -m http.server 8000"
+        verification_command = f'{sys.executable} verify_server.py'
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": service_command, "timeout": 1}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": verification_command}}),
+                json.dumps({"type": "final", "message": "The preexisting probe confirmed the service state."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        timeout_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Command timed out after 1 seconds.",
+            "output": "Command timed out after 1 seconds.\nServing HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...",
+            "error_class": "timeout",
+            "timed_out": True,
+        }
+        verification_result = {
+            "ok": True,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Preexisting verification probe succeeded.",
+            "output": "verified\n",
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        def fake_run_shell(command: str, cwd: str = ".", timeout: int = 30) -> dict[str, object]:
+            if "http.server" in command:
+                return timeout_result
+            return verification_result
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", side_effect=fake_run_shell):
+                result = agent.handle_user("Start the service, then use the existing verify_server.py probe to check it.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("preexisting probe", result.message.lower())
+        self.assertEqual(tools.execute_counts.get("run_shell"), 2)
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "fail-closed-timeout-verification"
+        ]
+        self.assertEqual(controller_guards, [])
+
+    def test_final_success_claim_is_blocked_after_timeout_until_summary_is_accurate(self) -> None:
+        root = self._workspace_scratch()
+        service_command = "python -m http.server 8000"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": service_command, "timeout": 1}}),
+                json.dumps({"type": "final", "message": "The service is working and verification passed."}),
+                json.dumps({"type": "final", "message": "The command timed out; the service still needs a bounded probe or different launch strategy."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        timeout_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Command timed out after 1 seconds.",
+            "output": "Command timed out after 1 seconds.\nServing HTTP on 0.0.0.0 port 8000 (http://0.0.0.0:8000/) ...",
+            "error_class": "timeout",
+            "timed_out": True,
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", return_value=timeout_result):
+                result = agent.handle_user("Start the service and verify it works.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("timed out", result.message.lower())
+        self.assertIn("bounded probe", result.message.lower())
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "timeout-final-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("latest run_shell timed out", feedback)
+        self.assertIn("do not claim the command works", feedback)
+
+    def test_final_success_claim_is_blocked_after_command_not_found_until_summary_is_accurate(self) -> None:
+        root = self._workspace_scratch()
+        command = "go version"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command}}),
+                json.dumps({"type": "final", "message": "The command works and verification passed."}),
+                json.dumps({"type": "final", "message": "The command failed because go is not installed in this environment."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        failure_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "go: command not found",
+            "output": "/usr/bin/bash: line 1: go: command not found\n",
+            "error_class": "command_not_found",
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", return_value=failure_result):
+                result = agent.handle_user("Run `go version` and tell me whether it works.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("not installed", result.message.lower())
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "run-shell-final-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("latest run_shell failed", feedback)
+        self.assertIn("do not claim the command works", feedback)
+
+    def test_accurate_failure_summary_is_allowed_after_command_not_found(self) -> None:
+        root = self._workspace_scratch()
+        command = "go version"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": command}}),
+                json.dumps({"type": "final", "message": "The command failed because go is not installed in this environment."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        failure_result = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "go: command not found",
+            "output": "/usr/bin/bash: line 1: go: command not found\n",
+            "error_class": "command_not_found",
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", return_value=failure_result):
+                result = agent.handle_user("Run `go version` and tell me whether it works.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("not installed", result.message.lower())
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertNotIn("This request requires real tool use in this turn.", feedback)
+
+    def test_accurate_missing_path_summary_is_allowed_for_exists_question(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me whether it exists.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertNotIn("This request requires real tool use in this turn.", feedback)
+
+    def test_false_exists_claim_is_blocked_after_missing_path_failure(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "missing.py exists."}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me whether it exists.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "path-exists-final-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("latest path lookup failed", feedback)
+        self.assertIn("do not claim the path exists", feedback)
+
+    def test_accurate_missing_path_summary_is_allowed_for_direct_read_question(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me line 1.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertNotIn("This request requires real tool use in this turn.", feedback)
+
+    def test_false_content_claim_is_blocked_after_missing_path_failure(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "line 1 is hello"}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me line 1.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "missing-path-content-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("latest path lookup failed", feedback)
+        self.assertIn("do not invent file contents", feedback)
 
     def test_command_validation_event_records_rejected_common_command(self) -> None:
         root = self._workspace_scratch()
@@ -1834,6 +2842,31 @@ class AgentTests(unittest.TestCase):
         self.assertFalse(result.completed)
         self.assertIn("post-edit validation failed", result.message)
         self.assertIn("may return None", result.message)
+
+    def test_post_edit_validation_feedback_includes_validator_diagnostic(self) -> None:
+        root = self._workspace_scratch()
+        (root / "docs").mkdir()
+        (root / "docs" / "guide.md").write_text("Old guide text.\n", encoding="utf-8")
+        lint_command = subprocess.list2cmdline(
+            [sys.executable, "-c", "import sys; print('markdown heading missing'); sys.exit(1)"]
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"docs/guide.md"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"docs/guide.md","old":"Old guide text.","new":"Updated guide text."}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"docs/guide.md"}}',
+                '{"type":"final","message":"stopped"}',
+            ]
+        )
+        tools = EmptySelectTestsLintFallbackToolExecutor(root, approval_mode="auto", fallback_command=lint_command)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            agent.handle_user("Update docs/guide.md to use the new wording.")
+
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Post-edit validation failed before more tool use.", feedback)
+        self.assertIn("markdown heading missing", feedback)
 
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
@@ -3649,6 +4682,41 @@ class AgentTests(unittest.TestCase):
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(normalizations[0]["normalized_name"], "run_test")
 
+    def test_agent_normalizes_shell_test_to_original_run_test_without_configured_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(['{"type":"tool","name":"run_shell","arguments":{"command":"python -m unittest discover -s tests -v"}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Validate the project and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_test")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], "python -m unittest discover -s tests -v")
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "run_test")
+        self.assertIn("original command", normalizations[0]["reason"])
+
+    def test_agent_preserves_exact_user_requested_shell_test_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(['{"type":"tool","name":"run_shell","arguments":{"command":"python -m pytest --version"}}'])
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Use run_shell to execute exactly: python -m pytest --version. Then tell me the exit code.")
+
+        self.assertIn("exit code", result.message.lower())
+        self.assertEqual(tools.execute_counts.get("run_shell"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_test"))
+
     def test_agent_treats_disabled_tools_as_forbidden_up_front(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4697,6 +5765,41 @@ class AgentTests(unittest.TestCase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Use the diagnosis above to edit implementation before rerunning run_test.", feedback)
 
+    def test_trajectory_failure_compression_diagnoses_first_failed_test_before_more_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def f():\n    return 0\n", encoding="utf-8")
+            fail_command = subprocess.list2cmdline(
+                [sys.executable, "-c", "import sys; print('AssertionError: 0 != 1'); sys.exit(1)"]
+            )
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('ok')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "changed app.py"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+                result = agent.handle_user("Fix app.py, run tests, and rerun tests after editing.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "changed app.py")
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+        self.assertEqual(tools.execute_counts.get("diagnose_test_failure"), 1)
+        self.assertIsNone(tools.execute_counts.get("read_file"))
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "diagnose-first-failed-test" for event in agent.events))
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:4], ["run_test", "diagnose_test_failure", "write_file", "run_test"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the diagnosis above to edit the implementation before gathering more context", feedback)
+
     def test_agent_blocks_false_test_success_after_failed_run_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4922,6 +6025,33 @@ class AgentTests(unittest.TestCase):
         self.assertIn("unittest", command)
         self.assertIn("discover", command)
         self.assertIn("tests", command)
+
+    def test_trajectory_final_chance_validation_avoids_rediscovery_after_successful_lint(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value():\n    return 0\n", encoding="utf-8")
+        lint_command = subprocess.list2cmdline([sys.executable, "-c", "print('lint ok')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return 0","new":"return 1"}}',
+            ]
+        )
+        tools = EmptySelectTestsLintFallbackToolExecutor(root, approval_mode="auto", fallback_command=lint_command)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Ran validation after the latest edit: passed.")
+        self.assertEqual(tools.execute_counts.get("select_tests"), 1)
+        self.assertEqual(tools.execute_counts.get("lint_typecheck"), 1)
+        self.assertEqual(tools.execute_counts.get("contract_check"), 1)
+        self.assertEqual(tools.execute_counts.get("discover_validators"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_test"))
+        lint_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "lint_typecheck"]
+        self.assertTrue(lint_calls)
+        self.assertIsNone(lint_calls[-1].get("arguments", {}).get("command"))
 
     def test_agent_requires_edits_to_explicitly_named_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5169,7 +6299,7 @@ class AgentTests(unittest.TestCase):
     def test_agent_normalizes_edit_payload_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "docs.md").write_text("total total\n", encoding="utf-8")
+            (root / "docs.md").write_text("# Docs\n\ntotal total\n", encoding="utf-8")
             client = FakeClient(
                 [
                     json.dumps({"type": "tool", "name": "replace_in_file", "arguments": {"path": "docs.md", "old": "total", "new": "cart_total", "all": True}}),
@@ -5183,14 +6313,14 @@ class AgentTests(unittest.TestCase):
             final_text = (root / "docs.md").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "docs updated")
-        self.assertEqual(final_text, "cart_total cart_total\n")
+        self.assertEqual(final_text, "# Docs\n\ncart_total cart_total\n")
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertIn("replace_all", json.dumps(normalizations[0]["normalized_arguments"]))
 
     def test_agent_normalizes_replace_in_file_common_aliases(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "docs.md").write_text("total total totality\n", encoding="utf-8")
+            (root / "docs.md").write_text("# Docs\n\ntotal total totality\n", encoding="utf-8")
             client = FakeClient(
                 [
                     json.dumps(
@@ -5216,7 +6346,7 @@ class AgentTests(unittest.TestCase):
             final_text = (root / "docs.md").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "docs updated")
-        self.assertEqual(final_text, "cart_total cart_total totality\n")
+        self.assertEqual(final_text, "# Docs\n\ncart_total cart_total totality\n")
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertIn("match_whole_word", json.dumps(normalizations[0]["normalized_arguments"]))
 
@@ -5378,8 +6508,11 @@ class AgentTests(unittest.TestCase):
         read_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "read_file"]
         self.assertEqual(len(read_calls), 3)
         self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
-        guards = [event for event in agent.events if event.get("guard") == "no-edit-after-failed-test"]
-        self.assertEqual(len(guards), 2)
+        self.assertEqual(tools.execute_counts.get("diagnose_test_failure"), 1)
+        diagnosis_guards = [event for event in agent.events if event.get("guard") == "diagnose-first-failed-test"]
+        no_edit_guards = [event for event in agent.events if event.get("guard") == "no-edit-after-failed-test"]
+        self.assertEqual(len(diagnosis_guards), 1)
+        self.assertEqual(len(no_edit_guards), 1)
         self.assertIn("return left + right", final_text)
 
     def test_bulk_stub_guard_blocks_rerun_until_compact_stub_file_is_done(self) -> None:
@@ -5631,6 +6764,53 @@ class AgentTests(unittest.TestCase):
         phases = [event.get("phase") for event in agent.events if event.get("type") == "spec_guided_repair"]
         self.assertIn("mechanical_candidate_validation", phases)
 
+    def test_structured_test_repair_recovers_bad_configured_test_command_before_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "inventory.py").write_text(
+                "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_inventory.py").write_text(
+                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
+                + "from inventory import *\nimport unittest\n\n"
+                + "class InventoryTests(unittest.TestCase):\n"
+                + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
+                + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n"
+                + "if __name__ == '__main__':\n    unittest.main()\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "src/inventory.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "tests/test_inventory.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": "pytesst -q"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command="pytesst -q")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Run tests, fix src/inventory.py so total_units is correct, rerun tests, and summarize briefly.")
+            final_text = (root / "src" / "inventory.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Spec-guided", result.message)
+        self.assertIn("return sum(counts)", final_text)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertGreaterEqual(len(tool_names), 2)
+        self.assertEqual(tool_names[0], "run_test")
+        run_test_results = [event for event in agent.events if event.get("type") == "tool_result" and event.get("name") == "run_test"]
+        self.assertGreaterEqual(len(run_test_results), 2)
+        first_result = run_test_results[0].get("result", {})
+        self.assertTrue(first_result.get("recovered"))
+        self.assertEqual(first_result.get("original_command"), "pytesst -q")
+        self.assertIn("unittest discover", str(first_result.get("command", "")))
+        last_result = run_test_results[-1].get("result", {})
+        self.assertTrue(last_result.get("ok"))
+        self.assertIn("unittest discover", str(last_result.get("command", "")))
+
     def test_spec_guided_repair_runs_for_small_single_non_stub_module_with_one_direct_example(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -5873,7 +7053,7 @@ class AgentTests(unittest.TestCase):
                     candidate,
                 ]
             )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            tools = RawImplementationSpecCountingToolExecutor(root, approval_mode="auto", test_command=command)
             agent = OllamaCodeAgent(
                 client=client,
                 tools=tools,
@@ -5890,7 +7070,8 @@ class AgentTests(unittest.TestCase):
         self.assertTrue(result.completed)
         self.assertIn("Spec-guided", result.message)
         self.assertEqual(final_text, candidate)
-        self.assertGreaterEqual(tools.execute_counts.get("implementation_spec", 0), 1)
+        self.assertEqual(tools.execute_counts.get("implementation_spec"), 1)
+        self.assertEqual(tools.raw_implementation_spec_calls, 1)
         self.assertEqual(tools.execute_counts.get("context_pack"), None)
         strategy_events = [event for event in agent.events if event.get("type") == "repair_strategy"]
         self.assertEqual(len(strategy_events), 1)
@@ -6093,8 +7274,49 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 1)
         self.assertIn("def cart_total", source)
         self.assertIn("cart_total(prices)", docs)
-        self.assertGreaterEqual(tools.execute_counts.get("edit_intent", 0), 2)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
         self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
+    def test_require_llm_for_turn_normalizes_initial_list_files_for_project_rename_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "pricing.py").write_text("def total(prices: list[int]) -> int:\n    return sum(prices)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text(
+                "import sys\nimport unittest\nsys.path.insert(0, 'src')\nfrom pricing import cart_total\n\n"
+                "class PricingTest(unittest.TestCase):\n"
+                "    def test_total(self):\n"
+                "        self.assertEqual(cart_total([2, 3]), 5)\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "pricing.md").write_text("Call `total(prices)` to compute totals.\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            client = FakeClient([json.dumps({"type": "tool", "name": "list_files", "arguments": {"path": "."}})])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, require_llm_for_turn=True, max_tool_rounds=8)
+
+            result = agent.handle_user("Refactor the pricing API from total(prices) to cart_total(prices). Update src/pricing.py, tests, and docs/pricing.md. Run tests.")
+            source = (root / "src" / "pricing.py").read_text(encoding="utf-8")
+            docs = (root / "docs" / "pricing.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Renamed symbol project-wide", result.message)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNone(tools.execute_counts.get("list_files"))
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertIn("def cart_total", source)
+        self.assertIn("cart_total(prices)", docs)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        non_context_tool_names = [name for name in tool_names if name != "context_pack"]
+        self.assertGreaterEqual(len(non_context_tool_names), 1)
+        self.assertEqual(non_context_tool_names[0], "edit_intent")
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0].get("original_name"), "list_files")
+        self.assertEqual(normalized[0].get("normalized_name"), "edit_intent")
 
     def test_spec_guided_repair_uses_verifier_model_after_candidate_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -6667,7 +7889,7 @@ class AgentTests(unittest.TestCase):
     def test_agent_normalizes_replace_symbol_text_edit_on_non_code_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "docs.md").write_text("Use total(prices).\n", encoding="utf-8")
+            (root / "docs.md").write_text("# Docs\n\nUse total(prices).\n", encoding="utf-8")
             client = FakeClient(
                 [
                     json.dumps({"type": "tool", "name": "replace_symbol", "arguments": {"path": "docs.md", "symbol": "total", "content": "cart_total"}}),
@@ -6681,7 +7903,7 @@ class AgentTests(unittest.TestCase):
             final_text = (root / "docs.md").read_text(encoding="utf-8")
 
         self.assertEqual(result.message, "docs updated")
-        self.assertEqual(final_text, "Use cart_total(prices).\n")
+        self.assertEqual(final_text, "# Docs\n\nUse cart_total(prices).\n")
         self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
 
     def test_agent_normalizes_edit_file_alias_with_symbol_content(self) -> None:
@@ -6820,6 +8042,49 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
         self.assertEqual(len(client.calls), 0)
 
+    def test_require_llm_for_turn_normalizes_initial_search_symbols_for_optional_parameter_docs_update(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "api.py").write_text("def fetch_user(user_id: str) -> dict[str, str]:\n    return {'id': user_id}\n", encoding="utf-8")
+            (root / "docs" / "api.md").write_text("`fetch_user(user_id)` returns a user dict.\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "search_symbols",
+                            "arguments": {"query": "fetch_user", "path": "src/api.py"},
+                        }
+                    )
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, require_llm_for_turn=True, max_tool_rounds=8)
+
+            result = agent.handle_user(
+                "Add an optional include_orders: bool = False parameter to fetch_user in src/api.py and update docs/api.md with that parameter. No tests are needed."
+            )
+            source = (root / "src" / "api.py").read_text(encoding="utf-8")
+            docs = (root / "docs" / "api.md").read_text(encoding="utf-8")
+
+        self.assertIn("Updated", result.message)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNone(tools.execute_counts.get("search_symbols"))
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertIn("include_orders: bool = False", source)
+        self.assertIn("include_orders=False", docs)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        non_context_tool_names = [name for name in tool_names if name != "context_pack"]
+        self.assertGreaterEqual(len(non_context_tool_names), 1)
+        self.assertEqual(non_context_tool_names[0], "edit_intent")
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0].get("original_name"), "search_symbols")
+        self.assertEqual(normalized[0].get("normalized_name"), "edit_intent")
+
     def test_agent_deterministically_repairs_test_grounded_return_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -6914,6 +8179,52 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 0)
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
         self.assertGreaterEqual(tools.execute_counts.get("run_test", 0), 2)
+
+    def test_require_llm_for_turn_normalizes_initial_list_files_for_import_bug_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src" / "pkg").mkdir(parents=True)
+            (root / "tests").mkdir()
+            (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "src" / "pkg" / "helpers.py").write_text("def label(value):\n    return f'[{value}]'\n", encoding="utf-8")
+            (root / "src" / "pkg" / "core.py").write_text("from helpers import label\n\ndef wrapped():\n    return label('ok')\n", encoding="utf-8")
+            (root / "tests" / "test_pkg.py").write_text(
+                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
+                "import unittest\nfrom pkg.core import wrapped\n\n"
+                "class PackageTests(unittest.TestCase):\n"
+                "    def test_wrapped(self):\n"
+                "        self.assertEqual(wrapped(), '[ok]')\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            client = FakeClient([json.dumps({"type": "tool", "name": "list_files", "arguments": {"path": "."}})])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                require_llm_for_turn=True,
+                max_tool_rounds=8,
+            )
+
+            result = agent.handle_user("Run tests, fix the package import bug in src/pkg/core.py, rerun tests, and summarize.")
+            final_text = (root / "src" / "pkg" / "core.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("relative import repair", result.message)
+        self.assertIn("from .helpers import label", final_text)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNone(tools.execute_counts.get("list_files"))
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        non_context_tool_names = [name for name in tool_names if name != "context_pack"]
+        self.assertGreaterEqual(len(non_context_tool_names), 1)
+        self.assertEqual(non_context_tool_names[0], "run_test")
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0].get("original_name"), "list_files")
+        self.assertEqual(normalized[0].get("normalized_name"), "run_test")
 
     def test_agent_rejects_unrequested_git_commit_during_edit_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -7506,3 +8817,79 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(len(client.calls), 0)
         tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_names, ["search_symbols", "read_symbol", "replace_in_file"])
+
+
+def _extract_agent_tests(names: tuple[str, ...]) -> dict[str, object]:
+    extracted: dict[str, object] = {}
+    for name in names:
+        extracted[name] = getattr(AgentTests, name)
+        delattr(AgentTests, name)
+    return extracted
+
+
+EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
+    (
+        "test_trajectory_ground_guard_rejects_ungrounded_mutation_then_allows_after_read",
+        "test_trajectory_ground_guard_auto_reads_explicit_target_before_retry",
+        "test_trajectory_ground_guard_requires_target_path_grounding_after_unrelated_read",
+        "test_trajectory_ground_guard_auto_reads_symbol_before_symbol_edit_retry",
+        "test_trajectory_ground_guard_auto_reads_symbol_for_pathless_edit_after_source_context",
+        "test_trajectory_ground_guard_blocks_pathless_edit_after_unrelated_read_until_source_is_grounded",
+        "test_trajectory_ground_guard_auto_searches_then_reads_symbol_for_pathless_edit_without_context",
+        "test_trajectory_ground_guard_prefers_single_non_test_source_after_ambiguous_repo_search",
+        "test_trajectory_ground_guard_prefers_test_affined_source_after_multi_source_repo_search",
+        "test_trajectory_ground_guard_prefers_explicit_request_source_path_over_unrelated_recent_source",
+        "test_pathless_mutation_grounding_probe_does_not_auto_pick_when_request_names_multiple_sources",
+        "test_pathless_mutation_grounding_probe_uses_unique_context_pack_symbol_before_repo_search",
+        "test_pathless_mutation_grounding_probe_prefers_unique_symbol_match_among_multiple_explicit_sources",
+        "test_trajectory_grounding_probe_keeps_ambiguous_multiple_explicit_sources_unresolved_without_context_pack",
+        "test_trajectory_grounding_probe_uses_context_pack_for_ambiguous_multiple_explicit_sources",
+        "test_pathless_mutation_grounding_probe_prefers_test_affined_symbol_match_among_multiple_explicit_sources",
+        "test_contextual_explicit_source_path_prefers_recent_test_bridge_within_named_sources",
+        "test_pathless_mutation_grounding_probe_prefers_recent_named_source_when_explicit_symbol_matches_tie",
+        "test_pathless_mutation_grounding_probe_ignores_unrelated_recent_source_when_explicit_symbol_matches_tie",
+        "test_explicit_source_path_for_symbol_keeps_ambiguity_when_test_affinity_ties",
+        "test_trajectory_ground_probe_retry_message_lists_ambiguous_repo_candidates",
+        "test_trajectory_ground_probe_retry_message_guides_read_after_context_pack",
+        "test_trajectory_ground_guard_maps_failed_test_to_implementation_before_pathless_edit",
+        "test_trajectory_ground_guard_auto_diagnoses_failed_test_before_pathless_edit",
+        "test_trajectory_ground_guard_allows_explicit_new_file_creation",
+        "test_tool_error_guard_blocks_third_duplicate_path_failure",
+    )
+)
+
+EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
+    (
+        "test_trajectory_validation_selects_targeted_tests_after_edit",
+        "test_post_edit_validation_runs_before_extra_context_read",
+        "test_post_edit_validation_runs_after_non_code_edit_before_final",
+        "test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests",
+        "test_post_edit_validation_feedback_includes_validator_diagnostic",
+        "test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request",
+        "test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests",
+        "test_trajectory_final_chance_validation_discovers_repo_test_command_after_empty_targeted_selection",
+        "test_trajectory_final_chance_validation_avoids_rediscovery_after_successful_lint",
+    )
+)
+
+EXTRACTED_FAILURE_COMPRESSION_TESTS = _extract_agent_tests(
+    (
+        "test_trajectory_failure_compression_auto_diagnoses_repeated_run_test",
+        "test_trajectory_failure_compression_diagnoses_first_failed_test_before_more_context",
+    )
+)
+
+EXTRACTED_SHELL_COMMAND_PREFLIGHT_TESTS = _extract_agent_tests(
+    (
+        "test_tool_error_guard_auto_diagnoses_repeated_missing_dependency_failure",
+        "test_tool_error_guard_blocks_repeated_shell_syntax_failure",
+        "test_tool_error_guard_blocks_repeated_timeout_failure_with_service_guidance",
+        "test_tool_error_guard_blocks_ad_hoc_verification_script_after_timeout",
+        "test_timeout_verification_guard_clears_after_successful_changed_strategy",
+        "test_timeout_verification_guard_allows_preexisting_probe_script_after_timeout",
+        "test_final_success_claim_is_blocked_after_timeout_until_summary_is_accurate",
+        "test_final_success_claim_is_blocked_after_command_not_found_until_summary_is_accurate",
+        "test_accurate_failure_summary_is_allowed_after_command_not_found",
+        "test_command_validation_event_records_rejected_common_command",
+    )
+)

@@ -65,8 +65,11 @@ def ollama_host() -> str:
 
 def installed_models() -> list[str]:
     request = urllib.request.Request(f"{ollama_host()}/api/tags")
-    with urllib.request.urlopen(request, timeout=60) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return []
     models = payload.get("models") if isinstance(payload, dict) else []
     names: list[str] = []
     for item in models:

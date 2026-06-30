@@ -6,6 +6,7 @@ import difflib
 import json
 import math
 import re
+import shlex
 import textwrap
 import time
 from datetime import datetime, timezone
@@ -2042,11 +2043,92 @@ class OllamaCodeAgent:
             return paths
         return []
 
+    def _recent_list_files_code_paths(self, successful_tool_results: list[dict[str, Any]]) -> list[str]:
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "list_files":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            paths: list[str] = []
+            seen: set[str] = set()
+            for raw_line in str(result.get("output") or "").splitlines():
+                candidate = raw_line.strip().replace("\\", "/").lstrip("./")
+                if (
+                    not candidate
+                    or candidate.endswith("/")
+                    or candidate in seen
+                    or Path(candidate).suffix.lower() not in CODE_EDIT_SUFFIXES
+                    or self._path_looks_like_test_file(candidate)
+                ):
+                    continue
+                seen.add(candidate)
+                paths.append(candidate)
+            return paths
+        return []
+
     def _recent_identifier_search_code_paths(self, successful_tool_results: list[dict[str, Any]]) -> list[str]:
         query = self._recent_identifier_search_query(successful_tool_results)
         if not query:
             return []
         return self._recent_search_code_paths(successful_tool_results, query=query)
+
+    def _successful_context_pack_read_target(
+        self,
+        *,
+        successful_tool_results: list[dict[str, Any]],
+        preferred_symbol: str | None = None,
+    ) -> tuple[str, dict[str, Any]] | None:
+        normalized_preferred = str(preferred_symbol or "").strip().lower()
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "context_pack":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            suggested_next_tool = str(result.get("suggested_next_tool") or "").strip().lower()
+            ranked_paths = list(
+                dict.fromkeys(
+                    str(path or "").strip().replace("\\", "/").lstrip("./")
+                    for path in result.get("ranked_paths", [])
+                    if isinstance(path, str)
+                )
+            )
+            ranked_paths = [
+                path
+                for path in ranked_paths
+                if path.endswith(".py") and not self._path_looks_like_test_file(path)
+            ]
+            ranked_symbols: list[tuple[str, str]] = []
+            seen_ranked_symbols: set[tuple[str, str]] = set()
+            for raw_symbol in result.get("ranked_symbols", []) if isinstance(result.get("ranked_symbols"), list) else []:
+                if not isinstance(raw_symbol, dict):
+                    continue
+                path = str(raw_symbol.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                qualname = str(raw_symbol.get("qualname") or "").strip()
+                if not path or not qualname or self._path_looks_like_test_file(path):
+                    continue
+                key = (path, qualname)
+                if key in seen_ranked_symbols:
+                    continue
+                seen_ranked_symbols.add(key)
+                ranked_symbols.append(key)
+            if normalized_preferred:
+                preferred_matches = [
+                    (path, qualname)
+                    for path, qualname in ranked_symbols
+                    if normalized_preferred in {qualname.lower(), qualname.rsplit(".", 1)[-1].lower()}
+                ]
+                if len(preferred_matches) == 1:
+                    path, qualname = preferred_matches[0]
+                    return "read_symbol", {"path": path, "symbol": qualname, "include_context": 0}
+            if suggested_next_tool == "read_symbol" and len(ranked_symbols) == 1:
+                path, qualname = ranked_symbols[0]
+                return "read_symbol", {"path": path, "symbol": qualname, "include_context": 0}
+            if suggested_next_tool in {"read_symbol", "read_file"} and len(ranked_paths) == 1:
+                return "read_file", {"path": ranked_paths[0]}
+            return None
+        return None
 
     def _parse_code_outline_symbols(self, output: str) -> list[tuple[str, str]]:
         symbols: list[tuple[str, str]] = []
@@ -2308,6 +2390,10 @@ class OllamaCodeAgent:
             if isinstance(value, str):
                 values.append(value)
         return bool(values) and all(self._text_is_stub_like_python_repair(value) for value in values)
+
+    def _validation_failure_is_stub_placeholder(self, summary: str) -> bool:
+        lowered = summary.lower()
+        return "still has stub body" in lowered or "pass-style placeholder" in lowered or "stub/comment/pass-style placeholder" in lowered
 
     def _run_test_failure_diagnosis(self, output: str) -> str:
         if not output.strip():
@@ -3190,6 +3276,16 @@ class OllamaCodeAgent:
         output = str(result.get("output", "")).strip()
         if name == "run_test" and self._request_requires_test_run(request_text):
             return result.get("ok") is not True and bool(summary or output)
+        if name == "run_shell" and self._request_asks_if_command_works(request_text):
+            return result.get("ok") is not True and bool(summary or output)
+        if self._request_asks_if_path_exists(request_text) and str(result.get("error_class") or "") == "path_missing":
+            return result.get("ok") is not True and bool(summary or output)
+        if (
+            self._request_asks_direct_file_contents(request_text)
+            or self._request_asks_exact_line_text(request_text)
+            or self._request_asks_specific_file_line(request_text)
+        ) and str(result.get("error_class") or "") == "path_missing":
+            return result.get("ok") is not True and bool(summary or output)
         lowered = request_text.lower()
         expects_failure_details = any(
             phrase in lowered
@@ -3214,6 +3310,36 @@ class OllamaCodeAgent:
         if result.get("ok") is True:
             return False
         return bool(summary or output)
+
+    def _request_asks_if_command_works(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            phrase in lowered
+            for phrase in [
+                "whether it works",
+                "if it works",
+                "whether the command works",
+                "if the command works",
+                "tell me whether it works",
+                "tell me if it works",
+            ]
+        )
+
+    def _request_asks_if_path_exists(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(
+            phrase in lowered
+            for phrase in [
+                "whether it exists",
+                "if it exists",
+                "whether the file exists",
+                "if the file exists",
+                "whether the path exists",
+                "if the path exists",
+                "tell me whether it exists",
+                "tell me if it exists",
+            ]
+        )
 
     def _request_expects_exact_tool_error(self, text: str) -> bool:
         lowered = text.lower()
@@ -3241,6 +3367,14 @@ class OllamaCodeAgent:
         if "line" not in lowered or "exact" not in lowered:
             return False
         return any(phrase in lowered for phrase in ["text on line", "line text", "line only", "that line only"])
+
+    def _request_asks_specific_file_line(self, text: str) -> bool:
+        lowered = text.lower()
+        if "line" not in lowered:
+            return False
+        if not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text):
+            return False
+        return bool(re.search(r"\bline\s+\d+\b", lowered))
 
     def _request_asks_direct_file_contents(self, text: str) -> bool:
         lowered = text.lower()
@@ -3814,6 +3948,117 @@ class OllamaCodeAgent:
         normalized["command"] = self.tools.default_test_command
         return "run_test", normalized, "Normalized vague run_test command to the configured test command."
 
+    def _request_looks_like_explicit_python_import_bug_fix(self, request_text: str) -> bool:
+        if not self._request_requires_test_run(request_text):
+            return False
+        if not (self._request_requires_mutation(request_text) or self._request_requires_code_mutation(request_text)):
+            return False
+        if not (self.tools.default_test_command or self._workspace_has_test_signal()):
+            return False
+        lowered = request_text.lower()
+        if not re.search(r"\b(?:import|package|module|modulenotfound|importerror)\b", lowered):
+            return False
+        if not any(token in lowered for token in ("bug", "fix", "repair", "broken", "failure")):
+            return False
+        requested_tools = self._requested_tool_names(request_text, forbidden_tool_names=set())
+        if "list_files" in requested_tools:
+            return False
+        requested_paths = self._requested_mutation_paths(request_text)
+        source_paths = [path for path in requested_paths if path.endswith(".py") and not self._path_looks_like_test_file(path)]
+        aux_paths = [
+            path
+            for path in requested_paths
+            if self._path_looks_like_test_file(path) or path.startswith("docs/") or path.endswith((".md", ".rst", ".txt"))
+        ]
+        return len(source_paths) == 1 and not aux_paths
+
+    def _normalize_import_repair_bootstrap_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_text: str,
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "list_files":
+            return name, arguments, None
+        prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
+        if any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names):
+            return name, arguments, None
+        if not self._request_looks_like_explicit_python_import_bug_fix(request_text):
+            return name, arguments, None
+        normalized: dict[str, Any] = {}
+        if self.tools.default_test_command:
+            normalized["command"] = self.tools.default_test_command
+        return (
+            "run_test",
+            normalized,
+            "Normalized initial list_files to run_test because the request already names a Python source path and needs concrete import/test failure evidence first.",
+        )
+
+    def _normalize_project_rename_bootstrap_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_text: str,
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name not in {"list_files", "edit_intent"}:
+            return name, arguments, None
+        prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
+        if any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names):
+            return name, arguments, None
+        requested_tools = self._requested_tool_names(request_text, forbidden_tool_names=set())
+        if name == "list_files" and "list_files" in requested_tools:
+            return name, arguments, None
+        rename_ops = self._project_function_rename_operations(request_text)
+        if not rename_ops or len(rename_ops) != 1:
+            return name, arguments, None
+        tool_name, tool_arguments = rename_ops[0]
+        if tool_name != "edit_intent" or not isinstance(tool_arguments, dict):
+            return name, arguments, None
+        if name == "edit_intent":
+            target = str(arguments.get("target") or arguments.get("symbol") or "").strip()
+            replacement = str(arguments.get("replacement") or arguments.get("new") or "").strip()
+            if target != str(tool_arguments.get("target") or "").strip():
+                return name, arguments, None
+            if replacement != str(tool_arguments.get("replacement") or "").strip():
+                return name, arguments, None
+        return (
+            tool_name,
+            dict(tool_arguments),
+            f"Normalized initial {name} to edit_intent because the request already specifies a grounded project rename operation.",
+        )
+
+    def _normalize_optional_parameter_bootstrap_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_text: str,
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "search_symbols":
+            return name, arguments, None
+        prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
+        if any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names):
+            return name, arguments, None
+        requested_tools = self._requested_tool_names(request_text, forbidden_tool_names=set())
+        if "search_symbols" in requested_tools or "read_symbol" in requested_tools:
+            return name, arguments, None
+        optional_parameter_ops = self._optional_parameter_update_operations(request_text)
+        if not optional_parameter_ops:
+            return name, arguments, None
+        tool_name, tool_arguments = optional_parameter_ops[0]
+        if tool_name != "edit_intent" or not isinstance(tool_arguments, dict):
+            return name, arguments, None
+        return (
+            tool_name,
+            dict(tool_arguments),
+            "Normalized initial search_symbols to edit_intent because the request already specifies a grounded optional-parameter update.",
+        )
+
     def _normalize_unittest_file_command(self, command: str) -> str | None:
         match = re.match(
             r"^(?P<prefix>(?:\"[^\"]+\"|'[^']+'|[^\s]+)\s+-m\s+unittest)\s+(?P<path>[^\s]+\.py)\s*$",
@@ -3849,6 +4094,12 @@ class OllamaCodeAgent:
         ]
         return any(re.search(pattern, lowered) for pattern in test_patterns)
 
+    def _structured_repair_should_preflight_test_command(self) -> bool:
+        command = str(self.tools.default_test_command or "").strip()
+        if not command:
+            return False
+        return not self._shell_command_looks_like_test_run(command)
+
     def _normalize_shell_test_call(
         self,
         name: str,
@@ -3858,6 +4109,8 @@ class OllamaCodeAgent:
         exact_shell_command: str | None,
     ) -> tuple[str, dict[str, Any], str | None]:
         if name != "run_shell":
+            return name, arguments, None
+        if self.approval_mode() == "read-only":
             return name, arguments, None
         command = str(arguments.get("command", "")).strip()
         if not command:
@@ -3874,18 +4127,211 @@ class OllamaCodeAgent:
             if "timeout" in arguments:
                 normalized["timeout"] = arguments["timeout"]
             return "run_test", normalized, "Normalized run_shell to run_test because the request explicitly requires run_test."
-        if not self.tools.default_test_command:
-            return name, arguments, None
         if not self._shell_command_looks_like_test_run(command):
             return name, arguments, None
         if exact_shell_command and command == exact_shell_command:
             return name, arguments, None
-        normalized: dict[str, Any] = {"command": self.tools.default_test_command}
+        normalized: dict[str, Any] = {"command": self.tools.default_test_command or command}
         if "cwd" in arguments:
             normalized["cwd"] = arguments["cwd"]
         if "timeout" in arguments:
             normalized["timeout"] = arguments["timeout"]
-        return "run_test", normalized, "Normalized shell test command to the configured run_test command."
+        reason = (
+            "Normalized shell test command to the configured run_test command."
+            if self.tools.default_test_command
+            else "Normalized shell test command to run_test with the original command."
+        )
+        return "run_test", normalized, reason
+
+    def _normalize_shell_inspection_call(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        request_text: str,
+        exact_shell_command: str | None,
+    ) -> tuple[str, dict[str, Any], str | None]:
+        if name != "run_shell":
+            return name, arguments, None
+        if self.approval_mode() == "read-only":
+            return name, arguments, None
+        command = str(arguments.get("command", "")).strip()
+        if not command or exact_shell_command:
+            return name, arguments, None
+        request_forbidden = self._forbidden_tool_names(request_text)
+        if self._request_explicitly_requests_tool(request_text, "run_shell") and "run_shell" not in request_forbidden:
+            return name, arguments, None
+        if str(arguments.get("cwd") or ".").strip() not in {"", "."}:
+            return name, arguments, None
+        normalized_find_exec = self._normalize_find_exec_grep_shell_command(command)
+        if normalized_find_exec is not None:
+            return "search", normalized_find_exec, "Normalized find-plus-grep inspection to search for cacheable structured context."
+        if re.search(r"[|&;<>`$()\r\n]", command):
+            return name, arguments, None
+        path_token = r'(?:"([^"]+)"|\'([^\']+)\'|(\S+))'
+        cat_match = re.fullmatch(rf"(?:cat|type)\s+(?:-n\s+)?{path_token}", command, flags=re.IGNORECASE)
+        if cat_match:
+            path = next(group for group in cat_match.groups() if group)
+            if path.startswith("-"):
+                return name, arguments, None
+            return "read_file", {"path": path}, "Normalized shell file inspection to read_file for cacheable structured context."
+        list_match = re.fullmatch(rf"(?:ls|dir)\s+{path_token}", command, flags=re.IGNORECASE)
+        if list_match:
+            path = next(group for group in list_match.groups() if group)
+            if path.startswith("-"):
+                return name, arguments, None
+            return "list_files", {"path": path}, "Normalized shell directory inspection to list_files for cacheable structured context."
+        try:
+            argv = shlex.split(command, posix=True)
+        except ValueError:
+            return name, arguments, None
+        normalized_search = self._normalize_grep_shell_inspection(argv)
+        if normalized_search is not None:
+            return "search", normalized_search, "Normalized shell text search to search for cacheable structured context."
+        if argv and argv[0].lower() in {"head", "tail"}:
+            normalized_read = self._normalize_head_tail_shell_inspection(argv)
+            if normalized_read is not None:
+                return "read_file", normalized_read, "Normalized shell file preview to read_file for bounded structured context."
+        if argv and argv[0].lower() == "find":
+            normalized_find = self._normalize_find_shell_inspection(argv)
+            if normalized_find is not None:
+                tool_name, tool_arguments = normalized_find
+                return tool_name, tool_arguments, "Normalized simple shell discovery to structured search for cacheable context."
+        return name, arguments, None
+
+    def _normalize_grep_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
+        if len(argv) not in {3, 4} or not argv:
+            return None
+        if argv[0].lower() not in {"grep", "rg", "ripgrep"}:
+            return None
+        index = 1
+        if len(argv) == 4:
+            if argv[index] not in {"-n", "--line-number"}:
+                return None
+            index += 1
+        query, path = argv[index], argv[index + 1]
+        if query.startswith("-") or path.startswith("-"):
+            return None
+        return {"query": query, "path": path}
+
+    def _normalize_find_exec_grep_shell_command(self, command: str) -> dict[str, Any] | None:
+        if not command.lower().startswith("find "):
+            return None
+        if re.search(r"[|&<>`$()\r\n]", command):
+            return None
+        try:
+            argv = shlex.split(command, posix=True)
+        except ValueError:
+            return None
+        if len(argv) not in {10, 12}:
+            return None
+        if argv[0].lower() != "find" or argv[2] != "-name":
+            return None
+        path = argv[1]
+        file_glob = argv[3]
+        index = 4
+        if len(argv) == 12:
+            if argv[index] != "-type" or argv[index + 1].lower() not in {"f", "file"}:
+                return None
+            index += 2
+        expected = ["-exec", "grep", "-l"]
+        if argv[index : index + 3] != expected:
+            return None
+        query = argv[index + 3]
+        if argv[index + 4] != "{}" or argv[index + 5] != ";":
+            return None
+        if path.startswith("-") or file_glob.startswith("-") or query.startswith("-"):
+            return None
+        return {"query": query, "path": path, "file_glob": file_glob}
+
+    def _normalize_head_tail_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
+        if not argv:
+            return None
+        command = argv[0].lower()
+        if command not in {"head", "tail"}:
+            return None
+        count = 10
+        path: str | None = None
+        index = 1
+        if index < len(argv):
+            token = argv[index]
+            if token == "-n":
+                if index + 2 >= len(argv):
+                    return None
+                try:
+                    count = int(argv[index + 1])
+                except ValueError:
+                    return None
+                path = argv[index + 2]
+                index += 3
+            elif re.fullmatch(r"-\d+", token):
+                count = int(token[1:])
+                if index + 1 >= len(argv):
+                    return None
+                path = argv[index + 1]
+                index += 2
+            elif token.startswith("-"):
+                return None
+            else:
+                path = token
+                index += 1
+        if index != len(argv) or not path or path.startswith("-") or count <= 0:
+            return None
+        count = min(count, 200)
+        if command == "head":
+            return {"path": path, "start": 1, "end": count}
+        try:
+            target = self.tools.resolve_path(path, allow_missing=False)
+            if target.is_dir():
+                return None
+            line_count = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            return None
+        start = max(1, line_count - count + 1)
+        return {"path": path, "start": start, "end": max(start, line_count)}
+
+    def _normalize_find_shell_inspection(self, argv: list[str]) -> tuple[str, dict[str, Any]] | None:
+        if len(argv) < 4 or argv[0].lower() != "find":
+            return None
+        path = argv[1]
+        if path.startswith("-"):
+            return None
+        query: str | None = None
+        target_tool = "file_search"
+        index = 2
+        while index < len(argv):
+            token = argv[index]
+            if token == "-name":
+                if index + 1 >= len(argv) or query is not None:
+                    return None
+                query = argv[index + 1]
+                index += 2
+                continue
+            if token == "-type":
+                if index + 1 >= len(argv):
+                    return None
+                raw_kind = argv[index + 1].lower()
+                if raw_kind in {"f", "file"}:
+                    target_tool = "file_search"
+                elif raw_kind in {"d", "dir", "directory"}:
+                    target_tool = "directory_search"
+                else:
+                    return None
+                index += 2
+                continue
+            return None
+        if not query or query.startswith("-"):
+            return None
+        clean_query = query.strip()
+        if target_tool == "file_search":
+            if clean_query.startswith("*") and clean_query.endswith("*") and len(clean_query) > 2:
+                clean_query = clean_query.strip("*")
+            elif clean_query.startswith("*.") and len(clean_query) > 2:
+                clean_query = clean_query[1:]
+        clean_query = clean_query.strip()
+        if not clean_query:
+            return None
+        return target_tool, {"query": clean_query, "path": path, "limit": 100}
 
     def _request_explicitly_requests_tool(self, text: str, name: str) -> bool:
         requested = self._requested_tool_names(text, forbidden_tool_names=set())
@@ -4109,9 +4555,34 @@ class OllamaCodeAgent:
         recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
         recent_identifier_code_paths = self._recent_identifier_search_code_paths(successful_tool_results)
         recent_search_code_paths = self._recent_search_code_paths(successful_tool_results)
+        recent_list_files_code_paths = self._recent_list_files_code_paths(successful_tool_results)
+        context_pack_target = self._successful_context_pack_read_target(
+            successful_tool_results=successful_tool_results,
+            preferred_symbol=recent_identifier_query,
+        )
         if "find_implementation_target" not in forbidden_tool_names and not self._has_successful_tool_named(successful_tool_results, "find_implementation_target"):
             if test_paths and not source_paths:
                 return "find_implementation_target", {"test_path": test_paths[-1], "limit": 6}
+        if not source_paths and context_pack_target is not None:
+            probe_name, probe_arguments = context_pack_target
+            if probe_name == "read_symbol":
+                if (
+                    "read_symbol" not in forbidden_tool_names
+                    and not self._has_successful_read_symbol(
+                        path=str(probe_arguments.get("path") or ""),
+                        symbol=str(probe_arguments.get("symbol") or ""),
+                        successful_tool_results=successful_tool_results,
+                    )
+                ):
+                    return probe_name, probe_arguments
+            elif (
+                "read_file" not in forbidden_tool_names
+                and not self._has_successful_read_file(
+                    path=str(probe_arguments.get("path") or ""),
+                    successful_tool_results=successful_tool_results,
+                )
+            ):
+                return probe_name, probe_arguments
         if (
             not source_paths
             and recent_identifier_query
@@ -4158,6 +4629,13 @@ class OllamaCodeAgent:
             and not self._has_successful_tool_named(successful_tool_results, "code_outline")
         ):
             return "code_outline", {"path": recent_search_code_paths[0]}
+        if (
+            not source_paths
+            and len(recent_list_files_code_paths) == 1
+            and "code_outline" not in forbidden_tool_names
+            and not self._has_successful_tool_named(successful_tool_results, "code_outline")
+        ):
+            return "code_outline", {"path": recent_list_files_code_paths[0]}
         if source_paths:
             latest_source_path = source_paths[-1]
             implementation_target_symbol = self._successful_implementation_target_symbol(
@@ -4624,10 +5102,27 @@ class OllamaCodeAgent:
         recent_identifier_query = self._recent_identifier_search_query(successful_tool_results)
         recent_identifier_code_paths = self._recent_identifier_search_code_paths(successful_tool_results)
         recent_search_code_paths = self._recent_search_code_paths(successful_tool_results)
+        recent_list_files_code_paths = self._recent_list_files_code_paths(successful_tool_results)
         source_paths = self._recent_source_paths(successful_tool_results)
+        context_pack_target = self._successful_context_pack_read_target(
+            successful_tool_results=successful_tool_results,
+            preferred_symbol=recent_identifier_query,
+        )
         if not source_paths:
+            if context_pack_target is not None:
+                target_name, target_arguments = context_pack_target
+                if target_name == "read_symbol":
+                    return not self._has_successful_read_symbol(
+                        path=str(target_arguments.get("path") or ""),
+                        symbol=str(target_arguments.get("symbol") or ""),
+                        successful_tool_results=successful_tool_results,
+                    )
+                return not self._has_successful_read_file(
+                    path=str(target_arguments.get("path") or ""),
+                    successful_tool_results=successful_tool_results,
+                )
             if not recent_identifier_query or not recent_identifier_code_paths:
-                return len(recent_search_code_paths) == 1
+                return len(recent_search_code_paths) == 1 or len(recent_list_files_code_paths) == 1
             if not self._has_successful_symbol_search_query(
                 query=recent_identifier_query,
                 successful_tool_results=successful_tool_results,
@@ -4705,6 +5200,72 @@ class OllamaCodeAgent:
             return True
         return any(str(item.get("name", "")).strip() in GROUNDING_EVIDENCE_TOOL_NAMES for item in successful_tool_results)
 
+    def _mutation_target_paths(self, arguments: dict[str, Any]) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for key in ("path", "file", "filename"):
+            raw = str(arguments.get(key) or "").strip().replace("\\", "/")
+            normalized = "." if raw in {".", "./"} else raw.lstrip("./")
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            paths.append(normalized)
+        return paths
+
+    def _has_targeted_grounding_evidence(
+        self,
+        *,
+        paths: list[str],
+        successful_tool_results: list[dict[str, Any]],
+        latest_run_test_failed: bool,
+    ) -> bool:
+        if latest_run_test_failed:
+            return True
+        normalized_paths = {
+            str(path or "").strip().replace("\\", "/").lstrip("./")
+            for path in paths
+            if str(path or "").strip()
+        }
+        if not normalized_paths:
+            return False
+        grounded_paths: set[str] = set()
+        for item in successful_tool_results:
+            name = str(item.get("name") or "").strip()
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            if name in {"read_file", "read_symbol", "code_outline", "tree_sitter_syntax", "lsp_diagnostics"} or name in MUTATING_TOOL_NAMES:
+                raw_path = result.get("path") or arguments_dict.get("path")
+                path = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+                if path in normalized_paths:
+                    grounded_paths.add(path)
+            elif name == "context_pack":
+                ranked_paths = result.get("ranked_paths")
+                if isinstance(ranked_paths, list):
+                    for raw_path in ranked_paths:
+                        path = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+                        if path in normalized_paths:
+                            grounded_paths.add(path)
+                ranked_symbols = result.get("ranked_symbols")
+                if isinstance(ranked_symbols, list):
+                    for raw_symbol in ranked_symbols:
+                        if not isinstance(raw_symbol, dict):
+                            continue
+                        path = str(raw_symbol.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                        if path in normalized_paths:
+                            grounded_paths.add(path)
+            elif name == "find_implementation_target":
+                targets = result.get("targets")
+                if isinstance(targets, list):
+                    for target in targets:
+                        if not isinstance(target, dict):
+                            continue
+                        path = str(target.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                        if path in normalized_paths:
+                            grounded_paths.add(path)
+        return normalized_paths.issubset(grounded_paths)
+
     def _direct_file_creation_allowed(self, request_text: str, name: str, arguments: dict[str, Any]) -> bool:
         if name != "write_file":
             return False
@@ -4755,6 +5316,20 @@ class OllamaCodeAgent:
                     successful_tool_results=successful_tool_results,
                 ):
                     return not self._direct_file_creation_allowed(request_text, name, arguments)
+        else:
+            if name == "edit_intent":
+                return False
+            target_paths = [
+                path
+                for path in self._mutation_target_paths(arguments)
+                if Path(path).suffix.lower() in CODE_EDIT_SUFFIXES and not self._path_looks_like_test_file(path)
+            ]
+            if target_paths and not self._has_targeted_grounding_evidence(
+                paths=target_paths,
+                successful_tool_results=successful_tool_results,
+                latest_run_test_failed=latest_run_test_failed,
+            ):
+                return not self._direct_file_creation_allowed(request_text, name, arguments)
         if self._has_grounding_evidence(successful_tool_results=successful_tool_results, latest_run_test_failed=latest_run_test_failed):
             return False
         return not self._direct_file_creation_allowed(request_text, name, arguments)
@@ -4765,7 +5340,7 @@ class OllamaCodeAgent:
         return "Need current-turn evidence before mutation. Read the target file/symbol or call context_pack/repo_index_search first. Next JSON only."
 
     def _mutation_has_explicit_path_target(self, arguments: dict[str, Any]) -> bool:
-        return any(str(arguments.get(key) or "").strip() for key in ("path", "file", "filename"))
+        return bool(self._mutation_target_paths(arguments))
 
     def _mutation_requested_symbol_name(self, *, name: str, arguments: dict[str, Any]) -> str:
         raw_symbol = ""
@@ -5092,6 +5667,15 @@ class OllamaCodeAgent:
             )
             if search_source_path and (not explicit_source_scope or search_source_path in explicit_source_scope):
                 return "read_file", {"path": search_source_path}
+            context_pack_target = self._successful_context_pack_read_target(
+                successful_tool_results=successful_tool_results,
+                preferred_symbol=symbol_name,
+            )
+            if context_pack_target is not None:
+                probe_name, probe_arguments = context_pack_target
+                probe_path = str(probe_arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                if not explicit_source_scope or probe_path in explicit_source_scope:
+                    return probe_name, probe_arguments
             if not self._has_successful_symbol_search_query(
                 query=symbol_name,
                 successful_tool_results=successful_tool_results,
@@ -5443,9 +6027,24 @@ class OllamaCodeAgent:
                 "Call list_files or repo_index_search to find the correct path, or fail closed. Next JSON only."
             )
         if error_class == "syntax_error":
+            if name == "run_shell":
+                return (
+                    "run_shell already failed with shell syntax or quoting errors. Do not retry the same inline shell. "
+                    "Use a simpler one-line command, write a temporary script with valid syntax, or switch to run_test if this is validation. Next JSON only."
+                )
             return (
                 f"{name} already failed with syntax_error. Inspect the exact symbol/diagnostic, repair the edit, "
                 "then use edit_intent replace_body with a syntactically complete function body or replace_symbol with complete source before tests. Next JSON only."
+            )
+        if error_class == "timeout":
+            if name == "run_shell":
+                return (
+                    "run_shell already failed twice with timeout. Do not retry the same long-running service or install command. "
+                    "Use a short probe, bounded validator, background-safe launch, or report that the command needs a different execution strategy before retrying. Next JSON only."
+                )
+            return (
+                f"{name} already failed twice with timeout. Do not retry the same arguments. "
+                "Use a bounded probe, a cheaper validator, or fail closed before retrying. Next JSON only."
             )
         if error_class in {"missing_dependency", "command_not_found", "import_error"}:
             if diagnosis_ran:
@@ -5461,6 +6060,99 @@ class OllamaCodeAgent:
             f"{name} already failed twice with {error_class}. Do not retry the same arguments. "
             "Use a different tool class, gather new evidence, edit the cause, or fail closed. Next JSON only."
         )
+
+    def _ad_hoc_verification_script_path(self, command: str, mutated_paths_this_turn: set[str]) -> str | None:
+        normalized_command = str(command or "").replace("\\", "/").strip()
+        if not normalized_command:
+            return None
+        verification_roots = ("verify", "verification", "validate", "validation", "check", "smoke", "probe", "health", "completion")
+        for raw_token in re.findall(r'"[^"]+"|\'[^\']+\'|\S+', normalized_command):
+            token = raw_token.strip().strip("\"'")
+            if not token:
+                continue
+            normalized_token = token.replace("\\", "/").lstrip("./")
+            if not re.search(r"\.(?:py|sh|bash|ps1|bat|cmd|js|ts)$", normalized_token, re.IGNORECASE):
+                continue
+            basename = normalized_token.rsplit("/", 1)[-1].lower()
+            if any(
+                basename == f"{root_name}.{basename.rsplit('.', 1)[-1]}"
+                or basename.startswith(root_name + "_")
+                or basename.startswith(root_name + "-")
+                for root_name in verification_roots
+            ):
+                if normalized_token in mutated_paths_this_turn:
+                    return normalized_token
+                try:
+                    existing_path = self.tools.resolve_path(normalized_token, allow_missing=True)
+                except Exception:
+                    existing_path = None
+                if existing_path is None or not existing_path.exists():
+                    return normalized_token
+        return None
+
+    def _timeout_verification_guard_message(self, *, verification_script_path: str, prior_command: str, prior_summary: str) -> str:
+        message = (
+            f"Do not treat the ad hoc verification script {verification_script_path} as proof after the original timed-out command path failed. "
+            "Use a bounded probe against the original command/service, a background-safe launch, or report that the real path still needs a different execution strategy."
+        )
+        if prior_command:
+            message += " Timed-out command: " + self._truncate_text(prior_command, limit=180) + "."
+        if prior_summary:
+            message += " Evidence: " + self._truncate_text(prior_summary, limit=220) + "."
+        return message + " Next JSON only."
+
+    def _final_claims_timeout_success(self, message: str) -> bool:
+        lowered = str(message or "").lower()
+        if not lowered.strip():
+            return False
+        if re.search(r"\b(?:timed out|timeout|failed|could not|unable|did not|didn't|not working|still needs)\b", lowered):
+            return False
+        patterns = [
+            r"\bservice\s+(?:is\s+)?working\b",
+            r"\bverification\s+passed\b",
+            r"\bworks\b",
+            r"\bverified\b",
+            r"\bsucceeded\b",
+            r"\bstarted\b",
+            r"\brunning\b",
+            r"\bhealthy\b",
+            r"\bavailable\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _final_claims_run_shell_success(self, message: str) -> bool:
+        lowered = str(message or "").lower()
+        if not lowered.strip():
+            return False
+        if re.search(r"\b(?:timed out|timeout|failed|could not|unable|did not|didn't|not installed|missing|not found|still needs)\b", lowered):
+            return False
+        patterns = [
+            r"\bcommand\s+works\b",
+            r"\bservice\s+(?:is\s+)?working\b",
+            r"\bverification\s+passed\b",
+            r"\bworks\b",
+            r"\bverified\b",
+            r"\bsucceeded\b",
+            r"\bstarted\b",
+            r"\brunning\b",
+            r"\bhealthy\b",
+            r"\bavailable\b",
+        ]
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _final_claims_path_exists(self, message: str) -> bool:
+        lowered = str(message or "").lower().strip()
+        if not lowered:
+            return False
+        if re.search(r"\b(?:does not exist|is missing|are missing|not found|path_missing|no such file|no such directory)\b", lowered):
+            return False
+        return bool(re.search(r"\bexists\b", lowered))
+
+    def _final_acknowledges_missing_path(self, message: str) -> bool:
+        lowered = str(message or "").lower().strip()
+        if not lowered:
+            return False
+        return bool(re.search(r"\b(?:does not exist|is missing|are missing|not found|path_missing|no such file|no such directory)\b", lowered))
 
     def _forbidden_tool_feedback_message(
         self,
@@ -5552,23 +6244,45 @@ class OllamaCodeAgent:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
 
-    def _discover_validators_test_command(self, validation_result: dict[str, Any]) -> str | None:
+    def _discover_validators_followup(
+        self,
+        validation_result: dict[str, Any],
+        *,
+        forbidden_tool_names: set[str],
+        allow_non_test_validators: bool,
+        run_non_test_validators_as_commands: bool = False,
+    ) -> tuple[str, dict[str, Any], str] | None:
         configured = str(self.tools.default_test_command or "").strip()
-        if configured:
-            return configured
+        if configured and "run_test" not in forbidden_tool_names:
+            return "run_test", {"command": configured}, "test command selected after validator discovery"
         validators = validation_result.get("validators")
         if not isinstance(validators, list):
             return None
-        for item in validators:
-            if not isinstance(item, dict):
+        priority_order = [("test", "run_test", "test command selected after validator discovery")]
+        if allow_non_test_validators:
+            non_test_tool_name = "run_test" if run_non_test_validators_as_commands else "lint_typecheck"
+            non_test_reason_suffix = "validator command selected after validator discovery" if run_non_test_validators_as_commands else "validator selected after validator discovery"
+            priority_order.extend(
+                [
+                    ("check", non_test_tool_name, f"check {non_test_reason_suffix}"),
+                    ("typecheck", non_test_tool_name, f"typecheck {non_test_reason_suffix}"),
+                    ("lint", non_test_tool_name, f"lint {non_test_reason_suffix}"),
+                    ("syntax", non_test_tool_name, f"syntax {non_test_reason_suffix}"),
+                ]
+            )
+        for kind, tool_name, reason in priority_order:
+            if tool_name in forbidden_tool_names:
                 continue
-            if item.get("available") is not True:
-                continue
-            if str(item.get("kind") or "").strip().lower() != "test":
-                continue
-            command = str(item.get("command") or "").strip()
-            if command:
-                return command
+            for item in validators:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("available") is not True:
+                    continue
+                if str(item.get("kind") or "").strip().lower() != kind:
+                    continue
+                command = str(item.get("command") or "").strip()
+                if command:
+                    return tool_name, {"command": command}, reason
         return None
 
     def _execute_auto_validation_plan(
@@ -5608,6 +6322,9 @@ class OllamaCodeAgent:
             satisfied_tool_names=satisfied_tool_names,
             tool_calls_this_turn=tool_calls_this_turn,
         )
+        validation_promoted_from_discovery = False
+        validator_executed_before_select = False
+        code_validation_paths = sorted(path for path in mutated_paths if Path(path).suffix.lower() in CODE_EDIT_SUFFIXES)
         if validation_name == "select_tests" and validation_result.get("ok") is True:
             commands = validation_result.get("test_commands")
             if isinstance(commands, list) and commands and "run_test" not in forbidden_tool_names:
@@ -5651,21 +6368,28 @@ class OllamaCodeAgent:
                     satisfied_tool_names=satisfied_tool_names,
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
-        if validation_name == "discover_validators" and validation_result.get("ok") is True and "run_test" not in forbidden_tool_names:
-            discovered_test_command = self._discover_validators_test_command(validation_result)
-            if discovered_test_command:
+        if validation_name == "discover_validators" and validation_result.get("ok") is True:
+            discovered_followup = self._discover_validators_followup(
+                validation_result,
+                forbidden_tool_names=forbidden_tool_names,
+                allow_non_test_validators=bool(mutated_paths),
+                run_non_test_validators_as_commands=not bool(code_validation_paths),
+            )
+            if discovered_followup is not None:
+                followup_name, followup_arguments, followup_reason = discovered_followup
                 self._record_event(
                     "auto_validation",
-                    name="run_test",
-                    arguments={"command": discovered_test_command},
-                    reason=f"{reason_prefix}test command selected after validator discovery",
+                    name=followup_name,
+                    arguments=followup_arguments,
+                    reason=f"{reason_prefix}{followup_reason}",
                     mutation_version=mutation_version,
                     rounds=round_number,
                 )
-                validation_name = "run_test"
-                validation_arguments = {"command": discovered_test_command}
+                validation_promoted_from_discovery = True
+                validation_name = followup_name
+                validation_arguments = followup_arguments
                 validation_result = self._execute_controller_tool(
-                    name="run_test",
+                    name=followup_name,
                     arguments=validation_arguments,
                     request_text=request_text,
                     round_number=round_number,
@@ -5674,7 +6398,8 @@ class OllamaCodeAgent:
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
         if (
-            validation_name == "lint_typecheck"
+            not validation_promoted_from_discovery
+            and validation_name == "lint_typecheck"
             and validation_result.get("ok") is True
             and mutated_paths
             and "contract_check" not in forbidden_tool_names
@@ -5701,13 +6426,15 @@ class OllamaCodeAgent:
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
         if (
-            validation_name in {"lint_typecheck", "contract_check"}
+            not validation_promoted_from_discovery
             and validation_result.get("ok") is True
-            and mutated_paths
+            and validation_name in {"lint_typecheck", "contract_check"}
             and "select_tests" not in forbidden_tool_names
             and "run_test" not in forbidden_tool_names
+            and code_validation_paths
         ):
-            select_args = {"changed_files": sorted(path for path in mutated_paths if path.endswith(".py"))}
+            select_args = {"changed_files": code_validation_paths}
+            validator_executed_before_select = validation_name in {"lint_typecheck", "contract_check"}
             self._record_event(
                 "auto_validation",
                 name="select_tests",
@@ -5791,20 +6518,29 @@ class OllamaCodeAgent:
                     tool_calls_this_turn=tool_calls_this_turn,
                 )
                 if validation_result.get("ok") is True:
-                    discovered_test_command = self._discover_validators_test_command(validation_result)
-                    if discovered_test_command and "run_test" not in forbidden_tool_names:
+                    discovered_followup = self._discover_validators_followup(
+                        validation_result,
+                        forbidden_tool_names=forbidden_tool_names,
+                        allow_non_test_validators=True,
+                        run_non_test_validators_as_commands=False,
+                    )
+                    if discovered_followup is not None:
+                        followup_name, followup_arguments, followup_reason = discovered_followup
+                        if followup_name == "lint_typecheck" and validator_executed_before_select:
+                            return validation_name, validation_arguments, validation_result
                         self._record_event(
                             "auto_validation",
-                            name="run_test",
-                            arguments={"command": discovered_test_command},
-                            reason=f"{reason_prefix}test command selected after validator discovery",
+                            name=followup_name,
+                            arguments=followup_arguments,
+                            reason=f"{reason_prefix}{followup_reason}",
                             mutation_version=mutation_version,
                             rounds=round_number,
                         )
-                        validation_name = "run_test"
-                        validation_arguments = {"command": discovered_test_command}
+                        validation_promoted_from_discovery = True
+                        validation_name = followup_name
+                        validation_arguments = followup_arguments
                         validation_result = self._execute_controller_tool(
-                            name="run_test",
+                            name=followup_name,
                             arguments=validation_arguments,
                             request_text=request_text,
                             round_number=round_number,
@@ -6303,8 +7039,24 @@ class OllamaCodeAgent:
             )
         optional_parameter_ops = self._optional_parameter_update_operations(request_text)
         if optional_parameter_ops and "edit_intent" not in forbidden_tool_names:
+            pending_optional_parameter_ops = [
+                (tool_name, args)
+                for tool_name, args in optional_parameter_ops
+                if not self._successful_tool_call_already_satisfied(
+                    name=tool_name,
+                    arguments=args,
+                    successful_tool_results=successful_tool_results,
+                )
+            ]
+            if not pending_optional_parameter_ops:
+                edited_paths = sorted({str(args.get("path", "")) for _, args in optional_parameter_ops if args.get("path")})
+                return self._record_synthesized_final(
+                    f"Updated {', '.join(edited_paths)}.",
+                    tool="edit_intent",
+                    round_number=round_number,
+                )
             last_result: dict[str, Any] | None = None
-            for tool_name, args in optional_parameter_ops:
+            for tool_name, args in pending_optional_parameter_ops:
                 round_number += 1
                 last_result = self._execute_controller_tool(
                     name=tool_name,
@@ -6326,19 +7078,24 @@ class OllamaCodeAgent:
         rename_ops = self._project_function_rename_operations(request_text)
         if rename_ops and "edit_intent" not in forbidden_tool_names:
             last_result: dict[str, Any] | None = None
-            for tool_name, args in rename_ops:
-                round_number += 1
-                last_result = self._execute_controller_tool(
-                    name=tool_name,
-                    arguments=args,
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                if last_result.get("ok") is not True:
-                    return None
+            rename_already_satisfied = self._project_function_rename_already_satisfied(
+                request_text=request_text,
+                successful_tool_results=successful_tool_results,
+            )
+            if not rename_already_satisfied:
+                for tool_name, args in rename_ops:
+                    round_number += 1
+                    last_result = self._execute_controller_tool(
+                        name=tool_name,
+                        arguments=args,
+                        request_text=request_text,
+                        round_number=round_number,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if last_result.get("ok") is not True:
+                        return None
             if self._request_requires_test_run(request_text) and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
                 round_number += 1
                 test_result = self._execute_controller_tool(
@@ -6463,6 +7220,60 @@ class OllamaCodeAgent:
                 },
             )
         ]
+
+    def _project_function_rename_already_satisfied(
+        self,
+        *,
+        request_text: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        rename_ops = self._project_function_rename_operations(request_text)
+        if not rename_ops or len(rename_ops) != 1:
+            return False
+        tool_name, args = rename_ops[0]
+        if tool_name != "edit_intent" or not isinstance(args, dict):
+            return False
+        target = str(args.get("target") or "").strip()
+        replacement = str(args.get("replacement") or "").strip()
+        scope = str(args.get("scope") or "").strip().lower()
+        path = str(args.get("path") or "").strip()
+        if not target or not replacement:
+            return False
+        for item in reversed(successful_tool_results):
+            if str(item.get("name") or "").strip() != "edit_intent":
+                continue
+            item_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if str(item_arguments.get("target") or "").strip() != target:
+                continue
+            if str(item_arguments.get("replacement") or "").strip() != replacement:
+                continue
+            if str(item_arguments.get("scope") or "").strip().lower() != scope:
+                continue
+            if str(item_arguments.get("path") or "").strip() != path:
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is True:
+                return True
+        return False
+
+    def _successful_tool_call_already_satisfied(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        expected = json.dumps(arguments, sort_keys=True, ensure_ascii=True)
+        for item in reversed(successful_tool_results):
+            if str(item.get("name") or "").strip() != name:
+                continue
+            item_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            if json.dumps(item_arguments, sort_keys=True, ensure_ascii=True) != expected:
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is True:
+                return True
+        return False
 
     def _test_grounded_symbol_return_rewrite_spec(self, request_text: str) -> dict[str, str] | None:
         match = re.search(
@@ -6659,9 +7470,11 @@ class OllamaCodeAgent:
         forbidden_tool_names: set[str],
         session_memory_request: bool,
         requested_git_diff_mode: str | None,
+        successful_tool_results: list[dict[str, Any]] | None = None,
     ) -> AgentResult | None:
         if session_memory_request:
             return None
+        prior_successful_tool_results = list(successful_tool_results or [])
         successful_tool_results: list[dict[str, Any]] = []
         tool_calls_this_turn: list[dict[str, Any]] = []
         satisfied_tool_names: set[str] = set()
@@ -6705,7 +7518,7 @@ class OllamaCodeAgent:
             round_number=round_number,
             required_tool_names=required_tool_names,
             forbidden_tool_names=forbidden_tool_names,
-            successful_tool_results=successful_tool_results,
+            successful_tool_results=[*prior_successful_tool_results, *successful_tool_results],
             satisfied_tool_names=satisfied_tool_names,
             tool_calls_this_turn=tool_calls_this_turn,
         )
@@ -6830,6 +7643,13 @@ class OllamaCodeAgent:
         if "context_pack" in required_tool_names:
             return True
         if not feature_enabled("context-pack"):
+            return False
+        deterministic_bootstrap_available = (
+            self._project_function_rename_operations(request_text)
+            or self._optional_parameter_update_operations(request_text)
+            or self._request_looks_like_explicit_python_import_bug_fix(request_text)
+        )
+        if deterministic_bootstrap_available:
             return False
         if self._request_is_broad_or_ambiguous(request_text):
             return True
@@ -7562,6 +8382,20 @@ class OllamaCodeAgent:
         if paths is None:
             return None
         source_path, test_path = paths
+        initial_test_args = {"command": self.tools.default_test_command} if self.tools.default_test_command else {}
+        initial_failed_test_result: dict[str, Any] | None = None
+        if test_run_required and self._structured_repair_should_preflight_test_command():
+            initial_test_result = self._execute_controller_tool(
+                name="run_test",
+                arguments=initial_test_args,
+                request_text=request_text,
+                round_number=0,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if initial_test_result.get("ok") is not True:
+                initial_failed_test_result = initial_test_result
         try:
             source_text = self.tools.resolve_path(source_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -7616,16 +8450,18 @@ class OllamaCodeAgent:
         return self._try_spec_guided_repair(
             request_text=request_text,
             round_number=0,
-            failed_run_test_result={
+            failed_run_test_result=initial_failed_test_result
+            or {
                 "ok": False,
                 "tool": "structured_test_repair",
                 "summary": "Focused Python source+test repair selected by controller strategy planning.",
                 "output": "Focused Python source+test repair selected by controller strategy planning.",
             },
-            run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+            run_test_arguments=initial_test_args,
             successful_tool_results=successful_tool_results,
             satisfied_tool_names=satisfied_tool_names,
             tool_calls_this_turn=tool_calls_this_turn,
+            cached_spec_result=spec_result,
         )
 
     def _run_sub_agent(self, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -8099,6 +8935,22 @@ class OllamaCodeAgent:
     def _spec_guided_repair_enabled(self) -> bool:
         return not self.disable_spec_guided_repair
 
+    def _effective_repair_test_command(
+        self,
+        *,
+        failed_run_test_result: dict[str, Any] | None = None,
+        run_test_arguments: dict[str, Any] | None = None,
+    ) -> str:
+        if isinstance(failed_run_test_result, dict) and failed_run_test_result.get("recovered") is True:
+            recovered_command = str(failed_run_test_result.get("command") or "").strip()
+            original_command = str(failed_run_test_result.get("original_command") or "").strip()
+            if recovered_command and recovered_command != original_command:
+                return recovered_command
+        raw_command = (run_test_arguments or {}).get("command")
+        if isinstance(raw_command, str) and raw_command.strip():
+            return raw_command.strip()
+        return str(self.tools.default_test_command or "").strip()
+
     def _try_preemptive_mechanical_spec_guided_repair(
         self,
         *,
@@ -8297,7 +9149,10 @@ class OllamaCodeAgent:
             targets = self.tools.find_implementation_target(output=output, limit=4)
         except Exception:
             targets = {}
-        test_command = str(run_test_arguments.get("command") or self.tools.default_test_command or "").strip()
+        test_command = self._effective_repair_test_command(
+            failed_run_test_result=failed_run_test_result,
+            run_test_arguments=run_test_arguments,
+        )
         for item in targets.get("targets", []) if isinstance(targets.get("targets"), list) else []:
             if not isinstance(item, dict):
                 continue
@@ -8368,6 +9223,7 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]],
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
+        cached_spec_result: dict[str, Any] | None = None,
     ) -> AgentResult | None:
         paths = self._spec_guided_repair_paths(successful_tool_results)
         if paths is None:
@@ -8378,12 +9234,16 @@ class OllamaCodeAgent:
             source_text = source_file.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return None
-        try:
-            quick_spec = self.tools.implementation_spec(source_path, test_path, limit=60)
-        except Exception:
-            return None
-        if quick_spec.get("ok") is not True:
-            return None
+        spec_result = cached_spec_result if isinstance(cached_spec_result, dict) and cached_spec_result.get("ok") is True else None
+        if spec_result is None:
+            try:
+                quick_spec = self.tools.implementation_spec(source_path, test_path, limit=60)
+            except Exception:
+                return None
+            if quick_spec.get("ok") is not True:
+                return None
+        else:
+            quick_spec = spec_result
         failed_tool = str(failed_run_test_result.get("tool") or "").strip()
         if failed_tool == "preemptive_spec_repair":
             failed_output = str(failed_run_test_result.get("output") or failed_run_test_result.get("summary") or "").strip()
@@ -8404,19 +9264,23 @@ class OllamaCodeAgent:
             test_path=test_path,
             rounds=round_number,
         )
-        spec_result = self._execute_controller_tool(
-            name="implementation_spec",
-            arguments={"source_path": source_path, "test_path": test_path, "limit": 60},
-            request_text=request_text,
-            round_number=round_number,
-            successful_tool_results=successful_tool_results,
-            satisfied_tool_names=satisfied_tool_names,
-            tool_calls_this_turn=tool_calls_this_turn,
-        )
-        if spec_result.get("ok") is not True:
-            return None
+        if spec_result is None:
+            spec_result = self._execute_controller_tool(
+                name="implementation_spec",
+                arguments={"source_path": source_path, "test_path": test_path, "limit": 60},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if spec_result.get("ok") is not True:
+                return None
         spec_output = str(spec_result.get("output") or spec_result.get("summary") or "")
-        test_command = str(run_test_arguments.get("command") or self.tools.default_test_command or "").strip()
+        test_command = self._effective_repair_test_command(
+            failed_run_test_result=failed_run_test_result,
+            run_test_arguments=run_test_arguments,
+        )
         feedback = ""
         for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
@@ -8458,7 +9322,7 @@ class OllamaCodeAgent:
                 )
                 if apply_result.get("ok") is True:
                     final_test_args = dict(run_test_arguments)
-                    if test_command and "command" not in final_test_args:
+                    if test_command:
                         final_test_args["command"] = test_command
                     final_result = self._execute_controller_tool(
                         name="run_test",
@@ -8578,7 +9442,7 @@ class OllamaCodeAgent:
                 feedback = str(apply_result.get("summary") or "validated candidate could not be applied")
                 continue
             final_test_args = dict(run_test_arguments)
-            if test_command and "command" not in final_test_args:
+            if test_command:
                 final_test_args["command"] = test_command
             final_result = self._execute_controller_tool(
                 name="run_test",
@@ -8693,6 +9557,7 @@ class OllamaCodeAgent:
                 forbidden_tool_names=forbidden_tool_names,
                 session_memory_request=session_memory_request,
                 requested_git_diff_mode=requested_git_diff_mode,
+                successful_tool_results=None,
             )
             if deterministic_result is not None:
                 return deterministic_result
@@ -8730,6 +9595,13 @@ class OllamaCodeAgent:
         diagnosed_tool_error_keys: set[tuple[str, str, str]] = set()
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
+        last_failed_run_shell_command = ""
+        last_failed_run_shell_summary = ""
+        last_failed_run_shell_error_class = ""
+        last_failed_path_lookup_summary = ""
+        last_failed_path_lookup_error_class = ""
+        last_timeout_command = ""
+        last_timeout_summary = ""
         if (
             (mutation_required or code_mutation_required)
             and not exact_request
@@ -8843,6 +9715,7 @@ class OllamaCodeAgent:
                     forbidden_tool_names=forbidden_tool_names,
                     session_memory_request=session_memory_request,
                     requested_git_diff_mode=requested_git_diff_mode,
+                    successful_tool_results=successful_tool_results,
                 )
                 if deterministic_result is not None:
                     return deterministic_result
@@ -8997,6 +9870,99 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if (
+                    last_failed_run_shell_command
+                    and last_failed_run_shell_error_class != "timeout"
+                    and self._final_claims_run_shell_success(assistant_text)
+                ):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="run-shell-final-claim",
+                        prior_command=self._truncate_text(last_failed_run_shell_command, limit=200),
+                        error_class=last_failed_run_shell_error_class,
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The latest run_shell failed; do not claim the command works or that verification passed. "
+                            + "Summarize the failure accurately or explain what different environment or dependency is needed. "
+                            + "Evidence: "
+                            + self._truncate_text(last_failed_run_shell_summary or last_failed_run_shell_command, limit=280)
+                            + ". Next JSON only.",
+                        }
+                    )
+                    continue
+                if (
+                    self._request_asks_if_path_exists(text)
+                    and last_failed_path_lookup_error_class == "path_missing"
+                    and self._final_claims_path_exists(assistant_text)
+                ):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="path-exists-final-claim",
+                        error_class=last_failed_path_lookup_error_class,
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The latest path lookup failed; do not claim the path exists. "
+                            + "Summarize that it is missing or explain the lookup failure accurately. "
+                            + "Evidence: "
+                            + self._truncate_text(last_failed_path_lookup_summary, limit=280)
+                            + ". Next JSON only.",
+                        }
+                    )
+                    continue
+                if (
+                    last_failed_path_lookup_error_class == "path_missing"
+                    and (
+                        self._request_asks_direct_file_contents(text)
+                        or self._request_asks_exact_line_text(text)
+                        or self._request_asks_specific_file_line(text)
+                    )
+                    and not self._final_acknowledges_missing_path(assistant_text)
+                ):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="missing-path-content-claim",
+                        error_class=last_failed_path_lookup_error_class,
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The latest path lookup failed; do not invent file contents or line text. "
+                            + "Summarize that the path is missing or explain the lookup failure accurately. "
+                            + "Evidence: "
+                            + self._truncate_text(last_failed_path_lookup_summary, limit=280)
+                            + ". Next JSON only.",
+                        }
+                    )
+                    continue
+                if last_timeout_command and self._final_claims_timeout_success(assistant_text):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="timeout-final-claim",
+                        prior_command=self._truncate_text(last_timeout_command, limit=200),
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The latest run_shell timed out; do not claim the command works or that verification passed. "
+                            + "Report the timeout accurately, use a bounded probe, or describe the different execution strategy still needed. "
+                            + "Evidence: "
+                            + self._truncate_text(last_timeout_summary or last_timeout_command, limit=280)
+                            + ". Next JSON only.",
+                        }
+                    )
+                    continue
                 if mutation_required and latest_run_test_failed and not mutation_verified_this_turn:
                     self._append_assistant_payload(payload)
                     self.messages.append(
@@ -9088,6 +10054,24 @@ class OllamaCodeAgent:
                     diagnostics = "; ".join(
                         f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_static_diagnostics.items())
                     )
+                    if feature_enabled("trajectory-guards") and self._validation_failure_is_stub_placeholder(diagnostics):
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="placeholder-completion-claim",
+                            candidate_tool=name,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": "Post-edit validation shows the implementation is still a stub/comment/pass-style placeholder. "
+                                + "Replace it with complete behavior in the source file before finishing. "
+                                + self._truncate_text(diagnostics, limit=520)
+                                + ". Next JSON only.",
+                            }
+                        )
+                        continue
                     if not test_run_required:
                         failure = "Stopped because post-edit validation failed. " + self._truncate_text(diagnostics, limit=520)
                         self._record_event("assistant", content=failure, rounds=round_number)
@@ -9169,12 +10153,31 @@ class OllamaCodeAgent:
                             latest_run_test_failed = False
                             latest_run_test_failure_summary = ""
                     else:
+                        summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
+                        if feature_enabled("trajectory-guards") and self._validation_failure_is_stub_placeholder(summary):
+                            self._append_assistant_payload(payload)
+                            self._record_event(
+                                "controller_guard",
+                                guard="placeholder-completion-claim",
+                                candidate_tool="final",
+                                validation_tool=validation_name,
+                                rounds=round_number,
+                            )
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "Post-edit validation shows the implementation is still a stub/comment/pass-style placeholder. "
+                                    + "Replace it with complete behavior in the source file before finishing. "
+                                    + self._truncate_text(summary, limit=360)
+                                    + " Next JSON only.",
+                                }
+                            )
+                            continue
                         if validation_name == "run_test":
-                            raw_failure = str(validation_result.get("output") or validation_result.get("summary") or "").strip()
+                            raw_failure = summary
                             latest_run_test_failed = True
                             latest_run_test_failure_summary = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
                         failure = "Stopped because post-edit validation failed."
-                        summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
                         if summary:
                             failure += " " + self._truncate_text(summary, limit=360)
                         self._record_event("assistant", content=failure, rounds=round_number)
@@ -9362,6 +10365,13 @@ class OllamaCodeAgent:
                         exact_shell_command=exact_shell_command,
                     )
                 if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_shell_inspection_call(
+                        name,
+                        arguments,
+                        request_text=text,
+                        exact_shell_command=exact_shell_command,
+                    )
+                if normalization_reason is None:
                     name, arguments, normalization_reason = self._normalize_file_tool_alias_call(
                         name,
                         arguments,
@@ -9375,6 +10385,27 @@ class OllamaCodeAgent:
                     name, arguments, normalization_reason = self._normalize_snippet_symbol_edit_call(
                         name,
                         arguments,
+                    )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_import_repair_bootstrap_call(
+                        name,
+                        arguments,
+                        request_text=text,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_project_rename_bootstrap_call(
+                        name,
+                        arguments,
+                        request_text=text,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                if normalization_reason is None:
+                    name, arguments, normalization_reason = self._normalize_optional_parameter_bootstrap_call(
+                        name,
+                        arguments,
+                        request_text=text,
+                        tool_calls_this_turn=tool_calls_this_turn,
                     )
                 if name == "run_shell" and exact_shell_command and str(arguments.get("command", "")).strip() != exact_shell_command:
                     arguments = dict(arguments)
@@ -9667,6 +10698,43 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                     and failed_test_mutation_version == mutation_version
+                    and failed_test_context_reads == 0
+                    and latest_run_test_failure_output
+                    and last_failed_run_test_key is not None
+                    and last_failed_run_test_diagnosis_key != last_failed_run_test_key
+                    and name in CONTEXT_GATHERING_TOOL_NAMES
+                ):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="diagnose-first-failed-test",
+                        candidate_tool=name,
+                        forced_next_classes=["failure_diagnosis", "implementation_edit", "validation"],
+                        rounds=round_number,
+                    )
+                    diagnosis_result = self._execute_controller_tool(
+                        name="diagnose_test_failure",
+                        arguments={"output": latest_run_test_failure_output, "limit": 4},
+                        request_text=text,
+                        round_number=round_number,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if diagnosis_result.get("ok") is True:
+                        last_failed_run_test_diagnosis_key = last_failed_run_test_key
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": "The latest run_test failed. Use the diagnosis above to edit the implementation before gathering more context or rerunning tests. Next JSON only.",
+                        }
+                    )
+                    continue
+                if (
+                    latest_run_test_failed
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and failed_test_mutation_version == mutation_version
                     and failed_test_context_reads >= 1
                     and name in CONTEXT_GATHERING_TOOL_NAMES
                 ):
@@ -9707,6 +10775,32 @@ class OllamaCodeAgent:
                         )
                         self.messages.append({"role": "user", "content": bulk_stub_message})
                         continue
+                if name == "run_shell":
+                    verification_script_path = self._ad_hoc_verification_script_path(
+                        str(arguments.get("command") or ""),
+                        mutated_paths_this_turn,
+                    )
+                    if verification_script_path and last_timeout_command and last_timeout_command != str(arguments.get("command") or "").strip():
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="fail-closed-timeout-verification",
+                            candidate_tool=name,
+                            verification_script=verification_script_path,
+                            prior_command=self._truncate_text(last_timeout_command, limit=200),
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": self._timeout_verification_guard_message(
+                                    verification_script_path=verification_script_path,
+                                    prior_command=last_timeout_command,
+                                    prior_summary=last_timeout_summary,
+                                ),
+                            }
+                        )
+                        continue
                 cached_result = self._get_cached_tool_result(name, arguments)
                 cache_hit = cached_result is not None
                 repeated_error_class = self._matching_repeated_tool_error(
@@ -9725,11 +10819,11 @@ class OllamaCodeAgent:
                     diagnosis_ran = False
                     if (
                         feature_enabled("trajectory-guards")
-                        and repeated_error_class in {"missing_dependency", "command_not_found", "import_error", "path_missing", "cwd_git"}
+                        and repeated_error_class in {"missing_dependency", "command_not_found", "import_error", "path_missing", "cwd_git", "timeout"}
                         and repeated_error_key not in diagnosed_tool_error_keys
                     ):
                         prior_error_output = latest_tool_error_outputs.get(repeated_error_key, "")
-                        if prior_error_output:
+                        if prior_error_output and repeated_error_class != "timeout":
                             self._record_event(
                                 "controller_guard",
                                 guard="dependency-or-import-guard" if repeated_error_class in {"missing_dependency", "command_not_found", "import_error"} else "path-repair-guard",
@@ -9753,6 +10847,15 @@ class OllamaCodeAgent:
                             if diagnosis_result.get("ok") is True:
                                 diagnosis_ran = True
                                 diagnosed_tool_error_keys.add(repeated_error_key)
+                        elif prior_error_output and repeated_error_class == "timeout":
+                            self._record_event(
+                                "controller_guard",
+                                guard="bounded-command-validation",
+                                candidate_tool=name,
+                                error_class=repeated_error_class,
+                                rounds=round_number,
+                            )
+                            tool_used_this_turn = True
                     self._record_event(
                         "tool_error_guard",
                         guard="repeat-error",
@@ -10010,12 +11113,12 @@ class OllamaCodeAgent:
                         latest_run_test_failure_summary = compact_failure
                         if compact_failure:
                             previous_run_test_failure_summary = compact_failure
-                    self.messages.append(
-                        {
-                            "role": "user",
-                            "content": "Post-edit validation failed before more tool use. Fix the reported issue now instead of gathering more context. Next JSON only.",
-                        }
-                    )
+                    validation_summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
+                    validation_feedback = "Post-edit validation failed before more tool use."
+                    if validation_summary:
+                        validation_feedback += " " + self._truncate_text(validation_summary, limit=520)
+                    validation_feedback += " Fix the reported issue now instead of gathering more context. Next JSON only."
+                    self.messages.append({"role": "user", "content": validation_feedback})
                     continue
                 if (
                     name in MUTATING_TOOL_NAMES
@@ -10128,6 +11231,16 @@ class OllamaCodeAgent:
                         result=result,
                         tool_error_counts=tool_error_counts,
                     )
+                    if name == "run_shell":
+                        last_failed_run_shell_command = str(arguments.get("command") or "").strip()
+                        last_failed_run_shell_summary = str(result.get("summary") or result.get("output") or "").strip()
+                        last_failed_run_shell_error_class = error_class
+                    if error_class == "path_missing":
+                        last_failed_path_lookup_summary = str(result.get("summary") or result.get("output") or "").strip()
+                        last_failed_path_lookup_error_class = error_class
+                    if name == "run_shell" and error_class == "timeout":
+                        last_timeout_command = str(arguments.get("command") or "").strip()
+                        last_timeout_summary = str(result.get("summary") or result.get("output") or "").strip()
                     latest_tool_error_outputs[(name, self._tool_error_arg_key(name, arguments), error_class)] = str(result.get("output") or result.get("summary") or "").strip()
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
@@ -10142,6 +11255,25 @@ class OllamaCodeAgent:
                         result_path = str(result.get("path", "")).strip().replace("\\", "/").lstrip("./")
                         if result_path:
                             mutated_paths_this_turn.add(result_path)
+                    if (
+                        name == "run_shell"
+                        and result.get("ok") is True
+                    ):
+                        last_failed_run_shell_command = ""
+                        last_failed_run_shell_summary = ""
+                        last_failed_run_shell_error_class = ""
+                    if result.get("ok") is True:
+                        last_failed_path_lookup_summary = ""
+                        last_failed_path_lookup_error_class = ""
+                    if (
+                        name == "run_shell"
+                        and result.get("ok") is True
+                        and last_timeout_command
+                        and str(arguments.get("command") or "").strip()
+                        and str(arguments.get("command") or "").strip() != last_timeout_command
+                    ):
+                        last_timeout_command = ""
+                        last_timeout_summary = ""
                     if name in VALIDATION_TOOL_NAMES and result.get("ok") is True:
                         last_successful_validation_version = mutation_version
                 if self._counts_as_real_tool_use(name, result):

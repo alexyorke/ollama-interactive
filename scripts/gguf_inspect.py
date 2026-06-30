@@ -197,10 +197,13 @@ def load_manifests(models_dir: Path) -> dict[str, ManifestModel]:
             if not digest.startswith("sha256:"):
                 continue
             tag = manifest_tag(manifest, root)
+            blob = digest_to_blob(models_dir, digest)
+            if not blob.exists():
+                continue
             found[tag] = ManifestModel(
                 tag=tag,
                 manifest=manifest,
-                blob=digest_to_blob(models_dir, digest),
+                blob=blob,
                 size=int(layer.get("size") or 0),
             )
     return found
@@ -293,6 +296,9 @@ def tensor_to_dict(tensor: TensorInfo | None) -> dict[str, Any] | None:
 
 
 def print_table(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        print("no GGUF models found")
+        return
     headers = [
         "model",
         "gb",

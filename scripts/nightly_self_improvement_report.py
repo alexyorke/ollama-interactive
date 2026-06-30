@@ -16,7 +16,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts import trajectory_dataset_fetch, trajectory_profile
+from scripts import live_model_gate, trajectory_dataset_fetch, trajectory_profile
 
 
 def _repo_root() -> Path:
@@ -38,6 +38,14 @@ def _load_json(path: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _json_file_is_object(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict)
 
 
 def _run_command(repo_root: Path, name: str, command: list[str], timeout: int, output_path: Path | None = None) -> dict[str, Any]:
@@ -132,6 +140,20 @@ def _status_delta(current: dict[str, Any], baseline: dict[str, Any] | None) -> d
     return delta
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _collect_tool_totals(*payloads: dict[str, Any]) -> list[dict[str, Any]]:
     totals: dict[str, dict[str, Any]] = {}
     for payload in payloads:
@@ -151,10 +173,14 @@ def _collect_tool_totals(*payloads: dict[str, Any]) -> list[dict[str, Any]]:
                     str(tool_name),
                     {"tool": str(tool_name), "calls": 0, "duration_ms": 0.0, "failed": 0, "cached": 0},
                 )
-                bucket["calls"] += int(item.get("calls", 0) or 0)
-                bucket["duration_ms"] += float(item.get("duration_ms", 0.0) or 0.0)
-                bucket["failed"] += int(item.get("failed", 0) or 0)
-                bucket["cached"] += int(item.get("cached", 0) or 0)
+                calls = _safe_int(item.get("calls", 0) or 0)
+                duration_ms = _safe_float(item.get("duration_ms", 0.0) or 0.0)
+                failed = _safe_int(item.get("failed", 0) or 0)
+                cached = _safe_int(item.get("cached", 0) or 0)
+                bucket["calls"] += calls or 0
+                bucket["duration_ms"] += duration_ms or 0.0
+                bucket["failed"] += failed or 0
+                bucket["cached"] += cached or 0
     rows = [
         {**item, "duration_ms": round(float(item["duration_ms"]), 3)}
         for item in totals.values()
@@ -167,7 +193,14 @@ def _collect_probe_slowest(payload: dict[str, Any]) -> list[dict[str, Any]]:
     rows = payload.get("rows")
     if not isinstance(rows, list):
         return []
-    normalized = [row for row in rows if isinstance(row, dict)]
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        elapsed_ms = _safe_float(row.get("elapsed_ms", 0.0) or 0.0)
+        if elapsed_ms is None:
+            continue
+        normalized.append({**row, "elapsed_ms": elapsed_ms})
     return sorted(normalized, key=lambda row: float(row.get("elapsed_ms", 0.0) or 0.0), reverse=True)
 
 
@@ -175,10 +208,13 @@ def _question_quality_summary(payload: dict[str, Any]) -> dict[str, Any]:
     summary = payload.get("summary")
     if not isinstance(summary, dict):
         return {"cases": 0, "passed": 0, "failed": 0}
+    cases = _safe_int(summary.get("cases", 0) or 0)
+    passed = _safe_int(summary.get("passed", 0) or 0)
+    failed = _safe_int(summary.get("failed", 0) or 0)
     return {
-        "cases": int(summary.get("cases", 0) or 0),
-        "passed": int(summary.get("passed", 0) or 0),
-        "failed": int(summary.get("failed", 0) or 0),
+        "cases": cases or 0,
+        "passed": passed or 0,
+        "failed": failed or 0,
     }
 
 
@@ -186,13 +222,20 @@ def _trajectory_profile_summary(payload: dict[str, Any], *, expected_datasets: l
     datasets = payload.get("datasets")
     if not isinstance(datasets, list):
         return {
-            "available": bool(expected_datasets),
+            "available": False,
             "expected_datasets": expected_datasets,
             "rows_profiled": 0,
             "datasets_profiled": 0,
             "top_recommendations": [],
         }
-    rows_profiled = sum(int(item.get("rows_profiled", 0) or 0) for item in datasets if isinstance(item, dict))
+    rows_profiled = 0
+    for item in datasets:
+        if not isinstance(item, dict):
+            continue
+        parsed = _safe_int(item.get("rows_profiled", 0) or 0)
+        if parsed is None:
+            continue
+        rows_profiled += parsed
     portfolio = payload.get("portfolio_recommendations")
     top_recommendations = []
     if isinstance(portfolio, list):
@@ -213,7 +256,7 @@ def _trajectory_profile_summary(payload: dict[str, Any], *, expected_datasets: l
 def _trajectory_error_summary(payload: dict[str, Any], *, expected_datasets: list[str]) -> dict[str, Any]:
     datasets = payload.get("datasets")
     if not isinstance(datasets, list):
-        return {"available": bool(expected_datasets), "expected_datasets": expected_datasets, "top_errors": []}
+        return {"available": False, "expected_datasets": expected_datasets, "top_errors": []}
     counts: dict[str, int] = {}
     for item in datasets:
         if not isinstance(item, dict):
@@ -222,7 +265,10 @@ def _trajectory_error_summary(payload: dict[str, Any], *, expected_datasets: lis
         if not isinstance(error_counts, dict):
             continue
         for name, value in error_counts.items():
-            counts[str(name)] = counts.get(str(name), 0) + int(value or 0)
+            parsed = _safe_int(value or 0)
+            if parsed is None:
+                continue
+            counts[str(name)] = counts.get(str(name), 0) + parsed
     top = sorted(counts.items(), key=lambda pair: pair[1], reverse=True)[:8]
     return {
         "available": True,
@@ -234,15 +280,18 @@ def _trajectory_error_summary(payload: dict[str, Any], *, expected_datasets: lis
 def _trajectory_evidence_summary(payload: dict[str, Any], *, expected_datasets: list[str]) -> dict[str, Any]:
     coverage = payload.get("portfolio_fix_coverage")
     if not isinstance(coverage, list):
-        return {"available": bool(expected_datasets), "expected_datasets": expected_datasets, "top_fix_coverage": []}
+        return {"available": False, "expected_datasets": expected_datasets, "top_fix_coverage": []}
     top_fix_coverage = []
     for item in coverage[:6]:
         if not isinstance(item, dict):
             continue
+        evidence_count = _safe_int(item.get("evidence_count", 0) or 0)
+        if evidence_count is None:
+            continue
         top_fix_coverage.append(
             {
                 "id": str(item.get("id") or ""),
-                "evidence_count": int(item.get("evidence_count", 0) or 0),
+                "evidence_count": evidence_count,
                 "status": str(item.get("status") or ""),
             }
         )
@@ -260,12 +309,17 @@ def _trajectory_catalog_summary(payload: dict[str, Any]) -> dict[str, Any]:
             "gated_entries": 0,
             "high_priority_public_missing": [],
         }
+    entries = _safe_int(summary.get("entries", 0) or 0)
+    local_entries = _safe_int(summary.get("local_entries", 0) or 0)
+    analysis_ready_local_entries = _safe_int(summary.get("analysis_ready_local_entries", 0) or 0)
+    public_missing_entries = _safe_int(summary.get("public_missing_entries", 0) or 0)
+    gated_entries = _safe_int(summary.get("gated_entries", 0) or 0)
     return {
-        "entries": int(summary.get("entries", 0) or 0),
-        "local_entries": int(summary.get("local_entries", 0) or 0),
-        "analysis_ready_local_entries": int(summary.get("analysis_ready_local_entries", 0) or 0),
-        "public_missing_entries": int(summary.get("public_missing_entries", 0) or 0),
-        "gated_entries": int(summary.get("gated_entries", 0) or 0),
+        "entries": entries or 0,
+        "local_entries": local_entries or 0,
+        "analysis_ready_local_entries": analysis_ready_local_entries or 0,
+        "public_missing_entries": public_missing_entries or 0,
+        "gated_entries": gated_entries or 0,
         "high_priority_public_missing": list(summary.get("high_priority_public_missing") or []),
     }
 
@@ -282,17 +336,89 @@ def _trajectory_local_manifest_summary(data_root: Path, datasets: list[str]) -> 
                 "repo_id": str(manifest.get("repo_id") or ""),
                 "resolved_revision": str(manifest.get("resolved_revision") or ""),
                 "downloaded_at": str(manifest.get("downloaded_at") or ""),
-                "file_count": int(manifest.get("file_count", 0) or 0),
+                "file_count": _safe_int(manifest.get("file_count", 0) or 0) or 0,
             }
         )
     return rows
 
 
+def _latest_live_gate_summary_path(repo_root: Path) -> Path | None:
+    candidates: list[tuple[float, Path]] = []
+    scratch_root = repo_root / "scratch"
+    if not scratch_root.exists():
+        return None
+    for path in scratch_root.glob("live-model-gate*/live-model-gate-summary.json"):
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, path))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def _live_model_gate_summary(payload: dict[str, Any], *, path: Path | None) -> dict[str, Any]:
+    if not payload:
+        return {
+            "available": False,
+            "path": str(path) if path else None,
+            "ok": None,
+            "benchmark_suite": None,
+            "selected_default_model": None,
+            "selection_reason": None,
+            "models": [],
+        }
+    models = payload.get("models")
+    model_rows = list(models) if isinstance(models, list) else []
+    if not model_rows:
+        resolved_models = payload.get("resolved_models")
+        step_results = payload.get("step_results")
+        if isinstance(resolved_models, list) and isinstance(step_results, list):
+            model_rows = live_model_gate.build_model_rows(
+                [str(item) for item in resolved_models if isinstance(item, str)],
+                [item for item in step_results if isinstance(item, dict)],
+            )
+    selected_default_model = payload.get("selected_default_model")
+    selection_reason = payload.get("selection_reason")
+    if not isinstance(selected_default_model, str) or not selected_default_model.strip():
+        selected_default_model = None
+    if not isinstance(selection_reason, str) or not selection_reason.strip():
+        selection_reason = None
+    if not selected_default_model and model_rows:
+        selected_default_model, selection_reason = live_model_gate.choose_default_model(
+            [row for row in model_rows if isinstance(row, dict)]
+        )
+    return {
+        "available": True,
+        "path": str(path) if path else None,
+        "ok": payload.get("ok"),
+        "benchmark_suite": payload.get("benchmark_suite"),
+        "selected_default_model": selected_default_model,
+        "selection_reason": selection_reason,
+        "models": model_rows,
+    }
+
+
 def _available_trajectory_datasets(data_root: Path) -> list[str]:
     available: list[str] = []
     for dataset_name in trajectory_profile.DATASET_SPECS:
-        if (data_root / dataset_name).exists():
-            available.append(dataset_name)
+        manifest = trajectory_dataset_fetch.read_dataset_manifest(data_root, dataset_name)
+        if not isinstance(manifest, dict):
+            continue
+        files = manifest.get("files")
+        if not isinstance(files, list) or not files:
+            continue
+        dataset_dir = data_root / dataset_name
+        existing_files = [
+            relative
+            for relative in files
+            if isinstance(relative, str) and relative.strip() and (dataset_dir / relative).is_file()
+        ]
+        if not existing_files:
+            continue
+        available.append(dataset_name)
     return available
 
 
@@ -313,6 +439,13 @@ def _report_roots(repo_root: Path) -> tuple[Path, ...]:
     )
 
 
+def _resolved_compare_path(repo_root: Path, current_run_dir: Path, requested: Path | None) -> Path | None:
+    candidate = requested or _default_compare_path(repo_root, current_run_dir)
+    if candidate is None:
+        return None
+    return candidate if _json_file_is_object(candidate) else None
+
+
 def _default_compare_path(repo_root: Path, current_run_dir: Path) -> Path | None:
     timestamped: list[tuple[str, Path]] = []
     fallback: list[tuple[float, Path]] = []
@@ -322,6 +455,8 @@ def _default_compare_path(repo_root: Path, current_run_dir: Path) -> Path | None
             continue
         for path in root.glob("*/report.json"):
             if current_run_dir in path.parents:
+                continue
+            if not _json_file_is_object(path):
                 continue
             run_dir = path.parent
             run_timestamp = _run_dir_timestamp(run_dir)
@@ -339,6 +474,7 @@ def _default_compare_path(repo_root: Path, current_run_dir: Path) -> Path | None
             if prior:
                 prior.sort(key=lambda item: item[0], reverse=True)
                 return prior[0][1]
+            return None
         timestamped.sort(key=lambda item: item[0], reverse=True)
         return timestamped[0][1]
     if fallback:
@@ -392,23 +528,32 @@ def _suggest_targets(metrics: dict[str, Any], commands: list[dict[str, Any]]) ->
     if failed_commands:
         suggestions.append("Fix or shrink failing nightly command(s): " + ", ".join(failed_commands[:3]))
     question_quality = metrics.get("question_quality")
-    if isinstance(question_quality, dict) and int(question_quality.get("failed", 0) or 0):
+    question_quality_failed = _safe_int(question_quality.get("failed", 0) or 0) if isinstance(question_quality, dict) else None
+    if question_quality_failed:
         suggestions.append("Improve clarification-question quality before expanding autonomy or rewrite scope.")
     for key in ("token_efficiency", "coding_benchmark"):
         section = metrics.get(key)
         if not isinstance(section, dict):
             continue
         summary = section.get("summary") if isinstance(section.get("summary"), dict) else {}
-        if int(summary.get("fail", 0) or 0) or int(summary.get("fail_closed", 0) or 0):
+        summary_fail = _safe_int(summary.get("fail", 0) or 0) or 0
+        summary_fail_closed = _safe_int(summary.get("fail_closed", 0) or 0) or 0
+        if summary_fail or summary_fail_closed:
             suggestions.append(f"Inspect failed {key} cases before adding new features.")
         delta = section.get("delta") if isinstance(section.get("delta"), dict) else {}
-        if float(delta.get("total_tokens", 0) or 0) > 0:
+        delta_total_tokens = _safe_float(delta.get("total_tokens", 0) or 0) or 0.0
+        if delta_total_tokens > 0:
             suggestions.append(f"Reduce token growth in {key}; compare per-case prompt profiles.")
     slow_tools = metrics.get("slowest_tools")
     if isinstance(slow_tools, list) and slow_tools:
         first = slow_tools[0]
         if isinstance(first, dict) and first.get("tool"):
             suggestions.append(f"Profile deterministic tool path for {first['tool']}; it is the slowest recurring tool.")
+    slow_probe_tools = metrics.get("slowest_probe_tools")
+    if isinstance(slow_probe_tools, list) and slow_probe_tools:
+        first = slow_probe_tools[0]
+        if isinstance(first, dict) and first.get("name"):
+            suggestions.append(f"Optimize no-LLM tool probe {first['name']} before model prompt changes.")
     probe = metrics.get("tool_speed_probe")
     if isinstance(probe, dict):
         slowest_probe = probe.get("slowest")
@@ -419,7 +564,8 @@ def _suggest_targets(metrics: dict[str, Any], commands: list[dict[str, Any]]) ->
     sdk = metrics.get("python_sdk_search")
     if isinstance(sdk, dict):
         summary = sdk.get("summary") if isinstance(sdk.get("summary"), dict) else {}
-        if int(summary.get("fail", 0) or 0):
+        sdk_fail = _safe_int(summary.get("fail", 0) or 0) or 0
+        if sdk_fail:
             suggestions.append("Improve Python SDK retrieval before relying on it for agent routing.")
     trajectory_profile_summary = metrics.get("trajectory_profile")
     if isinstance(trajectory_profile_summary, dict):
@@ -449,7 +595,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     run_dir = args.output_dir or (repo_root / "scratch" / "nightly-self-improvement" / _timestamp())
     run_dir = run_dir.resolve(strict=False)
     run_dir.mkdir(parents=True, exist_ok=True)
-    compare_path = args.compare or _default_compare_path(repo_root, run_dir)
+    compare_path = _resolved_compare_path(repo_root, run_dir, args.compare)
     available_trajectory_datasets = _available_trajectory_datasets(args.trajectory_data_root)
     resolved_ollama_host = None if args.skip_llm else _resolve_ollama_host()
     llm_skip_reason = ""
@@ -681,15 +827,19 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
     trajectory_profile_payload = _load_json(trajectory_profile_path)
     trajectory_error_payload = _load_json(trajectory_error_path)
     trajectory_evidence_payload = _load_json(trajectory_evidence_path)
+    live_gate_summary_path = _latest_live_gate_summary_path(repo_root)
+    live_gate_payload = _load_json(live_gate_summary_path) if live_gate_summary_path else {}
     baseline = _load_json(compare_path) if compare_path else {}
     baseline_metrics = baseline.get("metrics") if isinstance(baseline.get("metrics"), dict) else {}
     baseline_token = baseline_metrics.get("token_efficiency") if isinstance(baseline_metrics.get("token_efficiency"), dict) else {}
     baseline_benchmark = baseline_metrics.get("coding_benchmark") if isinstance(baseline_metrics.get("coding_benchmark"), dict) else {}
+    slowest_probe_tools = _collect_probe_slowest(probe_payload)[:10]
+    live_gate_metric = _live_model_gate_summary(live_gate_payload, path=live_gate_summary_path)
 
     metrics: dict[str, Any] = {
         "tool_speed_probe": {
             "generated_files": probe_payload.get("generated_files"),
-            "slowest": _collect_probe_slowest(probe_payload)[:5],
+            "slowest": slowest_probe_tools[:5],
         },
         "python_sdk_search": {
             "summary": _summary(sdk_payload),
@@ -710,6 +860,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "trajectory_evidence_report": _trajectory_evidence_summary(
             trajectory_evidence_payload, expected_datasets=available_trajectory_datasets
         ),
+        "live_model_gate": live_gate_metric,
         "token_efficiency": {
             "summary": _summary(token_payload),
             "delta": _status_delta(token_payload, baseline_token),
@@ -723,8 +874,26 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "llm_bypass_failures": benchmark_payload.get("llm_bypass_failures", []),
         },
         "slowest_tools": _collect_tool_totals(token_payload, benchmark_payload)[:10],
+        "slowest_probe_tools": slowest_probe_tools,
     }
     metrics["suggested_implementation_targets"] = _suggest_targets(metrics, commands)
+    summary = {
+        "selected_default_model": live_gate_metric.get("selected_default_model"),
+        "live_gate": {
+            "available": live_gate_metric.get("available", False),
+            "ok": live_gate_metric.get("ok"),
+            "benchmark_suite": live_gate_metric.get("benchmark_suite"),
+            "selection_reason": live_gate_metric.get("selection_reason"),
+            "path": live_gate_metric.get("path"),
+        },
+        "trajectory": {
+            "available": bool(metrics["trajectory_profile"].get("available")),
+            "datasets": available_trajectory_datasets,
+            "data_root": str(args.trajectory_data_root.resolve(strict=False)),
+        },
+        "slowest_deterministic_probes": slowest_probe_tools[:5],
+        "suggested_implementation_targets": metrics["suggested_implementation_targets"],
+    }
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -744,9 +913,15 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "resolved_ollama_host": resolved_ollama_host,
             "llm_skip_reason": llm_skip_reason,
             "trajectory_skip_reason": trajectory_skip_reason,
+            "trajectory_data_root": str(args.trajectory_data_root.resolve(strict=False)),
+            "trajectory_profile_path": str(trajectory_profile_path) if not trajectory_skip_reason else None,
+            "trajectory_error_profile_path": str(trajectory_error_path) if not trajectory_skip_reason else None,
+            "trajectory_evidence_report_path": str(trajectory_evidence_path) if not trajectory_skip_reason else None,
+            "live_gate_summary_path": str(live_gate_summary_path) if live_gate_summary_path else None,
         },
         "compare_path": str(compare_path) if compare_path else None,
         "run_dir": str(run_dir),
+        "summary": summary,
         "commands": commands,
         "metrics": metrics,
     }

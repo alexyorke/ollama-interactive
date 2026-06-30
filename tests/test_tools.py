@@ -424,6 +424,26 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertLessEqual(len(result["output"].splitlines()), 3)
 
+    def test_search_rg_output_is_workspace_relative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "src" / "app.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("needle\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=f"{target}:1:needle\n",
+                stderr="",
+            )
+            with patch.object(shutil, "which", return_value="rg"):
+                with patch.object(tools, "_run_process", return_value=completed):
+                    result = tools.search("needle", path="src")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "src/app.py:1:needle")
+
     def test_search_falls_back_to_literal_when_rg_regex_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -433,6 +453,21 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn("total(prices)", str(result["output"]))
+
+    def test_search_accepts_filename_glob_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("needle in python\n", encoding="utf-8")
+            (root / "src" / "notes.md").write_text("needle in docs\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+
+            result = tools.search("needle", path="src", file_glob="*.py")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["file_glob"], "*.py")
+        self.assertIn("app.py", result["output"])
+        self.assertNotIn("notes.md", result["output"])
 
     def test_code_outline_returns_python_symbols_without_bodies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -869,6 +904,29 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("src/pricing.py", src_result["output"])
         self.assertNotIn("docs/guide.md", src_result["output"])
 
+    def test_fts_refresh_reuses_unchanged_rows_and_deletes_stale_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "notes.md"
+            target.write_text("# Alpha\nReusable content\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            first = tools.fts_refresh()
+            second = tools.fts_refresh()
+            target.unlink()
+            third = tools.fts_refresh()
+            search = tools.fts_search("Reusable", refresh=False)
+
+        self.assertTrue(first["ok"], first)
+        self.assertEqual(first["indexed"], 1)
+        self.assertEqual(first["unchanged"], 0)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(second["indexed"], 0)
+        self.assertEqual(second["unchanged"], 1)
+        self.assertTrue(third["ok"], third)
+        self.assertEqual(third["deleted"], 1)
+        self.assertTrue(search["ok"], search)
+        self.assertEqual(search["output"], "(no FTS matches)")
+
     def test_fd_search_reports_missing_fd(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
@@ -893,6 +951,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("suggested_next_tool", result["output"])
         self.assertIn("pricing.py", result["output"])
         self.assertIn("test_pricing.py", result["output"])
+        self.assertEqual(result["ranked_paths"], ["src/pricing.py"])
+        self.assertEqual(result["ranked_symbols"], [{"path": "src/pricing.py", "qualname": "calculate_discount"}])
 
     def test_repo_index_search_invalidates_changed_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1040,6 +1100,31 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"].splitlines()[0], "alpha_notes.py")
 
+    def test_directory_search_matches_directory_name_globs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests" / "mysql_backend").mkdir(parents=True)
+            (root / "tests" / "postgres_backend").mkdir(parents=True)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.directory_search("*mysql*", path="tests")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["output"], "tests/mysql_backend/")
+
+    def test_directory_search_skips_hidden_and_generated_dirs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src" / "target_cache").mkdir(parents=True)
+            (root / ".hidden_target").mkdir()
+            (root / "scratch" / "target_cache").mkdir(parents=True)
+            tools = ToolExecutor(root, approval_mode="auto")
+            result = tools.directory_search("*target*")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("src/target_cache/", result["output"])
+        self.assertNotIn(".hidden_target", result["output"])
+        self.assertNotIn("scratch", result["output"])
+
     def test_everything_search_reports_missing_cli(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1119,11 +1204,14 @@ class ToolExecutorTests(unittest.TestCase):
             root = Path(tmp)
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
-            with patch("ollama_code.tools.shutil.which", return_value=None):
-                result = tools.semgrep_scan("eval(...)")
+            with patch("ollama_code.tools.resolve_tool_executable", return_value=None):
+                with patch("ollama_code.tools.shutil.which", return_value=None):
+                    result = tools.semgrep_scan("eval(...)")
 
         self.assertFalse(result["ok"])
-        self.assertIn("semgrep is not installed", result["summary"])
+        self.assertIn("semgrep/opengrep is not installed", result["summary"])
+        self.assertEqual(result["compatible_tool_ids"], ["semgrep", "opengrep"])
+        self.assertTrue(result["compatible_install_hints"]["opengrep"])
 
     def test_semgrep_scan_rejects_unsupported_language_before_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1163,6 +1251,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("--json", command)
         self.assertIn("--lang", command)
         self.assertFalse(run_process.call_args.kwargs["shell"])
+
+    def test_semgrep_scan_uses_opengrep_when_semgrep_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            payload = {
+                "results": [
+                    {
+                        "path": str(root / "ops.py"),
+                        "start": {"line": 1},
+                        "extra": {"lines": "eval('1')"},
+                    }
+                ]
+            }
+            completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")
+
+            def fake_resolve(tool_id: str, executable: str, **_kwargs: object) -> str | None:
+                if tool_id == "opengrep" and executable == "opengrep":
+                    return "opengrep"
+                return None
+
+            with patch("ollama_code.tools.resolve_tool_executable", side_effect=fake_resolve):
+                with patch("ollama_code.tools.shutil.which", return_value=None):
+                    with patch.object(tools, "_run_process", return_value=completed) as run_process:
+                        result = tools.semgrep_scan("eval(...)", lang="python")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("ops.py:1", result["output"])
+        self.assertEqual(run_process.call_args.args[0][0], "opengrep")
 
     def test_semgrep_scan_can_run_through_remote_docker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1563,6 +1681,27 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["missing_dependency"], "ast-grep")
+
+    def test_ast_search_uses_native_python_function_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "ops.py").write_text(
+                "def add(a, b):\n"
+                "    return a + b\n\n"
+                "async def fetch():\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch.object(tools, "_ast_grep_executable", return_value="ast-grep"):
+                with patch.object(tools, "_run_process", side_effect=AssertionError("ast-grep should not run")):
+                    result = tools.ast_search("def $F($$$A): $$$B", "ops.py", lang="python")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["backend"], "native-python")
+        self.assertEqual(result["count"], 2)
+        self.assertIn("ops.py:1: def add(a, b):", result["output"])
+        self.assertIn("ops.py:4: async def fetch():", result["output"])
 
     def test_lsp_navigation_reports_missing_language_server(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -4295,6 +4434,52 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("gradle test", output)
         self.assertIn("cmake -S . -B build", output)
 
+    def test_discover_validators_checks_availability_only_for_selected_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "package.json").write_text(json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "typecheck": "tsc --noEmit"}}), encoding="utf-8")
+            (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
+            (root / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            with patch.object(tools, "_available_command", return_value=True) as available:
+                result = tools.discover_validators(limit=2)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(available.call_count, 2)
+        self.assertEqual(len(result["validators"]), 2)
+        self.assertTrue(all(item["available"] is True for item in result["validators"]))
+
+    def test_python_tool_command_resolution_is_cached_per_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            with patch("ollama_code.tools.shutil.which", return_value="/usr/bin/custom-tool") as which:
+                first = tools._python_tool_command("custom-tool", "custom_tool", "--version")
+                second = tools._python_tool_command("custom-tool", "custom_tool", "--version")
+
+        self.assertEqual(first, ["/usr/bin/custom-tool", "--version"])
+        self.assertEqual(second, ["/usr/bin/custom-tool", "--version"])
+        self.assertEqual(which.call_count, 1)
+
+    def test_command_path_resolution_is_cached_per_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            calls: list[str] = []
+
+            def fake_which(name: str) -> str | None:
+                calls.append(name)
+                return f"/usr/bin/{name}" if name == "ruff" else None
+
+            with patch("ollama_code.tools.shutil.which", side_effect=fake_which):
+                first = tools.discover_validators(limit=4)
+                second = tools.discover_validators(limit=4)
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(calls.count("ruff"), 1)
+
     def test_discover_validators_skips_cargo_nextest_without_plugin(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4953,6 +5138,7 @@ def double(value: int) -> int:
             (root / "src").mkdir()
             (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
             (root / "src" / "two.py").write_text("OTHER = 2\n", encoding="utf-8")
+            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
             calls: list[list[str]] = []
 
@@ -4967,18 +5153,19 @@ def double(value: int) -> int:
 
         self.assertTrue(result["ok"], result["output"])
         self.assertEqual(result["validator_targets"], ["src/one.py", "src/two.py"])
+        self.assertEqual(result["typechecker_targets"], ["src"])
         self.assertEqual(
             result["validator_commands"],
             [
                 "ruff check --no-cache src/one.py src/two.py",
-                "basedpyright --level error src/one.py src/two.py",
+                "basedpyright --level error src",
             ],
         )
         self.assertEqual(
             calls,
             [
                 ["ruff", "check", "--no-cache", "src/one.py", "src/two.py"],
-                ["basedpyright", "--level", "error", "src/one.py", "src/two.py"],
+                ["basedpyright", "--level", "error", "src"],
             ],
         )
         self.assertGreaterEqual(float(result["scan_ms"]), 0.0)
@@ -5005,6 +5192,7 @@ def double(value: int) -> int:
 
         self.assertTrue(result["ok"], result["output"])
         self.assertEqual(result["validator_targets"], ["."])
+        self.assertEqual(result["typechecker_targets"], ["."])
         self.assertEqual(
             calls,
             [["ruff", "check", "--no-cache", "."], ["basedpyright", "--level", "error", "."]],
@@ -5015,6 +5203,7 @@ def double(value: int) -> int:
             root = Path(tmp)
             src = root / "src"
             src.mkdir()
+            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
             for index in range(25):
                 (src / f"module_{index}.py").write_text(f"VALUE_{index} = {index}\n", encoding="utf-8")
             tools = ToolExecutor(root, approval_mode="auto")
@@ -5031,10 +5220,73 @@ def double(value: int) -> int:
 
         self.assertTrue(result["ok"], result["output"])
         self.assertEqual(result["validator_targets"], ["src"])
+        self.assertEqual(result["typechecker_targets"], ["src"])
         self.assertEqual(
             calls,
             [["ruff", "check", "--no-cache", "src"], ["basedpyright", "--level", "error", "src"]],
         )
+
+    def test_lint_typecheck_caches_unchanged_validator_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
+            target = root / "src" / "one.py"
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
+                calls.append(list(command))
+                return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
+                with patch.object(tools, "_python_tool_command", return_value=["basedpyright", "--level", "error"]):
+                    with patch.object(tools, "_run_process", side_effect=fake_run):
+                        first = tools.lint_typecheck("src")
+                        second = tools.lint_typecheck("src")
+                        target.write_text("VALUE = 2\n", encoding="utf-8")
+                        third = tools.lint_typecheck("src")
+
+        self.assertTrue(first["ok"], first["output"])
+        self.assertTrue(second["ok"], second["output"])
+        self.assertTrue(third["ok"], third["output"])
+        self.assertIsNone(first.get("cache_hit"))
+        self.assertTrue(second.get("cache_hit"))
+        self.assertIsNone(third.get("cache_hit"))
+        self.assertEqual(
+            calls,
+            [
+                ["ruff", "check", "--no-cache", "src/one.py"],
+                ["basedpyright", "--level", "error", "src"],
+                ["ruff", "check", "--no-cache", "src/one.py"],
+                ["basedpyright", "--level", "error", "src"],
+            ],
+        )
+
+    def test_lint_typecheck_skips_typechecker_for_unconfigured_focused_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
+            tools = ToolExecutor(root, approval_mode="auto")
+            calls: list[list[str]] = []
+
+            def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
+                calls.append(list(command))
+                return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+            with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
+                with patch.object(tools, "_python_tool_command", return_value=["basedpyright", "--level", "error"]) as python_tool:
+                    with patch.object(tools, "_run_process", side_effect=fake_run):
+                        result = tools.lint_typecheck("src")
+
+        self.assertTrue(result["ok"], result["output"])
+        self.assertEqual(result["validator_targets"], ["src/one.py"])
+        self.assertEqual(result["typechecker_targets"], [])
+        self.assertIn("No pyright/basedpyright config", result["typechecker_skipped_reason"])
+        self.assertEqual(calls, [["ruff", "check", "--no-cache", "src/one.py"]])
+        self.assertEqual(python_tool.call_count, 0)
 
     def test_select_tests_maps_python_source_to_importing_test(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5301,6 +5553,7 @@ def double(value: int) -> int:
         self.assertFalse(result["ok"])
         self.assertEqual(result["validation"]["family"], "bash")
         self.assertIn("bash -n rejected command syntax", result["summary"])
+        self.assertEqual(result["error_class"], "syntax_error")
         self.assertEqual(syntax_mock.call_count, 1)
         run_mock.assert_not_called()
 
@@ -5717,6 +5970,27 @@ def double(value: int) -> int:
         self.assertNotIn("recovered", result)
         self.assertEqual(result["command"], command)
         self.assertIn("AssertionError", result["output"])
+        self.assertEqual(tools.default_test_command, command)
+
+    def test_run_test_does_not_recover_from_application_import_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_app.py").write_text(
+                "import unittest\nfrom missing_app_module import value\n\n"
+                "class SampleTests(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual(value(), 1)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+            result = tools.run_test()
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("recovered", result)
+        self.assertEqual(result["command"], command)
+        self.assertIn("ModuleNotFoundError", result["output"])
         self.assertEqual(tools.default_test_command, command)
 
     def test_run_test_sees_immediate_same_size_python_write(self) -> None:

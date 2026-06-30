@@ -47,11 +47,17 @@ def _measure(label: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]
     started = time.perf_counter()
     result = action()
     elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+    if "count" in result:
+        count = result.get("count")
+    elif "files" in result:
+        count = result.get("files")
+    else:
+        count = len(str(result.get("output", "")).splitlines())
     row = {
         "name": label,
         "elapsed_ms": elapsed_ms,
         "ok": result.get("ok") is True,
-        "count": result.get("count") or result.get("files") or len(str(result.get("output", "")).splitlines()),
+        "count": count,
     }
     phase_timings = {
         key: float(result.get(key, 0.0) or 0.0)
@@ -62,6 +68,13 @@ def _measure(label: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]
         row["phase_timings_ms"] = phase_timings
     if isinstance(result.get("validator_targets"), list) and result["validator_targets"]:
         row["validator_targets"] = list(result["validator_targets"])
+    if isinstance(result.get("typechecker_targets"), list) and result["typechecker_targets"]:
+        row["typechecker_targets"] = list(result["typechecker_targets"])
+    if result.get("typechecker_skipped_reason"):
+        row["typechecker_skipped_reason"] = str(result["typechecker_skipped_reason"])
+    for key in ("indexed", "unchanged", "deleted"):
+        if key in result:
+            row[key] = result.get(key)
     return row
 
 
@@ -74,20 +87,22 @@ def run_probe(generated_files: int) -> dict[str, Any]:
             _measure("file_search", lambda: tools.file_search("pricing")),
             _measure("repo_index_search", lambda: tools.repo_index_search("calculate_discount")),
             _measure("fts_refresh", lambda: tools.fts_refresh()),
+            _measure("fts_refresh_cached", lambda: tools.fts_refresh()),
             _measure("context_pack", lambda: tools.context_pack("fix discount calculation")),
             _measure("discover_validators", lambda: tools.discover_validators()),
             _measure("tree_sitter_syntax", lambda: tools.tree_sitter_syntax("src")),
             _measure("ast_search", lambda: tools.ast_search("def $F($$$A): $$$B", "src/pricing.py", lang="python")),
             _measure("lint_typecheck", lambda: tools.lint_typecheck("src", timeout=120)),
+            _measure("lint_typecheck_cached", lambda: tools.lint_typecheck("src", timeout=120)),
         ]
     return {"generated_files": generated_files, "rows": rows}
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="No-LLM tool speed probe for broad repo operations.")
     parser.add_argument("--generated-files", type=int, default=2000)
     parser.add_argument("--output", type=Path, default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     payload = run_probe(max(0, args.generated_files))
     text = json.dumps(payload, indent=2)
     if args.output:

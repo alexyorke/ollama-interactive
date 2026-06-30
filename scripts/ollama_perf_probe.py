@@ -38,6 +38,8 @@ def _chat(host: str, model: str, prompt: str, *, options: dict[str, int] | None)
     output_tokens = int(raw.get("eval_count") or 0)
     prompt_eval_ns = int(raw.get("prompt_eval_duration") or 0)
     eval_ns = int(raw.get("eval_duration") or 0)
+    message = raw.get("message")
+    preview = str(message.get("content", "")) if isinstance(message, dict) else ""
     return {
         "options": options or {},
         "wall_s": round(wall_s, 3),
@@ -50,16 +52,22 @@ def _chat(host: str, model: str, prompt: str, *, options: dict[str, int] | None)
         "prompt_tok_s": round(prompt_tokens / (prompt_eval_ns / 1e9), 2) if prompt_eval_ns else None,
         "output_tok_s": round(output_tokens / (eval_ns / 1e9), 2) if eval_ns else None,
         "done_reason": raw.get("done_reason"),
-        "preview": str((raw.get("message") or {}).get("content", ""))[:120].replace("\n", " "),
+        "preview": preview[:120].replace("\n", " "),
     }
 
 
 def _stop_model(model: str) -> None:
-    subprocess.run(["ollama", "stop", model], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    try:
+        subprocess.run(["ollama", "stop", model], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    except OSError:
+        return
 
 
 def _ollama_ps() -> str:
-    result = subprocess.run(["ollama", "ps"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    try:
+        result = subprocess.run(["ollama", "ps"], capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    except OSError as exc:
+        return str(exc)
     return (result.stdout or result.stderr or "").strip()
 
 
@@ -87,22 +95,38 @@ def main(argv: list[str] | None = None) -> int:
         "long-ctx4096": (_long_prompt(args.long_lines), {"num_ctx": 4096, "num_predict": 48}),
     }
     results: list[dict[str, Any]] = []
+    had_error = False
     for model in args.models:
         if not args.keep_loaded:
             _stop_model(model)
         for case, (prompt, options) in prompts.items():
-            outcome = _chat(host, model, prompt, options=options)
-            row = {
-                "model": model,
-                "case": case,
-                **outcome,
-                "ollama_ps_after": _ollama_ps(),
-            }
+            try:
+                outcome = _chat(host, model, prompt, options=options)
+                row = {
+                    "model": model,
+                    "case": case,
+                    "ok": True,
+                    **outcome,
+                    "ollama_ps_after": _ollama_ps(),
+                }
+            except Exception as exc:
+                had_error = True
+                row = {
+                    "model": model,
+                    "case": case,
+                    "ok": False,
+                    "options": options or {},
+                    "error": str(exc),
+                    "ollama_ps_after": _ollama_ps(),
+                }
             results.append(row)
-            print(
-                f"[perf] model={model} case={case} wall={row['wall_s']}s "
-                f"prompt={row['prompt_tok_s']} tok/s output={row['output_tok_s']} tok/s"
-            )
+            if row["ok"]:
+                print(
+                    f"[perf] model={model} case={case} wall={row['wall_s']}s "
+                    f"prompt={row['prompt_tok_s']} tok/s output={row['output_tok_s']} tok/s"
+                )
+            else:
+                print(f"[perf] model={model} case={case} error={row['error']}")
         if not args.keep_loaded:
             _stop_model(model)
     payload = {
@@ -115,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     else:
         print(json.dumps(payload, indent=2))
-    return 0
+    return 1 if had_error else 0
 
 
 if __name__ == "__main__":

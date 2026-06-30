@@ -129,6 +129,7 @@ def fetch_datasets(
         spec = SUPPORTED_DATASET_SPECS[dataset]
         dataset_dir = data_root / dataset
         dataset_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = dataset_manifest_path(data_root, dataset)
         repo_id = str(spec["repo_id"])
         path_globs = list(spec["path_globs"])
         try:
@@ -152,7 +153,6 @@ def fetch_datasets(
                 path_globs=path_globs,
                 files=files,
             )
-            manifest_path = dataset_manifest_path(data_root, dataset)
             manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
             rows.append(
                 {
@@ -168,6 +168,12 @@ def fetch_datasets(
                 }
             )
         except Exception as exc:
+            try:
+                manifest_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
             rows.append(
                 {
                     "dataset": dataset,
@@ -176,7 +182,7 @@ def fetch_datasets(
                     "ok": False,
                     "error": str(exc),
                     "local_dir": str(dataset_dir.resolve(strict=False)),
-                    "manifest_path": str(dataset_manifest_path(data_root, dataset).resolve(strict=False)),
+                    "manifest_path": str(manifest_path.resolve(strict=False)),
                     "file_count": 0,
                     "files": [],
                 }

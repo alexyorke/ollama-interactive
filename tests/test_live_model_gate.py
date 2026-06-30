@@ -8,6 +8,69 @@ from scripts import live_model_gate
 
 
 class LiveModelGateTests(unittest.TestCase):
+    def test_choose_default_model_prefers_lower_tokens_after_pass_tie(self) -> None:
+        model, reason = live_model_gate.choose_default_model(
+            [
+                {
+                    "model": "granite4.1:8b",
+                    "benchmark_passes": 8,
+                    "benchmark_runs": 8,
+                    "benchmark_total_tokens": 2040,
+                    "benchmark_median_latency_s": 9.1,
+                },
+                {
+                    "model": "gemma4:e4b",
+                    "benchmark_passes": 8,
+                    "benchmark_runs": 8,
+                    "benchmark_total_tokens": 2408,
+                    "benchmark_median_latency_s": 8.6,
+                },
+                {
+                    "model": "qwen3:8b",
+                    "benchmark_passes": 8,
+                    "benchmark_runs": 8,
+                    "benchmark_total_tokens": 2521,
+                    "benchmark_median_latency_s": 22.8,
+                },
+            ]
+        )
+
+        self.assertEqual(model, "granite4.1:8b")
+        self.assertIsNotNone(reason)
+        self.assertIn("fewest benchmark tokens", reason or "")
+
+    def test_choose_default_model_prefers_granite_when_all_tie_breakers_match(self) -> None:
+        model, reason = live_model_gate.choose_default_model(
+            [
+                {
+                    "model": "granite4.1:8b",
+                    "benchmark_passes": 8,
+                    "benchmark_runs": 8,
+                    "benchmark_total_tokens": 2000,
+                    "benchmark_median_latency_s": 9.0,
+                },
+                {
+                    "model": "gemma4:e4b",
+                    "benchmark_passes": 8,
+                    "benchmark_runs": 8,
+                    "benchmark_total_tokens": 2000,
+                    "benchmark_median_latency_s": 9.0,
+                },
+            ]
+        )
+
+        self.assertEqual(model, "granite4.1:8b")
+        self.assertIsNotNone(reason)
+        self.assertIn("tie-break", reason or "")
+
+    def test_resolve_requested_models_dedupes_latest_aliases_while_preserving_order(self) -> None:
+        models = live_model_gate.resolve_requested_models(
+            ["gemma4:e4b", "gemma4:e4b:latest", "qwen3", "qwen3:latest", "gemma4:e4b"],
+            {"gemma4:e4b", "gemma4:e4b:latest", "qwen3:latest"},
+        )
+
+        self.assertEqual(models, ["gemma4:e4b", "gemma4:e4b:latest", "qwen3:latest"])
+
     def test_build_steps_includes_llm_required_benchmark_flags(self) -> None:
         repo_root = Path("C:/repo")
         output_dir = repo_root / "scratch" / "live-model-gate"
@@ -60,13 +123,29 @@ class LiveModelGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo_root = Path(tmp)
             output_dir = repo_root / "scratch" / "live-model-gate"
+            benchmark_artifact = output_dir / "coding-benchmark-gemma4-e4b.json"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            benchmark_artifact.write_text(
+                json.dumps(
+                    {
+                        "summary": {"pass": 8, "runs": 8, "total_tokens": 2408, "total_llm_calls": 4},
+                        "results": [{"latency_s": 8.6}, {"latency_s": 9.4}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            run_step_mock.side_effect = [
+                {"name": "e2e:gemma4:e4b", "model": "gemma4:e4b", "ok": True, "latency_s": 1.2, "artifact": None, "returncode": 0, "stdout_tail": "", "stderr_tail": "", "command": ["python"], "timeout_s": 600},
+                {"name": "verification:gemma4:e4b", "model": "gemma4:e4b", "ok": True, "latency_s": 2.4, "artifact": None, "returncode": 0, "stdout_tail": "", "stderr_tail": "", "command": ["python"], "timeout_s": 900},
+                {"name": "benchmark:gemma4:e4b", "model": "gemma4:e4b", "ok": True, "latency_s": 12.0, "artifact": str(benchmark_artifact), "returncode": 0, "stdout_tail": "", "stderr_tail": "", "command": ["python"], "timeout_s": 900},
+            ]
             payload = live_model_gate.run_gate(
                 repo_root,
                 output_dir,
                 requested_models=["gemma4:e4b"],
                 run_e2e=True,
                 run_verification=True,
-                run_benchmarks=False,
+                run_benchmarks=True,
                 e2e_scenarios=["scenario_transcripted_tool_use"],
                 e2e_timeout=600,
                 verification_timeout=600,
@@ -80,8 +159,27 @@ class LiveModelGateTests(unittest.TestCase):
             )
 
             self.assertTrue(payload["ok"])
+            self.assertEqual(payload["benchmark_suite"], "local-small")
             self.assertEqual(payload["resolved_models"], ["gemma4:e4b"])
-            self.assertEqual(payload["steps_completed"], ["e2e:gemma4:e4b", "verification:gemma4:e4b"])
+            self.assertEqual(payload["steps_completed"], ["e2e:gemma4:e4b", "verification:gemma4:e4b", "benchmark:gemma4:e4b"])
+            self.assertEqual(payload["selected_default_model"], "gemma4:e4b")
+            self.assertEqual(
+                payload["models"],
+                [
+                    {
+                        "model": "gemma4:e4b",
+                        "e2e_ok": True,
+                        "verification_ok": True,
+                        "benchmark_ok": True,
+                        "benchmark_passes": 8,
+                        "benchmark_runs": 8,
+                        "benchmark_total_tokens": 2408,
+                        "benchmark_total_llm_calls": 4,
+                        "benchmark_median_latency_s": 9.0,
+                        "benchmark_artifact": str(benchmark_artifact),
+                    }
+                ],
+            )
 
     @patch("scripts.live_model_gate.run_gate")
     def test_main_writes_summary_file(self, run_gate_mock: object) -> None:
@@ -89,10 +187,14 @@ class LiveModelGateTests(unittest.TestCase):
             output_dir = Path(tmp) / "gate"
             run_gate_mock.return_value = {
                 "generated_at": "2026-01-01T00:00:00+00:00",
+                "benchmark_suite": "local-small",
                 "preflight": {"ollama_host": "http://127.0.0.1:11434"},
                 "resolved_models": ["gemma4:e4b"],
+                "selected_default_model": "gemma4:e4b",
+                "selection_reason": "Selected gemma4:e4b because it had the highest benchmark pass count (8/8).",
                 "ok": True,
                 "elapsed_s": 3.14,
+                "models": [],
                 "step_results": [],
             }
 
@@ -103,6 +205,7 @@ class LiveModelGateTests(unittest.TestCase):
             self.assertTrue(summary.exists())
             payload = json.loads(summary.read_text(encoding="utf-8"))
             self.assertEqual(payload["resolved_models"], ["gemma4:e4b"])
+            self.assertEqual(payload["selected_default_model"], "gemma4:e4b")
 
     @patch("scripts.live_model_gate.run_gate", side_effect=RuntimeError("offline"))
     def test_main_writes_failure_summary_when_preflight_fails(self, _run_gate: object) -> None:
@@ -115,6 +218,9 @@ class LiveModelGateTests(unittest.TestCase):
             payload = json.loads((output_dir / "live-model-gate-summary.json").read_text(encoding="utf-8"))
             self.assertFalse(payload["ok"])
             self.assertEqual(payload["preflight_error"], "offline")
+            self.assertEqual(payload["benchmark_suite"], "local-small")
+            self.assertEqual(payload["models"], [])
+            self.assertIsNone(payload["selected_default_model"])
 
 
 if __name__ == "__main__":

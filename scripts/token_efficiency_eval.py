@@ -567,7 +567,8 @@ def main(argv: list[str] | None = None) -> int:
         if primary is not None and verifier is not None:
             matrix.append((primary, verifier, ["on"]))
     if not matrix:
-        raise SystemExit("No requested models are installed.")
+        print("No requested models are installed.")
+        return 1
 
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []

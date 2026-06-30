@@ -4,14 +4,26 @@
 
 Supported local datasets under ignored `scratch/external/datasets/`:
 
+- `agent-race-traces`
+- `trace-commons-agent-traces`
+- `thoughtworks-agentic-coding-trajectories`
 - `nebius-swe-agent-trajectories`
 - `nebius-swe-rebench-openhands-trajectories`
 - `swe-smith-trajectories`
 - `nvidia-swe-hero-openhands-trajectories`
+- `nvidia-swe-zero-openhands-trajectories`
+- `open-swe-traces-openhands`
+- `open-swe-traces-sweagent`
 - `coderforge-preview-swe-bench-verified-trajectories`
+- `cc-bench-trajectories`
 - `terminalbench-trajectories`
 
-The broader catalog also tracks downloaded-but-not-yet-normalized corpora such as `trace-commons-agent-traces` and `thoughtworks-agentic-coding-trajectories`. `SWE-chat` is still tracked separately because the Hugging Face dataset is gated.
+Catalog-only or manual-review corpora:
+
+- `codetracebench`
+- `swe-zero-12m-trajectories`
+- `tracebench`
+- `swe-chat` (gated)
 
 ## Dataset Catalog
 
@@ -54,14 +66,41 @@ python scripts/trajectory_dataset_fetch.py
 
 The fetcher downloads only the allowed Parquet globs for each supported dataset and writes a small manifest at `scratch/external/datasets/<dataset>/.ollama-interactive-manifest.json`. Treat these local files and the generated JSON under `scratch/` as regenerated evidence, not versioned source artifacts.
 
-The current analysis-ready public set includes SWE-agent, OpenHands, SWE-smith, SWE-Hero, CoderForge SWE-bench Verified, and TerminalBench. TerminalBench uses its own `steps` schema, but the local profile, error, and evidence scripts normalize its tool aliases into the same category model used for the SWE-style corpora.
+The current analysis-ready public set includes Agent Race, Trace Commons, Thoughtworks, SWE-agent, OpenHands, SWE-smith, SWE-Hero, SWE-Zero, Open-SWE, CoderForge SWE-bench Verified, CC-Bench, and TerminalBench. TerminalBench uses its own `steps` schema, but the local profile, error, and evidence scripts normalize its tool aliases into the same category model used for the chat-style corpora.
 
-As of June 29, 2026, the repo also has bounded local downloads of two additional public corpora discovered through the catalog pass:
+As of June 29, 2026, the repo also has a bounded local download of one additional public corpus that is useful for manual diagnosis even though it is not in the normalized profile/error/evidence pipeline:
 
-- `trace-commons/agent-traces`: a small but important real-user donated coding-agent sample with raw prompt, message, and trace fields.
-- `thoughtworks/agentic-coding-trajectories`: a 15k-session derivative Parquet corpus useful for cross-framework workload comparisons, but still mostly benchmark-style agent sessions rather than real-user traces.
+- `NJU-LINK/CodeTraceBench`: a human-verified incorrect-step benchmark with preserved assistant actions and observations, useful for studying premature completion claims, fake verification, install thrash, and timeout loops.
+- `AlienKevin/SWE-ZERO-12M-trajectories`: a very large execution-free corpus with chat messages and shell-command-only repair attempts, useful for manual review of command discipline and completion-claim efficiency before adding any new adapter.
+- `badlogicgames/pi-mono`: public redacted pi coding-agent sessions from real monorepo work, useful for first-turn orientation, tool-choice, and shell-loop review.
+- `thomasmustier/pi-mono-sessions`: another public pi-share-hf export from real Pi development work, useful for checking whether the same shell and orientation costs repeat across a different repo and user.
+- `thomasmustier/pi-nes-sessions`: public Pi extension sessions with audit, UI, docs, testing, and bugfix work, useful for seeing how coding agents behave on more creative product tasks instead of only issue repair.
+- `nmuendler/share-codex`: public exported Codex and Claude Code sessions with prompts, tool calls, and tool outputs from local repo work.
+- `peteromallet/my-personal-codex-data`: public DataClaw export of real Codex CLI work with per-session token and tool-use totals.
+- `misterkerns/my-personal-claude-code-data`: public DataClaw export of real Claude Code work with per-session token and tool-use totals.
+- `ultralazr/claude-code-traces`: public redacted Claude Code session files in native JSONL trace format from `cc-share-hf`.
+- `Glint-Research/Fable-5-traces`: public Pi-style converted coding-agent traces intended for manual inspection and distillation work.
+- `AlinCiocan/fable-5-claude-code-traces`: public native Claude Code JSONL traces with extra attachment rows that are ignored by the bounded analyzer.
+- `vedalken/merchantscroll-traces`: public Cursor JSONL traces with nested `message.role` rows and separate subagent files; the bounded analyzer keeps only main-session files.
 
-Those two datasets are not in the main `trajectory_profile.py` pipeline yet, so keep using the analysis-ready set for controller metrics and use the extra corpora for manual transcript review until a bounded parser lands.
+Use the normalized set for controller metrics and the catalog-only sets for manual review or future bounded adapters.
+
+To regenerate the bounded analysis for the web-discovered real-user corpora:
+
+```bash
+python scripts/web_discovered_agent_dataset_analysis.py
+```
+
+Default outputs:
+
+- `scratch/external/datasets/web-discovered-agent-datasets-analysis.json`
+- `scratch/external/datasets/web-discovered-agent-datasets-analysis.md`
+
+The current bounded run includes `share-codex`, `pi-mono`, `pi-mono-sessions`, `championswimmer/pi-coding-sessions`, `formal-web/pi-coding-sessions`, `pi-nes-sessions`, `pi-for-excel-sessions`, `pi-extensions-sessions`, `economist-tui-sessions`, `fable-5-traces`, `fable-5-claude-code-traces`, `merchantscroll-traces`, `RangaPrasath/coding-sessions`, `AlexLi31415/coding-sessions`, `ultralazr/claude-code-traces`, `peteromallet/my-personal-codex-data`, `misterkerns/my-personal-claude-code-data`, and `nlile/misc-merged-claude-code-traces-v1`. The latest local sample still shows shell-heavy behavior across the Pi, Claude Code, Cursor, and share-codex sets, but the newer Pi-family exports make the scale easier to see: `championswimmer/pi-coding-sessions` averages `51.33` tool calls per session, `formal-web/pi-coding-sessions` averages `105.08`, `pi-for-excel-sessions` averages `381.08`, and `0xKobolds` averages `187.83`, all dominated by repeated `bash`, `read`, and `edit` actions before convergence. The newer DataClaw exports add a stronger token-efficiency signal: the average session reaches about `157.0M` input tokens with `766.19` tool uses in the personal Codex dump and about `27.5M` input tokens with `146.46` tool uses in the personal Claude Code dump, which works out to roughly `204.8k` to `187.8k` input tokens per tool use on average. The bounded Cursor sample also averages `135.83` tool calls per session, while the native Fable Claude Code sample averages `60.0`. The new bounded `nlile/misc-merged-claude-code-traces-v1` slice now comes through the same analyzer path and shows `54.17` tool calls per accepted row over the first `500` rows, dominated by `Read`, `Grep`, `Bash`, `TodoWrite`, and `Edit` once helper rows and command-output wrappers are filtered. That is direct evidence that repeated long-context turns around tool loops are a larger cost center than the raw number of tools alone.
+
+The analyzer now also supports raw Codex Desktop `.codex/sessions` JSONL exports directly. Bounded local samples such as `nielsr/add-sam-3-lite-text-agent-traces` keep the original developer wrapper plus executed `function_call` events, which makes first-turn instruction bloat and actual tool-loop cost measurable without converting the trace into an intermediate schema first.
+
+The Pi exports still add two concrete efficiency signals that were easy to miss in benchmark-derived corpora: some sessions are just lightweight control chatter such as `hello`, `continue`, or `/load`, and many review or audit requests explicitly ask the model to read large PRs, issues, or architecture context "in full". Those should go through cheaper control handling and summarize-once context compression rather than the same full coding-agent loop used for code-edit tasks.
 
 Recent local CoderForge artifacts:
 
@@ -246,6 +285,46 @@ Default outputs:
 The report intentionally keeps example citations short and references them by dataset, row id, and message index so findings can be traced back to the original local corpus without copying large raw transcripts into version control.
 
 When `--max-rows` is set, the citation layer is sampled from that bounded slice only. If the default reference JSONs are present, the report also merges full-corpus trajectory/error aggregates so you can cite portfolio-scale counts without rescanning every raw message on each iteration.
+
+## Task Review
+
+`scripts/trajectory_task_review.py` is the focused qualitative layer for "what are people actually trying to do, and where do coding agents waste budget while doing it?" It reuses the local transcript readers, classifies sampled prompts into task families, and joins that with measured per-dataset workflow signals such as context loops and edit-without-test rates.
+
+```bash
+python scripts/trajectory_task_review.py
+```
+
+It writes:
+
+- `scratch/external/datasets/trajectory-task-review.json`
+- `scratch/external/datasets/trajectory-task-review.md`
+
+Use it when you want one bounded artifact that combines:
+
+- task-family mix such as bugfix, refactor, docs, setup-build, frontend, or planning
+- representative prompt examples from each family
+- measured workflow warnings such as repeated context loops or missing post-edit validation
+- ordered controller recommendations that stay grounded in the local transcript mix instead of one benchmark family
+
+Fresh June 29, 2026 bounded reruns that are useful for agent-product tuning:
+
+- `scratch/external/datasets/trajectory-task-review-agentmix-20260629.json`
+- `scratch/external/datasets/trajectory-task-review-agentmix-20260629.md`
+- `scratch/external/datasets/trajectory-profile-agentmix-20260629.json`
+- `scratch/external/datasets/trajectory-evidence-agentmix-20260629.json`
+- `scratch/external/datasets/trajectory-evidence-agentmix-20260629.md`
+- `scratch/external/datasets/trajectory-evidence-swe-zero-20260629.json`
+- `scratch/external/datasets/trajectory-evidence-swe-zero-20260629.md`
+
+That bounded agent-mix pass says the interactive and real-user slices are not just benchmark bugfixes:
+
+- `trace-commons-agent-traces` includes open-ended product work such as project scaffolding, styling, docs, setup, systems work, and data-analysis requests, but still averages `136.73` tool calls with `73.33%` context-loop rows.
+- `cc-bench-trajectories` is dominated by `application_development`, `frontend_development`, and `ui_optimization`, and still shows `47.81` average tool calls, `73.0%` context-loop rows, and `91.92%` edit-without-later-test.
+- `agent-race-traces` is tiny but useful for cross-harness comparison on the same task; the current local sample shows all four rows editing without prior grounding or later tests, so it is better for harness-discipline checks than broad controller tuning.
+- `terminalbench-trajectories` stays shell-heavy and under-validated: `28.52` average tool calls, `53.12%` edit-without-later-test, and command mixes dominated by `run_shell`, `execute_bash`, and `str_replace_editor`.
+- `thoughtworks-agentic-coding-trajectories` remains mostly issue-repair, but the bounded rerun still shows `25.0%` context-loop rows and `91.19%` edit-without-later-test, so it reinforces the same controller priorities.
+
+The newly added `nvidia-swe-zero-openhands-trajectories` set is useful as a failure-heavy synthetic comparison slice rather than a real-user one. In the current 120-row evidence sample it shows `100.0%` edit-without-context, `99.17%` edit-without-later-test, `1881` large context blobs, and shell behavior dominated by repeated `grep` and `find ... -exec grep` search patterns. That makes it a good stress test for grounding, post-edit validation, and shell-search compression, but not a substitute for `trace-commons` or `cc-bench` when deciding what real developers ask coding agents to do.
 
 Validation after implementing the generic guards:
 

@@ -27,11 +27,15 @@ ERROR_PATTERNS: dict[str, re.Pattern[str]] = {
     "import_error": re.compile(r"ImportError|cannot import name", re.I),
     "syntax_error": re.compile(r"SyntaxError|IndentationError|unexpected EOF|invalid syntax", re.I),
     "test_assertion": re.compile(r"\bAssertionError\b|(?m:^\s*FAILED\s+\S+|^\s*FAIL:\s|^\s*E\s+assert\b)"),
-    "invalid_args": re.compile(r"unrecognized arguments|invalid option|unknown option|usage:|error: argument|missing required", re.I),
+    "invalid_args": re.compile(
+        r"unrecognized arguments|invalid option|unknown option|error: argument|"
+        r"missing required|the following arguments are required|no such command|too few arguments",
+        re.I,
+    ),
     "command_not_found": re.compile(r"command not found|not recognized as (?:an internal|the name)", re.I),
     "path_missing": re.compile(r"No such file or directory|cannot access|FileNotFoundError|Path does not exist|path .* does not exist", re.I),
     "cwd_git": re.compile(r"cd: .*No such file|outside workspace|escapes the workspace|not inside a git repository", re.I),
-    "timeout": re.compile(r"\btimed out\b|\btimeout\b|\bexceeded\b[^\n]*\btimeout\b|\bkilled\b", re.I),
+    "timeout": re.compile(r"\btimed out\b|\bdeadline exceeded\b|\bexceeded\b[^\n]{0,120}\btimeout\b", re.I),
     "permission": re.compile(r"Permission denied|access is denied|Operation not permitted", re.I),
     "patch_apply": re.compile(r"patch failed|does not apply|git apply.*failed|hunk FAILED|error: patch", re.I),
 }
@@ -55,11 +59,20 @@ ERROR_HINTS: dict[str, tuple[str, ...]] = {
     "import_error": ("importerror", "cannot import name"),
     "syntax_error": ("syntaxerror", "indentationerror", "unexpected eof", "invalid syntax"),
     "test_assertion": ("assertionerror", "failed ", "fail:", "e assert"),
-    "invalid_args": ("unrecognized arguments", "invalid option", "unknown option", "usage:", "error: argument", "missing required"),
+    "invalid_args": (
+        "unrecognized arguments",
+        "invalid option",
+        "unknown option",
+        "error: argument",
+        "missing required",
+        "the following arguments are required",
+        "no such command",
+        "too few arguments",
+    ),
     "command_not_found": ("command not found", "not recognized as an internal", "not recognized as the name"),
     "path_missing": ("no such file or directory", "cannot access", "filenotfounderror", "path does not exist"),
     "cwd_git": ("cd:", "outside workspace", "escapes the workspace", "not inside a git repository"),
-    "timeout": ("timed out", "timeout", "exceeded", "killed"),
+    "timeout": ("timed out", "deadline exceeded", "exceeded timeout"),
     "permission": ("permission denied", "access is denied", "operation not permitted"),
     "patch_apply": ("patch failed", "does not apply", "git apply", "hunk failed", "error: patch"),
 }
@@ -76,8 +89,89 @@ SHELL_ERROR_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 
+def _agent_race_content_text(value: Any) -> str:
+    if isinstance(value, list):
+        text_parts: list[str] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                text_parts.append(text)
+                continue
+            content = item.get("content")
+            if isinstance(content, str) and content.strip():
+                text_parts.append(content)
+        if text_parts:
+            return "\n".join(text_parts)
+    return trajectory_profile._content_text(value)
+
+
 def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory_profile.Event]:
     events: list[trajectory_profile.Event] = []
+    if adapter == "agent_race":
+        raw_events = trajectory_profile._deserialize_possible_json(row.get("events"))
+        if not isinstance(raw_events, list):
+            return events
+        tool_names_by_id: dict[str, str] = {}
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                continue
+            message = raw_event.get("message")
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").lower()
+            content = message.get("content")
+            if role == "assistant":
+                items = content if isinstance(content, list) else []
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_type = str(item.get("type") or "").lower()
+                    if item_type not in {"tool_use", "toolcall"}:
+                        continue
+                    name = trajectory_profile._normalize_tool_name(str(item.get("name") or ""))
+                    tool_id = str(item.get("id") or "")
+                    if tool_id and name:
+                        tool_names_by_id[tool_id] = name
+                continue
+            if role == "toolresult":
+                raw_name = str(message.get("toolName") or "")
+                name = trajectory_profile._normalize_tool_name(raw_name)
+                tool_call_id = str(message.get("toolCallId") or "")
+                if not name:
+                    name = tool_names_by_id.get(tool_call_id, "tool")
+                content_text = _agent_race_content_text(content)
+                events.append(
+                    trajectory_profile.Event(
+                        role="tool",
+                        kind="tool_result",
+                        name=name,
+                        category=trajectory_profile._tool_category(name, content_text),
+                        content=content_text,
+                    )
+                )
+                continue
+            if role != "user" or not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("type") or "").lower() != "tool_result":
+                    continue
+                tool_call_id = str(item.get("tool_use_id") or "")
+                name = tool_names_by_id.get(tool_call_id, "tool")
+                content_text = _agent_race_content_text(item.get("content"))
+                events.append(
+                    trajectory_profile.Event(
+                        role="tool",
+                        kind="tool_result",
+                        name=name,
+                        category=trajectory_profile._tool_category(name, content_text),
+                        content=content_text,
+                    )
+                )
+        return events
     if adapter == "openhands":
         messages = trajectory_profile._openhands_messages(row)
         pending_tool_name = ""
@@ -98,8 +192,11 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
                     if not raw_name:
                         raw_name = str(tool_calls[0].get("name") or "")
                     pending_tool_name = trajectory_profile._normalize_tool_name(raw_name)
-                elif trajectory_profile._content_text(message.get("content")).strip():
-                    inferred = trajectory_profile._infer_tool_name_from_text(trajectory_profile._content_text(message.get("content")))
+                else:
+                    assistant_content = trajectory_profile._openhands_message_content(message)
+                    if not assistant_content.strip():
+                        continue
+                    inferred = trajectory_profile._infer_tool_name_from_text(assistant_content)
                     pending_tool_name = inferred or ""
                 continue
             if role != "tool":
@@ -121,13 +218,22 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
             )
             pending_tool_name = ""
         return events
-    if adapter == "trace_commons":
+    if adapter == "cc_bench":
         return _extract_result_events("openhands", row)
+    if adapter == "trace_commons":
+        if trajectory_profile._openhands_messages(row):
+            return _extract_result_events("openhands", row)
+        fallback_row = dict(row)
+        fallback_row["messages"] = trajectory_profile._trace_commons_fallback_messages(row)
+        return _extract_result_events("openhands", fallback_row)
     if adapter == "thoughtworks":
         effective_adapter = trajectory_profile._thoughtworks_row_adapter(row)
         if effective_adapter == "openhands":
             return _extract_result_events("openhands", row)
-        return _extract_result_events("smith", {"messages": row.get("messages") or row.get("messages_json")})
+        return _extract_result_events(
+            "smith",
+            {"messages": trajectory_profile._first_non_empty_deserialized(row.get("messages"), row.get("messages_json"))},
+        )
     if adapter == "swe_agent":
         previous_ai = ""
         for message in row.get("trajectory") or []:
@@ -153,7 +259,7 @@ def _extract_result_events(adapter: str, row: dict[str, Any]) -> list[trajectory
             previous_ai = ""
         return events
     if adapter == "smith":
-        messages = trajectory_profile._deserialize_possible_json(row.get("messages"))
+        messages = trajectory_profile._first_non_empty_deserialized(row.get("messages"), row.get("messages_json"))
         if not isinstance(messages, list):
             return events
         previous_ai = ""
@@ -262,7 +368,150 @@ def classify_shell_error(text: str) -> str | None:
     return "other_shell_error"
 
 
+def allow_shell_error_for_event(shell_error: str, event: trajectory_profile.Event) -> bool:
+    del shell_error
+    shellish_names = {"tool", "observation", "execute_bash", "run_shell", "bash", "powershell", "shell", "command"}
+    return event.category in {"shell", "test"} or event.name in shellish_names
+
+
+def _extract_success_output_block(text: str) -> str:
+    if "<returncode>0</returncode>" not in text:
+        return text
+    match = re.search(r"<output>\s*(.*?)\s*</output>", text, re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1)
+    return text
+
+
+def _unwrap_line_numbered_preview(text: str) -> str:
+    if "`cat -n`" not in text and "has been edited. Here's the result of running `cat -n`" not in text:
+        return text
+    lines = text.splitlines()
+    numbered: list[str] = []
+    for line in lines:
+        match = re.match(r"^\s*\d+\s+(.*)$", line)
+        if match:
+            numbered.append(match.group(1))
+    if len(numbered) >= 3:
+        return "\n".join(numbered)
+    return text
+
+
+def _is_line_numbered_preview(text: str) -> bool:
+    return _unwrap_line_numbered_preview(text) != text
+
+
+def _looks_like_source_code_snippet(text: str) -> bool:
+    lowered = text.lower()
+    if any(marker in lowered for marker in ("traceback (most recent call last)", "failed ", "fail:", " e   assert", "syntax error:")):
+        return False
+    if re.search(r"(?mi)^\s*error:\s", text):
+        return False
+    code_markers = 0
+    for marker in (
+        "from ",
+        "import ",
+        "def ",
+        "class ",
+        "return ",
+        "except ",
+        "raise ",
+        "if ",
+        "elif ",
+        "else:",
+        "try:",
+        "func ",
+        "package ",
+        "const ",
+        "let ",
+        "var ",
+        "describe(",
+        "it(",
+        "it.each",
+        ":=",
+    ):
+        if marker in lowered:
+            code_markers += 1
+    indented_lines = sum(1 for line in text.splitlines() if line.startswith(("    ", "\t", "  ")))
+    assignment_lines = sum(
+        1
+        for line in text.splitlines()
+        if re.match(r'^\s*[A-Za-z_][A-Za-z0-9_]*\s*(:=|=)\s*["\']?[^"\']+', line)
+    )
+    return (
+        code_markers >= 3
+        or (code_markers >= 2 and indented_lines >= 2)
+        or (code_markers >= 2 and assignment_lines >= 2)
+    )
+
+
+def _looks_like_expected_error_example(event: trajectory_profile.Event, error_class: str) -> bool:
+    lowered = event.content.lower()
+    success_wrapper = "<returncode>0</returncode>" in lowered
+    if error_class == "syntax_error":
+        if "pass [" in lowered and "=> error: syntaxerror" in lowered:
+            if "all smoke tests passed" in lowered or "pass [rt_sys/syntax]" in lowered:
+                return True
+    if error_class == "invalid_args":
+        if "test cli:" in lowered and "should fail" in lowered:
+            if "unrecognized option" in lowered or "unrecognized arguments" in lowered:
+                return True
+        if "expected error:" in lowered and (
+            "unrecognized option" in lowered
+            or "unrecognized arguments" in lowered
+            or "invalid option" in lowered
+        ):
+            return True
+        if "results:" in lowered and "passed" in lowered:
+            if "pass [exit=1]" in lowered or "fail [exit=1]" in lowered:
+                if "unknown option" in lowered or "unrecognized option" in lowered:
+                    return True
+        if success_wrapper and "expected error:" in lowered:
+            return True
+    if error_class in {"import_error", "missing_dependency", "test_assertion"}:
+        if success_wrapper and "expected error:" in lowered:
+            return True
+        if success_wrapper and "failed during execution due to " in lowered:
+            return True
+    if error_class == "test_assertion":
+        if success_wrapper and "type: <class 'assertionerror'>" in lowered:
+            return True
+    return False
+
+
+def _looks_like_source_code_observation(event: trajectory_profile.Event) -> bool:
+    extracted = _extract_success_output_block(event.content)
+    if _is_line_numbered_preview(extracted):
+        return True
+    text = _unwrap_line_numbered_preview(extracted)
+    if event.category in {"read", "edit"} or event.name in {"read_file", "str_replace_editor", "edit"}:
+        return _looks_like_source_code_snippet(text)
+    if event.category in {"shell", "test"} or event.name in {"bash", "execute_bash", "run_shell", "powershell", "shell", "command"}:
+        return _looks_like_source_code_snippet(text)
+    return False
+
+
 def _allow_error_class_for_event(error_class: str, event: trajectory_profile.Event) -> bool:
+    if _looks_like_expected_error_example(event, error_class):
+        return False
+    if _looks_like_source_code_observation(event) and error_class in {
+        "missing_dependency",
+        "import_error",
+        "syntax_error",
+        "test_assertion",
+        "invalid_args",
+        "command_not_found",
+        "path_missing",
+        "cwd_git",
+        "timeout",
+        "permission",
+        "patch_apply",
+    }:
+        return False
+    if error_class == "invalid_args":
+        if allow_shell_error_for_event(error_class, event):
+            return True
+        return False
     if error_class != "timeout":
         return True
     lowered = event.content.lower()
@@ -314,7 +563,7 @@ def summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) -
             result_events += 1
             error_class = classify_error(event.content)
             shell_error = classify_shell_error(event.content)
-            if shell_error and (event.category in {"shell", "test"} or event.name in {"tool", "observation", "execute_bash", "run_shell", "bash", "powershell", "shell", "command"}):
+            if shell_error and allow_shell_error_for_event(shell_error, event):
                 shell_errors[shell_error] += 1
                 shell_tool_errors[f"{event.name}:{shell_error}"] += 1
                 if len(shell_examples[shell_error]) < 3:
@@ -403,12 +652,17 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
     for pattern in spec["paths"]:
         paths.extend(sorted(root.glob(pattern)))
     adapter = str(spec["adapter"])
+    if adapter == "agent_race":
+        rows = trajectory_profile._iter_agent_race_rows(paths, max_rows=max_rows)
+        return adapter, trajectory_profile._iter_rows_with_trajectory_content(adapter, rows, max_rows=max_rows)
     if adapter == "smith":
         columns = ["messages"]
     elif adapter == "openhands":
         columns = ["trajectory", "messages", "messages_json"]
+    elif adapter == "cc_bench":
+        columns = ["trajectory", "task_id", "id", "task_category", "model_name"]
     elif adapter == "trace_commons":
-        columns = ["messages", "session_id", "harness", "prompt", "num_tool_calls"]
+        columns = ["messages", "messages_json", "trace", "session_id", "harness", "prompt", "num_tool_calls"]
     elif adapter == "thoughtworks":
         columns = ["messages", "messages_json", "agent_framework", "source_dataset", "session_id", "source_id"]
     elif adapter == "terminalbench":
@@ -420,10 +674,11 @@ def _iter_dataset_rows(data_root: Path, dataset: str, max_rows: int | None) -> t
 
 
 def build_profile(data_root: Path, datasets: list[str], max_rows: int | None) -> dict[str, Any]:
+    effective_max_rows = None if max_rows == 0 else max_rows
     summaries: list[dict[str, Any]] = []
     portfolio: Counter[str] = Counter()
     for dataset in datasets:
-        adapter, rows = _iter_dataset_rows(data_root, dataset, max_rows)
+        adapter, rows = _iter_dataset_rows(data_root, dataset, effective_max_rows)
         summary = summarize_dataset(dataset, adapter, rows)
         summaries.append(summary)
         for recommendation in summary["recommendations"]:
@@ -431,7 +686,7 @@ def build_profile(data_root: Path, datasets: list[str], max_rows: int | None) ->
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "data_root": data_root.as_posix(),
-        "max_rows_per_dataset": max_rows,
+        "max_rows_per_dataset": effective_max_rows,
         "datasets": summaries,
         "portfolio_recommendations": [{"id": key, "count": value} for key, value in portfolio.most_common()],
     }
@@ -458,13 +713,13 @@ def format_summary(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Profile tool/result error classes in coding-agent trajectories.")
     parser.add_argument("--data-root", type=Path, default=trajectory_profile.DEFAULT_DATA_ROOT)
     parser.add_argument("--datasets", nargs="*", default=list(trajectory_profile.DATASET_SPECS))
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     payload = build_profile(args.data_root, args.datasets, args.max_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

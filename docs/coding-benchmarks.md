@@ -55,6 +55,18 @@ Run the frequent local suite:
 python scripts/coding_benchmark_eval.py --suite local-small --models granite4.1:8b gemma4:e4b qwen3:8b --modes off on --benchmark-classes agent controller --jobs 12 --strict-accuracy --strict-budget
 ```
 
+Start with the fast repo-owned readiness tier before broader benchmark work:
+
+```bash
+python scripts/local_validation.py --tier smoke
+```
+
+Run the full local validation stack before merging larger controller changes:
+
+```bash
+python scripts/local_validation.py --tier full
+```
+
 Run A/B feature profiles without changing prompts:
 
 ```bash
@@ -133,6 +145,7 @@ Artifacts land under:
 - `scratch/live-model-gate/coding-benchmark-<model>.json`
 
 The summary JSON records the detected `OLLAMA_HOST`, installed models, resolved models, exact commands, return codes, durations, and command output tails for each gate step.
+It also records the canonical release selection fields: `benchmark_suite`, `selected_default_model`, `selection_reason`, and per-model gate rows with benchmark pass/token/latency totals.
 
 If you want to A/B a narrower profile such as `trajectory-guards`, pass it explicitly with `--benchmark-feature-profiles trajectory-guards`. Keep that separate from release gating, because the gate should reflect the actual shipped/default runtime profile.
 

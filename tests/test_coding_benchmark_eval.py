@@ -189,6 +189,17 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(rc, 1)
 
+    def test_main_returns_nonzero_when_no_requested_models_are_available(self) -> None:
+        case = bench.BenchmarkCase(name="only", suite="local-small", turns=("prompt",), validate=lambda ctx: "pass")
+
+        with (
+            patch.object(bench, "selected_cases", return_value=[case]),
+            patch.object(bench, "installed_models", return_value=[]),
+        ):
+            rc = bench.main(["--suite", "local-small", "--models", "demo-model", "--modes", "off", "--reconcile-modes", "off"])
+
+        self.assertEqual(rc, 1)
+
     def test_coding_accuracy_prompts_do_not_leak_synthetic_answers(self) -> None:
         cases = bench.selected_cases("local-full")
         violations = {case.name: bench.prompt_integrity_findings(case) for case in cases if bench.prompt_integrity_findings(case)}
@@ -780,6 +791,83 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertTrue(seen)
         self.assertIn(".codex", seen[0].as_posix())
+
+    def test_evaluate_case_retries_transient_ollama_timeout_once_for_agent_benchmark(self) -> None:
+        seen_workspaces: list[Path] = []
+
+        def fake_build_workspace(workspace: Path, *, init_git: bool = True) -> bool:
+            workspace.mkdir(parents=True, exist_ok=True)
+            return init_git
+
+        def fake_run_cli(
+            repo_root: Path,
+            workspace: Path,
+            model: str,
+            prompt: str,
+            *,
+            session_file: Path | None = None,
+            **_: object,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertIsNotNone(session_file)
+            seen_workspaces.append(workspace)
+            session_file = Path(session_file or workspace / "scratch" / "session.json")
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(json.dumps({"events": [{"type": "assistant", "content": "ok"}], "messages": []}), encoding="utf-8")
+            if len(seen_workspaces) == 1:
+                return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="error: Ollama timed out after 300 seconds.\n")
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
+
+        case = bench.BenchmarkCase(
+            name="retryable_agent_case",
+            suite="local-small",
+            turns=("prompt",),
+            validate=lambda ctx: "pass",
+        )
+
+        with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli", side_effect=fake_run_cli):
+            outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "off", case, timeout=30)
+
+        self.assertEqual(outcome["status"], "pass")
+        self.assertEqual(outcome.get("transient_ollama_retries"), 1)
+        self.assertEqual(len(seen_workspaces), 2)
+        self.assertNotEqual(seen_workspaces[0], seen_workspaces[1])
+
+    def test_evaluate_case_does_not_retry_non_timeout_failure(self) -> None:
+        seen_workspaces: list[Path] = []
+
+        def fake_build_workspace(workspace: Path, *, init_git: bool = True) -> bool:
+            workspace.mkdir(parents=True, exist_ok=True)
+            return init_git
+
+        def fake_run_cli(
+            repo_root: Path,
+            workspace: Path,
+            model: str,
+            prompt: str,
+            *,
+            session_file: Path | None = None,
+            **_: object,
+        ) -> subprocess.CompletedProcess[str]:
+            self.assertIsNotNone(session_file)
+            seen_workspaces.append(workspace)
+            session_file = Path(session_file or workspace / "scratch" / "session.json")
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(json.dumps({"events": [], "messages": []}), encoding="utf-8")
+            return subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="error: model unavailable\n")
+
+        case = bench.BenchmarkCase(
+            name="non_retryable_agent_case",
+            suite="local-small",
+            turns=("prompt",),
+            validate=lambda ctx: "pass",
+        )
+
+        with patch.object(bench, "build_workspace", side_effect=fake_build_workspace), patch.object(bench, "run_cli", side_effect=fake_run_cli):
+            outcome = bench.evaluate_case(Path.cwd(), "fake-model", None, "off", case, timeout=30)
+
+        self.assertEqual(outcome["status"], "fail")
+        self.assertEqual(len(seen_workspaces), 1)
+        self.assertNotIn("transient_ollama_retries", outcome)
 
 
 if __name__ == "__main__":

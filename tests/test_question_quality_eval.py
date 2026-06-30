@@ -7,6 +7,29 @@ from scripts import question_quality_eval as question_eval
 
 
 class QuestionQualityEvalTests(unittest.TestCase):
+    def test_match_answer_to_choices_prefers_exact_match_over_overlapping_subset(self) -> None:
+        matches = question_eval.match_answer_to_choices(
+            "benchmark pass rate",
+            ["benchmark pass rate", "pass rate", "wall-clock latency"],
+        )
+
+        self.assertEqual(matches, ["benchmark pass rate"])
+
+    def test_build_parser_accepts_legacy_output_flag(self) -> None:
+        args = question_eval._build_parser().parse_args(["--output", "scratch/question-eval.json"])
+
+        self.assertEqual(args.output, Path("scratch/question-eval.json"))
+
+    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
+        output_json, output_md = question_eval._resolve_output_paths(
+            output=Path("scratch/question-eval.json"),
+            output_json=None,
+            output_md=None,
+        )
+
+        self.assertEqual(output_json, Path("scratch/question-eval.json"))
+        self.assertEqual(output_md, Path("scratch/question-eval.md"))
+
     def test_match_answer_to_choices_returns_unique_choice(self) -> None:
         matches = question_eval.match_answer_to_choices(
             "Optimize model/tool token cost first.",

@@ -6,6 +6,7 @@ import configparser
 from copy import deepcopy
 import dis
 import difflib
+import fnmatch
 import hashlib
 import importlib
 import inspect
@@ -241,6 +242,10 @@ class ToolExecutor:
         indexer: Any | None = None,
     ) -> None:
         self.workspace_root = Path(workspace_root).resolve()
+        self._workspace_root_text = os.path.normpath(os.fspath(self.workspace_root))
+        self._workspace_root_normcase = os.path.normcase(self._workspace_root_text)
+        self._workspace_root_prefix_text = self._workspace_root_text if self._workspace_root_text.endswith(os.sep) else self._workspace_root_text + os.sep
+        self._workspace_root_prefix_normcase = os.path.normcase(self._workspace_root_prefix_text)
         self.approval_mode = approval_mode
         self.input_func = input_func
         self.agent_runner = agent_runner
@@ -256,6 +261,9 @@ class ToolExecutor:
         self._initial_dirty_paths = self._git_dirty_paths()
         self._todos: list[dict[str, str]] = []
         self._tree_sitter_parsers: dict[str, Any] = {}
+        self._lint_typecheck_cache: dict[str, dict[str, Any]] = {}
+        self._python_tool_command_cache: dict[tuple[str, str, tuple[str, ...]], list[str] | None] = {}
+        self._which_cache: dict[str, str | None] = {}
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
@@ -355,6 +363,7 @@ class ToolExecutor:
             "read_file": self.read_file,
             "search": self.search,
             "file_search": self.file_search,
+            "directory_search": self.directory_search,
             "fd_search": self.fd_search,
             "file_index_refresh": self.file_index_refresh,
             "everything_search": self.everything_search,
@@ -575,8 +584,21 @@ class ToolExecutor:
         return candidate
 
     def relative_label(self, path: Path) -> str:
+        fast = self._fast_workspace_relative_label(path)
+        if fast is not None:
+            return fast
         candidate = path if path.is_absolute() else self.workspace_root / path
         return candidate.resolve(strict=False).relative_to(self.workspace_root).as_posix() or "."
+
+    def _fast_workspace_relative_label(self, path: Path) -> str | None:
+        candidate = path if path.is_absolute() else self.workspace_root / path
+        candidate_text = os.path.normpath(os.fspath(candidate))
+        candidate_normcase = os.path.normcase(candidate_text)
+        if candidate_normcase == self._workspace_root_normcase:
+            return "."
+        if not candidate_normcase.startswith(self._workspace_root_prefix_normcase):
+            return None
+        return candidate_text[len(self._workspace_root_prefix_text):].replace("\\", "/")
 
     def _confirm(self, prompt: str) -> bool:
         while True:
@@ -824,10 +846,14 @@ class ToolExecutor:
         return any(pattern.match(lowered) for pattern in SKIP_GENERATED_DIR_PATTERNS)
 
     def _path_has_skipped_part(self, path: Path) -> bool:
-        try:
-            parts = path.resolve(strict=False).relative_to(self.workspace_root).parts
-        except ValueError:
-            parts = path.parts
+        relative = self._fast_workspace_relative_label(path)
+        if relative is not None:
+            parts = relative.split("/")
+        else:
+            try:
+                parts = path.resolve(strict=False).relative_to(self.workspace_root).parts
+            except ValueError:
+                parts = path.parts
         return any(self._generated_dir_name(part) for part in parts)
 
     def _repo_files_from_git(self, base: Path, *, limit: int, suffixes: set[str] | None = None) -> list[Path] | None:
@@ -1014,15 +1040,20 @@ class ToolExecutor:
             "output": "\n".join(rendered) if rendered else "(no content in requested range)",
         }
 
-    def search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
+    def search(self, query: str, path: str = ".", limit: int = 100, file_glob: str | None = None) -> dict[str, Any]:
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
+        clean_file_glob = str(file_glob or "").strip()
+        if clean_file_glob.startswith("-"):
+            return {"ok": False, "tool": "search", "summary": "file_glob must be a filename glob, not an option."}
         if shutil.which("rg"):
             command = ["rg", "-n", "--color", "never", "--no-ignore-parent", "--max-count", str(limit)]
             for directory in sorted(SKIP_CODE_DIRS):
                 command.extend(["--glob", f"!{directory}/**"])
             for glob in SKIP_WALK_GLOBS:
                 command.extend(["--glob", glob])
+            if clean_file_glob:
+                command.extend(["--glob", clean_file_glob])
             command.extend([query, str(base)])
             result = self._run_process(command, cwd=self.workspace_root, timeout=30)
             if result.returncode not in {0, 1} and "regex parse error" in (result.stderr or ""):
@@ -1031,11 +1062,21 @@ class ToolExecutor:
                 result = self._run_process(literal_command, cwd=self.workspace_root, timeout=30)
             output = result.stdout.strip() or result.stderr.strip() or "(no matches)"
             if output != "(no matches)":
-                output = "\n".join(output.splitlines()[: max(1, limit)])
+                rel_root = str(self.workspace_root.resolve(strict=False))
+                rel_root_lower = rel_root.lower()
+                normalized_lines: list[str] = []
+                for line in output.splitlines()[: max(1, limit)]:
+                    rewritten = line
+                    if line.lower().startswith(rel_root_lower):
+                        suffix = line[len(rel_root) :].lstrip("\\/")
+                        rewritten = suffix.replace("\\", "/")
+                    normalized_lines.append(rewritten)
+                output = "\n".join(normalized_lines)
             return {
                 "ok": result.returncode in {0, 1},
                 "tool": "search",
                 "path": self.relative_label(base),
+                "file_glob": clean_file_glob or None,
                 "output": output,
             }
         matches: list[str] = []
@@ -1052,6 +1093,8 @@ class ToolExecutor:
 
         for file_path in self._iter_workspace_files(base, limit=50000):
             self._check_interrupted()
+            if clean_file_glob and not fnmatch.fnmatchcase(file_path.name, clean_file_glob):
+                continue
             for line_no, line in enumerate(file_path.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
                 self._check_interrupted()
                 if matcher(line):
@@ -1064,6 +1107,7 @@ class ToolExecutor:
             "ok": True,
             "tool": "search",
             "path": self.relative_label(base),
+            "file_glob": clean_file_glob or None,
             "output": "\n".join(matches) if matches else "(no matches)",
         }
 
@@ -1187,6 +1231,35 @@ class ToolExecutor:
             "path": self.relative_label(base),
             "count": len(ranked),
             "output": "\n".join(ranked) if ranked else "(no file matches)",
+        }
+
+    def directory_search(self, query: str, path: str = ".", limit: int = 100) -> dict[str, Any]:
+        self._check_interrupted()
+        base = self.resolve_path(path, allow_missing=False)
+        clean_query = str(query or "").strip()
+        if not clean_query:
+            return {"ok": False, "tool": "directory_search", "summary": "directory_search requires a non-empty query."}
+        safe_limit = self._coerce_int(limit, default=100, minimum=1)
+        matches: list[str] = []
+        if base.is_file():
+            return {"ok": False, "tool": "directory_search", "summary": f"{path} is a file."}
+        for root, dirs, _files in os.walk(base):
+            self._check_interrupted()
+            root_path = Path(root)
+            dirs[:] = sorted(d for d in dirs if not d.startswith(".") and not self._generated_dir_name(d))
+            for directory in dirs:
+                if fnmatch.fnmatchcase(directory, clean_query):
+                    matches.append(f"{self.relative_label(root_path / directory)}/")
+                    if len(matches) >= safe_limit:
+                        break
+            if len(matches) >= safe_limit:
+                break
+        return {
+            "ok": True,
+            "tool": "directory_search",
+            "path": self.relative_label(base),
+            "count": len(matches),
+            "output": "\n".join(matches) if matches else "(no directory matches)",
         }
 
     def _fd_cli_path(self) -> str | None:
@@ -1359,6 +1432,80 @@ class ToolExecutor:
         if len(file_targets) <= MAX_EXPLICIT_VALIDATOR_FILES:
             return file_targets
         return scope_targets or file_targets
+
+    def _python_typechecker_targets(
+        self,
+        *,
+        discovered_files: Iterable[str],
+        requested_scopes: Iterable[str],
+        limit: int = 100,
+    ) -> list[str]:
+        file_targets = self._collapse_validation_targets(discovered_files, limit=limit)
+        if not file_targets:
+            return []
+        scope_targets = self._collapse_validation_targets(requested_scopes, limit=limit)
+        if "." in scope_targets:
+            return ["."]
+        if len(scope_targets) == 1 and not scope_targets[0].endswith(".py"):
+            return scope_targets
+        return file_targets
+
+    def _python_typechecker_configured(self) -> bool:
+        if (self.workspace_root / "pyrightconfig.json").exists() or (self.workspace_root / "basedpyrightconfig.json").exists():
+            return True
+        pyproject = self._read_toml(self.workspace_root / "pyproject.toml")
+        return self._toml_tool_section(pyproject, "pyright") or self._toml_tool_section(pyproject, "basedpyright")
+
+    def _lint_typecheck_cache_key(
+        self,
+        *,
+        checked: Iterable[str],
+        validator_targets: Iterable[str],
+        typechecker_targets: Iterable[str],
+        shell_targets: Iterable[str],
+        ruff_path: str | None,
+        typechecker_command: list[str] | None,
+        bash_path: str | None,
+    ) -> str:
+        file_stats: list[dict[str, Any]] = []
+        for label in sorted({str(item).replace("\\", "/") for item in checked if str(item).strip()}):
+            try:
+                stat = (self.workspace_root / label).stat()
+            except OSError:
+                file_stats.append({"path": label, "missing": True})
+                continue
+            file_stats.append({"path": label, "mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)})
+        config_stats: list[dict[str, Any]] = []
+        for label in (
+            "pyproject.toml",
+            "setup.cfg",
+            "tox.ini",
+            "ruff.toml",
+            ".ruff.toml",
+            "pyrightconfig.json",
+            "basedpyrightconfig.json",
+        ):
+            path = self.workspace_root / label
+            if not path.exists():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            config_stats.append({"path": label, "mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)})
+        payload = {
+            "version": 1,
+            "checked": file_stats,
+            "configs": config_stats,
+            "validator_targets": list(validator_targets),
+            "typechecker_targets": list(typechecker_targets),
+            "shell_targets": list(shell_targets),
+            "ruff_path": ruff_path or "",
+            "typechecker_command": list(typechecker_command or []),
+            "bash_path": bash_path or "",
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
 
     def _python_signature(self, lines: list[str], start: int) -> str:
         collected: list[str] = []
@@ -2694,16 +2841,41 @@ class ToolExecutor:
             return self._missing_dependency_result("fts_refresh", "sqlite-fts5", f"SQLite FTS5 is unavailable: {exc}")
         files = self._iter_fts_files(base, limit=max(1, int(limit)))
         scope_sql, scope_params = self._fts_scope(base)
+        indexed = 0
+        unchanged = 0
+        deleted = 0
         try:
-            if scope_sql:
-                conn.execute("DELETE FROM repo_fts WHERE " + scope_sql.removeprefix(" AND "), scope_params)
-            else:
-                conn.execute("DELETE FROM repo_fts")
+            existing_rows = conn.execute(
+                "SELECT path, mtime_ns, size FROM repo_fts WHERE 1=1" + scope_sql,
+                scope_params,
+            ).fetchall()
+            existing = {
+                str(row[0]): (int(row[1]), int(row[2]))
+                for row in existing_rows
+                if len(row) >= 3
+            }
+            current_paths: set[str] = set()
             for file_path in files:
+                rel = self.relative_label(file_path)
+                current_paths.add(rel)
+                try:
+                    stat = file_path.stat()
+                except OSError:
+                    continue
+                current_fingerprint = (int(stat.st_mtime_ns), int(stat.st_size))
+                if existing.get(rel) == current_fingerprint:
+                    unchanged += 1
+                    continue
+                conn.execute("DELETE FROM repo_fts WHERE path = ?", (rel,))
                 conn.execute(
                     "INSERT INTO repo_fts(path,path_text,symbols,headings,text,mtime_ns,size) VALUES(?,?,?,?,?,?,?)",
                     self._fts_record(file_path),
                 )
+                indexed += 1
+            stale_paths = sorted(set(existing) - current_paths)
+            for rel in stale_paths:
+                conn.execute("DELETE FROM repo_fts WHERE path = ?", (rel,))
+            deleted = len(stale_paths)
             conn.commit()
         finally:
             self._close_fts(conn)
@@ -2712,8 +2884,11 @@ class ToolExecutor:
             "tool": "fts_refresh",
             "path": self.relative_label(base),
             "files": len(files),
+            "indexed": indexed,
+            "unchanged": unchanged,
+            "deleted": deleted,
             "cache": self.relative_label(self._fts_cache_path()),
-            "output": f"Indexed {len(files)} file(s) into SQLite FTS.",
+            "output": f"Indexed {indexed} changed file(s), kept {unchanged} unchanged, deleted {deleted} stale row(s) in SQLite FTS.",
         }
 
     def fts_search(self, query: str, path: str = ".", limit: int = 20, refresh: bool = False) -> dict[str, Any]:
@@ -2910,6 +3085,9 @@ class ToolExecutor:
             if score:
                 scored.append({"score": score, "path": record.get("path"), "symbols": matched_symbols})
         ranked_records = sorted(scored, key=lambda item: (-int(item["score"]), str(item["path"])))[: max(1, int(limit))]
+        ranked_paths = [str(item["path"]) for item in ranked_records if str(item.get("path") or "")]
+        ranked_symbols: list[dict[str, str]] = []
+        seen_ranked_symbols: set[tuple[str, str]] = set()
         output: list[str] = []
         for item in ranked_records:
             rel = str(item["path"])
@@ -2921,9 +3099,14 @@ class ToolExecutor:
             for symbol in record.get("symbols", []):
                 if not isinstance(symbol, dict):
                     continue
-                haystack = f"{symbol.get('qualname', '')} {symbol.get('signature', '')}".lower()
-                if symbol.get("qualname") in matched_symbol_names or any(term in haystack for term in terms):
-                    snippets.append(f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {symbol['qualname']}: {symbol['signature']}")
+                qualname = str(symbol.get("qualname", "")).strip()
+                haystack = f"{qualname} {symbol.get('signature', '')}".lower()
+                if qualname in matched_symbol_names or any(term in haystack for term in terms):
+                    snippets.append(f"{rel}:{symbol['start']}-{symbol['end']} {symbol['kind']} {qualname}: {symbol['signature']}")
+                    ranked_symbol_key = (rel, qualname)
+                    if qualname and ranked_symbol_key not in seen_ranked_symbols:
+                        ranked_symbols.append({"path": rel, "qualname": qualname})
+                        seen_ranked_symbols.add(ranked_symbol_key)
             for line_item in record.get("line_index", []):
                 if not isinstance(line_item, dict):
                     continue
@@ -2940,6 +3123,8 @@ class ToolExecutor:
             "tool": "repo_index_search",
             "path": self.relative_label(base),
             "count": len(ranked_records),
+            "ranked_paths": ranked_paths,
+            "ranked_symbols": ranked_symbols,
             "output": "\n".join(output) if output else "(no ranked snippets)",
         }
 
@@ -3122,8 +3307,54 @@ class ToolExecutor:
             return resolved
         return None
 
+    def _native_python_function_ast_search(self, *, pattern: str, base: Path, limit: int) -> dict[str, Any] | None:
+        if pattern.strip() != "def $F($$$A): $$$B":
+            return None
+        files = [base] if base.is_file() else self._iter_repo_files(base, limit=50000, suffixes={".py"})
+        rows: list[str] = []
+        safe_limit = max(1, int(limit))
+        for file_path in files:
+            self._check_interrupted()
+            try:
+                source = file_path.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source)
+            except (OSError, SyntaxError, ValueError):
+                continue
+            lines = source.splitlines()
+            rel = self.relative_label(file_path)
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                line_number = int(getattr(node, "lineno", 1) or 1)
+                text = lines[line_number - 1].strip() if 0 < line_number <= len(lines) else node.name
+                rows.append(f"{rel}:{line_number}: {text[:220]}")
+                if len(rows) >= safe_limit:
+                    return {
+                        "ok": True,
+                        "tool": "ast_search",
+                        "path": self.relative_label(base),
+                        "lang": "python",
+                        "backend": "native-python",
+                        "count": len(rows),
+                        "output": "\n".join(rows),
+                    }
+        return {
+            "ok": True,
+            "tool": "ast_search",
+            "path": self.relative_label(base),
+            "lang": "python",
+            "backend": "native-python",
+            "count": len(rows),
+            "output": "\n".join(rows) if rows else "(no ast-grep matches)",
+        }
+
     def _semgrep_executable(self) -> str | None:
-        return resolve_tool_executable("semgrep", "semgrep", workspace_root=self.workspace_root) or shutil.which("semgrep")
+        return (
+            resolve_tool_executable("semgrep", "semgrep", workspace_root=self.workspace_root)
+            or shutil.which("semgrep")
+            or resolve_tool_executable("opengrep", "opengrep", workspace_root=self.workspace_root)
+            or shutil.which("opengrep")
+        )
 
     def _docker_command(self) -> str | None:
         return resolve_tool_executable("docker", "docker", workspace_root=self.workspace_root) or shutil.which("docker")
@@ -3153,7 +3384,19 @@ class ToolExecutor:
     def _run_semgrep_in_docker(self, pattern: str, base: Path, lang: str, limit: int) -> dict[str, Any]:
         docker = self._docker_command()
         if not docker or not self._docker_tools_enabled():
-            return self._missing_dependency_result("semgrep_scan", "semgrep", "semgrep is not installed. Install semgrep or enable Docker-backed semgrep with OLLAMA_CODE_DOCKER_HOST=ssh://host.")
+            result = self._missing_dependency_result(
+                "semgrep_scan",
+                "semgrep",
+                "semgrep/opengrep is not installed. Install semgrep, install opengrep, or enable Docker-backed semgrep with OLLAMA_CODE_DOCKER_HOST=ssh://host.",
+            )
+            opengrep = resolve_dependency("opengrep")
+            if opengrep is not None:
+                opengrep_status = dependency_status(opengrep, workspace_root=self.workspace_root)
+                result["compatible_tool_ids"] = ["semgrep", "opengrep"]
+                result["compatible_install_hints"] = {
+                    "opengrep": opengrep_status["install_hints"],
+                }
+            return result
         container_target = f"/src/target{base.suffix}" if base.is_file() and base.suffix else "/src/target"
         create_command = [
             "create",
@@ -3331,6 +3574,8 @@ class ToolExecutor:
                     "status": post_status,
                 }
             )
+        self._python_tool_command_cache.clear()
+        self._which_cache.clear()
         ok = all(item.get("ok") for item in results)
         lines = [
             f"{item['dependency']}: {'ok' if item.get('ok') else 'failed'} command={item.get('command')}"
@@ -3348,6 +3593,10 @@ class ToolExecutor:
         if not clean_pattern:
             return {"ok": False, "tool": "ast_search", "summary": "ast_search requires a pattern."}
         clean_lang = (lang or self._semgrep_lang_for_path(base) or "").strip().lower()
+        if clean_lang == "python":
+            native_result = self._native_python_function_ast_search(pattern=clean_pattern, base=base, limit=limit)
+            if native_result is not None:
+                return native_result
         command = [executable, "--json", "-p", clean_pattern]
         if clean_lang:
             command.extend(["--lang", clean_lang])
@@ -3670,6 +3919,19 @@ class ToolExecutor:
             "count": ranked.get("count", 0),
             "suggested_next_tool": suggested,
             "test_files": test_files,
+            "ranked_paths": [
+                path
+                for path in ranked.get("ranked_paths", [])
+                if isinstance(path, str) and path.endswith(".py") and not self._path_looks_like_test(Path(path))
+            ],
+            "ranked_symbols": [
+                item
+                for item in ranked.get("ranked_symbols", [])
+                if isinstance(item, dict)
+                and isinstance(item.get("path"), str)
+                and str(item.get("path")).endswith(".py")
+                and not self._path_looks_like_test(Path(str(item.get("path"))))
+            ],
             "output": "\n".join(lines),
         }
 
@@ -10393,7 +10655,13 @@ import string
         candidate = Path(executable)
         if candidate.is_absolute():
             return candidate.exists()
-        return shutil.which(executable) is not None or (working_dir / executable).exists() or (self.workspace_root / executable).exists()
+        return self._which(executable) is not None or (working_dir / executable).exists() or (self.workspace_root / executable).exists()
+
+    def _which(self, executable: str) -> str | None:
+        key = str(executable)
+        if key not in self._which_cache:
+            self._which_cache[key] = shutil.which(key)
+        return self._which_cache[key]
 
     def _python_module_command(self, module: str, *args: str) -> list[str] | None:
         if importlib.util.find_spec(module) is None:
@@ -10401,15 +10669,25 @@ import string
         return [sys.executable, "-m", module, *args]
 
     def _python_tool_command(self, executable: str, module: str, *args: str) -> list[str] | None:
+        key = (str(executable), str(module), tuple(str(arg) for arg in args))
+        if key in self._python_tool_command_cache:
+            cached = self._python_tool_command_cache[key]
+            return list(cached) if cached is not None else None
         dependency = resolve_dependency(executable) or resolve_dependency(module)
         if dependency is not None:
             resolved_tool = resolve_tool_executable(dependency.id, executable, workspace_root=self.workspace_root)
             if resolved_tool:
-                return [resolved_tool, *args]
-        resolved = shutil.which(executable)
+                command = [resolved_tool, *args]
+                self._python_tool_command_cache[key] = list(command)
+                return command
+        resolved = self._which(executable)
         if resolved:
-            return [resolved, *args]
-        return self._python_module_command(module, *args)
+            command = [resolved, *args]
+            self._python_tool_command_cache[key] = list(command)
+            return command
+        command = self._python_module_command(module, *args)
+        self._python_tool_command_cache[key] = list(command) if command is not None else None
+        return command
 
     def _read_toml(self, path: Path) -> dict[str, Any]:
         if not path.exists():
@@ -10451,7 +10729,7 @@ import string
         validators: list[dict[str, Any]] = []
 
         def add(kind: str, lang: str, command: str, reason: str) -> None:
-            validators.append({"kind": kind, "lang": lang, "command": command, "available": self._available_command(command, cwd=root), "reason": reason})
+            validators.append({"kind": kind, "lang": lang, "command": command, "reason": reason})
 
         def python_tool_command_text(executable: str, module: str, *args: str) -> str:
             command = self._python_tool_command(executable, module, *args)
@@ -10459,10 +10737,36 @@ import string
 
         pyproject = self._read_toml(root / "pyproject.toml")
         repo_files = self._iter_repo_files(root, limit=50000)
-        suffixes = {file_path.suffix.lower() for file_path in repo_files}
-        file_names = [file_path.name.lower() for file_path in repo_files]
-        rel_paths = [self.relative_label(file_path).replace("\\", "/") for file_path in repo_files]
-        rel_paths_lower = [rel.lower() for rel in rel_paths]
+        suffixes: set[str] = set()
+        file_names: list[str] = []
+        workflow_file = ""
+        yaml_file = ""
+        shell_script = ""
+        dockerfile = ""
+        markdown_file = ""
+        sql_file = ""
+        schema_file = ""
+        for file_path in repo_files:
+            suffix = file_path.suffix.lower()
+            name = file_path.name.lower()
+            suffixes.add(suffix)
+            file_names.append(name)
+            if suffix in {".yml", ".yaml"} and (not yaml_file or not workflow_file):
+                rel = self.relative_label(file_path).replace("\\", "/")
+                if not yaml_file:
+                    yaml_file = rel
+                if rel.lower().startswith(".github/workflows/"):
+                    workflow_file = rel
+            if not shell_script and suffix in SHELL_SCRIPT_SUFFIXES:
+                shell_script = self.relative_label(file_path).replace("\\", "/")
+            if not dockerfile and (name == "dockerfile" or name.endswith(".dockerfile")):
+                dockerfile = self.relative_label(file_path).replace("\\", "/")
+            if not markdown_file and suffix in {".md", ".markdown"}:
+                markdown_file = self.relative_label(file_path).replace("\\", "/")
+            if not sql_file and suffix == ".sql":
+                sql_file = self.relative_label(file_path).replace("\\", "/")
+            if not schema_file and (name.endswith(".schema.json") or name.endswith(".jsonschema")):
+                schema_file = self.relative_label(file_path).replace("\\", "/")
         if (root / ".pre-commit-config.yaml").exists() or (root / ".pre-commit-config.yml").exists():
             add("validate", "repo", python_tool_command_text("pre-commit", "pre_commit", "run", "--all-files"), "pre-commit config found.")
         python_files = ".py" in suffixes
@@ -10494,7 +10798,7 @@ import string
                 (root / "ruff.toml").exists()
                 or (root / ".ruff.toml").exists()
                 or self._toml_tool_section(pyproject, "ruff")
-                or shutil.which("ruff")
+                or self._which("ruff")
             ):
                 add("lint", "python", "ruff check . --no-cache", "ruff config or executable found.")
             if (
@@ -10518,7 +10822,7 @@ import string
             coverage_command = self._python_tool_command("coverage", "coverage", "run", "-m", "pytest")
             if coverage_command:
                 add("coverage", "python", command_to_text(tuple(coverage_command)), "coverage.py module or executable found.")
-            if (python_tests or pytest_config) and shutil.which("pytest") and importlib.util.find_spec("testmon") is not None:
+            if (python_tests or pytest_config) and self._which("pytest") and importlib.util.find_spec("testmon") is not None:
                 add("test", "python", f"{sys.executable} -m pytest --testmon", "pytest-testmon is importable.")
             if (root / "tox.ini").exists() or self._toml_tool_section(pyproject, "tox"):
                 add("test", "python", python_tool_command_text("tox", "tox"), "tox config found.")
@@ -10566,7 +10870,7 @@ import string
         if (root / "Cargo.toml").exists() or ".rs" in suffixes:
             add("check", "rust", "cargo check", "Cargo project or Rust source files found.")
             add("test", "rust", "cargo test", "Cargo project or Rust source files found.")
-            if shutil.which("cargo-nextest"):
+            if self._which("cargo-nextest"):
                 add("test", "rust", "cargo nextest run", "Cargo project or Rust source files found and cargo-nextest is available.")
         gradlew = "gradlew.bat" if os.name == "nt" else "./gradlew"
         if (root / "build.gradle").exists() or (root / "settings.gradle").exists() or (root / gradlew).exists() or ".java" in suffixes:
@@ -10576,7 +10880,7 @@ import string
             if (root / "build").exists():
                 add("test", "cpp", "ctest --test-dir build --output-on-failure", "CMake build directory found.")
             add("setup", "cpp", "cmake -S . -B build", "CMake project detected; creates/updates build dir if run.")
-        if any(rel.startswith(".github/workflows/") and rel.endswith((".yml", ".yaml")) for rel in rel_paths_lower):
+        if workflow_file:
             add("lint", "github-actions", "actionlint", "GitHub Actions workflow files found.")
             add(
                 "schema",
@@ -10584,26 +10888,20 @@ import string
                 python_tool_command_text("check-jsonschema", "check_jsonschema", "--builtin-schema", "vendor.github-workflows", ".github/workflows"),
                 "GitHub Actions workflow files found.",
             )
-        yaml_file = next((rel for rel in rel_paths if rel.lower().endswith((".yml", ".yaml"))), None)
         if yaml_file:
             add("lint", "yaml", python_tool_command_text("yamllint", "yamllint", yaml_file), "YAML files found.")
-        shell_script = next((rel for rel, name in zip(rel_paths, file_names) if Path(name).suffix.lower() in SHELL_SCRIPT_SUFFIXES), None)
         if shell_script:
             add("syntax", "shell", command_to_text(("bash", "-n", shell_script)), "Shell scripts found; bash -n catches syntax errors cheaply.")
             add("lint", "shell", command_to_text(("shellcheck", shell_script)), "Shell scripts found.")
             add("format-check", "shell", command_to_text(("shfmt", "-d", shell_script)), "Shell scripts found.")
-        dockerfile = next((rel for rel, name in zip(rel_paths, file_names) if name == "dockerfile" or name.endswith(".dockerfile")), None)
         if dockerfile:
             add("lint", "dockerfile", f"hadolint {dockerfile}", "Dockerfile found.")
-        markdown_file = next((rel for rel in rel_paths if rel.lower().endswith((".md", ".markdown"))), None)
         if markdown_file:
             add("lint", "markdown", "markdownlint-cli2 \"**/*.md\"", "Markdown docs found.")
         if markdown_file or python_files:
             add("lint", "text", "codespell .", "Docs or Python files found.")
-        sql_file = next((rel for rel in rel_paths if rel.lower().endswith(".sql")), None)
         if sql_file:
             add("lint", "sql", "sqlfluff lint .", "SQL files found.")
-        schema_file = next((rel for rel in rel_paths if rel.lower().endswith((".schema.json", ".jsonschema"))), None)
         if schema_file:
             add("schema", "json", python_tool_command_text("check-jsonschema", "check_jsonschema", "--check-metaschema", schema_file), "JSON schema files found.")
         dependency_manifest_names = {
@@ -10624,9 +10922,11 @@ import string
                 add("security", "python", python_tool_command_text("pip-audit", "pip_audit"), "Python dependency manifest found.")
             add("security", "dependencies", "trivy fs --quiet .", "Dependency manifest or lockfile found.")
             add("security", "dependencies", "grype dir:.", "Dependency manifest or lockfile found.")
-        if ".toml" in suffixes and shutil.which("taplo"):
+        if ".toml" in suffixes and self._which("taplo"):
             add("config", "toml", "taplo check .", "TOML files and taplo executable found.")
-        selected = validators[: max(1, int(limit))]
+        selected = [dict(item) for item in validators[: max(1, int(limit))]]
+        for item in selected:
+            item["available"] = self._available_command(str(item.get("command") or ""), cwd=root)
         lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
         return {
             "ok": True,
@@ -10700,6 +11000,8 @@ import string
         seen_shell_targets: set[str] = set()
         validator_commands: list[str] = []
         validator_targets: list[str] = []
+        typechecker_targets: list[str] = []
+        typechecker_skipped_reason = ""
         phase_timings_ms = {"scan_ms": 0.0, "ruff_ms": 0.0, "typecheck_ms": 0.0, "shell_ms": 0.0}
         active_phase = "scan_ms"
         active_phase_started = time.perf_counter()
@@ -10722,7 +11024,7 @@ import string
                         if rel not in seen_shell_targets:
                             shell_targets.append(rel)
                             seen_shell_targets.add(rel)
-                    elif file_path.suffix.lower() in {".js", ".jsx"} and shutil.which("node"):
+                    elif file_path.suffix.lower() in {".js", ".jsx"} and self._which("node"):
                         completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
                         if completed.returncode != 0:
                             diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=500))
@@ -10738,7 +11040,42 @@ import string
                 requested_scopes=python_validator_scopes,
                 limit=100,
             )
-            if validator_targets and shutil.which("ruff"):
+            typechecker_targets = self._python_typechecker_targets(
+                discovered_files=python_validator_files,
+                requested_scopes=python_validator_scopes,
+                limit=100,
+            )
+            typechecker_configured = self._python_typechecker_configured()
+            if typechecker_targets and not typechecker_configured and "." not in self._collapse_validation_targets(python_validator_scopes, limit=100):
+                typechecker_targets = []
+                typechecker_skipped_reason = "No pyright/basedpyright config found for focused scope; skipped cold typechecker startup."
+            ruff_path = self._which("ruff") if validator_targets else None
+            typechecker_command = (
+                self._python_tool_command("basedpyright", "basedpyright", "--level", "error")
+                or self._python_tool_command("pyright", "pyright", "--level", "error")
+                if typechecker_targets
+                else None
+            )
+            bash = self._which("bash") if shell_targets else None
+            cache_key = self._lint_typecheck_cache_key(
+                checked=checked,
+                validator_targets=validator_targets,
+                typechecker_targets=typechecker_targets,
+                shell_targets=shell_targets,
+                ruff_path=ruff_path,
+                typechecker_command=typechecker_command,
+                bash_path=bash,
+            )
+            cached = self._lint_typecheck_cache.get(cache_key)
+            if cached is not None:
+                result = deepcopy(cached)
+                result["cache_hit"] = True
+                result["scan_ms"] = phase_timings_ms["scan_ms"]
+                result["ruff_ms"] = 0.0
+                result["typecheck_ms"] = 0.0
+                result["shell_ms"] = 0.0
+                return result
+            if validator_targets and ruff_path:
                 target_args = validator_targets
                 command = ["ruff", "check", "--no-cache", *target_args]
                 validator_commands.append(command_to_text(tuple(command)))
@@ -10748,9 +11085,8 @@ import string
                 phase_timings_ms["ruff_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
                 if completed.returncode != 0:
                     diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
-            typechecker_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error") or self._python_tool_command("pyright", "pyright", "--level", "error")
-            if validator_targets and typechecker_command:
-                target_args = validator_targets
+            if typechecker_targets and typechecker_command:
+                target_args = typechecker_targets
                 command = [*typechecker_command, *target_args]
                 validator_commands.append(command_to_text(tuple(command)))
                 active_phase = "typecheck_ms"
@@ -10759,7 +11095,6 @@ import string
                 phase_timings_ms["typecheck_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
                 if completed.returncode != 0:
                     diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
-            bash = shutil.which("bash")
             if bash:
                 for rel in shell_targets[:100]:
                     command = [bash, "-n", rel]
@@ -10792,6 +11127,8 @@ import string
                 "diagnostics": [*diagnostics, timeout_details],
                 "validator_commands": validator_commands,
                 "validator_targets": validator_targets,
+                "typechecker_targets": typechecker_targets,
+                "typechecker_skipped_reason": typechecker_skipped_reason,
                 **phase_timings_ms,
                 "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
                 "summary": timeout_summary,
@@ -10799,16 +11136,21 @@ import string
                 "timed_out": True,
                 "command": timeout_command,
             }
-        return {
+        result = {
             "ok": not diagnostics,
             "tool": "lint_typecheck",
             "checked": checked,
             "diagnostics": diagnostics,
             "validator_commands": validator_commands,
             "validator_targets": validator_targets,
+            "typechecker_targets": typechecker_targets,
+            "typechecker_skipped_reason": typechecker_skipped_reason,
             **phase_timings_ms,
             "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} code file(s)",
         }
+        if "cache_key" in locals():
+            self._lint_typecheck_cache[cache_key] = deepcopy(result)
+        return result
 
     def _test_module_for_path(self, test_path: Path) -> str:
         rel = self.relative_label(test_path)
@@ -13309,7 +13651,10 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         argv, validation = self._validate_common_command(command, working_dir)
         if validation.get("valid") is False:
             reason = str(validation.get("reason") or "invalid command")
-            error_class = "command_not_found" if "executable not found" in reason else "invalid_args"
+            if "bash -n rejected command syntax" in reason or "invalid quoting" in reason:
+                error_class = "syntax_error"
+            else:
+                error_class = "command_not_found" if "executable not found" in reason else "invalid_args"
             return {
                 "ok": False,
                 "tool": "run_shell",
@@ -13411,7 +13756,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             )
         )
         recovery_validators = None
-        if selected_from_default and result.get("ok") is not True and self._run_test_needs_command_recovery(result):
+        if selected_from_default and result.get("ok") is not True and self._run_test_needs_command_recovery(result, selected_command=selected_command):
             recovery_validators = self.discover_validators(cwd)
             fallback_command = self._preferred_test_validator_command(
                 recovery_validators,
@@ -13447,13 +13792,19 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
             result["summary"] = normalized if result.get("ok") else f"{normalized}. {result.get('output', '')[:180]}"
         return result
 
-    def _run_test_needs_command_recovery(self, result: dict[str, Any]) -> bool:
+    def _run_test_needs_command_recovery(self, result: dict[str, Any], *, selected_command: str = "") -> bool:
         validation = result.get("validation")
         if isinstance(validation, dict) and validation.get("valid") is False:
             return True
         error_class = str(result.get("error_class") or "").strip().lower()
-        if error_class in {"command_not_found", "invalid_args", "missing_dependency", "path_missing", "cwd_missing"}:
+        if error_class in {"command_not_found", "invalid_args", "path_missing", "cwd_missing"}:
             return True
+        if error_class == "missing_dependency":
+            missing = str(result.get("missing_dependency") or self._missing_dependency_name(str(result.get("output") or result.get("summary") or "")) or "").strip()
+            command_text = str(selected_command or result.get("command") or "").lower()
+            if missing and re.search(rf"(?:^|\b|-m\s+){re.escape(missing.lower())}(?:\b|$)", command_text):
+                return True
+            return missing in {"pytest", "unittest", "testmon"} and missing in command_text
         output = str(result.get("output") or result.get("summary") or "").lower()
         return any(
             marker in output

@@ -30,6 +30,8 @@ Command = list[str] | str
 FEATURE_PROFILES = ("baseline", "schema", "context-pack", "evidence-handles", "num-predict-caps", "structured-edits", "trajectory-guards", "contract-guards", "all")
 BENCHMARK_CLASSES = ("agent", "controller")
 UNKNOWN_BENCHMARK_CLASS = "unknown"
+TRANSIENT_OLLAMA_TIMEOUT_MARKER = "error: Ollama timed out after "
+MAX_TRANSIENT_OLLAMA_TIMEOUT_RETRIES = 1
 FAIL_CLOSED_MESSAGES = {
     "Stopped because grounded final verification could not accept a final answer.",
     "Stopped because assumption audit could not approve a next tool step.",
@@ -1216,7 +1218,14 @@ def default_benchmark_jobs() -> int:
     return 8
 
 
-def evaluate_case(
+def _outcome_is_transient_ollama_timeout(outcome: dict[str, Any]) -> bool:
+    if str(outcome.get("status") or "") != "fail":
+        return False
+    stderr_tail = str(outcome.get("stderr_tail") or "")
+    return TRANSIENT_OLLAMA_TIMEOUT_MARKER in stderr_tail
+
+
+def _evaluate_case_once(
     repo_root: Path,
     model: str,
     verifier_model: str | None,
@@ -1377,6 +1386,39 @@ def evaluate_case(
             "stderr_tail": ctx.stderr[-1200:],
         }
         return outcome
+
+
+def evaluate_case(
+    repo_root: Path,
+    model: str,
+    verifier_model: str | None,
+    mode: str,
+    case: BenchmarkCase,
+    timeout: int,
+    reconcile: str = "auto",
+    feature_profile: str = "baseline",
+) -> dict[str, Any]:
+    benchmark_class = benchmark_class_for_case(case)
+    retries_used = 0
+    total_attempts = 1 + (MAX_TRANSIENT_OLLAMA_TIMEOUT_RETRIES if benchmark_class == "agent" else 0)
+    for attempt in range(total_attempts):
+        outcome = _evaluate_case_once(
+            repo_root,
+            model,
+            verifier_model,
+            mode,
+            case,
+            timeout,
+            reconcile=reconcile,
+            feature_profile=feature_profile,
+        )
+        if attempt < total_attempts - 1 and _outcome_is_transient_ollama_timeout(outcome):
+            retries_used += 1
+            continue
+        if retries_used:
+            outcome["transient_ollama_retries"] = retries_used
+        return outcome
+    raise AssertionError("benchmark evaluation exhausted without returning an outcome")
 
 
 def evaluate_case_batch(
@@ -1787,7 +1829,8 @@ def main(argv: list[str] | None = None) -> int:
             if primary is not None and verifier is not None:
                 matrix.append((primary, verifier, ["on"]))
         if not matrix:
-            raise SystemExit("No requested models are installed.")
+            print("No requested models are installed.")
+            return 1
         results = []
         for model, verifier_model, modes in matrix:
             _LOADED_MODELS.add(model)

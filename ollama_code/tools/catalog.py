@@ -26,13 +26,18 @@ TOOL_DESCRIPTIONS = [
     },
     {
         "name": "search",
-        "arguments": {"query": "regex or plain text", "path": "relative path, default .", "limit": "int, default 100"},
-        "description": "Search text in the workspace.",
+        "arguments": {"query": "regex or plain text", "path": "relative path, default .", "limit": "int, default 100", "file_glob": "optional filename glob such as *.py"},
+        "description": "Search text in the workspace, optionally constrained to a filename glob.",
     },
     {
         "name": "file_search",
         "arguments": {"query": "filename/path terms", "path": "relative path, default .", "limit": "int, default 100"},
         "description": "Search cached workspace file paths quickly without reading file contents.",
+    },
+    {
+        "name": "directory_search",
+        "arguments": {"query": "directory name glob", "path": "relative path, default .", "limit": "int, default 100"},
+        "description": "Search workspace directory names without reading file contents.",
     },
     {
         "name": "fd_search",
@@ -375,6 +380,7 @@ TOOL_GROUPS = [
             "read_file",
             "search",
             "file_search",
+            "directory_search",
             "fd_search",
             "file_index_refresh",
             "everything_search",
@@ -490,6 +496,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None, *, grouped
         "read_file": "read_file(path,start=1,end=200)",
         "search": "search(query,path='.',limit=100)",
         "file_search": "file_search(query,path='.',limit=100)",
+        "directory_search": "directory_search(query,path='.',limit=100)",
         "fd_search": "fd_search(query,path='.',limit=100,kind='any')",
         "file_index_refresh": "file_index_refresh(path='.',limit=50000)",
         "everything_search": "everything_search(query,path='.',limit=100)",

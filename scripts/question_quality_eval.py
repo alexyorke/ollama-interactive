@@ -55,15 +55,22 @@ def _normalize_text(text: str) -> str:
 def match_answer_to_choices(answer: str, choices: list[str]) -> list[str]:
     normalized_answer = _normalize_text(answer)
     answer_tokens = {token for token in normalized_answer.split() if token}
-    matches: list[str] = []
+    exact_matches: list[str] = []
+    normalized_choices: list[tuple[str, set[str], str]] = []
     for choice in choices:
         normalized_choice = _normalize_text(choice)
         choice_tokens = {token for token in normalized_choice.split() if token}
         if not normalized_choice or not choice_tokens:
             continue
+        normalized_choices.append((choice, choice_tokens, normalized_choice))
+        if normalized_answer == normalized_choice:
+            exact_matches.append(choice)
+    if exact_matches:
+        return exact_matches
+    matches: list[str] = []
+    for choice, choice_tokens, normalized_choice in normalized_choices:
         if (
-            normalized_answer == normalized_choice
-            or normalized_answer in normalized_choice
+            normalized_answer in normalized_choice
             or normalized_choice in normalized_answer
             or choice_tokens.issubset(answer_tokens)
         ):
@@ -281,20 +288,47 @@ def format_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
-def main(argv: list[str] | None = None) -> int:
+def _resolve_output_paths(
+    *,
+    output: Path | None,
+    output_json: Path | None,
+    output_md: Path | None,
+) -> tuple[Path, Path]:
+    if output is None:
+        return output_json or DEFAULT_JSON_OUTPUT, output_md or DEFAULT_MARKDOWN_OUTPUT
+    suffix = output.suffix.lower()
+    if suffix == ".json":
+        return output_json or output, output_md or output.with_suffix(".md")
+    if suffix == ".md":
+        return output_json or output.with_suffix(".json"), output_md or output
+    return output_json or output.with_suffix(".json"), output_md or output.with_suffix(".md")
+
+
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate clarification question quality for EBA-style prompts using synthetic cases.")
-    parser.add_argument("--output-json", type=Path, default=DEFAULT_JSON_OUTPUT)
-    parser.add_argument("--output-md", type=Path, default=DEFAULT_MARKDOWN_OUTPUT)
+    parser.add_argument("--output", type=Path, default=None, help="Base output path or explicit .json/.md path; writes both JSON and Markdown siblings.")
+    parser.add_argument("--output-json", type=Path, default=None)
+    parser.add_argument("--output-md", type=Path, default=None)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = _build_parser()
     args = parser.parse_args(argv)
+    output_json, output_md = _resolve_output_paths(
+        output=args.output,
+        output_json=args.output_json,
+        output_md=args.output_md,
+    )
 
     payload = evaluate_cases()
-    args.output_json.parent.mkdir(parents=True, exist_ok=True)
-    args.output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    output_json.parent.mkdir(parents=True, exist_ok=True)
+    output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     markdown = format_markdown(payload)
-    args.output_md.parent.mkdir(parents=True, exist_ok=True)
-    args.output_md.write_text(markdown, encoding="utf-8")
-    print(f"Wrote JSON: {args.output_json}")
-    print(f"Wrote Markdown: {args.output_md}")
+    output_md.parent.mkdir(parents=True, exist_ok=True)
+    output_md.write_text(markdown, encoding="utf-8")
+    print(f"Wrote JSON: {output_json}")
+    print(f"Wrote Markdown: {output_md}")
     print(
         f"clarification-question-eval: cases={payload['summary']['cases']} passed={payload['summary']['passed']} failed={payload['summary']['failed']}"
     )

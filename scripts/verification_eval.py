@@ -37,13 +37,19 @@ atexit.register(_cleanup_loaded_models)
 
 def resolve_requested_models(requested: list[str], available: set[str]) -> list[str]:
     resolved: list[str] = []
+    seen: set[str] = set()
     for model in requested:
+        candidate: str | None = None
         if model in available:
-            resolved.append(model)
+            candidate = model
+        else:
+            latest = f"{model}:latest"
+            if latest in available:
+                candidate = latest
+        if candidate is None or candidate in seen:
             continue
-        latest = f"{model}:latest"
-        if latest in available:
-            resolved.append(latest)
+        resolved.append(candidate)
+        seen.add(candidate)
     return resolved
 
 

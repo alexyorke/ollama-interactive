@@ -28,6 +28,7 @@ class Backend:
     scheme: str
     host: str
     port: int
+    path_prefix: str = ""
     inflight: int = 0
 
 
@@ -46,12 +47,15 @@ class BackendPool:
                 raise ValueError(f"Unsupported backend scheme: {raw}")
             if not parts.hostname or parts.port is None:
                 raise ValueError(f"Backend must include host and port: {raw}")
+            path_prefix = (parts.path or "").rstrip("/")
+            base_url = f"{parts.scheme}://{parts.hostname}:{parts.port}{path_prefix}"
             backends.append(
                 Backend(
-                    base_url=f"{parts.scheme}://{parts.hostname}:{parts.port}",
+                    base_url=base_url,
                     scheme=parts.scheme,
                     host=parts.hostname,
                     port=parts.port,
+                    path_prefix=path_prefix,
                 )
             )
         if not backends:
@@ -102,8 +106,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if key.lower() not in HOP_BY_HOP_HEADERS and key.lower() != "host"
         }
         connection = connection_cls(backend.host, backend.port, timeout=900)
+        upstream_path = self.path
+        if backend.path_prefix:
+            upstream_path = f"{backend.path_prefix}{self.path}" if self.path.startswith("/") else f"{backend.path_prefix}/{self.path}"
         try:
-            connection.request(self.command, self.path, body=body, headers=upstream_headers)
+            connection.request(self.command, upstream_path, body=body, headers=upstream_headers)
             response = connection.getresponse()
             self.send_response(response.status, response.reason)
             for key, value in response.getheaders():
@@ -121,7 +128,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             connection.close()
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Least-connections proxy for multiple Ollama backends.")
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, default=11437)
@@ -131,11 +138,11 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Backend base URLs, for example http://127.0.0.1:11435 http://127.0.0.1:11436",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
     ProxyHandler.pool = BackendPool.from_urls(args.backends)
     server = ThreadingHTTPServer((args.listen_host, args.listen_port), ProxyHandler)
     print(
