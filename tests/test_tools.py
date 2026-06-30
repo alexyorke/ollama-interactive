@@ -1992,8 +1992,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["examples"][0]["test_name"], "test_add")
 
     def test_test_spec_extract_resolves_local_expected_values_and_messages(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "transpose.py").write_text("def transpose(text):\n    pass\n", encoding="utf-8")
             (root / "transpose_test.py").write_text(
                 "import unittest\nfrom transpose import transpose\n\n"
@@ -2008,7 +2007,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertEqual(err.exception.args[0], 'invalid input')\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.test_spec_extract("transpose_test.py", source_path="transpose.py", limit=10)
 
         self.assertTrue(result["ok"], result)
@@ -2017,8 +2015,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("transpose('bad') raises ValueError('invalid input')", output)
 
     def test_test_spec_extract_captures_stateful_object_scenarios(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "grade_school.py").write_text(
                 "class School:\n"
                 "    def add_student(self, name, grade):\n"
@@ -2037,15 +2034,13 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertEqual(school.roster(), expected)\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.test_spec_extract("grade_school_test.py", source_path="grade_school.py", limit=10)
 
         self.assertTrue(result["ok"], result)
         self.assertIn("school = School(); school.add_student(name='Aimee', grade=2); school.roster() -> ['Aimee']", result["output"])
 
     def test_test_spec_extract_captures_assert_true_and_false_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "retry.py").write_text("def should_retry(status_code, attempt):\n    pass\n", encoding="utf-8")
             (root / "retry_test.py").write_text(
                 "import unittest\nfrom retry import should_retry\n\n"
@@ -2056,7 +2051,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertFalse(should_retry(404, 0))\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.test_spec_extract("retry_test.py", source_path="retry.py", limit=10)
 
         self.assertTrue(result["ok"], result)
@@ -2064,8 +2058,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("should_retry(404, 0) -> False", result["output"])
 
     def test_test_spec_extract_keeps_constructor_attribute_and_receiver_context(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "phone_number.py").write_text("class PhoneNumber:\n    def __init__(self, number):\n        pass\n", encoding="utf-8")
             (root / "phone_number_test.py").write_text(
                 "import unittest\nfrom phone_number import PhoneNumber\n\n"
@@ -2097,7 +2090,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertEqual(Scale('C').interval('MMmMMMm'), expected)\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             phone = tools.test_spec_extract("phone_number_test.py", source_path="phone_number.py", limit=10)
             scale = tools.test_spec_extract("scale_generator_test.py", source_path="scale_generator.py", limit=10)
 
@@ -2109,8 +2101,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Scale('C').interval('MMmMMMm') -> ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C']", scale["output"])
 
     def test_test_spec_extract_preserves_nested_receiver_and_repeated_mutation_history(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "simple_linked_list.py").write_text(
                 "class LinkedList:\n"
                 "    def __init__(self, values=None):\n"
@@ -2142,7 +2133,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertIsNone(sut.head().next())\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.test_spec_extract("simple_linked_list_test.py", source_path="simple_linked_list.py", limit=10)
 
         self.assertTrue(result["ok"], result)
@@ -2156,8 +2146,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("sut = LinkedList([1]); sut.head().next() -> None", result["output"])
 
     def test_test_spec_extract_captures_regex_not_equal_and_reset_history(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "robot_name.py").write_text(
                 "class Robot:\n"
                 "    def __init__(self):\n"
@@ -2185,7 +2174,6 @@ class ToolExecutorTests(unittest.TestCase):
                 "        self.assertRegex(name2, self.name_re)\n",
                 encoding="utf-8",
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.test_spec_extract("robot_name_test.py", source_path="robot_name.py", limit=20)
 
         self.assertTrue(result["ok"], result)
