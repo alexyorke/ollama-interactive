@@ -904,11 +904,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("second_name", second["output"])
 
     def test_repo_index_search_invalidates_same_size_changed_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             target = root / "ops.py"
             target.write_text("def first_name():\n    return 'old'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             first = tools.repo_index_search("first_name")
             target.write_text("def third_name():\n    return 'new'\n", encoding="utf-8")
             second = tools.repo_index_search("third_name")
@@ -919,11 +917,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("third_name", second["output"])
 
     def test_indexed_search_uses_cached_lines_and_invalidates_changed_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             target = root / "ops.py"
             target.write_text("def first_name():\n    return 'alpha needle'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             first = tools.indexed_search("alpha needle")
             target.write_text("def second_name():\n    return 'beta needle'\n", encoding="utf-8")
             second = tools.indexed_search("beta needle")
@@ -935,13 +931,11 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("beta needle", second["output"])
 
     def test_file_search_uses_cached_paths_and_invalidates_changed_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             first_path = root / "src" / "alpha_report.txt"
             second_path = root / "src" / "beta_report.txt"
             first_path.write_text("one", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             first = tools.file_search("alpha report")
             first_path.unlink()
             second_path.write_text("two", encoding="utf-8")
@@ -954,10 +948,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("alpha_report", second["output"])
 
     def test_file_index_refresh_writes_file_path_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "README.md").write_text("hello", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.file_index_refresh()
             payload = json.loads((root / ".ollama-code" / "index" / "file_index.json").read_text(encoding="utf-8"))
 
@@ -966,8 +958,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("README.md", payload["files"])
 
     def test_file_search_respects_path_scope_and_skips_generated_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             (root / "docs").mkdir()
             (root / "node_modules").mkdir()
@@ -976,7 +967,6 @@ class ToolExecutorTests(unittest.TestCase):
             (root / "docs" / "target_config.md").write_text("x\n", encoding="utf-8")
             (root / "node_modules" / "target_config.js").write_text("x\n", encoding="utf-8")
             (root / ".ollama-code" / "index" / "target_config.json").write_text("{}", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             src_result = tools.file_search("target config", path="src")
             root_result = tools.file_search("target config")
 
@@ -988,8 +978,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn(".ollama-code", root_result["output"])
 
     def test_broad_repo_tools_skip_generated_and_ignored_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             (root / "scratch").mkdir()
             (root / "verify_scratch").mkdir()
@@ -999,7 +988,6 @@ class ToolExecutorTests(unittest.TestCase):
             (root / "src" / "app.py").write_text("def live_target():\n    return 'ok'\n", encoding="utf-8")
             for directory in ["scratch", "verify_scratch", "ollama-code-bench-deadbeef", "probe-123", "tmpabc123"]:
                 (root / directory / "ignored_target.py").write_text("def ignored_target():\n    return 'skip'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             real_which = shutil.which
 
             with patch("ollama_code.tools.shutil.which", side_effect=lambda name: None if name == "rg" else real_which(name)):
@@ -1023,35 +1011,29 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("live_target", live_result["output"])
 
     def test_file_search_prefers_exact_filename_match(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "alpha").mkdir()
             (root / "alpha" / "notes.py").write_text("x = 1\n", encoding="utf-8")
             (root / "alpha_notes.py").write_text("x = 2\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.file_search("alpha_notes.py", limit=2)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"].splitlines()[0], "alpha_notes.py")
 
     def test_directory_search_matches_directory_name_globs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "tests" / "mysql_backend").mkdir(parents=True)
             (root / "tests" / "postgres_backend").mkdir(parents=True)
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.directory_search("*mysql*", path="tests")
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "tests/mysql_backend/")
 
     def test_directory_search_skips_hidden_and_generated_dirs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src" / "target_cache").mkdir(parents=True)
             (root / ".hidden_target").mkdir()
             (root / "scratch" / "target_cache").mkdir(parents=True)
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.directory_search("*target*")
 
         self.assertTrue(result["ok"])
@@ -1060,9 +1042,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("scratch", result["output"])
 
     def test_everything_search_reports_missing_cli(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch.object(tools, "_everything_cli_path", return_value=None):
                 result = tools.everything_search("README")
 
@@ -1070,14 +1050,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("es.exe", result["summary"])
 
     def test_everything_search_runs_cli_and_filters_to_workspace(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             inside = root / "README.md"
-            outside = Path(tmp).parent / f"outside-{uuid4().hex}.txt"
+            outside = root.parent / f"outside-{uuid4().hex}.txt"
             inside.write_text("hello", encoding="utf-8")
             outside.write_text("skip", encoding="utf-8")
             self.addCleanup(lambda: outside.unlink(missing_ok=True))
-            tools = ToolExecutor(root, approval_mode="auto")
             completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=f"{inside}\n{outside}\n", stderr="")
             with patch.object(tools, "_everything_cli_path", return_value="es.exe"):
                 with patch.object(tools, "_run_process", return_value=completed) as run_process:
@@ -1091,12 +1069,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(run_process.call_args.kwargs["shell"])
 
     def test_everything_search_uses_configured_cli_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             fake_cli = root / "tools" / "es.exe"
             fake_cli.parent.mkdir()
             fake_cli.write_text("", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch.dict("os.environ", {"EVERYTHING_CLI": str(fake_cli)}):
                 with patch("ollama_code.tools.shutil.which", return_value=None):
                     discovered = tools._everything_cli_path()
@@ -1104,15 +1080,13 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(discovered, str(fake_cli))
 
     def test_everything_search_filters_to_requested_subdirectory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "src").mkdir()
             (root / "docs").mkdir()
             inside = root / "src" / "target.py"
             outside = root / "docs" / "target.py"
             inside.write_text("x\n", encoding="utf-8")
             outside.write_text("x\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=f"{inside}\n{outside}\n", stderr="")
             with patch.object(tools, "_everything_cli_path", return_value="es.exe"):
                 with patch.object(tools, "_run_process", return_value=completed):
@@ -1122,10 +1096,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["output"], "src/target.py")
 
     def test_repo_index_refresh_writes_line_index_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.repo_index_refresh()
             payload = json.loads((root / ".ollama-code" / "index" / "repo_index.json").read_text(encoding="utf-8"))
 
@@ -1134,10 +1106,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("line_index", payload["files"]["ops.py"])
 
     def test_semgrep_scan_reports_missing_semgrep(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch("ollama_code.tools.resolve_tool_executable", return_value=None):
                 with patch("ollama_code.tools.shutil.which", return_value=None):
                     result = tools.semgrep_scan("eval(...)")
@@ -1148,10 +1118,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["compatible_install_hints"]["opengrep"])
 
     def test_semgrep_scan_rejects_unsupported_language_before_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch("ollama_code.tools.shutil.which", return_value="semgrep"):
                 with patch.object(tools, "_run_process") as run_process:
                     result = tools.semgrep_scan("eval(...)", lang="madeuplang")
@@ -1161,10 +1129,8 @@ class ToolExecutorTests(unittest.TestCase):
         run_process.assert_not_called()
 
     def test_semgrep_scan_runs_structural_search_and_compacts_results(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             payload = {
                 "results": [
                     {
@@ -1187,10 +1153,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertFalse(run_process.call_args.kwargs["shell"])
 
     def test_semgrep_scan_uses_opengrep_when_semgrep_is_missing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("eval('1')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             payload = {
                 "results": [
                     {
