@@ -35,6 +35,7 @@ from uuid import uuid4
 from ollama_code.interrupts import OperationInterrupted
 from ollama_code.tool_dependencies import (
     TOOL_DEPENDENCIES,
+    clear_dependency_status_cache,
     command_to_text,
     configured_docker_host,
     current_platform,
@@ -3576,6 +3577,7 @@ class ToolExecutor:
             )
         self._python_tool_command_cache.clear()
         self._which_cache.clear()
+        clear_dependency_status_cache()
         ok = all(item.get("ok") for item in results)
         lines = [
             f"{item['dependency']}: {'ok' if item.get('ok') else 'failed'} command={item.get('command')}"

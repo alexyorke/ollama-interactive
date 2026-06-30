@@ -6,7 +6,8 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from ollama_code.tool_dependencies import configured_docker_host, configured_docker_host_setting, dependency_status, docker_host_kind, resolve_dependency
+from ollama_code import tool_dependencies
+from ollama_code.tool_dependencies import clear_dependency_status_cache, configured_docker_host, configured_docker_host_setting, dependency_status, dependency_statuses, docker_host_kind, resolve_dependency
 from ollama_code.tools import ToolExecutor
 
 
@@ -176,6 +177,52 @@ class ToolDependencyTests(unittest.TestCase):
 
         self.assertTrue(status["installed"])
         self.assertEqual(status["found_isolated_executables"], ["semgrep"])
+
+    def test_dependency_statuses_cache_reuses_scan_and_returns_fresh_copies(self) -> None:
+        dependency = resolve_dependency("ruff")
+        self.assertIsNotNone(dependency)
+
+        calls = 0
+
+        def fake_status(_dependency: object, platform_name: str | None = None, *, workspace_root: str | Path | None = None) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {
+                "id": "ruff",
+                "display_name": "Ruff",
+                "category": "python-validation",
+                "purpose": "lint",
+                "recommended": True,
+                "optional": True,
+                "supported": True,
+                "platform": "test",
+                "installed": True,
+                "install_mode": "host",
+                "found_executables": ["ruff"],
+                "found_isolated_executables": [],
+                "found_modules": [],
+                "missing_executables": [],
+                "missing_modules": [],
+                "install_hints": [],
+                "verify_command": "ruff --version",
+                "verify_argv": ["ruff", "--version"],
+                "notes": "",
+            }
+
+        clear_dependency_status_cache()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch.object(tool_dependencies, "TOOL_DEPENDENCIES", (dependency,)):
+                with patch.object(tool_dependencies, "dependency_status", side_effect=fake_status):
+                    first = dependency_statuses(workspace_root=root)
+                    first[0]["installed"] = False
+                    second = dependency_statuses(workspace_root=root)
+                    clear_dependency_status_cache()
+                    third = dependency_statuses(workspace_root=root)
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(second[0]["installed"])
+        self.assertTrue(third[0]["installed"])
 
     def test_tool_install_denies_read_only_even_when_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import importlib.util
 import os
 import platform
@@ -12,6 +13,7 @@ import sysconfig
 from urllib.parse import urlparse
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 
@@ -1149,7 +1151,18 @@ def dependency_statuses(
     missing_only: bool = False,
     workspace_root: str | Path | None = None,
 ) -> list[dict[str, object]]:
+    workspace_key = str(Path(workspace_root).resolve(strict=False)) if workspace_root is not None else ""
+    return deepcopy(list(_dependency_statuses_cached(recommended_only, missing_only, workspace_key)))
+
+
+@lru_cache(maxsize=32)
+def _dependency_statuses_cached(
+    recommended_only: bool,
+    missing_only: bool,
+    workspace_key: str,
+) -> tuple[dict[str, object], ...]:
     rows: list[dict[str, object]] = []
+    workspace_root = Path(workspace_key) if workspace_key else None
     for dependency in TOOL_DEPENDENCIES:
         if recommended_only and not dependency.recommended:
             continue
@@ -1157,7 +1170,11 @@ def dependency_statuses(
         if missing_only and status["installed"]:
             continue
         rows.append(status)
-    return rows
+    return tuple(rows)
+
+
+def clear_dependency_status_cache() -> None:
+    _dependency_statuses_cached.cache_clear()
 
 
 def first_install_hint(dependency: ToolDependency, platform_name: str | None = None) -> InstallHint | None:
