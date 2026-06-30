@@ -2505,42 +2505,40 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_sequence_utilities_candidate_from_standard_signatures(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "seq.py").write_text(
-                "def append(left, right):\n    pass\n\n"
-                "def concat(groups):\n    pass\n\n"
-                "def filter(function, values):\n    pass\n\n"
-                "def length(values):\n    pass\n\n"
-                "def map(function, values):\n    pass\n\n"
-                "def foldl(function, values, initial):\n    pass\n\n"
-                "def foldr(function, values, initial):\n    pass\n\n"
-                "def reverse(values):\n    pass\n",
-                encoding="utf-8",
-            )
-            (root / "seq_test.py").write_text(
-                "import unittest\nfrom seq import append, concat, filter, foldl, foldr, length, map, reverse\n\n"
-                "class SequenceTest(unittest.TestCase):\n"
-                "    def test_append(self):\n"
-                "        self.assertEqual(append([1], [2]), [1, 2])\n"
-                "    def test_concat(self):\n"
-                "        self.assertEqual(concat([[1], [2, 3]]), [1, 2, 3])\n"
-                "    def test_filter(self):\n"
-                "        self.assertEqual(filter(lambda item: item % 2 == 1, [1, 2, 3]), [1, 3])\n"
-                "    def test_length(self):\n"
-                "        self.assertEqual(length(['a', 'b']), 2)\n"
-                "    def test_map(self):\n"
-                "        self.assertEqual(map(lambda item: item + 1, [1, 2]), [2, 3])\n"
-                "    def test_foldl(self):\n"
-                "        self.assertEqual(foldl(lambda acc, item: acc - item, [1, 2], 10), 7)\n"
-                "    def test_foldr(self):\n"
-                "        self.assertEqual(foldr(lambda acc, item: item + acc, ['e', 'x'], '!'), 'ex!')\n"
-                "    def test_reverse(self):\n"
-                "        self.assertEqual(reverse([1, 2, 3]), [3, 2, 1])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "seq.py": (
+                    "def append(left, right):\n    pass\n\n"
+                    "def concat(groups):\n    pass\n\n"
+                    "def filter(function, values):\n    pass\n\n"
+                    "def length(values):\n    pass\n\n"
+                    "def map(function, values):\n    pass\n\n"
+                    "def foldl(function, values, initial):\n    pass\n\n"
+                    "def foldr(function, values, initial):\n    pass\n\n"
+                    "def reverse(values):\n    pass\n"
+                ),
+                "seq_test.py": (
+                    "import unittest\nfrom seq import append, concat, filter, foldl, foldr, length, map, reverse\n\n"
+                    "class SequenceTest(unittest.TestCase):\n"
+                    "    def test_append(self):\n"
+                    "        self.assertEqual(append([1], [2]), [1, 2])\n"
+                    "    def test_concat(self):\n"
+                    "        self.assertEqual(concat([[1], [2, 3]]), [1, 2, 3])\n"
+                    "    def test_filter(self):\n"
+                    "        self.assertEqual(filter(lambda item: item % 2 == 1, [1, 2, 3]), [1, 3])\n"
+                    "    def test_length(self):\n"
+                    "        self.assertEqual(length(['a', 'b']), 2)\n"
+                    "    def test_map(self):\n"
+                    "        self.assertEqual(map(lambda item: item + 1, [1, 2]), [2, 3])\n"
+                    "    def test_foldl(self):\n"
+                    "        self.assertEqual(foldl(lambda acc, item: acc - item, [1, 2], 10), 7)\n"
+                    "    def test_foldr(self):\n"
+                    "        self.assertEqual(foldr(lambda acc, item: item + acc, ['e', 'x'], '!'), 'ex!')\n"
+                    "    def test_reverse(self):\n"
+                    "        self.assertEqual(reverse([1, 2, 3]), [3, 2, 1])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_sequence_utilities_candidate("seq.py", "seq_test.py")
             validation = tools.validate_implementation_candidate(
                 "seq.py",
@@ -2554,34 +2552,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_affine_substitution_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "affine_cipher.py").write_text("def encode(plain_text, a, b):\n    pass\n\n\ndef decode(ciphered_text, a, b):\n    pass\n", encoding="utf-8")
-            (root / "affine_cipher_test.py").write_text(
-                "import unittest\nfrom affine_cipher import decode, encode\n\n"
-                "class AffineCipherTest(unittest.TestCase):\n"
-                "    def test_encode_yes(self):\n"
-                "        self.assertEqual(encode('yes', 5, 7), 'xbt')\n"
-                "    def test_encode_omg(self):\n"
-                "        self.assertEqual(encode('OMG', 21, 3), 'lvz')\n"
-                "    def test_encode_numbers_and_groups(self):\n"
-                "        self.assertEqual(encode('Testing,1 2 3, testing.', 3, 4), 'jqgjc rw123 jqgjc rw')\n"
-                "    def test_encode_with_a_not_coprime_to_m(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            encode('This is a test.', 6, 17)\n"
-                "        self.assertEqual(err.exception.args[0], 'a and m must be coprime.')\n"
-                "    def test_decode_exercism(self):\n"
-                "        self.assertEqual(decode('tytgn fjr', 3, 7), 'exercism')\n"
-                "    def test_decode_numbers(self):\n"
-                "        self.assertEqual(decode('odpoz ub123 odpoz ub', 25, 7), 'testing123testing')\n"
-                "    def test_decode_with_a_not_coprime_to_m(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            decode('Test', 13, 5)\n"
-                "        self.assertEqual(err.exception.args[0], 'a and m must be coprime.')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "affine_cipher.py": "def encode(plain_text, a, b):\n    pass\n\n\ndef decode(ciphered_text, a, b):\n    pass\n",
+                "affine_cipher_test.py": (
+                    "import unittest\nfrom affine_cipher import decode, encode\n\n"
+                    "class AffineCipherTest(unittest.TestCase):\n"
+                    "    def test_encode_yes(self):\n"
+                    "        self.assertEqual(encode('yes', 5, 7), 'xbt')\n"
+                    "    def test_encode_omg(self):\n"
+                    "        self.assertEqual(encode('OMG', 21, 3), 'lvz')\n"
+                    "    def test_encode_numbers_and_groups(self):\n"
+                    "        self.assertEqual(encode('Testing,1 2 3, testing.', 3, 4), 'jqgjc rw123 jqgjc rw')\n"
+                    "    def test_encode_with_a_not_coprime_to_m(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            encode('This is a test.', 6, 17)\n"
+                    "        self.assertEqual(err.exception.args[0], 'a and m must be coprime.')\n"
+                    "    def test_decode_exercism(self):\n"
+                    "        self.assertEqual(decode('tytgn fjr', 3, 7), 'exercism')\n"
+                    "    def test_decode_numbers(self):\n"
+                    "        self.assertEqual(decode('odpoz ub123 odpoz ub', 25, 7), 'testing123testing')\n"
+                    "    def test_decode_with_a_not_coprime_to_m(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            decode('Test', 13, 5)\n"
+                    "        self.assertEqual(err.exception.args[0], 'a and m must be coprime.')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_affine_substitution_candidate("affine_cipher.py", "affine_cipher_test.py")
             validation = tools.validate_implementation_candidate(
                 "affine_cipher.py",
@@ -2595,28 +2592,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_countdown_song_candidate_for_beer_song(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "beer_song.py").write_text("def recite(start, take=1):\n    pass\n", encoding="utf-8")
-            (root / "beer_song_test.py").write_text(
-                "import unittest\nfrom beer_song import recite\n\n"
-                "class BeerSongTest(unittest.TestCase):\n"
-                "    def test_first_generic_verse(self):\n"
-                "        expected = ['99 bottles of beer on the wall, 99 bottles of beer.', 'Take one down and pass it around, 98 bottles of beer on the wall.']\n"
-                "        self.assertEqual(recite(start=99), expected)\n"
-                "    def test_verse_with_1_bottle(self):\n"
-                "        expected = ['1 bottle of beer on the wall, 1 bottle of beer.', 'Take it down and pass it around, no more bottles of beer on the wall.']\n"
-                "        self.assertEqual(recite(start=1), expected)\n"
-                "    def test_verse_with_0_bottles(self):\n"
-                "        expected = ['No more bottles of beer on the wall, no more bottles of beer.', 'Go to the store and buy some more, 99 bottles of beer on the wall.']\n"
-                "        self.assertEqual(recite(start=0), expected)\n"
-                "    def test_last_three_verses(self):\n"
-                "        expected = ['2 bottles of beer on the wall, 2 bottles of beer.', 'Take one down and pass it around, 1 bottle of beer on the wall.', '', '1 bottle of beer on the wall, 1 bottle of beer.', 'Take it down and pass it around, no more bottles of beer on the wall.', '', 'No more bottles of beer on the wall, no more bottles of beer.', 'Go to the store and buy some more, 99 bottles of beer on the wall.']\n"
-                "        self.assertEqual(recite(start=2, take=3), expected)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "beer_song.py": "def recite(start, take=1):\n    pass\n",
+                "beer_song_test.py": (
+                    "import unittest\nfrom beer_song import recite\n\n"
+                    "class BeerSongTest(unittest.TestCase):\n"
+                    "    def test_first_generic_verse(self):\n"
+                    "        expected = ['99 bottles of beer on the wall, 99 bottles of beer.', 'Take one down and pass it around, 98 bottles of beer on the wall.']\n"
+                    "        self.assertEqual(recite(start=99), expected)\n"
+                    "    def test_verse_with_1_bottle(self):\n"
+                    "        expected = ['1 bottle of beer on the wall, 1 bottle of beer.', 'Take it down and pass it around, no more bottles of beer on the wall.']\n"
+                    "        self.assertEqual(recite(start=1), expected)\n"
+                    "    def test_verse_with_0_bottles(self):\n"
+                    "        expected = ['No more bottles of beer on the wall, no more bottles of beer.', 'Go to the store and buy some more, 99 bottles of beer on the wall.']\n"
+                    "        self.assertEqual(recite(start=0), expected)\n"
+                    "    def test_last_three_verses(self):\n"
+                    "        expected = ['2 bottles of beer on the wall, 2 bottles of beer.', 'Take one down and pass it around, 1 bottle of beer on the wall.', '', '1 bottle of beer on the wall, 1 bottle of beer.', 'Take it down and pass it around, no more bottles of beer on the wall.', '', 'No more bottles of beer on the wall, no more bottles of beer.', 'Go to the store and buy some more, 99 bottles of beer on the wall.']\n"
+                    "        self.assertEqual(recite(start=2, take=3), expected)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_countdown_song_candidate("beer_song.py", "beer_song_test.py")
             validation = tools.validate_implementation_candidate(
                 "beer_song.py",
@@ -2630,22 +2626,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_countdown_song_candidate_for_green_bottles(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "bottle_song.py").write_text("def recite(start, take=1):\n    pass\n", encoding="utf-8")
-            (root / "bottle_song_test.py").write_text(
-                "import unittest\nfrom bottle_song import recite\n\n"
-                "class BottleSongTest(unittest.TestCase):\n"
-                "    def test_first_generic_verse(self):\n"
-                "        expected = ['Ten green bottles hanging on the wall,', 'Ten green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be nine green bottles hanging on the wall.\"]\n"
-                "        self.assertEqual(recite(start=10), expected)\n"
-                "    def test_last_three_verses(self):\n"
-                "        expected = ['Three green bottles hanging on the wall,', 'Three green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be two green bottles hanging on the wall.\", '', 'Two green bottles hanging on the wall,', 'Two green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be one green bottle hanging on the wall.\", '', 'One green bottle hanging on the wall,', 'One green bottle hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be no green bottles hanging on the wall.\"]\n"
-                "        self.assertEqual(recite(start=3, take=3), expected)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "bottle_song.py": "def recite(start, take=1):\n    pass\n",
+                "bottle_song_test.py": (
+                    "import unittest\nfrom bottle_song import recite\n\n"
+                    "class BottleSongTest(unittest.TestCase):\n"
+                    "    def test_first_generic_verse(self):\n"
+                    "        expected = ['Ten green bottles hanging on the wall,', 'Ten green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be nine green bottles hanging on the wall.\"]\n"
+                    "        self.assertEqual(recite(start=10), expected)\n"
+                    "    def test_last_three_verses(self):\n"
+                    "        expected = ['Three green bottles hanging on the wall,', 'Three green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be two green bottles hanging on the wall.\", '', 'Two green bottles hanging on the wall,', 'Two green bottles hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be one green bottle hanging on the wall.\", '', 'One green bottle hanging on the wall,', 'One green bottle hanging on the wall,', 'And if one green bottle should accidentally fall,', \"There'll be no green bottles hanging on the wall.\"]\n"
+                    "        self.assertEqual(recite(start=3, take=3), expected)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_countdown_song_candidate("bottle_song.py", "bottle_song_test.py")
             validation = tools.validate_implementation_candidate(
                 "bottle_song.py",
@@ -2659,37 +2654,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_discounted_set_pricing_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "book_store.py").write_text("def total(basket):\n    pass\n", encoding="utf-8")
-            (root / "book_store_test.py").write_text(
-                "import unittest\nfrom book_store import total\n\n"
-                "class BookStoreTest(unittest.TestCase):\n"
-                "    def test_only_a_single_book(self):\n"
-                "        basket = [1]\n"
-                "        self.assertEqual(total(basket), 800)\n"
-                "    def test_two_different_books(self):\n"
-                "        basket = [1, 2]\n"
-                "        self.assertEqual(total(basket), 1520)\n"
-                "    def test_three_different_books(self):\n"
-                "        basket = [1, 2, 3]\n"
-                "        self.assertEqual(total(basket), 2160)\n"
-                "    def test_four_different_books(self):\n"
-                "        basket = [1, 2, 3, 4]\n"
-                "        self.assertEqual(total(basket), 2560)\n"
-                "    def test_five_different_books(self):\n"
-                "        basket = [1, 2, 3, 4, 5]\n"
-                "        self.assertEqual(total(basket), 3000)\n"
-                "    def test_two_groups_of_four_is_cheaper_than_group_of_five_plus_group_of_three(self):\n"
-                "        basket = [1, 1, 2, 2, 3, 3, 4, 5]\n"
-                "        self.assertEqual(total(basket), 5120)\n"
-                "    def test_complex_grouping(self):\n"
-                "        basket = [1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5]\n"
-                "        self.assertEqual(total(basket), 10000)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "book_store.py": "def total(basket):\n    pass\n",
+                "book_store_test.py": (
+                    "import unittest\nfrom book_store import total\n\n"
+                    "class BookStoreTest(unittest.TestCase):\n"
+                    "    def test_only_a_single_book(self):\n"
+                    "        basket = [1]\n"
+                    "        self.assertEqual(total(basket), 800)\n"
+                    "    def test_two_different_books(self):\n"
+                    "        basket = [1, 2]\n"
+                    "        self.assertEqual(total(basket), 1520)\n"
+                    "    def test_three_different_books(self):\n"
+                    "        basket = [1, 2, 3]\n"
+                    "        self.assertEqual(total(basket), 2160)\n"
+                    "    def test_four_different_books(self):\n"
+                    "        basket = [1, 2, 3, 4]\n"
+                    "        self.assertEqual(total(basket), 2560)\n"
+                    "    def test_five_different_books(self):\n"
+                    "        basket = [1, 2, 3, 4, 5]\n"
+                    "        self.assertEqual(total(basket), 3000)\n"
+                    "    def test_two_groups_of_four_is_cheaper_than_group_of_five_plus_group_of_three(self):\n"
+                    "        basket = [1, 1, 2, 2, 3, 3, 4, 5]\n"
+                    "        self.assertEqual(total(basket), 5120)\n"
+                    "    def test_complex_grouping(self):\n"
+                    "        basket = [1, 2, 2, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 5]\n"
+                    "        self.assertEqual(total(basket), 10000)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_discounted_set_pricing_candidate("book_store.py", "book_store_test.py")
             validation = tools.validate_implementation_candidate(
                 "book_store.py",
