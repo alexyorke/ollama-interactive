@@ -87,6 +87,22 @@ def _pytest_target_command(*targets: str, jobs: str) -> list[str]:
     return [sys.executable, "-m", "pytest", "-q", *_pytest_worker_args(jobs), *targets]
 
 
+def _all_pytest_targets(repo_root: Path = REPO_ROOT) -> tuple[str, ...]:
+    tests_root = repo_root / "tests"
+    return tuple(
+        sorted(
+            str(path.relative_to(repo_root)).replace("\\", "/")
+            for path in tests_root.rglob("*.py")
+            if path.name.startswith("test_") or path.name.endswith("_test.py")
+        )
+    )
+
+
+def _remaining_pytest_targets(*excluded_modules: str, repo_root: Path = REPO_ROOT) -> tuple[str, ...]:
+    excluded = {_module_to_path(module) for module in excluded_modules}
+    return tuple(target for target in _all_pytest_targets(repo_root) if target not in excluded)
+
+
 def _runtime_capabilities() -> dict[str, bool]:
     return {
         "pytest_available": _has_module("pytest"),
@@ -106,7 +122,11 @@ def _run(
     completed = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, check=False)
     elapsed_s = round(time.perf_counter() - started, 3)
     combined = "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
-    target_args = command[6:] if runner == "pytest" and resolved_jobs != "off" else command[4:] if runner == "pytest" else command[3:-1] if command[:3] == [sys.executable, "-m", "unittest"] and command[-1] == "-q" else []
+    target_args = []
+    if runner == "pytest":
+        target_args = command[6:] if resolved_jobs != "off" else command[4:]
+    elif command[:3] == [sys.executable, "-m", "unittest"] and command[-1] == "-q":
+        target_args = command[3:-1]
     return {
         "name": name,
         "command": command,
@@ -135,7 +155,9 @@ def _tier_commands(tier: str, *, runner: str, jobs: str) -> list[tuple[str, list
             commands.append(("agent", [sys.executable, "-m", "unittest", *AGENT_MODULES, "-q"]))
     if tier == "full":
         if resolved_runner == "pytest":
-            commands.append(("full-suite", _pytest_target_command("tests", jobs=jobs)))
+            remaining_targets = _remaining_pytest_targets(*SMOKE_MODULES, *AGENT_MODULES)
+            if remaining_targets:
+                commands.append(("full-remaining", _pytest_target_command(*remaining_targets, jobs=jobs)))
         else:
             commands.append(("full-discover", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]))
     return commands

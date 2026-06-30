@@ -173,7 +173,7 @@ Run the fuller local validation stack before merging larger controller or toolin
 python scripts/local_validation.py --tier full
 ```
 
-When `pytest` is installed, `full` now uses the same fast `pytest` path for the broad final repo pass with the same bounded worker policy instead of a separate serial `unittest discover` run. Environments without `pytest` still fall back to the older `unittest` path.
+When `pytest` is installed, `full` uses the same bounded-worker `pytest` path for the broad final repo pass and skips the `smoke` and `agent` targets it already ran, instead of rerunning them inside a broad `pytest tests` command. Environments without `pytest` still fall back to the older `unittest` path.
 
 One-shot prompt:
 
