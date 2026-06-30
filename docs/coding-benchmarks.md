@@ -67,6 +67,8 @@ Run the full local validation stack before merging larger controller changes:
 python scripts/local_validation.py --tier full
 ```
 
+When `pytest` and `xdist` are available, the local validation script resolves `--jobs auto` to a bounded worker count instead of delegating to unrestricted `xdist auto`.
+
 Run A/B feature profiles without changing prompts:
 
 ```bash

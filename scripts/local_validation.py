@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import time
@@ -36,6 +37,8 @@ AGENT_MODULES = (
     "tests.test_coding_benchmark_eval",
 )
 
+MAX_AUTO_PYTEST_WORKERS = 16
+
 
 def _module_to_path(module: str) -> str:
     return module.replace(".", "/") + ".py"
@@ -51,6 +54,13 @@ def _resolved_runner(requested: str) -> str:
     return requested
 
 
+def _auto_pytest_jobs() -> str:
+    cpu_count = max(1, int(os.cpu_count() or 1))
+    if cpu_count <= 1:
+        return "off"
+    return str(min(cpu_count, MAX_AUTO_PYTEST_WORKERS))
+
+
 def _resolved_jobs(jobs: str, *, runner: str) -> str:
     if runner != "pytest" or not _has_module("xdist"):
         return "off"
@@ -58,7 +68,7 @@ def _resolved_jobs(jobs: str, *, runner: str) -> str:
     if value in {"", "0", "1", "off"}:
         return "off"
     if value == "auto":
-        return "auto"
+        return _auto_pytest_jobs()
     if value.isdigit() and int(value) > 1:
         return value
     raise ValueError(f"unsupported --jobs value: {jobs!r}")
@@ -167,7 +177,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run the repo-owned local validation tiers and persist a JSON summary.")
     parser.add_argument("--tier", choices=["smoke", "agent", "full"], default="smoke")
     parser.add_argument("--runner", choices=["auto", "pytest", "unittest"], default="auto")
-    parser.add_argument("--jobs", default="auto", help="Pytest xdist workers: auto, off, 1, or an integer > 1.")
+    parser.add_argument("--jobs", default="auto", help="Pytest xdist workers: auto, off, 1, or an integer > 1. auto uses a bounded worker count.")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help="JSON summary output path.")
     args = parser.parse_args(argv)
 
