@@ -244,6 +244,17 @@ class ToolDependencyTests(unittest.TestCase):
 
         self.assertEqual(calls, 2)
 
+    def test_resolve_tool_executable_uses_winget_index_when_path_lookup_misses(self) -> None:
+        clear_dependency_status_cache()
+        with patch("ollama_code.tool_dependencies.shutil.which", return_value=None):
+            with patch("ollama_code.tool_dependencies.sysconfig.get_path", return_value=""):
+                with patch("ollama_code.tool_dependencies.site.getuserbase", return_value=""):
+                    with patch("ollama_code.tool_dependencies._winget_executable_index", return_value={"missing-tool.exe": "C:/winget/missing-tool.exe"}):
+                        resolved = tool_dependencies.resolve_tool_executable("ruff", "missing-tool")
+
+        expected = "C:/winget/missing-tool.exe" if os.name == "nt" else None
+        self.assertEqual(resolved, expected)
+
     def test_tool_install_denies_read_only_even_when_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="read-only", input_func=lambda _prompt: "y")

@@ -960,6 +960,27 @@ def _resolve_isolated_executable(workspace_root: str | Path | None, tool_id: str
     return None
 
 
+@lru_cache(maxsize=1)
+def _winget_executable_index() -> dict[str, str]:
+    if os.name != "nt":
+        return {}
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if not local_app_data:
+        return {}
+    root = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+    if not root.exists():
+        return {}
+    index: dict[str, str] = {}
+    for candidate in root.rglob("*"):
+        if not candidate.is_file():
+            continue
+        suffix = candidate.suffix.lower()
+        if suffix not in {".exe", ".cmd", ".bat"}:
+            continue
+        index.setdefault(candidate.name.lower(), str(candidate))
+    return index
+
+
 @lru_cache(maxsize=256)
 def _resolve_host_executable(name: str) -> str | None:
     candidate = Path(name)
@@ -985,16 +1006,11 @@ def _resolve_host_executable(name: str) -> str | None:
             if candidate.exists():
                 return str(candidate)
     if os.name == "nt":
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if local_app_data:
-            winget_packages = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
-            if winget_packages.exists():
-                for executable_name in _executable_names(name):
-                    direct_matches = list(winget_packages.glob(f"*/*{executable_name}"))
-                    recursive_matches = direct_matches or list(winget_packages.glob(f"*/**/{executable_name}"))
-                    for candidate in recursive_matches:
-                        if candidate.is_file():
-                            return str(candidate)
+        winget_index = _winget_executable_index()
+        for executable_name in _executable_names(name):
+            resolved = winget_index.get(executable_name.lower())
+            if resolved:
+                return resolved
     return None
 
 
@@ -1183,6 +1199,7 @@ def _dependency_statuses_cached(
 def clear_dependency_status_cache() -> None:
     _dependency_statuses_cached.cache_clear()
     _resolve_host_executable.cache_clear()
+    _winget_executable_index.cache_clear()
 
 
 def first_install_hint(dependency: ToolDependency, platform_name: str | None = None) -> InstallHint | None:
