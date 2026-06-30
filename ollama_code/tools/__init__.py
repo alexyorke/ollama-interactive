@@ -11043,15 +11043,22 @@ import string
                 requested_scopes=python_validator_scopes,
                 limit=100,
             )
+            collapsed_python_scopes = self._collapse_validation_targets(python_validator_scopes, limit=100)
             typechecker_targets = self._python_typechecker_targets(
                 discovered_files=python_validator_files,
                 requested_scopes=python_validator_scopes,
                 limit=100,
             )
             typechecker_configured = self._python_typechecker_configured()
-            if typechecker_targets and not typechecker_configured and "." not in self._collapse_validation_targets(python_validator_scopes, limit=100):
-                typechecker_targets = []
-                typechecker_skipped_reason = "No pyright/basedpyright config found for focused scope; skipped cold typechecker startup."
+            if typechecker_targets and not typechecker_configured:
+                if "." not in collapsed_python_scopes:
+                    typechecker_targets = []
+                    typechecker_skipped_reason = "No pyright/basedpyright config found for focused scope; skipped cold typechecker startup."
+                elif python_validator_files and all(self._path_looks_like_test(Path(label)) for label in python_validator_files):
+                    typechecker_targets = []
+                    typechecker_skipped_reason = (
+                        "No pyright/basedpyright config found for test-only workspace scope; skipped cold typechecker startup."
+                    )
             ruff_path = self._which("ruff") if validator_targets else None
             typechecker_command = (
                 self._python_tool_command("basedpyright", "basedpyright", "--level", "error")
