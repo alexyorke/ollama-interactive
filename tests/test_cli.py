@@ -189,20 +189,31 @@ class CliCommandTests(unittest.TestCase):
         self.addCleanup(lambda: shutil.rmtree(root, ignore_errors=True))
         return root
 
+    def _run_meta(
+        self,
+        command: str,
+        agent: DummyAgent | None = None,
+        output: list[str] | None = None,
+    ) -> tuple[DummyAgent, list[str], bool | None]:
+        active_agent = agent or DummyAgent()
+        active_output = output if output is not None else []
+        handled = handle_meta_command(command, active_agent, active_output.append)
+        return active_agent, active_output, handled
+
+    def _assert_meta_usage(self, command: str, usage: str, agent: DummyAgent | None = None) -> DummyAgent:
+        active_agent, output, handled = self._run_meta(command, agent)
+        self.assertTrue(handled)
+        self.assertEqual(output, [usage])
+        return active_agent
+
     def test_model_command_updates_model(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/model gemma3:4b", agent, output.append)
+        agent, _output, handled = self._run_meta("/model gemma3:4b")
         self.assertTrue(handled)
         self.assertEqual(agent.model, "gemma3:4b")
 
     def test_model_command_rejects_extra_args(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/model gemma3:4b trailing", agent, output.append)
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage("/model gemma3:4b trailing", "Usage: /model <name>")
         self.assertEqual(agent.model, DEFAULT_MODEL)
-        self.assertEqual(output, ["Usage: /model <name>"])
 
     def test_parser_defaults_max_tool_rounds_to_100(self) -> None:
         args = build_parser().parse_args([])
@@ -469,9 +480,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertIn("Press Esc", text)
 
     def test_help_command_prints_multiline_command_reference(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/help", agent, output.append)
+        _agent, output, handled = self._run_meta("/help")
 
         self.assertTrue(handled)
         self.assertEqual(len(output), 1)
@@ -553,31 +562,22 @@ class CliCommandTests(unittest.TestCase):
 
     def test_doctor_command_prints_report(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
 
         with patch("ollama_code.cli.shutil.which", return_value=None):
-            handled = handle_meta_command("/doctor", agent, output.append)
+            agent, output, handled = self._run_meta("/doctor", agent)
 
         self.assertTrue(handled)
         self.assertEqual(len(output), 1)
         self.assertIn("Ollama Code doctor", output[0])
 
     def test_doctor_command_rejects_extra_args(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/doctor "   "', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /doctor"])
+        self._assert_meta_usage('/doctor "   "', "Usage: /doctor")
 
     def test_status_command_prints_config_and_model_source(self) -> None:
         agent = DummyAgent()
         agent.config_path = Path("settings.json").resolve()
         agent.model_source = "config:settings.json"
-        output: list[str] = []
-
-        handled = handle_meta_command("/status", agent, output.append)
+        _agent, output, handled = self._run_meta("/status", agent)
 
         self.assertTrue(handled)
         self.assertIn("model_source=config:settings.json", output[0])
@@ -598,10 +598,9 @@ class CliCommandTests(unittest.TestCase):
     def test_tools_command_is_compact_by_default_and_full_on_request(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
-
-        compact = handle_meta_command("/tools", agent, output.append)
-        full = handle_meta_command("/tools full", agent, output.append)
-        groups = handle_meta_command("/tools groups", agent, output.append)
+        _agent, output, compact = self._run_meta("/tools", agent, output)
+        _agent, output, full = self._run_meta("/tools full", agent, output)
+        _agent, output, groups = self._run_meta("/tools groups", agent, output)
 
         self.assertTrue(compact)
         self.assertTrue(full)
@@ -613,10 +612,9 @@ class CliCommandTests(unittest.TestCase):
     def test_tools_command_reports_and_installs_optional_dependencies(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
-
-        missing = handle_meta_command("/tools missing", agent, output.append)
-        install = handle_meta_command("/tools install ruff", agent, output.append)
-        recommended = handle_meta_command("/tools install --recommended", agent, output.append)
+        _agent, output, missing = self._run_meta("/tools missing", agent, output)
+        _agent, output, install = self._run_meta("/tools install ruff", agent, output)
+        _agent, output, recommended = self._run_meta("/tools install --recommended", agent, output)
 
         self.assertTrue(missing)
         self.assertTrue(install)
@@ -633,41 +631,22 @@ class CliCommandTests(unittest.TestCase):
         )
 
     def test_tools_install_command_rejects_extra_args(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command("/tools install ruff extra", agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
+        agent = self._assert_meta_usage("/tools install ruff extra", "Usage: /tools install <tool-id>|--recommended")
         self.assertEqual(agent.install_requests, [])
 
     def test_tools_install_command_rejects_empty_target(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/tools install ""', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
+        agent = self._assert_meta_usage('/tools install ""', "Usage: /tools install <tool-id>|--recommended")
         self.assertEqual(agent.install_requests, [])
 
     def test_tools_install_command_rejects_whitespace_only_target(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/tools install "   "', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /tools install <tool-id>|--recommended"])
+        agent = self._assert_meta_usage('/tools install "   "', "Usage: /tools install <tool-id>|--recommended")
         self.assertEqual(agent.install_requests, [])
 
     def test_todos_command_shows_and_clears_todo_list(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
-
-        shown = handle_meta_command("/todos", agent, output.append)
-        cleared = handle_meta_command("/todos clear", agent, output.append)
+        _agent, output, shown = self._run_meta("/todos", agent, output)
+        _agent, output, cleared = self._run_meta("/todos clear", agent, output)
 
         self.assertTrue(shown)
         self.assertTrue(cleared)
@@ -675,23 +654,16 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(output[1], "(empty)")
 
     def test_todos_command_rejects_explicit_empty_subcommand(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/todos ""', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /todos [clear]"])
+        agent = self._assert_meta_usage('/todos ""', "Usage: /todos [clear]")
         self.assertEqual(agent.todo_requests, [])
 
     def test_index_command_reports_and_controls_indexer(self) -> None:
         agent = DummyAgent()
         output: list[str] = []
-
-        status = handle_meta_command("/index status", agent, output.append)
-        refresh = handle_meta_command("/index refresh", agent, output.append)
-        stop = handle_meta_command("/index stop", agent, output.append)
-        start = handle_meta_command("/index start", agent, output.append)
+        _agent, output, status = self._run_meta("/index status", agent, output)
+        _agent, output, refresh = self._run_meta("/index refresh", agent, output)
+        _agent, output, stop = self._run_meta("/index stop", agent, output)
+        _agent, output, start = self._run_meta("/index start", agent, output)
 
         self.assertTrue(status)
         self.assertTrue(refresh)
@@ -703,13 +675,7 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(output[3], "indexer started")
 
     def test_index_command_rejects_whitespace_only_quoted_subcommand(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/index "   "', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /index status|refresh|stop|start"])
+        agent = self._assert_meta_usage('/index "   "', "Usage: /index status|refresh|stop|start")
         self.assertEqual(agent.index_requests, [])
 
     def test_status_renderer_skips_redundant_thinking_redraws(self) -> None:
@@ -768,34 +734,27 @@ class CliCommandTests(unittest.TestCase):
         self.assertEqual(agent.reconcile_mode(), "on")
 
     def test_approval_command_updates_mode(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/approval auto", agent, output.append)
+        agent, _output, handled = self._run_meta("/approval auto")
         self.assertTrue(handled)
         self.assertEqual(agent.approval_mode(), "auto")
 
     def test_debate_command_updates_mode(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/debate off", agent, output.append)
+        agent, output, handled = self._run_meta("/debate off")
         self.assertTrue(handled)
         self.assertFalse(agent.debate_mode())
         self.assertIn("debate set to off", output[0])
 
     def test_reconcile_command_updates_mode(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/reconcile on", agent, output.append)
+        agent, output, handled = self._run_meta("/reconcile on")
         self.assertTrue(handled)
         self.assertEqual(agent.reconcile_mode(), "on")
         self.assertIn("reconcile set to on", output[0])
 
     def test_save_command_uses_custom_path(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             target = str(Path(tmp) / "trace.json")
-            handled = handle_meta_command(f"/save {target}", agent, output.append)
+            agent, _output, handled = self._run_meta(f"/save {target}", agent)
         self.assertTrue(handled)
         self.assertIsNotNone(agent.saved_path)
         self.assertTrue(str(agent.saved_path).endswith("trace.json"))
@@ -808,125 +767,67 @@ class CliCommandTests(unittest.TestCase):
     def test_quit_command_rejects_extra_args(self) -> None:
         for command in ('/quit "   "', "/quit later", "/exit now"):
             with self.subTest(command=command):
-                agent = DummyAgent()
-                output: list[str] = []
-
-                handled = handle_meta_command(command, agent, output.append)
-
-                self.assertTrue(handled)
-                self.assertEqual(output, ["Usage: /quit"])
+                self._assert_meta_usage(command, "Usage: /quit")
 
     def test_reset_command_rejects_extra_args(self) -> None:
         for command in ('/reset "   "', "/reset later"):
             with self.subTest(command=command):
-                agent = DummyAgent()
-                output: list[str] = []
-
-                handled = handle_meta_command(command, agent, output.append)
-
-                self.assertTrue(handled)
-                self.assertEqual(output, ["Usage: /reset"])
+                agent = self._assert_meta_usage(command, "Usage: /reset")
                 self.assertEqual(agent.reset_requests, 0)
 
     def test_models_command_lists_models(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/models", agent, output.append)
+        _agent, output, handled = self._run_meta("/models")
         self.assertTrue(handled)
         self.assertIn(DEFAULT_MODEL, output[0])
 
     def test_sessions_command_lists_saved_sessions(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/sessions", agent, output.append)
+        _agent, output, handled = self._run_meta("/sessions")
         self.assertTrue(handled)
         self.assertIn("trace.json", output[0])
 
     def test_sessions_command_rejects_zero_limit(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/sessions 0", agent, output.append)
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /sessions [limit]"])
+        self._assert_meta_usage("/sessions 0", "Usage: /sessions [limit]")
 
     def test_sessions_command_rejects_negative_limit(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/sessions -5", agent, output.append)
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /sessions [limit]"])
+        self._assert_meta_usage("/sessions -5", "Usage: /sessions [limit]")
 
     def test_load_command_updates_session(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
         with tempfile.TemporaryDirectory() as tmp:
             target = str(Path(tmp) / "saved.json")
-            handled = handle_meta_command(f"/load {target}", agent, output.append)
+            agent, _output, handled = self._run_meta(f"/load {target}", agent)
         self.assertTrue(handled)
         self.assertIsNotNone(agent.loaded_path)
         self.assertTrue(str(agent.loaded_path).endswith("saved.json"))
 
     def test_save_command_rejects_extra_path_args(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/save first.json second.json", agent, output.append)
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage("/save first.json second.json", "Usage: /save [path]")
         self.assertIsNone(agent.saved_path)
-        self.assertEqual(output, ["Usage: /save [path]"])
 
     def test_save_command_rejects_explicit_empty_path(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/save ""', agent, output.append)
-
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage('/save ""', "Usage: /save [path]")
         self.assertIsNone(agent.saved_path)
-        self.assertEqual(output, ["Usage: /save [path]"])
 
     def test_save_command_rejects_whitespace_only_quoted_path(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/save "   "', agent, output.append)
-
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage('/save "   "', "Usage: /save [path]")
         self.assertIsNone(agent.saved_path)
-        self.assertEqual(output, ["Usage: /save [path]"])
 
     def test_load_command_rejects_extra_path_args(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/load saved.json trailing", agent, output.append)
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage("/load saved.json trailing", "Usage: /load <path>")
         self.assertIsNone(agent.loaded_path)
-        self.assertEqual(output, ["Usage: /load <path>"])
 
     def test_load_command_rejects_explicit_empty_path(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/load ""', agent, output.append)
-
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage('/load ""', "Usage: /load <path>")
         self.assertIsNone(agent.loaded_path)
-        self.assertEqual(output, ["Usage: /load <path>"])
 
     def test_load_command_rejects_whitespace_only_quoted_path(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/load "   "', agent, output.append)
-
-        self.assertTrue(handled)
+        agent = self._assert_meta_usage('/load "   "', "Usage: /load <path>")
         self.assertIsNone(agent.loaded_path)
-        self.assertEqual(output, ["Usage: /load <path>"])
 
     def test_load_command_preserves_windows_backslashes(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
         with patch("ollama_code.cli.os.name", "nt"):
-            handled = handle_meta_command(r"/load C:\Users\yorke\saved.json", agent, output.append)
+            agent, _output, handled = self._run_meta(r"/load C:\Users\yorke\saved.json", agent)
         self.assertTrue(handled)
         self.assertIsNotNone(agent.loaded_path)
         self.assertIn(r"C:\Users\yorke\saved.json", str(agent.loaded_path))
@@ -934,8 +835,7 @@ class CliCommandTests(unittest.TestCase):
     @unittest.skipUnless(os.name != "nt", "POSIX only")
     def test_save_command_keeps_posix_escaped_spaces(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command(r"/save dir\ with\ spaces/trace.json", agent, output.append)
+        agent, _output, handled = self._run_meta(r"/save dir\ with\ spaces/trace.json", agent)
         self.assertTrue(handled)
         self.assertIsNotNone(agent.saved_path)
         self.assertTrue(str(agent.saved_path).endswith(str(Path("dir with spaces") / "trace.json")))
@@ -943,16 +843,13 @@ class CliCommandTests(unittest.TestCase):
     @unittest.skipUnless(os.name != "nt", "POSIX only")
     def test_load_command_keeps_posix_escaped_spaces(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command(r"/load dir\ with\ spaces/saved.json", agent, output.append)
+        agent, _output, handled = self._run_meta(r"/load dir\ with\ spaces/saved.json", agent)
         self.assertTrue(handled)
         self.assertIsNotNone(agent.loaded_path)
         self.assertTrue(str(agent.loaded_path).endswith(str(Path("dir with spaces") / "saved.json")))
 
     def test_diff_command_prints_git_diff(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/diff --cached tracked.txt", agent, output.append)
+        agent, output, handled = self._run_meta("/diff --cached tracked.txt")
         self.assertTrue(handled)
         self.assertIn("+after", output[0])
         self.assertEqual(agent.diff_request, {"cached": True, "path": "tracked.txt"})
@@ -960,87 +857,54 @@ class CliCommandTests(unittest.TestCase):
     @unittest.skipUnless(os.name != "nt", "POSIX only")
     def test_diff_command_preserves_windows_backslashes_on_posix(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command(r"/diff C:\Users\yorke\ws\ollama-interactive\tracked.txt", agent, output.append)
+        agent, _output, handled = self._run_meta(r"/diff C:\Users\yorke\ws\ollama-interactive\tracked.txt", agent)
         self.assertTrue(handled)
         self.assertEqual(agent.diff_request, {"cached": False, "path": r"C:\Users\yorke\ws\ollama-interactive\tracked.txt"})
 
     @unittest.skipUnless(os.name != "nt", "POSIX only")
     def test_diff_command_keeps_posix_escaped_spaces(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command(r"/diff dir\ with\ spaces/file.txt", agent, output.append)
+        agent, _output, handled = self._run_meta(r"/diff dir\ with\ spaces/file.txt", agent)
         self.assertTrue(handled)
         self.assertEqual(agent.diff_request, {"cached": False, "path": "dir with spaces/file.txt"})
 
     def test_diff_command_rejects_explicit_empty_path(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/diff ""', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /diff [--cached] [path]"])
+        agent = self._assert_meta_usage('/diff ""', "Usage: /diff [--cached] [path]")
         self.assertIsNone(agent.diff_request)
 
     def test_diff_command_rejects_whitespace_only_quoted_path_with_cached_flag(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/diff --cached "   "', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /diff [--cached] [path]"])
+        agent = self._assert_meta_usage('/diff --cached "   "', "Usage: /diff [--cached] [path]")
         self.assertIsNone(agent.diff_request)
 
     def test_test_command_preserves_windows_executable_path(self) -> None:
         agent = DummyAgent()
-        output: list[str] = []
         command = r'"C:\Program Files\Python312\python.exe" -m unittest -q'
         with patch("ollama_code.cli.os.name", "nt"):
-            handled = handle_meta_command(f"/test {command}", agent, output.append)
+            agent, output, handled = self._run_meta(f"/test {command}", agent)
         self.assertTrue(handled)
         self.assertIn(command, output[0])
 
     def test_test_command_strips_wrapping_quotes(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command('/test "pytest -q"', agent, output.append)
+        _agent, output, handled = self._run_meta('/test "pytest -q"')
         self.assertTrue(handled)
         self.assertIn("pytest -q", output[0])
         self.assertNotIn('"pytest -q"', output[0])
 
     def test_test_command_rejects_explicit_empty_command(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/test ""', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /test [command]"])
+        agent = self._assert_meta_usage('/test ""', "Usage: /test [command]")
         self.assertEqual(agent.test_requests, [])
 
     def test_commit_command_prints_commit_output(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command('/commit "Save work"', agent, output.append)
+        _agent, output, handled = self._run_meta('/commit "Save work"')
         self.assertTrue(handled)
         self.assertIn("Save work", output[0])
 
     def test_commit_command_rejects_whitespace_only_quoted_message(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-
-        handled = handle_meta_command('/commit "   "', agent, output.append)
-
-        self.assertTrue(handled)
-        self.assertEqual(output, ["Usage: /commit <message>"])
+        agent = self._assert_meta_usage('/commit "   "', "Usage: /commit <message>")
         self.assertEqual(agent.commit_requests, [])
 
     def test_test_command_prints_test_output(self) -> None:
-        agent = DummyAgent()
-        output: list[str] = []
-        handled = handle_meta_command("/test pytest -q", agent, output.append)
+        _agent, output, handled = self._run_meta("/test pytest -q")
         self.assertTrue(handled)
         self.assertIn("pytest -q", output[0])
 
