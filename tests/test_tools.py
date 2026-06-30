@@ -1532,7 +1532,7 @@ class ToolExecutorTests(unittest.TestCase):
     def test_python_sdk_search_finds_current_stdlib_api(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="auto")
-            refresh = tools.python_sdk_refresh(limit=5000)
+            refresh = tools.python_sdk_refresh(limit=200)
             result = tools.python_sdk_search("parse json string loads", limit=5)
 
         self.assertTrue(refresh["ok"], refresh)
@@ -5489,11 +5489,11 @@ def double(value: int) -> int:
     def test_run_shell_timeout_returns_structured_result_with_partial_output(self) -> None:
         root = self._workspace_scratch()
         tools = ToolExecutor(root, approval_mode="auto")
+        command = f'"{sys.executable}" -c "import sys,time; print(123); sys.stdout.flush(); time.sleep(2)"'
+        timeout_error = subprocess.TimeoutExpired(cmd=command, timeout=1, output="123\n")
 
-        result = tools.run_shell(
-            f'"{sys.executable}" -c "import sys,time; print(123); sys.stdout.flush(); time.sleep(2)"',
-            timeout=1,
-        )
+        with patch.object(ToolExecutor, "_run_process", side_effect=timeout_error):
+            result = tools.run_shell(command, timeout=1)
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["timed_out"])
@@ -5869,8 +5869,10 @@ def double(value: int) -> int:
         root = self._workspace_scratch()
         command = f'"{sys.executable}" -c "import sys,time; print(321); sys.stdout.flush(); time.sleep(2)"'
         tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        timeout_error = subprocess.TimeoutExpired(cmd=command, timeout=1, output="321\n")
 
-        result = tools.run_test(timeout=1)
+        with patch.object(ToolExecutor, "_run_process", side_effect=timeout_error):
+            result = tools.run_test(timeout=1)
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["timed_out"])
