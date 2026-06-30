@@ -224,6 +224,26 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertTrue(second[0]["installed"])
         self.assertTrue(third[0]["installed"])
 
+    def test_clear_dependency_status_cache_resets_host_executable_probe_cache(self) -> None:
+        calls = 0
+
+        def fake_which(_name: str) -> str | None:
+            nonlocal calls
+            calls += 1
+            return None
+
+        clear_dependency_status_cache()
+        with patch("ollama_code.tool_dependencies.shutil.which", side_effect=fake_which):
+            with patch("ollama_code.tool_dependencies.sysconfig.get_path", return_value=""):
+                with patch("ollama_code.tool_dependencies.site.getuserbase", return_value=""):
+                    with patch.dict(os.environ, {"LOCALAPPDATA": ""}, clear=False):
+                        self.assertIsNone(tool_dependencies.resolve_tool_executable("ruff", "missing-tool"))
+                        self.assertIsNone(tool_dependencies.resolve_tool_executable("ruff", "missing-tool"))
+                        clear_dependency_status_cache()
+                        self.assertIsNone(tool_dependencies.resolve_tool_executable("ruff", "missing-tool"))
+
+        self.assertEqual(calls, 2)
+
     def test_tool_install_denies_read_only_even_when_confirmed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tools = ToolExecutor(Path(tmp), approval_mode="read-only", input_func=lambda _prompt: "y")

@@ -960,17 +960,16 @@ def _resolve_isolated_executable(workspace_root: str | Path | None, tool_id: str
     return None
 
 
-def _resolve_executable(name: str, *, workspace_root: str | Path | None = None, tool_id: str | None = None) -> str | None:
-    if tool_id:
-        isolated = _resolve_isolated_executable(workspace_root, tool_id, name)
-        if isolated:
-            return isolated
-    resolved = shutil.which(name)
-    if resolved:
-        return resolved
+@lru_cache(maxsize=256)
+def _resolve_host_executable(name: str) -> str | None:
     candidate = Path(name)
     if candidate.is_absolute() and candidate.exists():
         return str(candidate)
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    if candidate.is_absolute():
+        return None
     script_roots: set[Path] = set()
     for value in (sysconfig.get_path("scripts"), site.getuserbase()):
         if value:
@@ -997,6 +996,14 @@ def _resolve_executable(name: str, *, workspace_root: str | Path | None = None, 
                         if candidate.is_file():
                             return str(candidate)
     return None
+
+
+def _resolve_executable(name: str, *, workspace_root: str | Path | None = None, tool_id: str | None = None) -> str | None:
+    if tool_id:
+        isolated = _resolve_isolated_executable(workspace_root, tool_id, name)
+        if isolated:
+            return isolated
+    return _resolve_host_executable(name)
 
 
 def resolve_tool_executable(tool_id: str, executable: str, *, workspace_root: str | Path | None = None) -> str | None:
@@ -1175,6 +1182,7 @@ def _dependency_statuses_cached(
 
 def clear_dependency_status_cache() -> None:
     _dependency_statuses_cached.cache_clear()
+    _resolve_host_executable.cache_clear()
 
 
 def first_install_hint(dependency: ToolDependency, platform_name: str | None = None) -> InstallHint | None:

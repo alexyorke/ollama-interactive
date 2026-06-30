@@ -2239,13 +2239,14 @@ class ToolExecutor:
     def _python_sdk_entries(self, *, limit: int) -> list[dict[str, Any]]:
         entries = self._python_sdk_imported_entries(remaining=min(limit, 1200), existing_ids=set())
         existing_ids = {str(entry["id"]) for entry in entries}
-        for entry in self._python_sdk_ast_entries(limit=limit):
-            if len(entries) >= limit:
-                break
-            if str(entry["id"]) in existing_ids:
-                continue
-            entries.append(entry)
-            existing_ids.add(str(entry["id"]))
+        if len(entries) < limit:
+            for entry in self._python_sdk_ast_entries(limit=limit):
+                if len(entries) >= limit:
+                    break
+                if str(entry["id"]) in existing_ids:
+                    continue
+                entries.append(entry)
+                existing_ids.add(str(entry["id"]))
         if len(entries) < limit:
             entries.extend(self._python_sdk_imported_entries(remaining=limit - len(entries), existing_ids=existing_ids))
         return entries[:limit]

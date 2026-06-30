@@ -1540,6 +1540,25 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("json.loads", result["output"])
         self.assertIn("Deserialize", result["output"])
 
+    def test_python_sdk_refresh_skips_ast_scan_when_imported_entries_fill_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            entry = tools._python_sdk_entry(
+                kind="function",
+                module="json",
+                qualname="json.loads",
+                signature="loads(s)",
+                doc="Deserialize JSON text.",
+                source_path="(built-in)",
+                line=1,
+            )
+            with patch.object(ToolExecutor, "_python_sdk_imported_entries", return_value=[entry]):
+                with patch.object(ToolExecutor, "_python_sdk_ast_entries", side_effect=AssertionError("AST scan should be skipped")):
+                    refresh = tools.python_sdk_refresh(limit=1)
+
+        self.assertTrue(refresh["ok"], refresh)
+        self.assertEqual(refresh["items"], 1)
+
     def test_python_sdk_search_can_rerank_with_cached_embeddings(self) -> None:
         entries = [
             {
