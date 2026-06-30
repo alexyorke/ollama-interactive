@@ -73,6 +73,10 @@ def _pytest_command(modules: tuple[str, ...], *, jobs: str) -> list[str]:
     return [sys.executable, "-m", "pytest", "-q", *_pytest_worker_args(jobs), *(_module_to_path(module) for module in modules)]
 
 
+def _pytest_target_command(*targets: str, jobs: str) -> list[str]:
+    return [sys.executable, "-m", "pytest", "-q", *_pytest_worker_args(jobs), *targets]
+
+
 def _runtime_capabilities() -> dict[str, bool]:
     return {
         "pytest_available": _has_module("pytest"),
@@ -120,7 +124,10 @@ def _tier_commands(tier: str, *, runner: str, jobs: str) -> list[tuple[str, list
         else:
             commands.append(("agent", [sys.executable, "-m", "unittest", *AGENT_MODULES, "-q"]))
     if tier == "full":
-        commands.append(("full-discover", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]))
+        if resolved_runner == "pytest":
+            commands.append(("full-suite", _pytest_target_command("tests", jobs=jobs)))
+        else:
+            commands.append(("full-discover", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]))
     return commands
 
 

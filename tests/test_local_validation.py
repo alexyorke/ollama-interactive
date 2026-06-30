@@ -35,8 +35,16 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(command[:4], [sys.executable, "-m", "pytest", "-q"])
         self.assertNotIn("-n", command)
 
-    def test_full_tier_keeps_unittest_discover_final_gate(self) -> None:
+    def test_full_tier_prefers_pytest_broad_final_gate(self) -> None:
         with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            commands = local_validation._tier_commands("full", runner="auto", jobs="auto")
+
+        self.assertEqual([name for name, _ in commands], ["smoke", "agent", "full-suite"])
+        self.assertEqual(commands[-1][1][:6], [sys.executable, "-m", "pytest", "-q", "-n", "auto"])
+        self.assertEqual(commands[-1][1][-1], "tests")
+
+    def test_full_tier_unittest_runner_keeps_discover_final_gate(self) -> None:
+        with patch.object(local_validation, "_has_module", return_value=False):
             commands = local_validation._tier_commands("full", runner="auto", jobs="auto")
 
         self.assertEqual([name for name, _ in commands], ["smoke", "agent", "full-discover"])
@@ -82,9 +90,9 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(payload["resolved_jobs"], "auto")
         self.assertTrue(payload["pytest_available"])
         self.assertTrue(payload["xdist_available"])
-        self.assertEqual(payload["planned_tiers"], ["smoke", "agent", "full-discover"])
+        self.assertEqual(payload["planned_tiers"], ["smoke", "agent", "full-suite"])
         self.assertEqual(payload["tiers_completed"], ["smoke"])
-        self.assertEqual(payload["remaining_tiers"], ["agent", "full-discover"])
+        self.assertEqual(payload["remaining_tiers"], ["agent", "full-suite"])
         self.assertTrue(payload["stopped_after_failure"])
         self.assertFalse(payload["ok"])
 
