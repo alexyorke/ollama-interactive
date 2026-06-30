@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ollama_code import tool_dependencies
-from ollama_code.tool_dependencies import clear_dependency_status_cache, configured_docker_host, configured_docker_host_setting, dependency_status, dependency_statuses, docker_host_kind, resolve_dependency
+from ollama_code.tool_dependencies import ToolDependency, clear_dependency_status_cache, configured_docker_host, configured_docker_host_setting, dependency_status, dependency_statuses, docker_host_kind, resolve_dependency
 from ollama_code.tools import ToolExecutor
 
 
@@ -103,6 +103,27 @@ class ToolDependencyTests(unittest.TestCase):
         self.assertFalse(status["installed"])
         self.assertEqual(status["found_modules"], ["tree_sitter"])
         self.assertIn("tree_sitter_language_pack", status["missing_modules"])
+
+    def test_executable_dependency_defaults_verify_command_to_primary_version(self) -> None:
+        dependency = ToolDependency(
+            id="demo",
+            display_name="Demo",
+            category="demo",
+            purpose="demo executable",
+            executables=("demo", "demo-alt"),
+        )
+
+        with patch("ollama_code.tool_dependencies._resolve_executable", return_value=None):
+            status = dependency_status(dependency)
+
+        self.assertEqual(dependency.verify_command, ("demo", "--version"))
+        self.assertEqual(status["verify_command"], "demo --version")
+        self.assertEqual(status["verify_argv"], ["demo", "--version"])
+
+    def test_custom_verify_command_is_preserved_for_special_cases(self) -> None:
+        dependency = resolve_dependency("cargo-nextest")
+        self.assertIsNotNone(dependency)
+        self.assertEqual(dependency.verify_command, ("cargo", "nextest", "--version"))
 
     def test_missing_dependency_result_includes_install_hints(self) -> None:
         with self._temp_tools() as (root, tools):

@@ -38,8 +38,12 @@ class ToolDependency:
     optional: bool = True
     platforms: tuple[str, ...] = ("any",)
     install_hints: tuple[InstallHint, ...] = ()
-    verify_command: tuple[str, ...] = ()
+    verify_command: tuple[str, ...] | None = None
     notes: str = ""
+
+    def __post_init__(self) -> None:
+        if self.verify_command is None and self.executables:
+            object.__setattr__(self, "verify_command", (self.executables[0], "--version"))
 
 
 @dataclass(frozen=True)
@@ -102,7 +106,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("npm", ("npm", "install", "-g", "@ast-grep/cli")),
             _hint("cargo", ("cargo", "install", "ast-grep")),
         ),
-        verify_command=("ast-grep", "--version"),
     ),
     ToolDependency(
         id="ripgrep",
@@ -117,7 +120,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("brew", ("brew", "install", "ripgrep"), "macos", "linux"),
             _hint("cargo", ("cargo", "install", "ripgrep")),
         ),
-        verify_command=("rg", "--version"),
     ),
     ToolDependency(
         id="fd",
@@ -132,7 +134,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("brew", ("brew", "install", "fd"), "macos", "linux"),
             _hint("cargo", ("cargo", "install", "fd-find")),
         ),
-        verify_command=("fd", "--version"),
     ),
     ToolDependency(
         id="jq",
@@ -146,7 +147,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("apt", ("sudo", "apt-get", "install", "-y", "jq"), "linux", "wsl"),
             _hint("brew", ("brew", "install", "jq"), "macos", "linux"),
         ),
-        verify_command=("jq", "--version"),
     ),
     ToolDependency(
         id="yq",
@@ -160,7 +160,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("brew", ("brew", "install", "yq"), "macos", "linux"),
             _hint("go", ("go", "install", "github.com/mikefarah/yq/v4@latest")),
         ),
-        verify_command=("yq", "--version"),
     ),
     ToolDependency(
         id="uv",
@@ -174,7 +173,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("winget", ("winget", "install", "astral-sh.uv"), "windows"),
             _hint("brew", ("brew", "install", "uv"), "macos", "linux"),
         ),
-        verify_command=("uv", "--version"),
     ),
     ToolDependency(
         id="docker",
@@ -199,7 +197,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "typescript")),
         ),
-        verify_command=("tsc", "--version"),
     ),
     ToolDependency(
         id="eslint",
@@ -210,7 +207,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "eslint")),
         ),
-        verify_command=("eslint", "--version"),
     ),
     ToolDependency(
         id="prettier",
@@ -221,7 +217,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "prettier")),
         ),
-        verify_command=("prettier", "--version"),
     ),
     ToolDependency(
         id="biome",
@@ -232,7 +227,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "@biomejs/biome")),
         ),
-        verify_command=("biome", "--version"),
     ),
     ToolDependency(
         id="stylelint",
@@ -243,7 +237,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "stylelint")),
         ),
-        verify_command=("stylelint", "--version"),
     ),
     ToolDependency(
         id="markdownlint-cli2",
@@ -254,7 +247,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "markdownlint-cli2")),
         ),
-        verify_command=("markdownlint-cli2", "--version"),
     ),
     ToolDependency(
         id="taplo",
@@ -266,7 +258,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("cargo", ("cargo", "install", "taplo-cli", "--locked")),
             _hint("brew", ("brew", "install", "taplo"), "macos", "linux"),
         ),
-        verify_command=("taplo", "--version"),
     ),
     ToolDependency(
         id="ruff",
@@ -280,7 +271,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("ruff", "ruff"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("ruff"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("ruff", "--version"),
     ),
     ToolDependency(
         id="basedpyright",
@@ -294,7 +284,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("basedpyright", "basedpyright"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("basedpyright"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("basedpyright", "--version"),
     ),
     ToolDependency(
         id="pytest",
@@ -365,7 +354,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("pip", _python_pip_command("pre-commit")),
         ),
-        verify_command=("pre-commit", "--version"),
     ),
     ToolDependency(
         id="tox",
@@ -377,7 +365,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("pip", _python_pip_command("tox")),
         ),
-        verify_command=("tox", "--version"),
     ),
     ToolDependency(
         id="nox",
@@ -389,7 +376,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("pip", _python_pip_command("nox")),
         ),
-        verify_command=("nox", "--version"),
     ),
     ToolDependency(
         id="mypy",
@@ -402,7 +388,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("mypy", "mypy"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("mypy"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("mypy", "--version"),
     ),
     ToolDependency(
         id="pyright",
@@ -414,7 +399,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("npm", ("npm", "install", "-g", "pyright")),
             _hint("pip", _python_pip_command("pyright")),
         ),
-        verify_command=("pyright", "--version"),
     ),
     ToolDependency(
         id="deptry",
@@ -427,7 +411,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("deptry", "deptry"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("deptry"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("deptry", "--version"),
     ),
     ToolDependency(
         id="pip-audit",
@@ -440,7 +423,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("pip-audit", "pip-audit"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("pip-audit"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("pip-audit", "--version"),
     ),
     ToolDependency(
         id="pipdeptree",
@@ -453,7 +435,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("pipdeptree", "pipdeptree"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("pipdeptree"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("pipdeptree", "--version"),
     ),
     ToolDependency(
         id="vulture",
@@ -466,7 +447,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("vulture", "vulture"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("vulture"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("vulture", "--version"),
     ),
     ToolDependency(
         id="hypothesis",
@@ -490,7 +470,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _python_pip_command("py-spy"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
             _hint("cargo", ("cargo", "install", "py-spy")),
         ),
-        verify_command=("py-spy", "--version"),
     ),
     ToolDependency(
         id="scalene",
@@ -503,7 +482,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("scalene", "scalene"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("scalene"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("scalene", "--version"),
     ),
     ToolDependency(
         id="hyperfine",
@@ -517,7 +495,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("brew", ("brew", "install", "hyperfine"), "macos", "linux"),
             _hint("cargo", ("cargo", "install", "hyperfine")),
         ),
-        verify_command=("hyperfine", "--version"),
     ),
     ToolDependency(
         id="bubblewrap",
@@ -532,7 +509,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("dnf", ("sudo", "dnf", "install", "-y", "bubblewrap"), "linux"),
             _hint("pacman", ("sudo", "pacman", "-S", "bubblewrap"), "linux"),
         ),
-        verify_command=("bwrap", "--version"),
         notes="Unsupported on native Windows; use WSL/Linux for this integration.",
     ),
     ToolDependency(
@@ -547,7 +523,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("winget", ("winget", "install", "Wilfred.difftastic"), "windows"),
             _hint("brew", ("brew", "install", "difftastic"), "macos", "linux"),
         ),
-        verify_command=("difft", "--version"),
     ),
     ToolDependency(
         id="actionlint",
@@ -574,7 +549,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("apt", ("sudo", "apt-get", "install", "-y", "shellcheck"), "linux", "wsl"),
             _hint("brew", ("brew", "install", "shellcheck"), "macos", "linux"),
         ),
-        verify_command=("shellcheck", "--version"),
     ),
     ToolDependency(
         id="hadolint",
@@ -587,7 +561,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("winget", ("winget", "install", "hadolint.hadolint"), "windows"),
             _hint("brew", ("brew", "install", "hadolint"), "macos", "linux"),
         ),
-        verify_command=("hadolint", "--version"),
     ),
     ToolDependency(
         id="shfmt",
@@ -601,7 +574,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("brew", ("brew", "install", "shfmt"), "macos", "linux"),
             _hint("go", ("go", "install", "mvdan.cc/sh/v3/cmd/shfmt@latest")),
         ),
-        verify_command=("shfmt", "--version"),
     ),
     ToolDependency(
         id="yamllint",
@@ -614,7 +586,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("yamllint", "yamllint"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("yamllint"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("yamllint", "--version"),
     ),
     ToolDependency(
         id="check-jsonschema",
@@ -627,7 +598,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("check-jsonschema", "check-jsonschema"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("check-jsonschema"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("check-jsonschema", "--version"),
     ),
     ToolDependency(
         id="codespell",
@@ -640,7 +610,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("codespell", "codespell"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("codespell"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("codespell", "--version"),
     ),
     ToolDependency(
         id="sqlfluff",
@@ -653,7 +622,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("sqlfluff", "sqlfluff"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("sqlfluff"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("sqlfluff", "--version"),
     ),
     ToolDependency(
         id="osv-scanner",
@@ -666,7 +634,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("go", ("go", "install", "github.com/google/osv-scanner/cmd/osv-scanner@latest")),
             _hint("brew", ("brew", "install", "osv-scanner"), "macos", "linux"),
         ),
-        verify_command=("osv-scanner", "--version"),
     ),
     ToolDependency(
         id="gitleaks",
@@ -691,7 +658,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("winget", ("winget", "install", "AquaSecurity.Trivy"), "windows"),
             _hint("brew", ("brew", "install", "trivy"), "macos", "linux"),
         ),
-        verify_command=("trivy", "--version"),
     ),
     ToolDependency(
         id="grype",
@@ -752,7 +718,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("inspect-ai", "inspect-ai"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("inspect-ai"), note="Fallback only; known to conflict with some LiteLLM pins."),
         ),
-        verify_command=("inspect", "--version"),
     ),
     ToolDependency(
         id="sqlite-vec",
@@ -774,7 +739,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "@sourcegraph/scip-python")),
         ),
-        verify_command=("scip-python", "--version"),
     ),
     ToolDependency(
         id="scip-typescript",
@@ -785,7 +749,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
         install_hints=(
             _hint("npm", ("npm", "install", "-g", "@sourcegraph/scip-typescript")),
         ),
-        verify_command=("scip-typescript", "--version"),
     ),
     ToolDependency(
         id="gh",
@@ -797,7 +760,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("winget", ("winget", "install", "GitHub.cli"), "windows"),
             _hint("brew", ("brew", "install", "gh"), "macos", "linux"),
         ),
-        verify_command=("gh", "--version"),
     ),
     ToolDependency(
         id="golangci-lint",
@@ -809,7 +771,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("go", ("go", "install", "github.com/golangci/golangci-lint/cmd/golangci-lint@latest")),
             _hint("brew", ("brew", "install", "golangci-lint"), "macos", "linux"),
         ),
-        verify_command=("golangci-lint", "--version"),
     ),
     ToolDependency(
         id="cargo-nextest",
@@ -835,7 +796,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("docker", ("docker", "pull", "semgrep/semgrep"), mode="docker", note="Container image avoids Python dependency conflicts."),
             _hint("pip", _python_pip_command("semgrep"), note="Fallback only; known to conflict with some LiteLLM jsonschema pins."),
         ),
-        verify_command=("semgrep", "--version"),
     ),
     ToolDependency(
         id="opengrep",
@@ -847,7 +807,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("pip", _isolated_pip_command("opengrep", "opengrep"), mode="isolated-venv"),
             _hint("pip", _python_pip_command("opengrep"), note="Fallback only; prefer isolated-venv to avoid shared Python changes."),
         ),
-        verify_command=("opengrep", "--version"),
     ),
     ToolDependency(
         id="comby",
@@ -884,7 +843,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("apt", ("sudo", "apt-get", "install", "-y", "universal-ctags"), "linux", "wsl"),
             _hint("brew", ("brew", "install", "universal-ctags"), "macos", "linux"),
         ),
-        verify_command=("ctags", "--version"),
     ),
     ToolDependency(
         id="mergiraf",
@@ -896,7 +854,6 @@ TOOL_DEPENDENCIES: tuple[ToolDependency, ...] = (
             _hint("cargo", ("cargo", "install", "mergiraf")),
             _hint("brew", ("brew", "install", "mergiraf"), "macos", "linux"),
         ),
-        verify_command=("mergiraf", "--version"),
     ),
 )
 
@@ -1163,7 +1120,7 @@ def dependency_status(
         "missing_modules": missing_modules,
         "install_hints": hints,
         "verify_command": command_to_text(dependency.verify_command) if dependency.verify_command else "",
-        "verify_argv": list(dependency.verify_command),
+        "verify_argv": list(dependency.verify_command or ()),
         "notes": dependency.notes,
     }
 
