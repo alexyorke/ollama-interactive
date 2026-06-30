@@ -58,6 +58,12 @@ class _MalformedResponseHandler(BaseHTTPRequestHandler):
         return
 
 
+def _start_test_server_thread(server: ThreadingHTTPServer) -> threading.Thread:
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    return thread
+
+
 class OllamaClientTests(unittest.TestCase):
     def _with_server(self, body: bytes, *, delay: float = 0.0) -> tuple[OllamaClient, ThreadingHTTPServer, threading.Thread]:
         _MalformedResponseHandler.response_body = body
@@ -67,8 +73,7 @@ class OllamaClientTests(unittest.TestCase):
         _MalformedResponseHandler.last_request_body = b""
         _MalformedResponseHandler.last_request_bodies = []
         server = ThreadingHTTPServer(("127.0.0.1", 0), _MalformedResponseHandler)
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
+        thread = _start_test_server_thread(server)
         client = OllamaClient(host=f"http://127.0.0.1:{server.server_port}", timeout=5)
         return client, server, thread
 

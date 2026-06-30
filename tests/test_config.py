@@ -339,6 +339,12 @@ class _FakeOllamaHandler(BaseHTTPRequestHandler):
         return
 
 
+def _start_test_server_thread(server: ThreadingHTTPServer) -> threading.Thread:
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True)
+    thread.start()
+    return thread
+
+
 class ConfigCliSmokeTests(unittest.TestCase):
     def test_one_shot_cli_uses_workspace_config_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,8 +355,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
             _FakeOllamaHandler.tag_requests = 0
             _FakeOllamaHandler.available_models = [{"name": "config-model"}]
             server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            thread = _start_test_server_thread(server)
             try:
                 (config_dir / "config.json").write_text(
                     json.dumps({"host": f"http://127.0.0.1:{server.server_port}", "model": "config-model"}),
@@ -386,8 +391,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
             _FakeOllamaHandler.tag_requests = 0
             _FakeOllamaHandler.available_models = [{"name": "gemma3:4b"}]
             server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            thread = _start_test_server_thread(server)
             try:
                 (config_dir / "config.json").write_text(
                     json.dumps({"host": f"http://127.0.0.1:{server.server_port}"}),
@@ -422,8 +426,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
             _FakeOllamaHandler.tag_requests = 0
             _FakeOllamaHandler.available_models = [{"name": "gemma3:4b"}]
             server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            thread = _start_test_server_thread(server)
             try:
                 (config_dir / "config.json").write_text(
                     json.dumps({"host": f"http://127.0.0.1:{server.server_port}", "model": "stale-config-model"}),
@@ -458,8 +461,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
             _FakeOllamaHandler.tag_requests = 0
             _FakeOllamaHandler.available_models = [{"name": "hf.co/batiai/Granite-4.1-8B-GGUF:IQ4_XS"}]
             server = ThreadingHTTPServer(("127.0.0.1", 0), _FakeOllamaHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
+            thread = _start_test_server_thread(server)
             try:
                 (config_dir / "config.json").write_text(
                     json.dumps({"host": f"http://127.0.0.1:{server.server_port}"}),
