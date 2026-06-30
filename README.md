@@ -164,6 +164,9 @@ Run the fast local readiness tier before broader edits or benchmarks:
 python scripts/local_validation.py --tier smoke
 ```
 
+`smoke` and `agent` automatically use `pytest` with `xdist` workers when those optional packages are installed; otherwise they fall back to serial `unittest`.
+The JSON summary records the resolved runner, resolved worker mode, completed tiers, and any tiers skipped after a failure so the local gate reflects what actually ran.
+
 Run the fuller local validation stack before merging larger controller or tooling changes:
 
 ```bash
