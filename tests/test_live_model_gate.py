@@ -26,21 +26,21 @@ class LiveModelGateTests(unittest.TestCase):
                     "model": "granite4.1:8b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2040,
+                    "benchmark_total_tokens": 2048,
                     "benchmark_median_latency_s": 9.1,
                 },
                 {
                     "model": "gemma4:e4b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2408,
+                    "benchmark_total_tokens": 2436,
                     "benchmark_median_latency_s": 8.6,
                 },
                 {
                     "model": "qwen3:8b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2521,
+                    "benchmark_total_tokens": 2532,
                     "benchmark_median_latency_s": 22.8,
                 },
             ]
@@ -147,7 +147,7 @@ class LiveModelGateTests(unittest.TestCase):
             benchmark_artifact.write_text(
                 json.dumps(
                     {
-                        "summary": {"pass": 8, "runs": 8, "total_tokens": 2408, "total_llm_calls": 4},
+                        "summary": {"pass": 8, "runs": 8, "total_tokens": 2436, "total_llm_calls": 4},
                         "results": [{"latency_s": 8.6}, {"latency_s": 9.4}],
                     }
                 ),
@@ -194,7 +194,7 @@ class LiveModelGateTests(unittest.TestCase):
                         "benchmark_ok": True,
                         "benchmark_passes": 8,
                         "benchmark_runs": 8,
-                        "benchmark_total_tokens": 2408,
+                        "benchmark_total_tokens": 2436,
                         "benchmark_total_llm_calls": 4,
                         "benchmark_median_latency_s": 9.0,
                         "benchmark_artifact": str(benchmark_artifact),

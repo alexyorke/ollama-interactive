@@ -1,7 +1,9 @@
 import sys
+import json
 import unittest
 from io import StringIO
 from pathlib import Path
+import tempfile
 from unittest.mock import patch
 
 from scripts import local_validation
@@ -222,6 +224,87 @@ class LocalValidationTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["coverage_summary"], drifted_coverage)
 
+    def test_live_gate_claim_consistency_matches_canonical_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary_dir = root / "scratch" / "live-model-gate"
+            summary_dir.mkdir(parents=True)
+            (summary_dir / "live-model-gate-summary.json").write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {"model": "granite4.1:8b", "benchmark_total_tokens": 2048},
+                            {"model": "gemma4:e4b", "benchmark_total_tokens": 2436},
+                            {"model": "qwen3:8b", "benchmark_total_tokens": 2532},
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
+            (root / "docs").mkdir()
+            (root / "docs" / "token-efficiency.md").write_text(
+                "`granite4.1:8b` (`2048`)\n`gemma4:e4b` (`2436`)\n`qwen3:8b` (`2532`)\n",
+                encoding="utf-8",
+            )
+            (root / "TODO.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_live_model_gate.py").write_text(
+                '"benchmark_total_tokens": 2048\n"benchmark_total_tokens": 2436\n"benchmark_total_tokens": 2532\n',
+                encoding="utf-8",
+            )
+
+            result = local_validation._live_gate_claim_consistency(root)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["expected_tokens"], ["2048", "2436", "2532"])
+        self.assertTrue(all(row["ok"] for row in result["files"]))
+
+    def test_run_validation_fails_when_live_gate_claims_drift(self) -> None:
+        def fake_run(
+            repo_root: Path,
+            name: str,
+            command: list[str],
+            *,
+            runner: str,
+            resolved_jobs: str,
+        ) -> dict[str, object]:
+            return {
+                "name": name,
+                "command": command,
+                "runner": runner,
+                "resolved_jobs": resolved_jobs,
+                "target_count": 1,
+                "ok": True,
+                "returncode": 0,
+                "elapsed_s": 0.1,
+                "output_tail": "ok",
+            }
+
+        drift = {
+            "ok": False,
+            "available": True,
+            "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
+            "expected_tokens": ["2048", "2436", "2532"],
+            "files": [{"path": "TODO.md", "ok": False, "found_tokens": ["2040", "2408", "2521"]}],
+            "summary": "Live-gate token claims drift from the canonical summary.",
+        }
+
+        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            with patch.object(local_validation.os, "cpu_count", return_value=32):
+                with patch.object(local_validation, "_run", side_effect=fake_run):
+                    with patch.object(local_validation, "_live_gate_claim_consistency", return_value=drift):
+                        payload = local_validation.run_validation(
+                            "smoke",
+                            repo_root=Path.cwd(),
+                            runner="auto",
+                            jobs="auto",
+                        )
+
+        self.assertTrue(payload["command_ok"])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["live_gate_claim_consistency"], drift)
+
     def test_run_validation_records_optional_unittest_baseline_compare(self) -> None:
         def fake_run(
             repo_root: Path,
@@ -336,6 +419,12 @@ class LocalValidationTests(unittest.TestCase):
                 "full_plan_duplicate_target_count": 0,
                 "full_plan_uncovered_target_count": 0,
             },
+            "live_gate_claim_consistency": {
+                "ok": True,
+                "available": True,
+                "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
+                "summary": "All tracked live-gate token claims match the canonical summary.",
+            },
             "baseline_compare": {"requested": False, "ran": False, "skipped_reason": None},
         }
         output_path = Path.cwd() / "scratch" / "validation" / "test-local-validation-main.json"
@@ -356,6 +445,7 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn("share_pct=100.0", stdout.getvalue())
         self.assertIn("coverage tier=smoke", stdout.getvalue())
         self.assertIn("full_plan_complete=True", stdout.getvalue())
+        self.assertIn("live_gate_claims_ok=True", stdout.getvalue())
         self.assertIn('"timing_summary"', written_text["value"])
 
     def test_main_returns_nonzero_when_coverage_plan_is_incomplete(self) -> None:
@@ -373,6 +463,12 @@ class LocalValidationTests(unittest.TestCase):
                 "full_plan_covers_all_discovered_targets": False,
                 "full_plan_duplicate_target_count": 0,
                 "full_plan_uncovered_target_count": 1,
+            },
+            "live_gate_claim_consistency": {
+                "ok": True,
+                "available": True,
+                "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
+                "summary": "All tracked live-gate token claims match the canonical summary.",
             },
             "baseline_compare": {"requested": False, "ran": False, "skipped_reason": None},
         }

@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -38,6 +39,13 @@ AGENT_MODULES = (
 )
 
 MAX_AUTO_PYTEST_WORKERS = 16
+LIVE_GATE_SUMMARY_NAME = "live-model-gate-summary.json"
+LIVE_GATE_CLAIM_PATHS = (
+    "README.md",
+    "docs/token-efficiency.md",
+    "TODO.md",
+    "tests/test_live_model_gate.py",
+)
 
 
 def _module_to_path(module: str) -> str:
@@ -293,6 +301,82 @@ def _baseline_compare_payload(
     return payload
 
 
+def _latest_live_gate_summary_path(repo_root: Path) -> Path | None:
+    canonical = repo_root / "scratch" / "live-model-gate" / LIVE_GATE_SUMMARY_NAME
+    if canonical.exists():
+        return canonical
+    candidates = sorted((repo_root / "scratch").glob(f"live-model-gate-*/{LIVE_GATE_SUMMARY_NAME}"))
+    return candidates[-1] if candidates else None
+
+
+def _extract_release_token_claims(text: str, *, path: str) -> list[str] | None:
+    if path in {"README.md", "TODO.md"}:
+        match = re.search(r"fewest benchmark tokens \(`(\d+)` vs `(\d+)` and `(\d+)`\)", text)
+        return list(match.groups()) if match else None
+    if path == "docs/token-efficiency.md":
+        found: list[str] = []
+        for model in ("granite4.1:8b", "gemma4:e4b", "qwen3:8b"):
+            match = re.search(rf"`{re.escape(model)}`.*?\(`(\d+)`\)", text, flags=re.DOTALL)
+            if not match:
+                return None
+            found.append(match.group(1))
+        return found
+    if path == "tests/test_live_model_gate.py":
+        found = re.findall(r'"benchmark_total_tokens": (\d+)', text)
+        return found[:3] if len(found) >= 3 else None
+    return None
+
+
+def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
+    summary_path = _latest_live_gate_summary_path(repo_root)
+    if summary_path is None:
+        return {"ok": False, "available": False, "summary_path": None, "summary": "No live-gate summary artifact found."}
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {
+            "ok": False,
+            "available": False,
+            "summary_path": str(summary_path),
+            "summary": f"Could not read live-gate summary artifact: {exc}",
+        }
+    models = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(models, list) or len(models) < 3:
+        return {
+            "ok": False,
+            "available": False,
+            "summary_path": str(summary_path),
+            "summary": "Live-gate summary artifact is missing expected model rows.",
+        }
+    expected_tokens = [str(item.get("benchmark_total_tokens")) for item in models[:3]]
+    file_rows: list[dict[str, Any]] = []
+    for rel in LIVE_GATE_CLAIM_PATHS:
+        target = repo_root / rel
+        try:
+            text = target.read_text(encoding="utf-8")
+        except OSError as exc:
+            file_rows.append({"path": rel, "ok": False, "found_tokens": None, "summary": f"Could not read file: {exc}"})
+            continue
+        found_tokens = _extract_release_token_claims(text, path=rel)
+        file_rows.append(
+            {
+                "path": rel,
+                "ok": found_tokens == expected_tokens,
+                "found_tokens": found_tokens,
+                "summary": "matched" if found_tokens == expected_tokens else f"expected {expected_tokens}, found {found_tokens}",
+            }
+        )
+    ok = all(bool(row.get("ok")) for row in file_rows)
+    return {
+        "ok": ok,
+        "available": True,
+        "summary_path": str(summary_path),
+        "expected_tokens": expected_tokens,
+        "files": file_rows,
+        "summary": "All tracked live-gate token claims match the canonical summary." if ok else "Live-gate token claims drift from the canonical summary.",
+    }
+
+
 def _tier_commands(tier: str, *, runner: str, jobs: str) -> list[tuple[str, list[str]]]:
     commands: list[tuple[str, list[str]]] = []
     resolved_runner = _resolved_runner(runner)
@@ -348,7 +432,8 @@ def run_validation(
         jobs=jobs,
         resolved_jobs=resolved_jobs,
     )
-    ok = command_ok and _coverage_ok(coverage_summary)
+    live_gate_claim_consistency = _live_gate_claim_consistency(repo_root)
+    ok = command_ok and _coverage_ok(coverage_summary) and bool(live_gate_claim_consistency.get("ok"))
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root.resolve(strict=False)),
@@ -368,6 +453,7 @@ def run_validation(
         "elapsed_s": elapsed_s,
         "timing_summary": _timing_summary(command_rows, elapsed_s=elapsed_s),
         "coverage_summary": coverage_summary,
+        "live_gate_claim_consistency": live_gate_claim_consistency,
         "baseline_compare": _baseline_compare_payload(
             repo_root,
             requested=compare_unittest_baseline,
@@ -439,6 +525,13 @@ def main(argv: list[str] | None = None) -> int:
             + f" full_plan_complete={coverage_summary.get('full_plan_covers_all_discovered_targets')}"
             + f" duplicates={coverage_summary.get('full_plan_duplicate_target_count')}"
             + f" uncovered={coverage_summary.get('full_plan_uncovered_target_count')}"
+        )
+    claim_consistency = payload.get("live_gate_claim_consistency") or {}
+    if claim_consistency:
+        print(
+            "[local-validation]"
+            + f" live_gate_claims_ok={claim_consistency.get('ok')}"
+            + f" summary_path={claim_consistency.get('summary_path') or '-'}"
         )
     comparison = payload.get("baseline_compare") or {}
     if comparison.get("ran") and isinstance(comparison.get("unittest_discover"), dict):
