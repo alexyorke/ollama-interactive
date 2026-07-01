@@ -20,6 +20,31 @@ from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_too
 
 
 class ToolExecutorTests(unittest.TestCase):
+    def _default_temp_python_test_command(
+        self,
+        files: dict[str, str],
+        *,
+        test_discover_args: tuple[str, ...],
+    ) -> str:
+        test_files = sorted(
+            relative_path
+            for relative_path in files
+            if relative_path.endswith(".py")
+            and (
+                relative_path.endswith("_test.py")
+                or relative_path.split("/")[-1].startswith("test_")
+            )
+        )
+        if len(test_files) == 1:
+            test_path = Path(test_files[0])
+            test_dir = test_path.parent.as_posix() if test_path.parent != Path(".") else "."
+            return subprocess.list2cmdline(
+                [sys.executable, "-m", "unittest", "discover", "-s", test_dir, "-p", test_path.name, "-v"]
+            )
+        return subprocess.list2cmdline(
+            [sys.executable, "-m", "unittest", "discover", *test_discover_args]
+        )
+
     def _workspace_scratch(self) -> Path:
         root = (Path.cwd() / "verify_scratch" / f"test-tools-{uuid4().hex}").resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -57,8 +82,9 @@ class ToolExecutorTests(unittest.TestCase):
         test_discover_args: tuple[str, ...] = ("-p", "*_test.py", "-v"),
         **kwargs: object,
     ):
-        resolved_test_command = test_command or subprocess.list2cmdline(
-            [sys.executable, "-m", "unittest", "discover", *test_discover_args]
+        resolved_test_command = test_command or self._default_temp_python_test_command(
+            files,
+            test_discover_args=test_discover_args,
         )
         with self._temp_files_tools(
             files,
