@@ -91,6 +91,36 @@ class LocalValidationTests(unittest.TestCase):
             ["agent", "full-remaining", "smoke"],
         )
 
+    def test_coverage_summary_partitions_pytest_full_plan_without_duplicates(self) -> None:
+        discovered = (
+            *(local_validation._module_to_path(module) for module in local_validation.SMOKE_MODULES),
+            *(local_validation._module_to_path(module) for module in local_validation.AGENT_MODULES),
+            "tests/test_cli.py",
+            "tests/test_public_benchmark_eval.py",
+        )
+
+        with patch.object(local_validation, "_all_pytest_targets", return_value=tuple(discovered)):
+            commands = self._tier_commands_with_pytest("full", jobs="off")
+            summary = local_validation._coverage_summary(
+                "full",
+                repo_root=Path.cwd(),
+                runner="pytest",
+                jobs="off",
+                resolved_jobs="off",
+            )
+
+        self.assertEqual([name for name, _ in commands], ["smoke", "agent", "full-remaining"])
+        self.assertEqual(summary["mode"], "pytest_target_paths")
+        self.assertEqual(summary["discovered_test_target_count"], len(discovered))
+        self.assertEqual(summary["full_plan_duplicate_target_count"], 0)
+        self.assertEqual(summary["full_plan_uncovered_target_count"], 0)
+        self.assertEqual(summary["full_plan_extra_target_count"], 0)
+        self.assertTrue(summary["full_plan_covers_all_discovered_targets"])
+        self.assertEqual(
+            summary["full_plan_targets_by_tier"]["full-remaining"],
+            ["tests/test_cli.py", "tests/test_public_benchmark_eval.py"],
+        )
+
     def test_run_counts_unittest_module_targets(self) -> None:
         command = [sys.executable, "-m", "unittest", "tests.test_live_model_gate", "tests.test_nightly_self_improvement_report", "-q"]
 
@@ -145,6 +175,8 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(payload["commands"][0]["elapsed_share_pct"], 100.0)
         self.assertEqual(payload["timing_summary"]["command_count"], 1)
         self.assertEqual(payload["timing_summary"]["slowest_commands"][0]["name"], "smoke")
+        self.assertEqual(payload["coverage_summary"]["mode"], "pytest_target_paths")
+        self.assertIn("full_plan_covers_all_discovered_targets", payload["coverage_summary"])
 
     def test_run_validation_records_optional_unittest_baseline_compare(self) -> None:
         def fake_run(
@@ -191,6 +223,7 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(comparison["unittest_discover"]["name"], "unittest-baseline")
         self.assertEqual([row["elapsed_share_pct"] for row in payload["commands"]], [33.3, 33.3, 33.3])
         self.assertEqual(payload["timing_summary"]["slowest_commands"][0]["name"], "agent")
+        self.assertEqual(payload["coverage_summary"]["requested_tier"], "full")
 
     def test_run_validation_skips_unittest_baseline_compare_for_non_full_tier(self) -> None:
         def fake_run(
@@ -249,6 +282,16 @@ class LocalValidationTests(unittest.TestCase):
                     {"name": "smoke", "elapsed_s": 6.5, "target_count": 10, "ok": True}
                 ],
             },
+            "coverage_summary": {
+                "mode": "pytest_target_paths",
+                "requested_tier": "smoke",
+                "requested_unique_target_count": 10,
+                "full_plan_unique_target_count": 37,
+                "discovered_test_target_count": 37,
+                "full_plan_covers_all_discovered_targets": True,
+                "full_plan_duplicate_target_count": 0,
+                "full_plan_uncovered_target_count": 0,
+            },
             "baseline_compare": {"requested": False, "ran": False, "skipped_reason": None},
         }
         output_path = Path.cwd() / "scratch" / "validation" / "test-local-validation-main.json"
@@ -267,6 +310,8 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertIn("slowest=smoke", stdout.getvalue())
         self.assertIn("share_pct=100.0", stdout.getvalue())
+        self.assertIn("coverage tier=smoke", stdout.getvalue())
+        self.assertIn("full_plan_complete=True", stdout.getvalue())
         self.assertIn('"timing_summary"', written_text["value"])
 
 

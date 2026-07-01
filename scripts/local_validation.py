@@ -154,6 +154,18 @@ def _run(
     }
 
 
+def _command_targets(command: list[str], *, runner: str, resolved_jobs: str) -> list[str]:
+    if runner == "pytest":
+        return command[6:] if resolved_jobs != "off" else command[4:]
+    if command[:3] == [sys.executable, "-m", "unittest"]:
+        args = command[3:]
+        if not args or args[0] == "discover":
+            return []
+        trailing_flags = {"-q", "-v"}
+        return [arg for arg in args if arg not in trailing_flags and not arg.startswith("-")]
+    return []
+
+
 def _timing_summary(command_rows: list[dict[str, Any]], *, elapsed_s: float) -> dict[str, Any]:
     total_elapsed = round(float(elapsed_s), 3)
     slowest = sorted(
@@ -174,6 +186,61 @@ def _timing_summary(command_rows: list[dict[str, Any]], *, elapsed_s: float) -> 
         "failed_commands": sum(1 for row in command_rows if not row.get("ok")),
         "total_elapsed_s": total_elapsed,
         "slowest_commands": slowest[:3],
+    }
+
+
+def _coverage_summary(
+    tier: str,
+    *,
+    repo_root: Path,
+    runner: str,
+    jobs: str,
+    resolved_jobs: str,
+) -> dict[str, Any]:
+    if runner != "pytest":
+        return {
+            "mode": "unittest",
+            "requested_tier": tier,
+            "note": "path-level coverage accounting is only available for pytest runs",
+        }
+    all_targets = list(_all_pytest_targets(repo_root))
+    full_commands = _tier_commands("full", runner=runner, jobs=jobs)
+    requested_commands = _tier_commands(tier, runner=runner, jobs=jobs)
+
+    def flatten_target_lists(commands: list[tuple[str, list[str]]]) -> tuple[list[str], dict[str, list[str]]]:
+        by_tier: dict[str, list[str]] = {}
+        flat: list[str] = []
+        for name, command in commands:
+            targets = _command_targets(command, runner=runner, resolved_jobs=resolved_jobs)
+            by_tier[name] = targets
+            flat.extend(targets)
+        return flat, by_tier
+
+    requested_flat, requested_by_tier = flatten_target_lists(requested_commands)
+    full_flat, full_by_tier = flatten_target_lists(full_commands)
+    unique_full = set(full_flat)
+    unique_requested = set(requested_flat)
+    all_target_set = set(all_targets)
+    duplicate_targets = sorted({target for target in full_flat if full_flat.count(target) > 1})
+    uncovered_targets = sorted(all_target_set - unique_full)
+    extra_targets = sorted(unique_full - all_target_set)
+    return {
+        "mode": "pytest_target_paths",
+        "requested_tier": tier,
+        "discovered_test_target_count": len(all_targets),
+        "requested_target_count": len(requested_flat),
+        "requested_unique_target_count": len(unique_requested),
+        "full_plan_target_count": len(full_flat),
+        "full_plan_unique_target_count": len(unique_full),
+        "full_plan_duplicate_target_count": len(duplicate_targets),
+        "full_plan_duplicate_targets_sample": duplicate_targets[:5],
+        "full_plan_uncovered_target_count": len(uncovered_targets),
+        "full_plan_uncovered_targets_sample": uncovered_targets[:5],
+        "full_plan_extra_target_count": len(extra_targets),
+        "full_plan_extra_targets_sample": extra_targets[:5],
+        "full_plan_covers_all_discovered_targets": not duplicate_targets and not uncovered_targets and not extra_targets,
+        "requested_targets_by_tier": requested_by_tier,
+        "full_plan_targets_by_tier": full_by_tier,
     }
 
 
@@ -285,6 +352,13 @@ def run_validation(
         "stopped_after_failure": bool(command_rows and not command_rows[-1]["ok"] and remaining_tiers),
         "elapsed_s": elapsed_s,
         "timing_summary": _timing_summary(command_rows, elapsed_s=elapsed_s),
+        "coverage_summary": _coverage_summary(
+            tier,
+            repo_root=repo_root,
+            runner=resolved_runner,
+            jobs=jobs,
+            resolved_jobs=resolved_jobs,
+        ),
         "baseline_compare": _baseline_compare_payload(
             repo_root,
             requested=compare_unittest_baseline,
@@ -344,6 +418,18 @@ def main(argv: list[str] | None = None) -> int:
             + f" elapsed_s={slowest.get('elapsed_s')}"
             + f" share_pct={next((row.get('elapsed_share_pct') for row in payload['commands'] if row.get('name') == slowest.get('name')), None)}"
             + f" total_elapsed_s={timing_summary.get('total_elapsed_s')}"
+        )
+    coverage_summary = payload.get("coverage_summary") or {}
+    if coverage_summary.get("mode") == "pytest_target_paths":
+        print(
+            "[local-validation]"
+            + f" coverage tier={coverage_summary.get('requested_tier')}"
+            + f" requested_unique={coverage_summary.get('requested_unique_target_count')}"
+            + f" full_unique={coverage_summary.get('full_plan_unique_target_count')}"
+            + f" discovered={coverage_summary.get('discovered_test_target_count')}"
+            + f" full_plan_complete={coverage_summary.get('full_plan_covers_all_discovered_targets')}"
+            + f" duplicates={coverage_summary.get('full_plan_duplicate_target_count')}"
+            + f" uncovered={coverage_summary.get('full_plan_uncovered_target_count')}"
         )
     comparison = payload.get("baseline_compare") or {}
     if comparison.get("ran") and isinstance(comparison.get("unittest_discover"), dict):
