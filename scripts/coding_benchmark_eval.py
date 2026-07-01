@@ -385,6 +385,17 @@ def _run_default_tests(workspace: Path) -> bool:
     return _run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], workspace, timeout=180).returncode == 0
 
 
+def _hidden_python_and_default_tests(workspace: Path, code: str) -> bool:
+    runner = (
+        "import unittest\n"
+        f"{code}\n"
+        "suite = unittest.defaultTestLoader.discover('tests')\n"
+        "result = unittest.TextTestRunner(verbosity=2).run(suite)\n"
+        "raise SystemExit(0 if result.wasSuccessful() else 1)\n"
+    )
+    return _run([sys.executable, "-c", runner], workspace, timeout=180).returncode == 0
+
+
 def prepare_issue_fix_hidden_tests(workspace: Path) -> None:
     _write(workspace / "src" / "calculator.py", "def add(left: int, right: int) -> int:\n    return left - right\n")
     _write(
@@ -417,7 +428,7 @@ def validate_multi_file_refactor(ctx: BenchmarkContext) -> str:
     hidden = "import sys; sys.path.insert(0, 'src'); from pricing import cart_total; assert cart_total([1, 2, 7]) == 10"
     if "def cart_total" not in source or "`total(prices)`" in docs or "cart_total" not in docs:
         return "fail"
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_large_repo_symbol_nav(workspace: Path) -> None:
@@ -450,7 +461,7 @@ def prepare_instructed_edit(workspace: Path) -> None:
 
 def validate_instructed_edit(ctx: BenchmarkContext) -> str:
     hidden = "import sys; sys.path.insert(0, 'src'); from formatter import normalize_email; assert normalize_email('\\tUSER@EXAMPLE.COM ') == 'user@example.com'"
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_terminal_artifact_task(workspace: Path) -> None:
@@ -476,7 +487,7 @@ def prepare_test_repair_task(workspace: Path) -> None:
 
 def validate_test_repair_task(ctx: BenchmarkContext) -> str:
     hidden = "import sys; sys.path.insert(0, 'src'); from slug import slugify; assert slugify('  Many   Spaces ') == 'many-spaces'"
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_forbidden_tool_efficiency(workspace: Path) -> None:
@@ -616,7 +627,7 @@ def validate_bad_test_command_recovery(ctx: BenchmarkContext) -> str:
         and "unittest discover" in str(result.get("command", ""))
         for result in tool_results(ctx.session, "run_test")
     )
-    return "pass" if recovered and _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if recovered and _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_renamed_simple_expression_hidden(workspace: Path) -> None:
@@ -634,7 +645,7 @@ def prepare_renamed_simple_expression_hidden(workspace: Path) -> None:
 
 def validate_renamed_simple_expression_hidden(ctx: BenchmarkContext) -> str:
     hidden = "import sys; sys.path.insert(0, 'src'); from scoreboard import score_delta; assert score_delta(9, -4) == 5; assert score_delta(-8, 3) == -5"
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_renamed_prefix_rotation_hidden(workspace: Path) -> None:
@@ -659,7 +670,7 @@ def validate_renamed_prefix_rotation_hidden(ctx: BenchmarkContext) -> str:
         "assert transform_words('therapy square apple') == 'erapythay aresquay appleay'; "
         "assert transform_words('rhythm pig') == 'ythmrhay igpay'"
     )
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_renamed_word_arithmetic_hidden(workspace: Path) -> None:
@@ -689,7 +700,7 @@ def validate_renamed_word_arithmetic_hidden(ctx: BenchmarkContext) -> str:
         "assert solve('What is 10 minus 3 multiplied by 2?') == 14; "
         "assert solve('What is -6 divided by 3 plus 5?') == 3"
     )
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_renamed_text_matrix_hidden(workspace: Path) -> None:
@@ -713,7 +724,7 @@ def validate_renamed_text_matrix_hidden(ctx: BenchmarkContext) -> str:
         "assert flip_text('AB\\n12\\nxy') == 'A1x\\nB2y'; "
         "assert flip_text('NO\\nUP') == 'NU\\nOP'"
     )
-    return "pass" if _hidden_python(ctx.workspace, hidden) and _run_default_tests(ctx.workspace) else "fail"
+    return "pass" if _hidden_python_and_default_tests(ctx.workspace, hidden) else "fail"
 
 
 def prepare_staged_vs_worktree_diff(workspace: Path) -> None:
