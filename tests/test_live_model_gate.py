@@ -33,14 +33,14 @@ class LiveModelGateTests(unittest.TestCase):
                     "model": "gemma4:e4b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2436,
+                    "benchmark_total_tokens": 2431,
                     "benchmark_median_latency_s": 8.6,
                 },
                 {
                     "model": "qwen3:8b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2532,
+                    "benchmark_total_tokens": 2533,
                     "benchmark_median_latency_s": 22.8,
                 },
             ]
