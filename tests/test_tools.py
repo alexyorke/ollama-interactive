@@ -3707,6 +3707,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("candidate changed signature for add", "\n".join(changed_signature["signature_warnings"]))
         self.assertTrue(passing["ok"], passing)
         self.assertTrue(annotated["ok"], annotated)
+        for result in (changed_signature, passing, annotated):
+            self.assertGreaterEqual(float(result["copy_ms"]), 0.0)
+            self.assertGreaterEqual(float(result["static_ms"]), 0.0)
+            self.assertGreaterEqual(float(result["probe_ms"]), 0.0)
+            self.assertGreater(float(result["test_ms"]), 0.0)
+            self.assertGreaterEqual(float(result["total_ms"]), float(result["test_ms"]))
         self.assertIn("pass", final_text)
 
     def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
@@ -3738,6 +3744,11 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertIn("Normalized foldr reducer order", result["normalized"])
         self.assertIn("accumulator = function(accumulator, item)", result["candidate_source"])
+        self.assertGreaterEqual(float(result["copy_ms"]), 0.0)
+        self.assertGreaterEqual(float(result["static_ms"]), 0.0)
+        self.assertGreaterEqual(float(result["probe_ms"]), 0.0)
+        self.assertGreater(float(result["test_ms"]), 0.0)
+        self.assertGreaterEqual(float(result["total_ms"]), float(result["test_ms"]))
 
     def test_run_test_example_probes_report_value_and_type_mismatches(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

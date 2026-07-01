@@ -8824,12 +8824,38 @@ import string
         timeout: int = 120,
     ) -> dict[str, Any]:
         self._check_interrupted()
+        started_at = time.perf_counter()
+        phase_timings_ms = {
+            "copy_ms": 0.0,
+            "static_ms": 0.0,
+            "probe_ms": 0.0,
+            "test_ms": 0.0,
+        }
+
+        def timing_fields() -> dict[str, float]:
+            return {
+                **phase_timings_ms,
+                "total_ms": round((time.perf_counter() - started_at) * 1000, 3),
+            }
+
         source_file = self.resolve_path(source_path, allow_missing=False)
         rel_source = self.relative_label(source_file)
         if source_file.suffix.lower() != ".py":
-            return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "summary": "candidate validation supports Python source files only."}
+            return {
+                "ok": False,
+                "tool": "validate_implementation_candidate",
+                "path": rel_source,
+                "summary": "candidate validation supports Python source files only.",
+                **timing_fields(),
+            }
         if not isinstance(candidate_source, str) or not candidate_source.strip():
-            return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "summary": "candidate_source is empty."}
+            return {
+                "ok": False,
+                "tool": "validate_implementation_candidate",
+                "path": rel_source,
+                "summary": "candidate_source is empty.",
+                **timing_fields(),
+            }
         original = source_file.read_text(encoding="utf-8", errors="replace")
         candidate_source, normalization = self._normalize_candidate_python_source(source_file, candidate_source)
         signature_diagnostics = self._candidate_signature_diagnostics(original, candidate_source)
@@ -8846,17 +8872,28 @@ import string
                 "normalized": normalization,
                 "output": output,
                 "summary": output,
+                **timing_fields(),
             }
         try:
             ast.parse(self._python_parse_text(candidate_source), filename=rel_source)
         except SyntaxError as exc:
             summary = f"candidate syntax error at {rel_source}:{exc.lineno or 1}: {exc.msg}"
-            return {"ok": False, "tool": "validate_implementation_candidate", "path": rel_source, "stage": "syntax", "summary": summary, "output": summary}
+            return {
+                "ok": False,
+                "tool": "validate_implementation_candidate",
+                "path": rel_source,
+                "stage": "syntax",
+                "summary": summary,
+                "output": summary,
+                **timing_fields(),
+            }
         tmp_base = self.workspace_root / ".ollama-code" / "tmp" / f"candidate-{uuid4().hex}"
         try:
             tmp_base.mkdir(parents=True, exist_ok=False)
             temp_root = tmp_base / "workspace"
+            phase_started_at = time.perf_counter()
             self._copy_workspace_for_candidate(temp_root)
+            phase_timings_ms["copy_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
             temp_source = temp_root / rel_source
             temp_source.parent.mkdir(parents=True, exist_ok=True)
             temp_source.write_text(candidate_source, encoding="utf-8")
@@ -8870,7 +8907,9 @@ import string
                 browser_enabled=self.browser_enabled,
                 security_enabled=self.security_enabled,
             )
+            phase_started_at = time.perf_counter()
             static_result = temp_tools.contract_check([rel_source], limit=12)
+            phase_timings_ms["static_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
             if static_result.get("ok") is not True:
                 summary = str(static_result.get("output") or static_result.get("summary") or "candidate static sanity failed")
                 return {
@@ -8883,17 +8922,22 @@ import string
                     "normalized": normalization,
                     "output": summary,
                     "summary": summary,
-            }
+                    **timing_fields(),
+                }
             probe_result: dict[str, Any] | None = None
             probe_failure_summary = ""
             if test_path:
+                phase_started_at = time.perf_counter()
                 probe_result = temp_tools.run_test_example_probes(rel_source, test_path, limit=max(1, min(int(probe_limit), 24)), timeout=min(max(1, int(timeout)), 60))
+                phase_timings_ms["probe_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
                 if probe_result.get("ok") is not True:
                     probe_failure_summary = str(probe_result.get("output") or probe_result.get("summary") or "candidate example probes failed")
             run_args: dict[str, Any] = {"timeout": max(1, int(timeout))}
             if test_command:
                 run_args["command"] = test_command
+            phase_started_at = time.perf_counter()
             test_result = temp_tools.run_test(**run_args)
+            phase_timings_ms["test_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
             if test_result.get("ok") is not True:
                 summary = str(test_result.get("output") or test_result.get("summary") or "candidate tests failed")
                 if probe_failure_summary:
@@ -8910,6 +8954,7 @@ import string
                     "normalized": normalization,
                     "output": self._truncate_text(summary, limit=1600),
                     "summary": self._truncate_text(summary, limit=520),
+                    **timing_fields(),
                 }
         finally:
             shutil.rmtree(tmp_base, ignore_errors=True)
@@ -8923,6 +8968,7 @@ import string
             "signature_warnings": signature_warnings,
             "summary": "candidate passed syntax, static sanity, example probes, and tests",
             "output": "candidate passed syntax, static sanity, example probes, and tests",
+            **timing_fields(),
         }
 
     def run_function_probe(
