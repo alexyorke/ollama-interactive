@@ -5305,8 +5305,7 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_bash_checks_then_runs_valid_unknown_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             run_result = subprocess.CompletedProcess(args="echo ok", returncode=0, stdout="ok\n", stderr="")
             with patch("ollama_code.tools.shutil.which", return_value="bash"):
                 with patch("ollama_code.tools.subprocess.run") as syntax_mock:
@@ -5320,8 +5319,7 @@ def double(value: int) -> int:
         self.assertTrue(run_mock.call_args.kwargs["shell"])
 
     def test_run_shell_bash_checks_shell_metachar_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             syntax_result = subprocess.CompletedProcess(args=["bash", "-n", "-c", "echo ok | cat"], returncode=0, stdout="", stderr="")
             run_result = subprocess.CompletedProcess(args="echo ok | cat", returncode=0, stdout="ok\n", stderr="")
             with patch("ollama_code.tools.shutil.which", return_value="bash"):
@@ -5336,8 +5334,7 @@ def double(value: int) -> int:
         self.assertTrue(run_mock.call_args.kwargs["shell"])
 
     def test_run_shell_rejects_missing_unknown_executable_after_bash_check(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
 
             def fake_which(name: str) -> str | None:
                 return "bash" if name == "bash" else None
@@ -5354,8 +5351,7 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_rejects_path_escape_for_validated_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch("ollama_code.tools.shutil.which", return_value="pytest"):
                 with patch.object(ToolExecutor, "_run_process") as run_mock:
                     result = tools.run_shell("pytest ../outside")
@@ -5365,11 +5361,9 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_rejects_path_escape_for_unknown_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             outside = root.parent / "outside.txt"
             outside.write_text("secret\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch.object(ToolExecutor, "_run_process") as run_mock:
                 result = tools.run_shell("cat ../outside.txt")
 
@@ -5378,13 +5372,11 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_rejects_executable_path_escape_for_unknown_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, tools):
             outside_name = "outside-tool.bat" if os.name == "nt" else "outside-tool.sh"
             outside = root.parent / outside_name
             outside.write_text("@echo off\r\necho hi\r\n" if os.name == "nt" else "#!/bin/sh\necho hi\n", encoding="utf-8")
             command = f"..\\{outside_name} --help" if os.name == "nt" else f"../{outside_name} --help"
-            tools = ToolExecutor(root, approval_mode="auto")
             with patch.object(ToolExecutor, "_run_process") as run_mock:
                 result = tools.run_shell(command)
 
@@ -5393,12 +5385,8 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_validates_local_executable_relative_to_cwd(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"service/gradlew.bat": "@echo off\n"}) as (root, tools):
             project = root / "service"
-            project.mkdir()
-            (project / "gradlew.bat").write_text("@echo off\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             completed = subprocess.CompletedProcess(args=["gradlew.bat", "test"], returncode=0, stdout="ok\n", stderr="")
 
             with patch("ollama_code.tools.shutil.which", return_value=None):
@@ -5412,8 +5400,7 @@ def double(value: int) -> int:
         self.assertEqual(run_mock.call_args.kwargs["timeout"], 7)
 
     def test_run_shell_runs_valid_common_command_without_shell(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             completed = subprocess.CompletedProcess(args=["git", "status", "--short"], returncode=0, stdout="ok\n", stderr="")
             with patch("ollama_code.tools.shutil.which", return_value="git"):
                 with patch.object(ToolExecutor, "_run_process", return_value=completed) as run_mock:
