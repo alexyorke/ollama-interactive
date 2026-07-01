@@ -3442,28 +3442,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_text_matrix_transpose_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "transpose.py").write_text("def transpose(text):\n    pass\n", encoding="utf-8")
-            (root / "transpose_test.py").write_text(
-                "import unittest\nfrom transpose import transpose\n\n"
-                "class TransposeTest(unittest.TestCase):\n"
-                "    def test_empty_string(self):\n"
-                "        self.assertEqual(transpose(''), '')\n"
-                "    def test_two_characters_in_a_row(self):\n"
-                "        self.assertEqual(transpose('A1'), 'A\\n1')\n"
-                "    def test_two_characters_in_a_column(self):\n"
-                "        self.assertEqual(transpose('A\\n1'), 'A1')\n"
-                "    def test_simple(self):\n"
-                "        self.assertEqual(transpose('ABC\\n123'), 'A1\\nB2\\nC3')\n"
-                "    def test_single_line_with_space(self):\n"
-                "        self.assertEqual(transpose('A B'), 'A\\n \\nB')\n"
-                "    def test_jagged_triangle(self):\n"
-                "        self.assertEqual(transpose('11\\n2\\n3333\\n444\\n555555\\n66666'), '123456\\n1 3456\\n  3456\\n  3 56\\n    56\\n    5')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "transpose.py": "def transpose(text):\n    pass\n",
+                "transpose_test.py": (
+                    "import unittest\nfrom transpose import transpose\n\n"
+                    "class TransposeTest(unittest.TestCase):\n"
+                    "    def test_empty_string(self):\n"
+                    "        self.assertEqual(transpose(''), '')\n"
+                    "    def test_two_characters_in_a_row(self):\n"
+                    "        self.assertEqual(transpose('A1'), 'A\\n1')\n"
+                    "    def test_two_characters_in_a_column(self):\n"
+                    "        self.assertEqual(transpose('A\\n1'), 'A1')\n"
+                    "    def test_simple(self):\n"
+                    "        self.assertEqual(transpose('ABC\\n123'), 'A1\\nB2\\nC3')\n"
+                    "    def test_single_line_with_space(self):\n"
+                    "        self.assertEqual(transpose('A B'), 'A\\n \\nB')\n"
+                    "    def test_jagged_triangle(self):\n"
+                    "        self.assertEqual(transpose('11\\n2\\n3333\\n444\\n555555\\n66666'), '123456\\n1 3456\\n  3456\\n  3 56\\n    56\\n    5')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_text_matrix_transpose_candidate("transpose.py", "transpose_test.py")
             validation = tools.validate_implementation_candidate(
                 "transpose.py",
@@ -3477,37 +3476,35 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("for column in range(width)", synthesized["candidate_source"])
 
     def test_synthesize_cyclic_interval_scale_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "scale_generator.py").write_text(
-                "class Scale:\n"
-                "    def __init__(self, tonic):\n"
-                "        pass\n"
-                "    def chromatic(self):\n"
-                "        pass\n"
-                "    def interval(self, intervals):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "scale_generator_test.py").write_text(
-                "import unittest\nfrom scale_generator import Scale\n\n"
-                "class ScaleTest(unittest.TestCase):\n"
-                "    def test_chromatic_scale_with_sharps(self):\n"
-                "        self.assertEqual(Scale('C').chromatic(), ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'])\n"
-                "    def test_chromatic_scale_with_flats(self):\n"
-                "        self.assertEqual(Scale('F').chromatic(), ['F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B', 'C', 'Db', 'D', 'Eb', 'E'])\n"
-                "    def test_simple_major_scale(self):\n"
-                "        self.assertEqual(Scale('C').interval('MMmMMMm'), ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C'])\n"
-                "    def test_major_scale_with_flats(self):\n"
-                "        self.assertEqual(Scale('F').interval('MMmMMMm'), ['F', 'G', 'A', 'Bb', 'C', 'D', 'E', 'F'])\n"
-                "    def test_minor_scale_with_sharps(self):\n"
-                "        self.assertEqual(Scale('f#').interval('MmMMmMM'), ['F#', 'G#', 'A', 'B', 'C#', 'D', 'E', 'F#'])\n"
-                "    def test_enigmatic(self):\n"
-                "        self.assertEqual(Scale('G').interval('mAMMMmm'), ['G', 'G#', 'B', 'C#', 'D#', 'F', 'F#', 'G'])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "scale_generator.py": (
+                    "class Scale:\n"
+                    "    def __init__(self, tonic):\n"
+                    "        pass\n"
+                    "    def chromatic(self):\n"
+                    "        pass\n"
+                    "    def interval(self, intervals):\n"
+                    "        pass\n"
+                ),
+                "scale_generator_test.py": (
+                    "import unittest\nfrom scale_generator import Scale\n\n"
+                    "class ScaleTest(unittest.TestCase):\n"
+                    "    def test_chromatic_scale_with_sharps(self):\n"
+                    "        self.assertEqual(Scale('C').chromatic(), ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'])\n"
+                    "    def test_chromatic_scale_with_flats(self):\n"
+                    "        self.assertEqual(Scale('F').chromatic(), ['F', 'Gb', 'G', 'Ab', 'A', 'Bb', 'B', 'C', 'Db', 'D', 'Eb', 'E'])\n"
+                    "    def test_simple_major_scale(self):\n"
+                    "        self.assertEqual(Scale('C').interval('MMmMMMm'), ['C', 'D', 'E', 'F', 'G', 'A', 'B', 'C'])\n"
+                    "    def test_major_scale_with_flats(self):\n"
+                    "        self.assertEqual(Scale('F').interval('MMmMMMm'), ['F', 'G', 'A', 'Bb', 'C', 'D', 'E', 'F'])\n"
+                    "    def test_minor_scale_with_sharps(self):\n"
+                    "        self.assertEqual(Scale('f#').interval('MmMMmMM'), ['F#', 'G#', 'A', 'B', 'C#', 'D', 'E', 'F#'])\n"
+                    "    def test_enigmatic(self):\n"
+                    "        self.assertEqual(Scale('G').interval('mAMMMmm'), ['G', 'G#', 'B', 'C#', 'D#', 'F', 'F#', 'G'])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_cyclic_interval_scale_candidate("scale_generator.py", "scale_generator_test.py")
             validation = tools.validate_implementation_candidate(
                 "scale_generator.py",
@@ -3521,35 +3518,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("F", synthesized["flat_tonics"])
 
     def test_synthesize_unique_regex_identifier_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "robot_name.py").write_text(
-                "class Robot:\n"
-                "    def __init__(self):\n"
-                "        self.name = None\n",
-                encoding="utf-8",
-            )
-            (root / "robot_name_test.py").write_text(
-                "import random\nimport unittest\nfrom robot_name import Robot\n\n"
-                "class RobotNameTest(unittest.TestCase):\n"
-                "    name_re = r'^[A-Z]{2}\\d{3}$'\n"
-                "    def test_has_name(self):\n"
-                "        self.assertRegex(Robot().name, self.name_re)\n"
-                "    def test_different_robots_have_different_names(self):\n"
-                "        self.assertNotEqual(Robot().name, Robot().name)\n"
-                "    def test_reset_name(self):\n"
-                "        random.seed('same')\n"
-                "        robot = Robot()\n"
-                "        name = robot.name\n"
-                "        random.seed('same')\n"
-                "        robot.reset()\n"
-                "        name2 = robot.name\n"
-                "        self.assertNotEqual(name, name2)\n"
-                "        self.assertRegex(name2, self.name_re)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "robot_name.py": (
+                    "class Robot:\n"
+                    "    def __init__(self):\n"
+                    "        self.name = None\n"
+                ),
+                "robot_name_test.py": (
+                    "import random\nimport unittest\nfrom robot_name import Robot\n\n"
+                    "class RobotNameTest(unittest.TestCase):\n"
+                    "    name_re = r'^[A-Z]{2}\\d{3}$'\n"
+                    "    def test_has_name(self):\n"
+                    "        self.assertRegex(Robot().name, self.name_re)\n"
+                    "    def test_different_robots_have_different_names(self):\n"
+                    "        self.assertNotEqual(Robot().name, Robot().name)\n"
+                    "    def test_reset_name(self):\n"
+                    "        random.seed('same')\n"
+                    "        robot = Robot()\n"
+                    "        name = robot.name\n"
+                    "        random.seed('same')\n"
+                    "        robot.reset()\n"
+                    "        name2 = robot.name\n"
+                    "        self.assertNotEqual(name, name2)\n"
+                    "        self.assertRegex(name2, self.name_re)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_unique_regex_identifier_candidate("robot_name.py", "robot_name_test.py")
             validation = tools.validate_implementation_candidate(
                 "robot_name.py",
@@ -3563,68 +3558,66 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(synthesized["attribute"], "name")
 
     def test_synthesize_node_collection_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "simple_linked_list.py").write_text(
-                "class EmptyListException(Exception):\n"
-                "    pass\n\n\n"
-                "class Node:\n"
-                "    def __init__(self, value):\n"
-                "        pass\n\n"
-                "    def value(self):\n"
-                "        pass\n\n"
-                "    def next(self):\n"
-                "        pass\n\n\n"
-                "class LinkedList:\n"
-                "    def __init__(self, values=None):\n"
-                "        pass\n\n"
-                "    def __iter__(self):\n"
-                "        pass\n\n"
-                "    def __len__(self):\n"
-                "        pass\n\n"
-                "    def head(self):\n"
-                "        pass\n\n"
-                "    def push(self, value):\n"
-                "        pass\n\n"
-                "    def pop(self):\n"
-                "        pass\n\n"
-                "    def reversed(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "simple_linked_list_test.py").write_text(
-                "import unittest\nfrom simple_linked_list import EmptyListException, LinkedList\n\n"
-                "class SimpleLinkedListTest(unittest.TestCase):\n"
-                "    def test_len(self):\n"
-                "        sut = LinkedList([1, 2, 3])\n"
-                "        self.assertEqual(len(sut), 3)\n"
-                "        sut.push(4)\n"
-                "        self.assertEqual(len(sut), 4)\n"
-                "    def test_empty_head(self):\n"
-                "        sut = LinkedList()\n"
-                "        with self.assertRaises(EmptyListException) as err:\n"
-                "            sut.head()\n"
-                "        self.assertEqual(err.exception.args[0], 'The list is empty.')\n"
-                "    def test_head_push_pop(self):\n"
-                "        sut = LinkedList([1, 2])\n"
-                "        self.assertEqual(sut.head().value(), 2)\n"
-                "        sut.push(3)\n"
-                "        self.assertEqual(sut.pop(), 3)\n"
-                "        self.assertEqual(sut.pop(), 2)\n"
-                "        self.assertEqual(sut.pop(), 1)\n"
-                "        with self.assertRaises(EmptyListException):\n"
-                "            sut.pop()\n"
-                "    def test_iter_and_reverse(self):\n"
-                "        sut = LinkedList([1, 2, 3])\n"
-                "        self.assertEqual(list(sut), [3, 2, 1])\n"
-                "        self.assertEqual(list(sut.reversed()), [1, 2, 3])\n"
-                "    def test_head_next(self):\n"
-                "        sut = LinkedList([1])\n"
-                "        self.assertIsNone(sut.head().next())\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "simple_linked_list.py": (
+                    "class EmptyListException(Exception):\n"
+                    "    pass\n\n\n"
+                    "class Node:\n"
+                    "    def __init__(self, value):\n"
+                    "        pass\n\n"
+                    "    def value(self):\n"
+                    "        pass\n\n"
+                    "    def next(self):\n"
+                    "        pass\n\n\n"
+                    "class LinkedList:\n"
+                    "    def __init__(self, values=None):\n"
+                    "        pass\n\n"
+                    "    def __iter__(self):\n"
+                    "        pass\n\n"
+                    "    def __len__(self):\n"
+                    "        pass\n\n"
+                    "    def head(self):\n"
+                    "        pass\n\n"
+                    "    def push(self, value):\n"
+                    "        pass\n\n"
+                    "    def pop(self):\n"
+                    "        pass\n\n"
+                    "    def reversed(self):\n"
+                    "        pass\n"
+                ),
+                "simple_linked_list_test.py": (
+                    "import unittest\nfrom simple_linked_list import EmptyListException, LinkedList\n\n"
+                    "class SimpleLinkedListTest(unittest.TestCase):\n"
+                    "    def test_len(self):\n"
+                    "        sut = LinkedList([1, 2, 3])\n"
+                    "        self.assertEqual(len(sut), 3)\n"
+                    "        sut.push(4)\n"
+                    "        self.assertEqual(len(sut), 4)\n"
+                    "    def test_empty_head(self):\n"
+                    "        sut = LinkedList()\n"
+                    "        with self.assertRaises(EmptyListException) as err:\n"
+                    "            sut.head()\n"
+                    "        self.assertEqual(err.exception.args[0], 'The list is empty.')\n"
+                    "    def test_head_push_pop(self):\n"
+                    "        sut = LinkedList([1, 2])\n"
+                    "        self.assertEqual(sut.head().value(), 2)\n"
+                    "        sut.push(3)\n"
+                    "        self.assertEqual(sut.pop(), 3)\n"
+                    "        self.assertEqual(sut.pop(), 2)\n"
+                    "        self.assertEqual(sut.pop(), 1)\n"
+                    "        with self.assertRaises(EmptyListException):\n"
+                    "            sut.pop()\n"
+                    "    def test_iter_and_reverse(self):\n"
+                    "        sut = LinkedList([1, 2, 3])\n"
+                    "        self.assertEqual(list(sut), [3, 2, 1])\n"
+                    "        self.assertEqual(list(sut.reversed()), [1, 2, 3])\n"
+                    "    def test_head_next(self):\n"
+                    "        sut = LinkedList([1])\n"
+                    "        self.assertIsNone(sut.head().next())\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_node_collection_candidate("simple_linked_list.py", "simple_linked_list_test.py")
             validation = tools.validate_implementation_candidate(
                 "simple_linked_list.py",
@@ -3638,28 +3631,25 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("node-backed collection", synthesized["summary"])
 
     def test_synthesize_relative_import_candidate_for_package_sibling(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src" / "pkg").mkdir(parents=True)
-            (root / "tests").mkdir()
-            (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
-            (root / "src" / "pkg" / "helpers.py").write_text("def label(value):\n    return f'[{value}]'\n", encoding="utf-8")
-            (root / "src" / "pkg" / "core.py").write_text(
-                "from helpers import label\n\n"
-                "def wrapped():\n"
-                "    return label('ok')\n",
-                encoding="utf-8",
-            )
-            (root / "tests" / "test_pkg.py").write_text(
-                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
-                "import unittest\nfrom pkg.core import wrapped\n\n"
-                "class PackageTests(unittest.TestCase):\n"
-                "    def test_wrapped(self):\n"
-                "        self.assertEqual(wrapped(), '[ok]')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "src/pkg/__init__.py": "",
+                "src/pkg/helpers.py": "def label(value):\n    return f'[{value}]'\n",
+                "src/pkg/core.py": (
+                    "from helpers import label\n\n"
+                    "def wrapped():\n"
+                    "    return label('ok')\n"
+                ),
+                "tests/test_pkg.py": (
+                    "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
+                    "import unittest\nfrom pkg.core import wrapped\n\n"
+                    "class PackageTests(unittest.TestCase):\n"
+                    "    def test_wrapped(self):\n"
+                    "        self.assertEqual(wrapped(), '[ok]')\n"
+                ),
+            },
+            test_discover_args=("-s", "tests", "-v"),
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_relative_import_candidate("src/pkg/core.py", "tests/test_pkg.py")
             validation = tools.validate_implementation_candidate(
                 "src/pkg/core.py",
