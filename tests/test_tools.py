@@ -20,6 +20,8 @@ from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_too
 
 
 class ToolExecutorTests(unittest.TestCase):
+    _git_template_root: Path | None = None
+
     def _default_temp_python_test_command(
         self,
         files: dict[str, str],
@@ -124,9 +126,15 @@ class ToolExecutorTests(unittest.TestCase):
         if shutil.which("git") is None:
             self.skipTest("git is not installed")
         try:
-            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "config", "user.name", "Test User"], cwd=root, check=True, capture_output=True, text=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=root, check=True, capture_output=True, text=True)
+            template_root = self.__class__._git_template_root
+            if template_root is None or not template_root.exists():
+                template_root = Path(tempfile.mkdtemp(prefix="test-tools-git-template-")).resolve()
+                subprocess.run(["git", "init"], cwd=template_root, check=True, capture_output=True, text=True)
+                subprocess.run(["git", "config", "user.name", "Test User"], cwd=template_root, check=True, capture_output=True, text=True)
+                subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=template_root, check=True, capture_output=True, text=True)
+                self.__class__._git_template_root = template_root
+                self.__class__.addClassCleanup(lambda: shutil.rmtree(template_root, ignore_errors=True))
+            shutil.copytree(template_root, root, dirs_exist_ok=True)
         except subprocess.CalledProcessError as exc:
             message = (exc.stderr or exc.stdout or str(exc)).strip()
             self.skipTest(f"git repo init is unavailable in this environment: {message}")
