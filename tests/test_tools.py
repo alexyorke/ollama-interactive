@@ -804,14 +804,14 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return a + b", final_text)
 
     def test_execute_ignores_extra_tool_arguments_when_required_args_exist(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pricing.py").write_text(
-                "def calculate_discount():\n"
-                "    return 'TOKEN_SYMBOL_750'\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "pricing.py": (
+                    "def calculate_discount():\n"
+                    "    return 'TOKEN_SYMBOL_750'\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.execute(
                 "read_symbol",
                 {"path": "pricing.py", "symbol": "calculate_discount", "start": 1, "end": 20},
@@ -821,18 +821,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("TOKEN_SYMBOL_750", result["output"])
 
     def test_code_outline_supports_generic_javascript_symbols(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "web.js").write_text(
-                "export class Widget {\n"
-                "  render() { return '<div></div>'; }\n"
-                "}\n\n"
-                "export function hydrateWidget() {\n"
-                "  return new Widget();\n"
-                "}\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "web.js": (
+                    "export class Widget {\n"
+                    "  render() { return '<div></div>'; }\n"
+                    "}\n\n"
+                    "export function hydrateWidget() {\n"
+                    "  return new Widget();\n"
+                    "}\n"
+                )
+            }
+        ) as (_root, tools):
             outline = tools.code_outline("web.js")
             symbol = tools.read_symbol("web.js", "hydrateWidget", include_context=0)
 
@@ -843,14 +843,14 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("new Widget", symbol["output"])
 
     def test_repo_index_search_returns_ranked_compact_snippets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pricing.py").write_text(
-                "def calculate_discount(cart):\n"
-                "    return sum(cart) * 0.9\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "pricing.py": (
+                    "def calculate_discount(cart):\n"
+                    "    return sum(cart) * 0.9\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.repo_index_search("discount calculation")
 
         self.assertTrue(result["ok"])
@@ -859,18 +859,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("   1 |", result["output"])
 
     def test_fts_search_indexes_symbols_headings_and_scopes_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "docs").mkdir()
-            (root / "src" / "pricing.py").write_text(
-                "def calculate_discount(cart):\n"
-                "    \"\"\"Seasonal discount calculation.\"\"\"\n"
-                "    return sum(cart) * 0.9\n",
-                encoding="utf-8",
-            )
-            (root / "docs" / "guide.md").write_text("# Seasonal Pricing\nUse discount calculation carefully.\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/pricing.py": (
+                    "def calculate_discount(cart):\n"
+                    "    \"\"\"Seasonal discount calculation.\"\"\"\n"
+                    "    return sum(cart) * 0.9\n"
+                ),
+                "docs/guide.md": "# Seasonal Pricing\nUse discount calculation carefully.\n",
+            }
+        ) as (_root, tools):
             refresh = tools.fts_refresh()
             all_result = tools.fts_search("seasonal discount")
             src_result = tools.fts_search("seasonal", path="src")
@@ -884,11 +882,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("docs/guide.md", src_result["output"])
 
     def test_fts_refresh_reuses_unchanged_rows_and_deletes_stale_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"notes.md": "# Alpha\nReusable content\n"}) as (root, tools):
             target = root / "notes.md"
-            target.write_text("# Alpha\nReusable content\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             first = tools.fts_refresh()
             second = tools.fts_refresh()
             target.unlink()
@@ -907,8 +902,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(search["output"], "(no FTS matches)")
 
     def test_fd_search_reports_missing_fd(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch.object(ToolExecutor, "_fd_cli_path", return_value=None):
                 result = tools.fd_search("README")
 
@@ -916,13 +910,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["missing_dependency"], "fd")
 
     def test_context_pack_returns_ranked_evidence_and_writes_index_cache(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "pricing.py").write_text("def calculate_discount(cart):\n    return sum(cart)\n", encoding="utf-8")
-            (root / "tests" / "test_pricing.py").write_text("from src.pricing import calculate_discount\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/pricing.py": "def calculate_discount(cart):\n    return sum(cart)\n",
+                "tests/test_pricing.py": "from src.pricing import calculate_discount\n",
+            }
+        ) as (_root, tools):
             result = tools.context_pack("fix discount calculation")
 
         self.assertTrue(result["ok"])
@@ -934,11 +927,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["ranked_symbols"], [{"path": "src/pricing.py", "qualname": "calculate_discount"}])
 
     def test_repo_index_search_invalidates_changed_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"ops.py": "def first_name():\n    return 'old'\n"}) as (root, tools):
             target = root / "ops.py"
-            target.write_text("def first_name():\n    return 'old'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             first = tools.repo_index_search("first_name")
             target.write_text("def second_name():\n    return 'new'\n", encoding="utf-8")
             second = tools.repo_index_search("second_name")
@@ -4539,18 +4529,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("fn(2, 5): 7", result["output"])
 
     def test_call_graph_finds_callers_and_callees(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def helper(value):\n"
-                "    return value + 1\n\n"
-                "def target(value):\n"
-                "    return helper(value)\n\n"
-                "def caller():\n"
-                "    return target(1)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def helper(value):\n"
+                    "    return value + 1\n\n"
+                    "def target(value):\n"
+                    "    return helper(value)\n\n"
+                    "def caller():\n"
+                    "    return target(1)\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.call_graph("app.py", "target")
 
         self.assertTrue(result["ok"])
@@ -4558,21 +4548,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("caller", result["output"])
 
     def test_contract_graph_reports_contracts_and_purity(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "import subprocess\n\n"
-                "def helper(value: int) -> int:\n"
-                "    return value + 1\n\n"
-                "def target(value: int) -> int:\n"
-                "    return helper(value)\n\n"
-                "def caller() -> int:\n"
-                "    return target(1)\n\n"
-                "def shell() -> None:\n"
-                "    subprocess.run(['echo', 'x'])\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "import subprocess\n\n"
+                    "def helper(value: int) -> int:\n"
+                    "    return value + 1\n\n"
+                    "def target(value: int) -> int:\n"
+                    "    return helper(value)\n\n"
+                    "def caller() -> int:\n"
+                    "    return target(1)\n\n"
+                    "def shell() -> None:\n"
+                    "    subprocess.run(['echo', 'x'])\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_graph("app.py", "target")
             all_result = tools.contract_graph("app.py")
 
@@ -4585,10 +4575,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("impure_hint", all_result["output"])
 
     def test_verified_function_index_search_and_show_cards(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "utils.py").write_text(
-                '''
+        with self._temp_files_tools(
+            {
+                "utils.py": '''
 def normalize_phone(value: str) -> str:
     """Normalize phone digits for lookup."""
     return "".join(ch for ch in value if ch.isdigit())
@@ -4596,11 +4585,9 @@ def normalize_phone(value: str) -> str:
 def noisy(value: str) -> str:
     print(value)
     return value
-'''.lstrip(),
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-
+'''.lstrip()
+            }
+        ) as (_root, tools):
             indexed = tools.verified_function_index()
             search = tools.verified_function_search("phone lookup")
             card_id = search["cards"][0]["id"]
@@ -4616,11 +4603,9 @@ def noisy(value: str) -> str:
         self.assertIn("Normalize phone digits", shown["output"])
 
     def test_promote_verified_function_with_docstring_probe_and_stale_detection(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            target = root / "math_utils.py"
-            target.write_text(
-                '''
+        with self._temp_files_tools(
+            {
+                "math_utils.py": '''
 def double(value: int) -> int:
     """Double an integer.
 
@@ -4628,11 +4613,10 @@ def double(value: int) -> int:
     6
     """
     return value * 2
-'''.lstrip(),
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-
+'''.lstrip()
+            }
+        ) as (root, tools):
+            target = root / "math_utils.py"
             promoted = tools.promote_verified_function("math_utils.py", "double")
             shown_fresh = tools.verified_function_show(promoted["id"])
             target.write_text(target.read_text(encoding="utf-8").replace("value * 2", "value * 3"), encoding="utf-8")
@@ -4644,10 +4628,9 @@ def double(value: int) -> int:
         self.assertTrue(shown_stale["stale"])
 
     def test_verify_function_contract_rejects_failing_docstring_probe(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "math_utils.py").write_text(
-                '''
+        with self._temp_files_tools(
+            {
+                "math_utils.py": '''
 def double(value: int) -> int:
     """Double an integer.
 
@@ -4655,11 +4638,9 @@ def double(value: int) -> int:
     7
     """
     return value * 2
-'''.lstrip(),
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-
+'''.lstrip()
+            }
+        ) as (_root, tools):
             result = tools.verify_function_contract("math_utils.py", "double")
 
         self.assertFalse(result["ok"])
