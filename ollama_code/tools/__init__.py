@@ -10776,6 +10776,7 @@ import string
         base = self.resolve_path(path, allow_missing=False)
         root = self._project_root_for(base)
         validators: list[dict[str, Any]] = []
+        limit_value = max(1, int(limit))
 
         def add(kind: str, lang: str, command: str, reason: str) -> None:
             validators.append({"kind": kind, "lang": lang, "command": command, "reason": reason})
@@ -10784,10 +10785,27 @@ import string
             command = self._python_tool_command(executable, module, *args)
             return command_to_text(tuple(command)) if command else command_to_text((executable, *args))
 
+        def finalize() -> dict[str, Any]:
+            selected = [dict(item) for item in validators[:limit_value]]
+            for item in selected:
+                item["available"] = self._available_command(str(item.get("command") or ""), cwd=root)
+            lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
+            return {
+                "ok": True,
+                "tool": "discover_validators",
+                "path": self.relative_label(root),
+                "count": len(selected),
+                "validators": selected,
+                "output": "\n".join(lines) if lines else "(no validators discovered)",
+            }
+
+        def reached_limit() -> bool:
+            return len(validators) >= limit_value
+
         pyproject = self._read_toml(root / "pyproject.toml")
         repo_files = self._iter_repo_files(root, limit=50000)
         suffixes: set[str] = set()
-        file_names: list[str] = []
+        file_names: set[str] = set()
         workflow_file = ""
         yaml_file = ""
         shell_script = ""
@@ -10795,11 +10813,14 @@ import string
         markdown_file = ""
         sql_file = ""
         schema_file = ""
+        python_tests = False
         for file_path in repo_files:
             suffix = file_path.suffix.lower()
             name = file_path.name.lower()
             suffixes.add(suffix)
-            file_names.append(name)
+            file_names.add(name)
+            if not python_tests and ((name.startswith("test") and name.endswith(".py")) or name.endswith("_test.py")):
+                python_tests = True
             if suffix in {".yml", ".yaml"} and (not yaml_file or not workflow_file):
                 rel = self.relative_label(file_path).replace("\\", "/")
                 if not yaml_file:
@@ -10819,10 +10840,6 @@ import string
         if (root / ".pre-commit-config.yaml").exists() or (root / ".pre-commit-config.yml").exists():
             add("validate", "repo", python_tool_command_text("pre-commit", "pre_commit", "run", "--all-files"), "pre-commit config found.")
         python_files = ".py" in suffixes
-        python_tests = any(
-            (name.startswith("test") and name.endswith(".py")) or name.endswith("_test.py")
-            for name in file_names
-        )
         pytest_config = (
             (root / "pytest.ini").exists()
             or (root / "pytest.toml").exists()
@@ -10862,6 +10879,8 @@ import string
             basedpyright_command = self._python_tool_command("basedpyright", "basedpyright", "--level", "error")
             if (root / "pyrightconfig.json").exists() or self._toml_tool_section(pyproject, "basedpyright") or basedpyright_command:
                 add("typecheck", "python", command_to_text(tuple(basedpyright_command or ["basedpyright"])), "basedpyright config, module, or executable found.")
+            if reached_limit():
+                return finalize()
             deptry_command = self._python_tool_command("deptry", "deptry", ".")
             if deptry_command:
                 add("dependency-check", "python", command_to_text(tuple(deptry_command)), "deptry module or executable found.")
@@ -10880,6 +10899,8 @@ import string
             pipdeptree_command = self._python_tool_command("pipdeptree", "pipdeptree", "--warn", "fail")
             if pipdeptree_command:
                 add("dependency-check", "python", command_to_text(tuple(pipdeptree_command)), "pipdeptree module or executable found.")
+            if reached_limit():
+                return finalize()
         package_json = root / "package.json"
         if package_json.exists():
             manager = self._package_manager_for(root)
@@ -10913,6 +10934,8 @@ import string
                 or (root / "prettier.config.js").exists()
             ):
                 add("format-check", "javascript", "prettier --check .", "Prettier config or executable found.")
+            if reached_limit():
+                return finalize()
         if (root / "go.mod").exists() or ".go" in suffixes:
             add("test", "go", "go test ./...", "Go module or source files found.")
             add("lint", "go", "golangci-lint run", "Go module or source files found.")
@@ -10973,18 +10996,7 @@ import string
             add("security", "dependencies", "grype dir:.", "Dependency manifest or lockfile found.")
         if ".toml" in suffixes and self._which("taplo"):
             add("config", "toml", "taplo check .", "TOML files and taplo executable found.")
-        selected = [dict(item) for item in validators[: max(1, int(limit))]]
-        for item in selected:
-            item["available"] = self._available_command(str(item.get("command") or ""), cwd=root)
-        lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
-        return {
-            "ok": True,
-            "tool": "discover_validators",
-            "path": self.relative_label(root),
-            "count": len(selected),
-            "validators": selected,
-            "output": "\n".join(lines) if lines else "(no validators discovered)",
-        }
+        return finalize()
 
     def diagnose_dependency_error(self, output: str, path: str = ".") -> dict[str, Any]:
         text = str(output or "")

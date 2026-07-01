@@ -4364,6 +4364,38 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("tox", output)
         self.assertIn("nox", output)
 
+    def test_discover_validators_stops_optional_python_tool_probing_after_limit(self) -> None:
+        with self._temp_files_tools(
+            {
+                "tests/test_app.py": "def test_ok():\n    assert True\n",
+                "pyproject.toml": (
+                    "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n\n"
+                    "[tool.mypy]\npython_version='3.12'\n\n[tool.pyright]\ntypeCheckingMode='basic'\n\n"
+                    "[tool.basedpyright]\ntypeCheckingMode='basic'\n\n[tool.tox]\nlegacy_tox_ini='[tox]\\nenvlist=py312'\n"
+                ),
+                "noxfile.py": "import nox\n",
+            }
+        ) as (_root, tools):
+            seen: list[str] = []
+            original = tools._python_tool_command
+
+            def wrapped(executable: str, module: str, *args: str) -> list[str] | None:
+                seen.append(executable)
+                return original(executable, module, *args)
+
+            with patch.object(tools, "_python_tool_command", side_effect=wrapped):
+                result = tools.discover_validators(limit=8)
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["count"], 8)
+        self.assertIn("basedpyright", seen)
+        self.assertNotIn("deptry", seen)
+        self.assertNotIn("vulture", seen)
+        self.assertNotIn("coverage", seen)
+        self.assertNotIn("tox", seen)
+        self.assertNotIn("nox", seen)
+        self.assertNotIn("pipdeptree", seen)
+
     def test_discover_validators_does_not_suggest_testmon_without_repo_test_signals(self) -> None:
         with self._temp_files_tools({"app.py": "VALUE = 1\n"}) as (_root, tools):
             result = tools.discover_validators(limit=20)
