@@ -262,6 +262,7 @@ class ToolExecutor:
         self._initial_dirty_paths = self._git_dirty_paths()
         self._todos: list[dict[str, str]] = []
         self._tree_sitter_parsers: dict[str, Any] = {}
+        self._tree_sitter_syntax_cache: dict[str, dict[str, Any]] = {}
         self._lint_typecheck_cache: dict[str, dict[str, Any]] = {}
         self._lint_typecheck_file_cache: dict[str, dict[str, Any]] = {}
         self._python_tool_command_cache: dict[tuple[str, str, tuple[str, ...]], list[str] | None] = {}
@@ -3755,6 +3756,35 @@ class ToolExecutor:
             return f"{self.relative_label(target)}: tree-sitter reported syntax errors for {language}"
         return None
 
+    def _tree_sitter_syntax_analysis(self, file_path: Path) -> dict[str, Any]:
+        rel = self.relative_label(file_path)
+        signature: dict[str, Any]
+        try:
+            stat = file_path.stat()
+            signature = {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+        except OSError:
+            signature = {"missing": True}
+        language = self._tree_sitter_language_for_path(file_path)
+        cached = self._tree_sitter_syntax_cache.get(rel)
+        if (
+            isinstance(cached, dict)
+            and cached.get("signature") == signature
+            and cached.get("language") == language
+        ):
+            analysis = cached.get("analysis")
+            if isinstance(analysis, dict):
+                return dict(analysis)
+        analysis = {"language": language, "diagnostic": None}
+        if language is not None:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            analysis["diagnostic"] = self._tree_sitter_syntax_diagnostic(file_path, text)
+        self._tree_sitter_syntax_cache[rel] = {
+            "signature": signature,
+            "language": language,
+            "analysis": dict(analysis),
+        }
+        return analysis
+
     def tree_sitter_syntax(self, path: str = ".", limit: int = 200) -> dict[str, Any]:
         self._check_interrupted()
         dependency = resolve_dependency("py-tree-sitter")
@@ -3764,13 +3794,13 @@ class ToolExecutor:
         checked: list[str] = []
         diagnostics: list[str] = []
         for file_path in self._iter_code_files(base, limit=max(1, int(limit))):
-            if self._tree_sitter_language_for_path(file_path) is None:
+            analysis = self._tree_sitter_syntax_analysis(file_path)
+            if analysis.get("language") is None:
                 continue
             checked.append(self.relative_label(file_path))
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
+            diagnostic = analysis.get("diagnostic")
             if diagnostic:
-                diagnostics.append(diagnostic)
+                diagnostics.append(str(diagnostic))
         return {
             "ok": not diagnostics,
             "tool": "tree_sitter_syntax",

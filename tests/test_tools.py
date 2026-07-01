@@ -5117,6 +5117,21 @@ def double(value: int) -> int:
             ],
         )
 
+    def test_tree_sitter_syntax_caches_unchanged_analysis(self) -> None:
+        with self._temp_files_tools({"app.py": "def demo():\n    return 1\n"}) as (_root, tools):
+            with patch("ollama_code.tools.resolve_dependency", return_value=None):
+                with patch.object(
+                    tools,
+                    "_tree_sitter_syntax_diagnostic",
+                    wraps=tools._tree_sitter_syntax_diagnostic,
+                ) as diagnostic_mock:
+                    first = tools.tree_sitter_syntax("app.py")
+                    second = tools.tree_sitter_syntax("app.py")
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(diagnostic_mock.call_count, 1)
+
     def test_lint_typecheck_skips_typechecker_for_unconfigured_focused_scope(self) -> None:
         with self._temp_files_tools({"src/one.py": "VALUE = 1\n"}) as (_root, tools):
             calls: list[list[str]] = []
