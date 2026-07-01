@@ -4445,10 +4445,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("go test ./...", result["test_commands"])
 
     def test_diagnose_dependency_error_reports_missing_module_and_manager(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pyproject.toml").write_text("[project]\nname='demo'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"pyproject.toml": "[project]\nname='demo'\n"}) as (_root, tools):
             result = tools.diagnose_dependency_error("ModuleNotFoundError: No module named 'requests'")
 
         self.assertTrue(result["ok"])
@@ -4456,8 +4453,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("pip", result["package_managers"])
 
     def test_browser_and_security_missing_dependencies_fail_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch("ollama_code.tools.subprocess.run", return_value=subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="missing")):
                 browser = tools.browser_smoke("http://127.0.0.1")
             with patch("ollama_code.tools.shutil.which", return_value=None):
@@ -4469,12 +4465,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("missing_dependency", security)
 
     def test_find_implementation_target_maps_test_imports_to_source(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            (root / "tests" / "test_ops.py").write_text("from ops import add\n\ndef test_add():\n    assert add(1, 2) == 3\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "ops.py": "def add(a, b):\n    return a + b\n",
+                "tests/test_ops.py": "from ops import add\n\ndef test_add():\n    assert add(1, 2) == 3\n",
+            }
+        ) as (_root, tools):
             result = tools.find_implementation_target(test_path="tests/test_ops.py")
 
         self.assertTrue(result["ok"])
@@ -4482,11 +4478,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("symbol=add", result["output"])
 
     def test_find_implementation_target_accepts_path_alias_for_source(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "src" / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"src/ops.py": "def add(a, b):\n    return a + b\n"}) as (_root, tools):
             result = tools.find_implementation_target(path="src/ops.py", query="add")
 
         self.assertTrue(result["ok"])
@@ -4494,17 +4486,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("symbol=add", result["output"])
 
     def test_diagnose_test_failure_groups_assertions_and_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "ops.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
-            (root / "tests" / "test_ops.py").write_text("from ops import add\n", encoding="utf-8")
+        with self._temp_files_tools(
+            {
+                "ops.py": "def add(a, b):\n    return a - b\n",
+                "tests/test_ops.py": "from ops import add\n",
+            }
+        ) as (_root, tools):
             output = (
                 "FAILED tests/test_ops.py::test_add - AssertionError\n"
                 "E       assert 1 == 3\n"
                 '  File "ops.py", line 2, in add\n'
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.diagnose_test_failure(output)
 
         self.assertTrue(result["ok"])
@@ -4512,23 +4504,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("ops.py", result["output"])
 
     def test_diagnose_test_failure_maps_unittest_traceback_imports_to_source(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools(
+            {
+                "list_ops.py": "def foldr(function, items, initial):\n    return initial\n",
+                "list_ops_test.py": (
+                    "from list_ops import foldr\n\n"
+                    "def test_foldr():\n"
+                    "    assert foldr(lambda acc, el: el + acc, ['e'], '!') == 'e!'\n"
+                ),
+            }
+        ) as (root, tools):
             test_file = root / "list_ops_test.py"
-            (root / "list_ops.py").write_text("def foldr(function, items, initial):\n    return initial\n", encoding="utf-8")
-            test_file.write_text(
-                "from list_ops import foldr\n\n"
-                "def test_foldr():\n"
-                "    assert foldr(lambda acc, el: el + acc, ['e'], '!') == 'e!'\n",
-                encoding="utf-8",
-            )
             output = (
                 "FAIL: test_foldr (list_ops_test.ListOpsTest.test_foldr)\n"
                 "Traceback (most recent call last):\n"
                 f'  File "{test_file}", line 4, in test_foldr\n'
                 "AssertionError: '!e' != 'e!'\n"
             )
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.diagnose_test_failure(output)
 
         self.assertTrue(result["ok"])
