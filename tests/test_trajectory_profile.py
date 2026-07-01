@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import tempfile
 import unittest
@@ -15,10 +16,15 @@ except ModuleNotFoundError:
 from scripts import trajectory_profile as profile
 
 
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
+
+
 class TrajectoryProfileTests(unittest.TestCase):
     def test_main_accepts_empty_data_root_without_formatter_crash(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             output_path = root / "trajectory-profile.json"
 
             exit_code = profile.main(
@@ -626,8 +632,7 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(metrics["categories"], ["test"])
 
     def test_iter_agent_race_rows_emits_one_row_per_jsonl_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             (root / "claude-code.jsonl").write_text(
                 '{"type":"message","message":{"role":"user","content":"task"},"sessionId":"s1"}\n',
                 encoding="utf-8",
@@ -832,8 +837,7 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual(portfolio[0]["seen_in_datasets"], 2)
 
     def test_resolve_dataset_paths_supports_thoughtworks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "thoughtworks-agentic-coding-trajectories"
             dataset_root.mkdir(parents=True)
             (dataset_root / "sessions.parquet").write_text("stub\n", encoding="utf-8")
@@ -844,8 +848,7 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual([path.name for path in paths], ["sessions.parquet"])
 
     def test_resolve_dataset_paths_supports_trace_commons(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "trace-commons-agent-traces" / "data"
             dataset_root.mkdir(parents=True)
             (dataset_root / "train-00000-of-00001.parquet").write_text("stub\n", encoding="utf-8")
@@ -856,8 +859,7 @@ class TrajectoryProfileTests(unittest.TestCase):
         self.assertEqual([path.name for path in paths], ["train-00000-of-00001.parquet"])
 
     def test_resolve_dataset_paths_supports_cc_bench(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "cc-bench-trajectories"
             dataset_root.mkdir(parents=True)
             (dataset_root / "train.parquet").write_text("stub\n", encoding="utf-8")
@@ -898,8 +900,8 @@ class TrajectoryProfileTests(unittest.TestCase):
     def test_iter_parquet_rows_honors_max_rows(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "sample.parquet"
+        with _temp_root() as root:
+            path = root / "sample.parquet"
             table = pa.table({"value": [1, 2, 3, 4]})
             pq.write_table(table, path)
 
@@ -938,8 +940,7 @@ class TrajectoryProfileTests(unittest.TestCase):
     def test_iter_dataset_rows_skips_terminalbench_null_rows_before_max_rows(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -963,8 +964,7 @@ class TrajectoryProfileTests(unittest.TestCase):
     def test_iter_dataset_rows_skips_empty_openhands_rows_before_max_rows(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "nebius-swe-rebench-openhands-trajectories"
             dataset_root.mkdir(parents=True)
             table = pa.table(
