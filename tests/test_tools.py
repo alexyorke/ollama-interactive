@@ -4245,8 +4245,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(all(item["available"] is True for item in result["validators"]))
 
     def test_python_tool_command_resolution_is_cached_per_executor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch("ollama_code.tools.shutil.which", return_value="/usr/bin/custom-tool") as which:
                 first = tools._python_tool_command("custom-tool", "custom_tool", "--version")
                 second = tools._python_tool_command("custom-tool", "custom_tool", "--version")
@@ -4256,10 +4255,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(which.call_count, 1)
 
     def test_command_path_resolution_is_cached_per_executor(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"app.py": "VALUE = 1\n"}) as (_root, tools):
             calls: list[str] = []
 
             def fake_which(name: str) -> str | None:
@@ -4361,26 +4357,25 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("ruff check", output)
 
     def test_discover_validators_detects_optional_oss_validators(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            workflows = root / ".github" / "workflows"
-            workflows.mkdir(parents=True)
-            (workflows / "ci.yml").write_text("name: ci\non: push\n", encoding="utf-8")
-            (root / "script.sh").write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
-            (root / "Dockerfile").write_text("FROM python:3.12\n", encoding="utf-8")
-            (root / "requirements.txt").write_text("requests==2.32.3\n", encoding="utf-8")
-            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
-            (root / "package.json").write_text(json.dumps({"scripts": {"test": "vitest"}}), encoding="utf-8")
-            (root / "tsconfig.json").write_text("{}\n", encoding="utf-8")
-            (root / ".eslintrc.json").write_text("{}\n", encoding="utf-8")
-            (root / ".prettierrc").write_text("{}\n", encoding="utf-8")
-            (root / "biome.json").write_text("{}\n", encoding="utf-8")
-            (root / ".pre-commit-config.yaml").write_text("repos: []\n", encoding="utf-8")
-            (root / "README.md").write_text("# Demo\n", encoding="utf-8")
-            (root / "query.sql").write_text("select 1;\n", encoding="utf-8")
-            (root / "schema.schema.json").write_text('{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n', encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                ".github/workflows/ci.yml": "name: ci\non: push\n",
+                "script.sh": "#!/bin/sh\necho ok\n",
+                "Dockerfile": "FROM python:3.12\n",
+                "requirements.txt": "requests==2.32.3\n",
+                "app.py": "VALUE = 1\n",
+                "pyrightconfig.json": "{}\n",
+                "package.json": json.dumps({"scripts": {"test": "vitest"}}),
+                "tsconfig.json": "{}\n",
+                ".eslintrc.json": "{}\n",
+                ".prettierrc": "{}\n",
+                "biome.json": "{}\n",
+                ".pre-commit-config.yaml": "repos: []\n",
+                "README.md": "# Demo\n",
+                "query.sql": "select 1;\n",
+                "schema.schema.json": '{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
+            }
+        ) as (_root, tools):
             result = tools.discover_validators(limit=40)
 
         output = result["output"]
@@ -4409,11 +4404,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("grype dir:.", output)
 
     def test_select_tests_returns_language_level_validator_for_go(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
-            (root / "calc.go").write_text("package app\nfunc Add(a int, b int) int { return a + b }\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "go.mod": "module example.com/app\n",
+                "calc.go": "package app\nfunc Add(a int, b int) int { return a + b }\n",
+            }
+        ) as (_root, tools):
             result = tools.select_tests(["calc.go"])
 
         self.assertTrue(result["ok"])
@@ -4504,10 +4500,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("symbol=foldr", result["output"])
 
     def test_run_function_probe_reports_actual_values(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"ops.py": "def add(a, b):\n    return a + b\n"}) as (_root, tools):
             result = tools.run_function_probe("ops", ["fn(2, 5)"], function="add")
 
         self.assertTrue(result["ok"])
