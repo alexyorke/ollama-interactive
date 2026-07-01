@@ -4175,12 +4175,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(indexed["files"], 1)
 
     def test_edit_intent_unknown_intent_fails_closed(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        original = "def add(left: int, right: int) -> int:\n    return left - right\n"
+        with self._temp_files_tools({"calculator.py": original}) as (root, tools):
             sample = root / "calculator.py"
-            original = "def add(left: int, right: int) -> int:\n    return left - right\n"
-            sample.write_text(original, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "calculator.py",
                 "remove_extra_def_keyword",
@@ -4195,15 +4192,13 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text, original)
 
     def test_edit_intent_routes_project_rename_to_structured_edit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "docs").mkdir()
-            (root / "src" / "pricing.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
-            (root / "tests" / "test_pricing.py").write_text("from src.pricing import total\n\nassert total([1]) == 1\n", encoding="utf-8")
-            (root / "docs" / "pricing.md").write_text("Call `total(prices)`.\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/pricing.py": "def total(prices):\n    return sum(prices)\n",
+                "tests/test_pricing.py": "from src.pricing import total\n\nassert total([1]) == 1\n",
+                "docs/pricing.md": "Call `total(prices)`.\n",
+            }
+        ) as (root, tools):
             result = tools.edit_intent(".", "rename", "total", "cart_total", scope="project")
 
             source = (root / "src" / "pricing.py").read_text(encoding="utf-8")
@@ -4217,13 +4212,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("cart_total(prices)", docs)
 
     def test_edit_intent_routes_renamed_function_replacement_to_project_rename(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "docs").mkdir()
-            (root / "src" / "pricing.py").write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
-            (root / "docs" / "pricing.md").write_text("Call `total(prices)`.\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/pricing.py": "def total(prices):\n    return sum(prices)\n",
+                "docs/pricing.md": "Call `total(prices)`.\n",
+            }
+        ) as (root, tools):
             result = tools.edit_intent(
                 "src/pricing.py",
                 "replace_symbol",
@@ -4239,14 +4233,15 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("cart_total(prices)", docs)
 
     def test_discover_validators_detects_polyglot_projects(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "package.json").write_text(json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "typecheck": "tsc --noEmit"}}), encoding="utf-8")
-            (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
-            (root / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n", encoding="utf-8")
-            (root / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
-            (root / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "package.json": json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "typecheck": "tsc --noEmit"}}),
+                "go.mod": "module example.com/app\n",
+                "Cargo.toml": "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+                "build.gradle": "plugins { id 'java' }\n",
+                "CMakeLists.txt": "cmake_minimum_required(VERSION 3.20)\n",
+            }
+        ) as (_root, tools):
             result = tools.discover_validators()
 
         output = result["output"]
@@ -4258,12 +4253,13 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("cmake -S . -B build", output)
 
     def test_discover_validators_checks_availability_only_for_selected_limit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "package.json").write_text(json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "typecheck": "tsc --noEmit"}}), encoding="utf-8")
-            (root / "go.mod").write_text("module example.com/app\n", encoding="utf-8")
-            (root / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "package.json": json.dumps({"scripts": {"test": "vitest", "lint": "eslint .", "typecheck": "tsc --noEmit"}}),
+                "go.mod": "module example.com/app\n",
+                "Cargo.toml": "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+            }
+        ) as (_root, tools):
             with patch.object(tools, "_available_command", return_value=True) as available:
                 result = tools.discover_validators(limit=2)
 
