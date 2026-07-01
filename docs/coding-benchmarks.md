@@ -61,13 +61,15 @@ Start with the fast repo-owned readiness tier before broader benchmark work:
 python scripts/local_validation.py --tier smoke
 ```
 
+For `pytest` runs, the summary JSON includes a `coverage_summary` block that proves whether the repo-owned `smoke` plus `agent` plus `full-remaining` partition still covers the discovered test files exactly once.
+
 Run the full local validation stack before merging larger controller changes:
 
 ```bash
 python scripts/local_validation.py --tier full
 ```
 
-When `pytest` and `xdist` are available, the local validation script resolves `--jobs auto` to a bounded worker count instead of delegating to unrestricted `xdist auto`.
+When `pytest` and `xdist` are available, the local validation script resolves `--jobs auto` to a bounded worker count instead of delegating to unrestricted `xdist auto`. If `coverage_summary.full_plan_covers_all_discovered_targets` is false, `scripts/local_validation.py` exits nonzero even when the subprocesses themselves passed.
 
 Run A/B feature profiles without changing prompts:
 

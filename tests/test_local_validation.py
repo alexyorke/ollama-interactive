@@ -178,6 +178,50 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(payload["coverage_summary"]["mode"], "pytest_target_paths")
         self.assertIn("full_plan_covers_all_discovered_targets", payload["coverage_summary"])
 
+    def test_run_validation_fails_when_pytest_coverage_plan_drifts(self) -> None:
+        def fake_run(
+            repo_root: Path,
+            name: str,
+            command: list[str],
+            *,
+            runner: str,
+            resolved_jobs: str,
+        ) -> dict[str, object]:
+            return {
+                "name": name,
+                "command": command,
+                "runner": runner,
+                "resolved_jobs": resolved_jobs,
+                "target_count": 1,
+                "ok": True,
+                "returncode": 0,
+                "elapsed_s": 0.1,
+                "output_tail": "ok",
+            }
+
+        drifted_coverage = {
+            "mode": "pytest_target_paths",
+            "requested_tier": "full",
+            "full_plan_covers_all_discovered_targets": False,
+            "full_plan_duplicate_target_count": 0,
+            "full_plan_uncovered_target_count": 1,
+        }
+
+        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            with patch.object(local_validation.os, "cpu_count", return_value=32):
+                with patch.object(local_validation, "_run", side_effect=fake_run):
+                    with patch.object(local_validation, "_coverage_summary", return_value=drifted_coverage):
+                        payload = local_validation.run_validation(
+                            "full",
+                            repo_root=Path.cwd(),
+                            runner="auto",
+                            jobs="auto",
+                        )
+
+        self.assertTrue(payload["command_ok"])
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["coverage_summary"], drifted_coverage)
+
     def test_run_validation_records_optional_unittest_baseline_compare(self) -> None:
         def fake_run(
             repo_root: Path,
@@ -313,6 +357,35 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn("coverage tier=smoke", stdout.getvalue())
         self.assertIn("full_plan_complete=True", stdout.getvalue())
         self.assertIn('"timing_summary"', written_text["value"])
+
+    def test_main_returns_nonzero_when_coverage_plan_is_incomplete(self) -> None:
+        payload = {
+            "ok": False,
+            "command_ok": True,
+            "commands": [],
+            "timing_summary": {"total_elapsed_s": 0.0, "slowest_commands": []},
+            "coverage_summary": {
+                "mode": "pytest_target_paths",
+                "requested_tier": "full",
+                "requested_unique_target_count": 36,
+                "full_plan_unique_target_count": 36,
+                "discovered_test_target_count": 37,
+                "full_plan_covers_all_discovered_targets": False,
+                "full_plan_duplicate_target_count": 0,
+                "full_plan_uncovered_target_count": 1,
+            },
+            "baseline_compare": {"requested": False, "ran": False, "skipped_reason": None},
+        }
+        output_path = Path.cwd() / "scratch" / "validation" / "test-local-validation-incomplete.json"
+        stdout = StringIO()
+
+        with patch.object(local_validation, "run_validation", return_value=payload):
+            with patch.object(Path, "write_text", autospec=True, return_value=0):
+                with patch.object(sys, "stdout", stdout):
+                    exit_code = local_validation.main(["--tier", "full", "--output", str(output_path)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("full_plan_complete=False", stdout.getvalue())
 
 
 if __name__ == "__main__":

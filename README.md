@@ -166,6 +166,7 @@ python scripts/local_validation.py --tier smoke
 
 `smoke` and `agent` automatically use `pytest` with a bounded `xdist` worker count when those optional packages are installed; otherwise they fall back to serial `unittest`.
 The JSON summary records the resolved runner, resolved worker mode, completed tiers, and any tiers skipped after a failure so the local gate reflects what actually ran.
+For `pytest` runs it also records a `coverage_summary` block proving whether the repo-owned validation plan covered the discovered test targets exactly once, with zero duplicates and zero uncovered files.
 
 Run the fuller local validation stack before merging larger controller or tooling changes:
 
@@ -174,6 +175,8 @@ python scripts/local_validation.py --tier full
 ```
 
 When `pytest` is installed, `full` uses the same bounded-worker `pytest` path for the broad final repo pass and skips the `smoke` and `agent` targets it already ran, instead of rerunning them inside a broad `pytest tests` command. Environments without `pytest` still fall back to the older `unittest` path.
+Treat `coverage_summary.full_plan_covers_all_discovered_targets=true` as the readiness invariant for the `full` tier. If that flag is false, `scripts/local_validation.py` exits nonzero even if the subprocesses themselves were green, because the validation plan has drifted.
+The console output now also prints the slowest validation step and a compact coverage line so contributors do not need to open the JSON artifact just to confirm timing and partition completeness.
 
 If local test runs feel slow and you want an apples-to-apples baseline, compare the preferred path against raw `unittest` discovery:
 

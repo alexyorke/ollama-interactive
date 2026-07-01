@@ -244,6 +244,12 @@ def _coverage_summary(
     }
 
 
+def _coverage_ok(summary: dict[str, Any]) -> bool:
+    if summary.get("mode") != "pytest_target_paths":
+        return True
+    return bool(summary.get("full_plan_covers_all_discovered_targets"))
+
+
 def _baseline_compare_payload(
     repo_root: Path,
     *,
@@ -331,10 +337,18 @@ def run_validation(
     completed_tiers = [row["name"] for row in command_rows]
     remaining_tiers = planned_tiers[len(completed_tiers) :]
     elapsed_s = round(sum(float(row["elapsed_s"]) for row in command_rows), 3)
-    ok = all(row["ok"] for row in command_rows)
+    command_ok = all(row["ok"] for row in command_rows)
     for row in command_rows:
         row_elapsed = round(float(row.get("elapsed_s", 0.0) or 0.0), 3)
         row["elapsed_share_pct"] = round((row_elapsed / elapsed_s) * 100, 1) if elapsed_s > 0 else 0.0
+    coverage_summary = _coverage_summary(
+        tier,
+        repo_root=repo_root,
+        runner=resolved_runner,
+        jobs=jobs,
+        resolved_jobs=resolved_jobs,
+    )
+    ok = command_ok and _coverage_ok(coverage_summary)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root.resolve(strict=False)),
@@ -345,6 +359,7 @@ def run_validation(
         "resolved_jobs": resolved_jobs,
         **_runtime_capabilities(),
         "ok": ok,
+        "command_ok": command_ok,
         "commands": command_rows,
         "planned_tiers": planned_tiers,
         "tiers_completed": completed_tiers,
@@ -352,13 +367,7 @@ def run_validation(
         "stopped_after_failure": bool(command_rows and not command_rows[-1]["ok"] and remaining_tiers),
         "elapsed_s": elapsed_s,
         "timing_summary": _timing_summary(command_rows, elapsed_s=elapsed_s),
-        "coverage_summary": _coverage_summary(
-            tier,
-            repo_root=repo_root,
-            runner=resolved_runner,
-            jobs=jobs,
-            resolved_jobs=resolved_jobs,
-        ),
+        "coverage_summary": coverage_summary,
         "baseline_compare": _baseline_compare_payload(
             repo_root,
             requested=compare_unittest_baseline,
