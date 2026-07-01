@@ -216,6 +216,10 @@ def summary_contract_ok(payload: dict[str, Any]) -> bool:
             return False
         if not isinstance(selection_reason, str) or not selection_reason.strip():
             return False
+        model_rows = [row for row in models if isinstance(row, dict)]
+        winner, _reason = choose_default_model(model_rows)
+        if winner is None or winner != selected_default_model:
+            return False
         return True
     if selected_default_model is not None and (not isinstance(selected_default_model, str) or not selected_default_model.strip()):
         return False

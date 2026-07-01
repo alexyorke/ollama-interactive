@@ -273,7 +273,15 @@ class LiveModelGateTests(unittest.TestCase):
                     "ok": True,
                     "selected_default_model": "granite4.1:8b",
                     "selection_reason": "Granite won the token tie-break.",
-                    "models": [],
+                    "models": [
+                        {
+                            "model": "granite4.1:8b",
+                            "benchmark_passes": 8,
+                            "benchmark_runs": 8,
+                            "benchmark_total_tokens": 2048,
+                            "benchmark_median_latency_s": 9.0,
+                        }
+                    ],
                 }
             )
         )
@@ -295,10 +303,20 @@ class LiveModelGateTests(unittest.TestCase):
             live_model_gate.summary_contract_ok(
                 {
                     "benchmark_suite": "local-small",
+                    "git_commit": "abc123",
+                    "git_dirty": False,
                     "ok": True,
-                    "selected_default_model": "granite4.1:8b",
+                    "selected_default_model": "gemma4:e4b",
                     "selection_reason": "Granite won the token tie-break.",
-                    "models": [],
+                    "models": [
+                        {
+                            "model": "granite4.1:8b",
+                            "benchmark_passes": 8,
+                            "benchmark_runs": 8,
+                            "benchmark_total_tokens": 2048,
+                            "benchmark_median_latency_s": 9.0,
+                        }
+                    ],
                 }
             )
         )
