@@ -19,10 +19,12 @@ from typing import Any, Callable
 
 try:
     from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from model_resolution import resolve_requested_model
     from test_imports import standard_test_import
     from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:  # Imported as scripts.coding_benchmark_eval in unit tests.
     from scripts.e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from scripts.model_resolution import resolve_requested_model
     from scripts.test_imports import standard_test_import
     from scripts.workspace_temp import workspace_temp_dir
 
@@ -173,15 +175,6 @@ class BenchmarkContext:
     returncodes: tuple[int, ...]
     results: tuple[subprocess.CompletedProcess[str], ...]
     case: BenchmarkCase
-
-
-def resolve_requested_model(model: str, available: set[str]) -> str | None:
-    if model in available:
-        return model
-    latest = f"{model}:latest"
-    if latest in available:
-        return latest
-    return None
 
 
 def tool_results(session: dict[str, Any], tool_name: str) -> list[dict[str, Any]]:
