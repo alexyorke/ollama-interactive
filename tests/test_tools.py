@@ -4095,81 +4095,76 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("calls reversed with 1 supplied args", result["output"])
 
     def test_contract_check_ignores_expected_exception_call_arity(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "paasio.py").write_text(
-                "class MeteredSocket:\n"
-                "    def recv(self, bufsize, flags=0):\n"
-                "        return b''\n",
-                encoding="utf-8",
-            )
-            (root / "paasio_test.py").write_text(
-                "import unittest\n"
-                "from paasio import MeteredSocket\n\n"
-                "class PaasioTest(unittest.TestCase):\n"
-                "    def test_meteredsocket_bufsize_required(self):\n"
-                "        socket = MeteredSocket()\n"
-                "        with self.assertRaises(TypeError):\n"
-                "            socket.recv()\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "paasio.py": (
+                    "class MeteredSocket:\n"
+                    "    def recv(self, bufsize, flags=0):\n"
+                    "        return b''\n"
+                ),
+                "paasio_test.py": (
+                    "import unittest\n"
+                    "from paasio import MeteredSocket\n\n"
+                    "class PaasioTest(unittest.TestCase):\n"
+                    "    def test_meteredsocket_bufsize_required(self):\n"
+                    "        socket = MeteredSocket()\n"
+                    "        with self.assertRaises(TypeError):\n"
+                    "            socket.recv()\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["paasio.py", "paasio_test.py"], limit=20)
 
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls recv with 0 supplied args", result["output"])
 
     def test_contract_check_allows_nested_helper_closure_names(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text(
-                "def foldr(function, list, initial):\n"
-                "    if not list:\n"
-                "        return initial\n"
-                "    def folder(item):\n"
-                "        return function(item, folder(list[1:]))\n"
-                "    return folder(list[0])\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "ops.py": (
+                    "def foldr(function, list, initial):\n"
+                    "    if not list:\n"
+                    "        return initial\n"
+                    "    def folder(item):\n"
+                    "        return function(item, folder(list[1:]))\n"
+                    "    return folder(list[0])\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["ops.py"], limit=20)
 
         self.assertTrue(result["ok"], result)
 
     def test_contract_check_resolves_workspace_star_imports(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "pricing.py").write_text(
-                "__all__ = ['cart_total']\n\n"
-                "def cart_total(prices):\n"
-                "    return sum(prices)\n",
-                encoding="utf-8",
-            )
-            (root / "tests" / "test_pricing.py").write_text(
-                "import sys\n"
-                "from pathlib import Path\n"
-                "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
-                "from pricing import *\n\n"
-                "def test_cart_total():\n"
-                "    assert cart_total([2, 3, 4]) == 9\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/pricing.py": (
+                    "__all__ = ['cart_total']\n\n"
+                    "def cart_total(prices):\n"
+                    "    return sum(prices)\n"
+                ),
+                "tests/test_pricing.py": (
+                    "import sys\n"
+                    "from pathlib import Path\n"
+                    "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
+                    "from pricing import *\n\n"
+                    "def test_cart_total():\n"
+                    "    assert cart_total([2, 3, 4]) == 9\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["src/pricing.py", "tests/test_pricing.py"], limit=20)
 
         self.assertTrue(result["ok"], result)
         self.assertNotIn("undefined local/global name 'cart_total'", result["output"])
 
     def test_broad_scans_skip_public_benchmark_meta(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / ".meta").mkdir()
-            (root / ".meta" / "example.py").write_text("SECRET_REFERENCE = 1\n", encoding="utf-8")
-            (root / "exercise.py").write_text("def answer():\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
-
+        with self._temp_files_tools(
+            {
+                ".meta/example.py": "SECRET_REFERENCE = 1\n",
+                "exercise.py": "def answer():\n    pass\n",
+            }
+        ) as (_root, tools):
             listed = tools.list_files()
             searched = tools.search("SECRET_REFERENCE")
             indexed = tools.repo_index_refresh()
