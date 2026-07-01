@@ -44,7 +44,6 @@ LIVE_GATE_CLAIM_PATHS = (
     "README.md",
     "docs/token-efficiency.md",
     "TODO.md",
-    "tests/test_live_model_gate.py",
 )
 
 
@@ -344,22 +343,46 @@ def _git_worktree_dirty(repo_root: Path) -> bool | None:
     return bool(completed.stdout.strip())
 
 
-def _extract_release_token_claims(text: str, *, path: str) -> list[str] | None:
-    if path in {"README.md", "TODO.md"}:
-        match = re.search(r"fewest benchmark tokens \(`(\d+)` vs `(\d+)` and `(\d+)`\)", text)
-        return list(match.groups()) if match else None
-    if path == "docs/token-efficiency.md":
-        found: list[str] = []
-        for model in ("granite4.1:8b", "gemma4:e4b", "qwen3:8b"):
-            match = re.search(rf"`{re.escape(model)}`.*?\(`(\d+)`\)", text, flags=re.DOTALL)
-            if not match:
-                return None
-            found.append(match.group(1))
-        return found
-    if path == "tests/test_live_model_gate.py":
-        found = re.findall(r'"benchmark_total_tokens": (\d+)', text)
-        return found[:3] if len(found) >= 3 else None
+def _table_line_for_model(text: str, model: str) -> str | None:
+    prefix = f"| `{model}` |"
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line
     return None
+
+
+def _release_claim_check(
+    text: str,
+    *,
+    path: str,
+    selected_model: str,
+    compared_models: list[str],
+) -> dict[str, Any]:
+    summary_relpath = "scratch/live-model-gate/live-model-gate-summary.json"
+    required_models = [selected_model, *compared_models]
+    if path in {"README.md", "TODO.md"}:
+        missing: list[str] = []
+        for model in required_models:
+            if f"`{model}`" not in text:
+                missing.append(model)
+        if "token tie-break" not in text:
+            missing.append("token tie-break")
+        if summary_relpath not in text:
+            missing.append(summary_relpath)
+        return {"ok": not missing, "summary": "matched" if not missing else f"missing {', '.join(missing)}"}
+    if path == "docs/token-efficiency.md":
+        missing = []
+        selected_line = _table_line_for_model(text, selected_model)
+        if selected_line is None or "default" not in selected_line or "token tie-break" not in selected_line:
+            missing.append(f"default row for {selected_model}")
+        for model in compared_models:
+            line = _table_line_for_model(text, model)
+            if line is None or "comparison model" not in line:
+                missing.append(f"comparison row for {model}")
+        if summary_relpath not in text:
+            missing.append(summary_relpath)
+        return {"ok": not missing, "summary": "matched" if not missing else f"missing {', '.join(missing)}"}
+    return {"ok": False, "summary": f"unsupported claim path {path}"}
 
 
 def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
@@ -383,7 +406,17 @@ def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
             "summary_path": str(summary_path),
             "summary": "Live-gate summary artifact is missing expected model rows.",
         }
+    selected_model = payload.get("selected_default_model") if isinstance(payload.get("selected_default_model"), str) else None
+    if not selected_model:
+        return {
+            "ok": False,
+            "available": False,
+            "summary_path": str(summary_path),
+            "summary": "Live-gate summary artifact is missing the selected default model.",
+        }
     expected_tokens = [str(item.get("benchmark_total_tokens")) for item in models[:3]]
+    model_names = [str(item.get("model")) for item in models[:3] if isinstance(item, dict) and item.get("model")]
+    compared_models = [model for model in model_names if model != selected_model]
     file_rows: list[dict[str, Any]] = []
     for rel in LIVE_GATE_CLAIM_PATHS:
         target = repo_root / rel
@@ -392,13 +425,13 @@ def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
         except OSError as exc:
             file_rows.append({"path": rel, "ok": False, "found_tokens": None, "summary": f"Could not read file: {exc}"})
             continue
-        found_tokens = _extract_release_token_claims(text, path=rel)
+        claim = _release_claim_check(text, path=rel, selected_model=selected_model, compared_models=compared_models)
         file_rows.append(
             {
                 "path": rel,
-                "ok": found_tokens == expected_tokens,
-                "found_tokens": found_tokens,
-                "summary": "matched" if found_tokens == expected_tokens else f"expected {expected_tokens}, found {found_tokens}",
+                "ok": bool(claim.get("ok")),
+                "found_tokens": None,
+                "summary": str(claim.get("summary") or ""),
             }
         )
     summary_commit = payload.get("git_commit") if isinstance(payload.get("git_commit"), str) else None
@@ -422,6 +455,8 @@ def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
         "ok": ok,
         "available": True,
         "summary_path": str(summary_path),
+        "selected_default_model": selected_model,
+        "compared_models": compared_models,
         "expected_tokens": expected_tokens,
         "summary_git_commit": summary_commit,
         "summary_git_dirty": summary_dirty,
@@ -430,9 +465,9 @@ def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
         "git_metadata_ok": git_metadata_ok,
         "files": file_rows,
         "summary": (
-            "All tracked live-gate token claims match the canonical summary and current checkout."
+            "All tracked live-gate release claims match the canonical summary and current checkout."
             if ok
-            else (git_metadata_summary or "Live-gate token claims drift from the canonical summary.")
+            else (git_metadata_summary or "Live-gate release claims drift from the canonical summary.")
         ),
     }
 

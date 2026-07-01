@@ -232,6 +232,7 @@ class LocalValidationTests(unittest.TestCase):
             (summary_dir / "live-model-gate-summary.json").write_text(
                 json.dumps(
                     {
+                        "selected_default_model": "granite4.1:8b",
                         "models": [
                             {"model": "granite4.1:8b", "benchmark_total_tokens": 2048},
                             {"model": "gemma4:e4b", "benchmark_total_tokens": 2436},
@@ -241,22 +242,28 @@ class LocalValidationTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / "README.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
-            (root / "docs").mkdir()
-            (root / "docs" / "token-efficiency.md").write_text(
-                "`granite4.1:8b` (`2048`)\n`gemma4:e4b` (`2436`)\n`qwen3:8b` (`2532`)\n",
+            (root / "README.md").write_text(
+                "Granite stayed the default because it won the benchmark token tie-break. Exact per-run totals live in `scratch/live-model-gate/live-model-gate-summary.json`. Compared models: `granite4.1:8b`, `gemma4:e4b`, `qwen3:8b`.\n",
                 encoding="utf-8",
             )
-            (root / "TODO.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
-            (root / "tests").mkdir()
-            (root / "tests" / "test_live_model_gate.py").write_text(
-                '"benchmark_total_tokens": 2048\n"benchmark_total_tokens": 2436\n"benchmark_total_tokens": 2532\n',
+            (root / "docs").mkdir()
+            (root / "docs" / "token-efficiency.md").write_text(
+                "| `granite4.1:8b` | suite | selected as the default on the benchmark token tie-break |\n"
+                "| `gemma4:e4b` | suite | remains a comparison model |\n"
+                "| `qwen3:8b` | suite | remains a comparison model rather than the default |\n"
+                "Exact per-run token totals intentionally live only in `scratch/live-model-gate/live-model-gate-summary.json`.\n",
+                encoding="utf-8",
+            )
+            (root / "TODO.md").write_text(
+                "Latest gate: `scratch/live-model-gate/live-model-gate-summary.json`; `granite4.1:8b`, `gemma4:e4b`, and `qwen3:8b` all passed, and Granite stayed default because it won the benchmark token tie-break.\n",
                 encoding="utf-8",
             )
 
             result = local_validation._live_gate_claim_consistency(root)
 
         self.assertTrue(result["ok"])
+        self.assertEqual(result["selected_default_model"], "granite4.1:8b")
+        self.assertEqual(result["compared_models"], ["gemma4:e4b", "qwen3:8b"])
         self.assertEqual(result["expected_tokens"], ["2048", "2436", "2532"])
         self.assertTrue(all(row["ok"] for row in result["files"]))
         self.assertTrue(result["git_metadata_ok"])
@@ -271,6 +278,7 @@ class LocalValidationTests(unittest.TestCase):
                     {
                         "git_commit": "395e10d",
                         "git_dirty": True,
+                        "selected_default_model": "granite4.1:8b",
                         "models": [
                             {"model": "granite4.1:8b", "benchmark_total_tokens": 2048},
                             {"model": "gemma4:e4b", "benchmark_total_tokens": 2436},
@@ -280,16 +288,20 @@ class LocalValidationTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            (root / "README.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
-            (root / "docs").mkdir()
-            (root / "docs" / "token-efficiency.md").write_text(
-                "`granite4.1:8b` (`2048`)\n`gemma4:e4b` (`2436`)\n`qwen3:8b` (`2532`)\n",
+            (root / "README.md").write_text(
+                "Granite stayed the default because it won the benchmark token tie-break. Exact per-run totals live in `scratch/live-model-gate/live-model-gate-summary.json`. Compared models: `granite4.1:8b`, `gemma4:e4b`, `qwen3:8b`.\n",
                 encoding="utf-8",
             )
-            (root / "TODO.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
-            (root / "tests").mkdir()
-            (root / "tests" / "test_live_model_gate.py").write_text(
-                '"benchmark_total_tokens": 2048\n"benchmark_total_tokens": 2436\n"benchmark_total_tokens": 2532\n',
+            (root / "docs").mkdir()
+            (root / "docs" / "token-efficiency.md").write_text(
+                "| `granite4.1:8b` | suite | selected as the default on the benchmark token tie-break |\n"
+                "| `gemma4:e4b` | suite | remains a comparison model |\n"
+                "| `qwen3:8b` | suite | remains a comparison model rather than the default |\n"
+                "Exact per-run token totals intentionally live only in `scratch/live-model-gate/live-model-gate-summary.json`.\n",
+                encoding="utf-8",
+            )
+            (root / "TODO.md").write_text(
+                "Latest gate: `scratch/live-model-gate/live-model-gate-summary.json`; `granite4.1:8b`, `gemma4:e4b`, and `qwen3:8b` all passed, and Granite stayed default because it won the benchmark token tie-break.\n",
                 encoding="utf-8",
             )
 
@@ -328,6 +340,8 @@ class LocalValidationTests(unittest.TestCase):
             "ok": False,
             "available": True,
             "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
+            "selected_default_model": "granite4.1:8b",
+            "compared_models": ["gemma4:e4b", "qwen3:8b"],
             "expected_tokens": ["2048", "2436", "2532"],
             "summary_git_commit": "abc1234",
             "summary_git_dirty": False,
@@ -335,7 +349,7 @@ class LocalValidationTests(unittest.TestCase):
             "current_git_dirty": False,
             "git_metadata_ok": True,
             "files": [{"path": "TODO.md", "ok": False, "found_tokens": ["2040", "2408", "2521"]}],
-            "summary": "Live-gate token claims drift from the canonical summary.",
+            "summary": "Live-gate release claims drift from the canonical summary.",
         }
 
         with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
@@ -387,6 +401,8 @@ class LocalValidationTests(unittest.TestCase):
                             "ok": True,
                             "available": True,
                             "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
+                            "selected_default_model": "granite4.1:8b",
+                            "compared_models": ["gemma4:e4b", "qwen3:8b"],
                             "expected_tokens": ["2048", "2436", "2532"],
                             "summary_git_commit": "867a63c",
                             "summary_git_dirty": False,
@@ -394,7 +410,7 @@ class LocalValidationTests(unittest.TestCase):
                             "current_git_dirty": False,
                             "git_metadata_ok": True,
                             "files": [],
-                            "summary": "All tracked live-gate token claims match the canonical summary and current checkout.",
+                            "summary": "All tracked live-gate release claims match the canonical summary and current checkout.",
                         },
                     ):
                         payload = local_validation.run_validation(
