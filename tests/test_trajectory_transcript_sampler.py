@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import tempfile
 import unittest
@@ -13,6 +14,12 @@ except ModuleNotFoundError:
     pq = None
 
 from scripts import trajectory_transcript_sampler as sampler
+
+
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
 
 
 @unittest.skipIf(pa is None or pq is None, "pyarrow not installed")
@@ -33,8 +40,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(output_md, Path("scratch/external/datasets/transcript-review.md"))
 
     def test_sample_dataset_reads_trace_commons_prompt_and_tools(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "trace-commons-agent-traces" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -93,8 +99,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         )
 
     def test_sample_dataset_reads_trace_commons_trace_fallback_when_messages_are_empty(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "trace-commons-agent-traces" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -165,8 +170,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(summary["samples"][0]["tool_preview"], ["read"])
 
     def test_sample_dataset_reads_trace_commons_structured_trace_fallback(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "trace-commons-agent-traces" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -235,8 +239,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(summary["samples"][0]["tool_preview"], ["websearch"])
 
     def test_sample_dataset_prefers_reasoning_content_when_assistant_content_is_tool_only(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "trace-commons-agent-traces" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -280,8 +283,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         )
 
     def test_sample_dataset_reads_terminalbench_prompt_from_steps(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -329,8 +331,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(summary["top_models_or_harnesses"][0]["name"], "demo-model")
 
     def test_terminalbench_sampling_prefers_non_warmup_rows_when_available(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -382,8 +383,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(summary["samples"][0]["assistant_preview"], "I will inspect the parser module first.")
 
     def test_terminalbench_placeholder_prompt_falls_back_to_task_name(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -423,8 +423,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(summary["samples"][0]["prompt_preview"], "adaptive-rejection-sampler")
 
     def test_terminalbench_environment_context_prompt_falls_back_to_task_name(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -467,8 +466,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(summary["samples"][0]["prompt_preview"], "adaptive-rejection-sampler")
 
     def test_terminalbench_environment_context_prefix_preserves_real_prompt_text(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -514,8 +512,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         )
 
     def test_iter_dataset_rows_skips_terminalbench_null_rows_before_max_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -538,8 +535,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual([row["trial_id"] for row in filtered], ["keep-1"])
 
     def test_terminalbench_sampling_diversifies_tasks_when_scores_tie(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -594,8 +590,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         )
 
     def test_terminalbench_sampling_avoids_near_duplicate_prompt_shape_with_same_task(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "terminalbench-trajectories" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -650,8 +645,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         )
 
     def test_build_report_formats_multiple_datasets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             trace_root = root / "trace-commons-agent-traces" / "data"
             trace_root.mkdir(parents=True)
             pq.write_table(
@@ -711,8 +705,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertIn("Fix the shell script.", markdown)
 
     def test_sample_dataset_prefers_duplicate_informative_rows_over_empty_rows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "trace-commons-agent-traces" / "data"
             dataset_root.mkdir(parents=True)
             table = pa.table(
@@ -840,8 +833,7 @@ class TrajectoryTranscriptSamplerTests(unittest.TestCase):
         self.assertEqual(preview, "Let me inspect the available tools first.")
 
     def test_agent_race_summary_falls_back_to_source_file_for_harness_label(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             dataset_root = root / "agent-race-traces"
             dataset_root.mkdir(parents=True)
             (dataset_root / "claude-code.jsonl").write_text(
