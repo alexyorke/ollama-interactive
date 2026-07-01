@@ -33,6 +33,21 @@ class ToolExecutorTests(unittest.TestCase):
             yield root, ToolExecutor(root, approval_mode=approval_mode, **kwargs)
 
     @contextmanager
+    def _temp_files_tools(
+        self,
+        files: dict[str, str],
+        *,
+        approval_mode: str = "auto",
+        **kwargs: object,
+    ):
+        with self._temp_tools(approval_mode=approval_mode, **kwargs) as (root, tools):
+            for relative_path, content in files.items():
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+            yield root, tools
+
+    @contextmanager
     def _temp_python_tools(
         self,
         files: dict[str, str],
@@ -45,11 +60,12 @@ class ToolExecutorTests(unittest.TestCase):
         resolved_test_command = test_command or subprocess.list2cmdline(
             [sys.executable, "-m", "unittest", "discover", *test_discover_args]
         )
-        with self._temp_tools(approval_mode=approval_mode, test_command=resolved_test_command, **kwargs) as (root, tools):
-            for relative_path, content in files.items():
-                path = root / relative_path
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(content, encoding="utf-8")
+        with self._temp_files_tools(
+            files,
+            approval_mode=approval_mode,
+            test_command=resolved_test_command,
+            **kwargs,
+        ) as (root, tools):
             yield root, tools, resolved_test_command
 
     def _cross_platform_workspace_alias(self, root: Path) -> str:
@@ -3955,29 +3971,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_contract_check_static_sanity_catches_python_edit_defects(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "robot_name.py").write_text(
-                "class Robot:\n"
-                "    def __init__(self):\n"
-                "        self.name = name\n",
-                encoding="utf-8",
-            )
-            (root / "phone_number.py").write_text(
-                "class PhoneNumber:\n"
-                "    def __init__(self, number):\n"
-                "        self.number = self._clean_number(number)\n",
-                encoding="utf-8",
-            )
-            (root / "linked.py").write_text(
-                "class LinkedList:\n"
-                "    def __init__(self):\n"
-                "        self.head = None\n"
-                "    def head(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "robot_name.py": (
+                    "class Robot:\n"
+                    "    def __init__(self):\n"
+                    "        self.name = name\n"
+                ),
+                "phone_number.py": (
+                    "class PhoneNumber:\n"
+                    "    def __init__(self, number):\n"
+                    "        self.number = self._clean_number(number)\n"
+                ),
+                "linked.py": (
+                    "class LinkedList:\n"
+                    "    def __init__(self):\n"
+                    "        self.head = None\n"
+                    "    def head(self):\n"
+                    "        pass\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["robot_name.py", "phone_number.py", "linked.py"])
 
         self.assertFalse(result["ok"], result)
@@ -3988,28 +4002,26 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("still has stub body", output)
 
     def test_contract_check_catches_constructor_arity_and_placeholder_text(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "robot_name.py").write_text(
-                "class Robot:\n"
-                "    def __init__(self, name):\n"
-                "        self.name = name\n",
-                encoding="utf-8",
-            )
-            (root / "robot_name_test.py").write_text(
-                "from robot_name import Robot\n\n"
-                "def test_robot():\n"
-                "    return Robot()\n",
-                encoding="utf-8",
-            )
-            (root / "scale_generator.py").write_text(
-                "class Scale:\n"
-                "    def chromatic(self):\n"
-                "        # Placeholder implementation in a real scenario.\n"
-                "        return [f'Note_{i}' for i in range(12)]\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "robot_name.py": (
+                    "class Robot:\n"
+                    "    def __init__(self, name):\n"
+                    "        self.name = name\n"
+                ),
+                "robot_name_test.py": (
+                    "from robot_name import Robot\n\n"
+                    "def test_robot():\n"
+                    "    return Robot()\n"
+                ),
+                "scale_generator.py": (
+                    "class Scale:\n"
+                    "    def chromatic(self):\n"
+                    "        # Placeholder implementation in a real scenario.\n"
+                    "        return [f'Note_{i}' for i in range(12)]\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["robot_name.py", "scale_generator.py"], limit=20)
 
         self.assertFalse(result["ok"], result)
@@ -4017,66 +4029,65 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("placeholder", result["output"].lower())
 
     def test_contract_check_treats_instance_methods_as_bound_calls(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "phone_number.py").write_text(
-                "class PhoneNumber:\n"
-                "    def __init__(self, number):\n"
-                "        self.number = number\n"
-                "    def pretty(self):\n"
-                "        return self.number\n",
-                encoding="utf-8",
-            )
-            (root / "phone_number_test.py").write_text(
-                "from phone_number import PhoneNumber\n\n"
-                "def test_pretty():\n"
-                "    number = PhoneNumber('2234567890')\n"
-                "    return number.pretty()\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "phone_number.py": (
+                    "class PhoneNumber:\n"
+                    "    def __init__(self, number):\n"
+                    "        self.number = number\n"
+                    "    def pretty(self):\n"
+                    "        return self.number\n"
+                ),
+                "phone_number_test.py": (
+                    "from phone_number import PhoneNumber\n\n"
+                    "def test_pretty():\n"
+                    "    number = PhoneNumber('2234567890')\n"
+                    "    return number.pretty()\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["phone_number.py", "phone_number_test.py"], limit=20)
 
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls pretty with 0 supplied args; expected 1", result["output"])
 
     def test_contract_check_counts_keyword_arguments_for_arity(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "grade_school.py").write_text(
-                "class School:\n"
-                "    def add_student(self, name, grade):\n"
-                "        return True\n\n"
-                "def scenario():\n"
-                "    school = School()\n"
-                "    return school.add_student(name='Aimee', grade=2)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "grade_school.py": (
+                    "class School:\n"
+                    "    def add_student(self, name, grade):\n"
+                    "        return True\n\n"
+                    "def scenario():\n"
+                    "    school = School()\n"
+                    "    return school.add_student(name='Aimee', grade=2)\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["grade_school.py"], limit=20)
 
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls add_student with", result["output"])
 
     def test_contract_check_allows_exception_messages_and_bare_builtin_name_collision(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "linked.py").write_text(
-                "class EmptyListException(Exception):\n"
-                "    pass\n\n"
-                "class LinkedList:\n"
-                "    def __init__(self, values=None):\n"
-                "        for value in reversed(values or []):\n"
-                "            self.push(value)\n"
-                "    def push(self, value):\n"
-                "        return value\n"
-                "    def reversed(self):\n"
-                "        return LinkedList()\n"
-                "    def pop(self):\n"
-                "        raise EmptyListException('The list is empty.')\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "linked.py": (
+                    "class EmptyListException(Exception):\n"
+                    "    pass\n\n"
+                    "class LinkedList:\n"
+                    "    def __init__(self, values=None):\n"
+                    "        for value in reversed(values or []):\n"
+                    "            self.push(value)\n"
+                    "    def push(self, value):\n"
+                    "        return value\n"
+                    "    def reversed(self):\n"
+                    "        return LinkedList()\n"
+                    "    def pop(self):\n"
+                    "        raise EmptyListException('The list is empty.')\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["linked.py"], limit=20)
 
         self.assertTrue(result["ok"], result)
