@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 import unittest
 import tempfile
 from pathlib import Path
@@ -13,10 +14,15 @@ except ModuleNotFoundError:
 from scripts import trajectory_error_profile as error_profile
 
 
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
+
+
 class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_main_accepts_argv_and_writes_output(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             output_path = root / "trajectory-error-profile.json"
 
             exit_code = error_profile.main(
@@ -686,8 +692,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_reads_coderforge_messages_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "coderforge-preview-swe-bench-verified-trajectories"
             path = data_root / dataset / "trajectory" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -713,8 +718,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_reads_openhands_messages_json_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "nebius-swe-rebench-openhands-trajectories"
             path = data_root / dataset / "trajectories.parquet"
             path.parent.mkdir(parents=True)
@@ -741,8 +745,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_reads_thoughtworks_messages_json_with_framework_dispatch(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "thoughtworks-agentic-coding-trajectories"
             path = data_root / dataset / "sessions.parquet"
             path.parent.mkdir(parents=True)
@@ -770,8 +773,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_thoughtworks_falls_back_to_messages_json_when_messages_is_empty_list_string(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "thoughtworks-agentic-coding-trajectories"
             path = data_root / dataset / "sessions.parquet"
             path.parent.mkdir(parents=True)
@@ -800,8 +802,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_reads_trace_commons_messages_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "trace-commons-agent-traces"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -828,8 +829,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_reads_trace_commons_messages_json_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "trace-commons-agent-traces"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -856,8 +856,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_reads_trace_commons_trace_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "trace-commons-agent-traces"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -904,8 +903,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["error_counts"]["test_assertion"], 1)
 
     def test_build_profile_reads_agent_race_jsonl_sessions(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "agent-race-traces"
             path = data_root / dataset / "pi-kimi.jsonl"
             path.parent.mkdir(parents=True)
@@ -936,8 +934,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(summary["top_tool_errors"][0]["tool_error"], "bash:test_assertion")
 
     def test_build_profile_treats_max_rows_zero_as_unbounded(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "agent-race-traces"
             path = data_root / dataset / "pi-kimi.jsonl"
             path.parent.mkdir(parents=True)
@@ -1003,8 +1000,7 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
     def test_build_profile_skips_terminalbench_null_rows_before_max_rows(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "terminalbench-trajectories"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
