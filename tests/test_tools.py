@@ -2221,32 +2221,31 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("robot = Robot(); robot.name != robot = Robot(); robot.reset(); robot.name", output)
 
     def test_test_spec_extract_balances_examples_across_symbols(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "list_ops.py").write_text(
-                "def append(a, b):\n    pass\n"
-                "def foldr(function, values, initial):\n    pass\n"
-                "def reverse(values):\n    pass\n",
-                encoding="utf-8",
-            )
-            (root / "list_ops_test.py").write_text(
-                "import unittest\nfrom list_ops import append, foldr, reverse\n\n"
-                "class ListOpsTest(unittest.TestCase):\n"
-                "    def test_append_one(self):\n"
-                "        self.assertEqual(append([], []), [])\n"
-                "    def test_append_two(self):\n"
-                "        self.assertEqual(append([1], [2]), [1, 2])\n"
-                "    def test_append_three(self):\n"
-                "        self.assertEqual(append([3], []), [3])\n"
-                "    def test_append_four(self):\n"
-                "        self.assertEqual(append([], [4]), [4])\n"
-                "    def test_foldr(self):\n"
-                "        self.assertEqual(foldr(lambda acc, el: el + acc, ['e'], '!'), 'e!')\n"
-                "    def test_reverse(self):\n"
-                "        self.assertEqual(reverse([1, 2]), [2, 1])\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "list_ops.py": (
+                    "def append(a, b):\n    pass\n"
+                    "def foldr(function, values, initial):\n    pass\n"
+                    "def reverse(values):\n    pass\n"
+                ),
+                "list_ops_test.py": (
+                    "import unittest\nfrom list_ops import append, foldr, reverse\n\n"
+                    "class ListOpsTest(unittest.TestCase):\n"
+                    "    def test_append_one(self):\n"
+                    "        self.assertEqual(append([], []), [])\n"
+                    "    def test_append_two(self):\n"
+                    "        self.assertEqual(append([1], [2]), [1, 2])\n"
+                    "    def test_append_three(self):\n"
+                    "        self.assertEqual(append([3], []), [3])\n"
+                    "    def test_append_four(self):\n"
+                    "        self.assertEqual(append([], [4]), [4])\n"
+                    "    def test_foldr(self):\n"
+                    "        self.assertEqual(foldr(lambda acc, el: el + acc, ['e'], '!'), 'e!')\n"
+                    "    def test_reverse(self):\n"
+                    "        self.assertEqual(reverse([1, 2]), [2, 1])\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.test_spec_extract("list_ops_test.py", source_path="list_ops.py", limit=4)
 
         self.assertTrue(result["ok"], result)
@@ -2255,32 +2254,31 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("reverse:", result["output"])
 
     def test_implementation_spec_groups_signatures_stubs_examples_and_risks(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "bag.py").write_text(
-                "class Bag:\n"
-                "    def __init__(self):\n"
-                "        self.items = []\n"
-                "        self.size = 0\n"
-                "\n"
-                "    def size(self):\n"
-                "        pass\n"
-                "\n"
-                "def add(left, right):\n"
-                "    pass\n",
-                encoding="utf-8",
-            )
-            (root / "bag_test.py").write_text(
-                "import unittest\nfrom bag import add, Bag\n\n"
-                "class BagTest(unittest.TestCase):\n"
-                "    def test_add(self):\n"
-                "        self.assertEqual(add(1, 2), 3)\n"
-                "    def test_bag_size(self):\n"
-                "        bag = Bag()\n"
-                "        self.assertEqual(bag.size(), 0)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "bag.py": (
+                    "class Bag:\n"
+                    "    def __init__(self):\n"
+                    "        self.items = []\n"
+                    "        self.size = 0\n"
+                    "\n"
+                    "    def size(self):\n"
+                    "        pass\n"
+                    "\n"
+                    "def add(left, right):\n"
+                    "    pass\n"
+                ),
+                "bag_test.py": (
+                    "import unittest\nfrom bag import add, Bag\n\n"
+                    "class BagTest(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(add(1, 2), 3)\n"
+                    "    def test_bag_size(self):\n"
+                    "        bag = Bag()\n"
+                    "        self.assertEqual(bag.size(), 0)\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.implementation_spec("bag.py", "bag_test.py", limit=20)
 
         self.assertTrue(result["ok"], result)
@@ -2290,17 +2288,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("bag.py::add", result["stubs"])
 
     def test_implementation_spec_does_not_hide_late_single_symbol_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "words.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
-            tests = "import unittest\nfrom words import translate\n\nclass WordsTest(unittest.TestCase):\n"
-            for index in range(12):
-                tests += (
-                    f"    def test_case_{index}(self):\n"
-                    f"        self.assertEqual(translate('word{index}'), 'out{index}')\n"
-                )
-            (root / "words_test.py").write_text(tests, encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        tests = "import unittest\nfrom words import translate\n\nclass WordsTest(unittest.TestCase):\n"
+        for index in range(12):
+            tests += (
+                f"    def test_case_{index}(self):\n"
+                f"        self.assertEqual(translate('word{index}'), 'out{index}')\n"
+            )
+        with self._temp_files_tools(
+            {
+                "words.py": "def translate(text):\n    pass\n",
+                "words_test.py": tests,
+            }
+        ) as (_root, tools):
             result = tools.implementation_spec("words.py", "words_test.py", limit=40)
 
         self.assertTrue(result["ok"], result)
@@ -2308,21 +2307,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("translate('word11') -> 'out11'", result["output"])
 
     def test_implementation_spec_includes_string_transform_hints(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pig.py").write_text("def translate(text):\n    pass\n", encoding="utf-8")
-            (root / "pig_test.py").write_text(
-                "import unittest\nfrom pig import translate\n\n"
-                "class PigTest(unittest.TestCase):\n"
-                "    def test_word_beginning_with_a_vowel(self):\n"
-                "        self.assertEqual(translate('apple'), 'appleay')\n"
-                "    def test_word_beginning_with_qu(self):\n"
-                "        self.assertEqual(translate('queen'), 'eenquay')\n"
-                "    def test_word_with_consonant_before_qu(self):\n"
-                "        self.assertEqual(translate('square'), 'aresquay')\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "pig.py": "def translate(text):\n    pass\n",
+                "pig_test.py": (
+                    "import unittest\nfrom pig import translate\n\n"
+                    "class PigTest(unittest.TestCase):\n"
+                    "    def test_word_beginning_with_a_vowel(self):\n"
+                    "        self.assertEqual(translate('apple'), 'appleay')\n"
+                    "    def test_word_beginning_with_qu(self):\n"
+                    "        self.assertEqual(translate('queen'), 'eenquay')\n"
+                    "    def test_word_with_consonant_before_qu(self):\n"
+                    "        self.assertEqual(translate('square'), 'aresquay')\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.implementation_spec("pig.py", "pig_test.py", limit=20)
 
         self.assertTrue(result["ok"], result)
