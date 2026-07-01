@@ -337,6 +337,8 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
                 if name == "live-model-gate-summary.json":
                     return {
                         "ok": True,
+                        "git_commit": "abc123",
+                        "git_dirty": False,
                         "benchmark_suite": "local-small",
                         "selected_default_model": "granite4.1:8b",
                         "selection_reason": "Granite won the token tie-break.",
@@ -417,6 +419,8 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
             valid.write_text(
                 json.dumps(
                     {
+                        "git_commit": "abc123",
+                        "git_dirty": False,
                         "benchmark_suite": "local-small",
                         "selected_default_model": "granite4.1:8b",
                         "selection_reason": "Granite won the token tie-break.",

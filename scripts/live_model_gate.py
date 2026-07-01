@@ -51,6 +51,30 @@ def _load_json_object(path: Path | None) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _git_commit(repo_root: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return completed.stdout.strip() if completed.returncode == 0 else "unknown"
+
+
+def _git_dirty(repo_root: Path) -> bool:
+    completed = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    return bool(completed.stdout.strip()) if completed.returncode == 0 else False
+
+
 def _safe_int(value: Any) -> int | None:
     try:
         return int(value)
@@ -175,9 +199,15 @@ def summary_contract_ok(payload: dict[str, Any]) -> bool:
     benchmark_suite = payload.get("benchmark_suite")
     selected_default_model = payload.get("selected_default_model")
     selection_reason = payload.get("selection_reason")
+    git_commit = payload.get("git_commit")
+    git_dirty = payload.get("git_dirty")
     models = payload.get("models")
     ok = payload.get("ok")
     if not isinstance(benchmark_suite, str) or not benchmark_suite.strip():
+        return False
+    if not isinstance(git_commit, str) or not git_commit.strip():
+        return False
+    if not isinstance(git_dirty, bool):
         return False
     if not isinstance(models, list):
         return False
@@ -428,6 +458,8 @@ def run_gate(
     selected_default_model, selection_reason = choose_default_model(model_rows)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "git_commit": _git_commit(repo_root),
+        "git_dirty": _git_dirty(repo_root),
         "repo_root": str(repo_root.resolve(strict=False)),
         "output_dir": str(output_dir.resolve(strict=False)),
         "benchmark_suite": benchmark_suite,
@@ -487,6 +519,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         payload = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
+            "git_commit": _git_commit(repo_root),
+            "git_dirty": _git_dirty(repo_root),
             "repo_root": str(repo_root.resolve(strict=False)),
             "output_dir": str(args.output_dir.resolve(strict=False)),
             "benchmark_suite": args.benchmark_suite,
