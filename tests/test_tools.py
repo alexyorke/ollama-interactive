@@ -3022,38 +3022,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_hangman_state_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "hangman.py").write_text(
-                "STATUS_WIN = 'win'\nSTATUS_LOSE = 'lose'\nSTATUS_ONGOING = 'ongoing'\n\n"
-                "class Hangman:\n"
-                "    def __init__(self, word):\n"
-                "        self.remaining_guesses = 9\n"
-                "        self.status = STATUS_ONGOING\n"
-                "    def guess(self, char):\n"
-                "        pass\n"
-                "    def get_masked_word(self):\n"
-                "        pass\n"
-                "    def get_status(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "hangman_test.py").write_text(
-                "import unittest\nimport hangman\nfrom hangman import Hangman\n\n"
-                "class HangmanTest(unittest.TestCase):\n"
-                "    def test_win_and_end(self):\n"
-                "        game = Hangman('aaa')\n"
-                "        for ch in 'bcdefghij':\n"
-                "            game.guess(ch)\n"
-                "        game.guess('a')\n"
-                "        self.assertEqual(game.remaining_guesses, 0)\n"
-                "        self.assertEqual(game.get_status(), hangman.STATUS_WIN)\n"
-                "        with self.assertRaisesRegex(ValueError, 'already ended'):\n"
-                "            game.guess('x')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "hangman.py": (
+                    "STATUS_WIN = 'win'\nSTATUS_LOSE = 'lose'\nSTATUS_ONGOING = 'ongoing'\n\n"
+                    "class Hangman:\n"
+                    "    def __init__(self, word):\n"
+                    "        self.remaining_guesses = 9\n"
+                    "        self.status = STATUS_ONGOING\n"
+                    "    def guess(self, char):\n"
+                    "        pass\n"
+                    "    def get_masked_word(self):\n"
+                    "        pass\n"
+                    "    def get_status(self):\n"
+                    "        pass\n"
+                ),
+                "hangman_test.py": (
+                    "import unittest\nimport hangman\nfrom hangman import Hangman\n\n"
+                    "class HangmanTest(unittest.TestCase):\n"
+                    "    def test_win_and_end(self):\n"
+                    "        game = Hangman('aaa')\n"
+                    "        for ch in 'bcdefghij':\n"
+                    "            game.guess(ch)\n"
+                    "        game.guess('a')\n"
+                    "        self.assertEqual(game.remaining_guesses, 0)\n"
+                    "        self.assertEqual(game.get_status(), hangman.STATUS_WIN)\n"
+                    "        with self.assertRaisesRegex(ValueError, 'already ended'):\n"
+                    "            game.guess('x')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_hangman_state_candidate("hangman.py", "hangman_test.py")
             validation = tools.validate_implementation_candidate("hangman.py", str(synthesized.get("candidate_source") or ""), test_path="hangman_test.py", test_command=command)
 
@@ -3061,32 +3059,30 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_rest_api_debt_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "rest_api.py").write_text(
-                "class RestAPI:\n"
-                "    def __init__(self, database=None):\n"
-                "        pass\n"
-                "    def get(self, url, payload=None):\n"
-                "        pass\n"
-                "    def post(self, url, payload=None):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "rest_api_test.py").write_text(
-                "import json\nimport unittest\nfrom rest_api import RestAPI\n\n"
-                "class RestApiTest(unittest.TestCase):\n"
-                "    def test_iou(self):\n"
-                "        database = {'users': [{'name': 'Adam', 'owes': {'Bob': 3.0}, 'owed_by': {}, 'balance': -3.0}, {'name': 'Bob', 'owes': {}, 'owed_by': {'Adam': 3.0}, 'balance': 3.0}]}\n"
-                "        api = RestAPI(database)\n"
-                "        response = api.post('/iou', json.dumps({'lender': 'Adam', 'borrower': 'Bob', 'amount': 4.0}))\n"
-                "        self.assertEqual(json.loads(response)['users'][0]['balance'], 1.0)\n"
-                "    def test_add(self):\n"
-                "        self.assertEqual(json.loads(RestAPI({'users': []}).post('/add', json.dumps({'user': 'Adam'})))['name'], 'Adam')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "rest_api.py": (
+                    "class RestAPI:\n"
+                    "    def __init__(self, database=None):\n"
+                    "        pass\n"
+                    "    def get(self, url, payload=None):\n"
+                    "        pass\n"
+                    "    def post(self, url, payload=None):\n"
+                    "        pass\n"
+                ),
+                "rest_api_test.py": (
+                    "import json\nimport unittest\nfrom rest_api import RestAPI\n\n"
+                    "class RestApiTest(unittest.TestCase):\n"
+                    "    def test_iou(self):\n"
+                    "        database = {'users': [{'name': 'Adam', 'owes': {'Bob': 3.0}, 'owed_by': {}, 'balance': -3.0}, {'name': 'Bob', 'owes': {}, 'owed_by': {'Adam': 3.0}, 'balance': 3.0}]}\n"
+                    "        api = RestAPI(database)\n"
+                    "        response = api.post('/iou', json.dumps({'lender': 'Adam', 'borrower': 'Bob', 'amount': 4.0}))\n"
+                    "        self.assertEqual(json.loads(response)['users'][0]['balance'], 1.0)\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(json.loads(RestAPI({'users': []}).post('/add', json.dumps({'user': 'Adam'})))['name'], 'Adam')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_rest_api_debt_candidate("rest_api.py", "rest_api_test.py")
             validation = tools.validate_implementation_candidate("rest_api.py", str(synthesized.get("candidate_source") or ""), test_path="rest_api_test.py", test_command=command)
 
@@ -3094,31 +3090,29 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_forth_interpreter_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "forth.py").write_text(
-                "class StackUnderflowError(Exception):\n"
-                "    pass\n\n"
-                "def evaluate(input_data):\n"
-                "    pass\n",
-                encoding="utf-8",
-            )
-            (root / "forth_test.py").write_text(
-                "import unittest\nfrom forth import evaluate, StackUnderflowError\n\n"
-                "class ForthTest(unittest.TestCase):\n"
-                "    def test_arithmetic(self):\n"
-                "        self.assertEqual(evaluate(['1 2 + 4 -']), [-1])\n"
-                "    def test_definition_binding(self):\n"
-                "        self.assertEqual(evaluate([': foo 5 ;', ': bar foo ;', ': foo 6 ;', 'bar foo']), [5, 6])\n"
-                "    def test_case(self):\n"
-                "        self.assertEqual(evaluate(['1 DUP Dup dup']), [1, 1, 1, 1])\n"
-                "    def test_underflow(self):\n"
-                "        with self.assertRaisesRegex(StackUnderflowError, 'Insufficient'):\n"
-                "            evaluate(['swap'])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "forth.py": (
+                    "class StackUnderflowError(Exception):\n"
+                    "    pass\n\n"
+                    "def evaluate(input_data):\n"
+                    "    pass\n"
+                ),
+                "forth_test.py": (
+                    "import unittest\nfrom forth import evaluate, StackUnderflowError\n\n"
+                    "class ForthTest(unittest.TestCase):\n"
+                    "    def test_arithmetic(self):\n"
+                    "        self.assertEqual(evaluate(['1 2 + 4 -']), [-1])\n"
+                    "    def test_definition_binding(self):\n"
+                    "        self.assertEqual(evaluate([': foo 5 ;', ': bar foo ;', ': foo 6 ;', 'bar foo']), [5, 6])\n"
+                    "    def test_case(self):\n"
+                    "        self.assertEqual(evaluate(['1 DUP Dup dup']), [1, 1, 1, 1])\n"
+                    "    def test_underflow(self):\n"
+                    "        with self.assertRaisesRegex(StackUnderflowError, 'Insufficient'):\n"
+                    "            evaluate(['swap'])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_forth_interpreter_candidate("forth.py", "forth_test.py")
             validation = tools.validate_implementation_candidate("forth.py", str(synthesized.get("candidate_source") or ""), test_path="forth_test.py", test_command=command)
 
@@ -3127,35 +3121,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_sgf_tree_parser_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "sgf_parsing.py").write_text(
-                "class SgfTree:\n"
-                "    def __init__(self, properties=None, children=None):\n"
-                "        self.properties = properties or {}\n"
-                "        self.children = children or []\n"
-                "    def __eq__(self, other):\n"
-                "        return isinstance(other, SgfTree) and self.properties == other.properties and self.children == other.children\n"
-                "    def __ne__(self, other):\n"
-                "        return not self == other\n\n"
-                "def parse(input_string):\n"
-                "    pass\n",
-                encoding="utf-8",
-            )
-            (root / "sgf_parsing_test.py").write_text(
-                "import unittest\nfrom sgf_parsing import parse, SgfTree\n\n"
-                "class SgfTest(unittest.TestCase):\n"
-                "    def test_simple(self):\n"
-                "        self.assertEqual(parse('(;A[B])'), SgfTree(properties={'A': ['B']}))\n"
-                "    def test_escape(self):\n"
-                "        self.assertEqual(parse('(;A[\\\\]])'), SgfTree(properties={'A': [']']}))\n"
-                "    def test_lower(self):\n"
-                "        with self.assertRaisesRegex(ValueError, 'property must be in uppercase'):\n"
-                "            parse('(;a[b])')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "sgf_parsing.py": (
+                    "class SgfTree:\n"
+                    "    def __init__(self, properties=None, children=None):\n"
+                    "        self.properties = properties or {}\n"
+                    "        self.children = children or []\n"
+                    "    def __eq__(self, other):\n"
+                    "        return isinstance(other, SgfTree) and self.properties == other.properties and self.children == other.children\n"
+                    "    def __ne__(self, other):\n"
+                    "        return not self == other\n\n"
+                    "def parse(input_string):\n"
+                    "    pass\n"
+                ),
+                "sgf_parsing_test.py": (
+                    "import unittest\nfrom sgf_parsing import parse, SgfTree\n\n"
+                    "class SgfTest(unittest.TestCase):\n"
+                    "    def test_simple(self):\n"
+                    "        self.assertEqual(parse('(;A[B])'), SgfTree(properties={'A': ['B']}))\n"
+                    "    def test_escape(self):\n"
+                    "        self.assertEqual(parse('(;A[\\\\]])'), SgfTree(properties={'A': [']']}))\n"
+                    "    def test_lower(self):\n"
+                    "        with self.assertRaisesRegex(ValueError, 'property must be in uppercase'):\n"
+                    "            parse('(;a[b])')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_sgf_tree_parser_candidate("sgf_parsing.py", "sgf_parsing_test.py")
             validation = tools.validate_implementation_candidate("sgf_parsing.py", str(synthesized.get("candidate_source") or ""), test_path="sgf_parsing_test.py", test_command=command)
 
@@ -3164,22 +3156,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_poker_ranking_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "poker.py").write_text("def best_hands(hands):\n    pass\n", encoding="utf-8")
-            (root / "poker_test.py").write_text(
-                "import unittest\nfrom poker import best_hands\n\n"
-                "class PokerTest(unittest.TestCase):\n"
-                "    def test_winner(self):\n"
-                "        self.assertEqual(best_hands(['4S 5H 4D 5D 4H', '7S 8S 9S 6S 10S']), ['7S 8S 9S 6S 10S'])\n"
-                "    def test_tie(self):\n"
-                "        self.assertEqual(best_hands(['3S 4S 5D 6H JH', '3H 4H 5C 6C JD']), ['3S 4S 5D 6H JH', '3H 4H 5C 6C JD'])\n"
-                "    def test_wheel(self):\n"
-                "        self.assertEqual(best_hands(['2H 3H 4H 5H 6H', '4D AD 3D 2D 5D']), ['2H 3H 4H 5H 6H'])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "poker.py": "def best_hands(hands):\n    pass\n",
+                "poker_test.py": (
+                    "import unittest\nfrom poker import best_hands\n\n"
+                    "class PokerTest(unittest.TestCase):\n"
+                    "    def test_winner(self):\n"
+                    "        self.assertEqual(best_hands(['4S 5H 4D 5D 4H', '7S 8S 9S 6S 10S']), ['7S 8S 9S 6S 10S'])\n"
+                    "    def test_tie(self):\n"
+                    "        self.assertEqual(best_hands(['3S 4S 5D 6H JH', '3H 4H 5C 6C JD']), ['3S 4S 5D 6H JH', '3H 4H 5C 6C JD'])\n"
+                    "    def test_wheel(self):\n"
+                    "        self.assertEqual(best_hands(['2H 3H 4H 5H 6H', '4D AD 3D 2D 5D']), ['2H 3H 4H 5H 6H'])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_poker_ranking_candidate("poker.py", "poker_test.py")
             validation = tools.validate_implementation_candidate("poker.py", str(synthesized.get("candidate_source") or ""), test_path="poker_test.py", test_command=command)
 
