@@ -1,4 +1,5 @@
 import json
+from contextlib import contextmanager
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,12 @@ except ModuleNotFoundError:
     pq = None
 
 from scripts import trajectory_evidence_report as report
+
+
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
 
 
 class TrajectoryEvidenceReportTests(unittest.TestCase):
@@ -33,8 +40,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_openhands_messages_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "coderforge-preview-swe-bench-verified-trajectories"
             path = data_root / dataset / "trajectory" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -55,8 +61,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_openhands_messages_json_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "nebius-swe-rebench-openhands-trajectories"
             path = data_root / dataset / "trajectories.parquet"
             path.parent.mkdir(parents=True)
@@ -83,8 +88,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_cc_bench_trajectory_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "cc-bench-trajectories"
             path = data_root / dataset / "train.parquet"
             path.parent.mkdir(parents=True)
@@ -138,8 +142,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_thoughtworks_messages_json_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "thoughtworks-agentic-coding-trajectories"
             path = data_root / dataset / "sessions.parquet"
             path.parent.mkdir(parents=True)
@@ -167,8 +170,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_trace_commons_messages_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "trace-commons-agent-traces"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -195,8 +197,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_trace_commons_messages_json_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "trace-commons-agent-traces"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -223,8 +224,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_preserves_trace_commons_trace_column(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "trace-commons-agent-traces"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -258,8 +258,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertTrue(any(record.kind == "tool_call" and record.name == "websearch" for record in records))
 
     def test_iter_dataset_rows_preserves_agent_race_jsonl_sessions(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "agent-race-traces"
             path = data_root / dataset / "pi-kimi.jsonl"
             path.parent.mkdir(parents=True)
@@ -313,8 +312,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         )
 
     def test_build_report_treats_max_rows_zero_as_unbounded(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "agent-race-traces"
             first = data_root / dataset / "pi-kimi.jsonl"
             first.parent.mkdir(parents=True)
@@ -347,8 +345,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_iter_dataset_rows_skips_terminalbench_null_steps_before_max_rows(self) -> None:
         if pa is None or pq is None:
             self.skipTest("pyarrow is not installed")
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset = "terminalbench-trajectories"
             path = data_root / dataset / "data" / "train-00000-of-00001.parquet"
             path.parent.mkdir(parents=True)
@@ -2186,8 +2183,7 @@ class TrajectoryEvidenceReportTests(unittest.TestCase):
         self.assertNotIn("shell-intent:file-discovery", markdown)
 
     def test_build_report_attaches_dataset_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset_root = data_root / "nebius-swe-agent-trajectories"
             (dataset_root / "data").mkdir(parents=True)
             (dataset_root / report.trajectory_dataset_fetch.MANIFEST_NAME).write_text(
