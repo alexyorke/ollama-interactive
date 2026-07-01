@@ -25,6 +25,7 @@ DEFAULT_BENCHMARK_FEATURE_PROFILES = ("all",)
 DEFAULT_BENCHMARK_CLASSES = ("agent", "controller")
 DEFAULT_BENCHMARK_MODES = ("off",)
 DEFAULT_SELECTION_MODEL = "granite4.1:8b"
+SUMMARY_FILENAME = "live-model-gate-summary.json"
 
 
 @dataclass(frozen=True)
@@ -168,6 +169,36 @@ def choose_default_model(model_rows: list[dict[str, Any]]) -> tuple[str | None, 
     if selected_model == DEFAULT_SELECTION_MODEL:
         return selected_model, f"Selected {selected_model} because benchmark pass count, total tokens, and median latency tied, so the configured Granite default won the tie-break."
     return selected_model, f"Selected {selected_model} as the best available benchmark tie-break winner among the requested models."
+
+
+def summary_contract_ok(payload: dict[str, Any]) -> bool:
+    benchmark_suite = payload.get("benchmark_suite")
+    selected_default_model = payload.get("selected_default_model")
+    selection_reason = payload.get("selection_reason")
+    models = payload.get("models")
+    if not isinstance(benchmark_suite, str) or not benchmark_suite.strip():
+        return False
+    if selected_default_model is not None and (not isinstance(selected_default_model, str) or not selected_default_model.strip()):
+        return False
+    if selection_reason is not None and (not isinstance(selection_reason, str) or not selection_reason.strip()):
+        return False
+    if not isinstance(models, list):
+        return False
+    return True
+
+
+def write_summary_artifacts(payload: dict[str, Any], output_dir: Path) -> list[Path]:
+    summary_path = output_dir / SUMMARY_FILENAME
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(payload, indent=2)
+    summary_path.write_text(encoded, encoding="utf-8")
+    written = [summary_path]
+    canonical_path = DEFAULT_OUTPUT_DIR / SUMMARY_FILENAME
+    if canonical_path.resolve(strict=False) != summary_path.resolve(strict=False):
+        canonical_path.parent.mkdir(parents=True, exist_ok=True)
+        canonical_path.write_text(encoded, encoding="utf-8")
+        written.append(canonical_path)
+    return written
 
 
 def resolve_requested_models(requested: list[str], available: set[str]) -> list[str]:
@@ -419,8 +450,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     repo_root = Path(__file__).resolve().parent.parent
-    summary_path = args.output_dir / "live-model-gate-summary.json"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         payload = run_gate(
             repo_root,
@@ -458,8 +487,11 @@ def main(argv: list[str] | None = None) -> int:
             "models": [],
             "step_results": [],
         }
-    summary_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    written_paths = write_summary_artifacts(payload, args.output_dir)
+    summary_path = written_paths[0]
     print(f"[live-model-gate] wrote {summary_path}")
+    for mirror_path in written_paths[1:]:
+        print(f"[live-model-gate] mirrored {mirror_path}")
     preflight_payload = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
     host = preflight_payload.get("ollama_host", ollama_host())
     print(

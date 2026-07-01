@@ -206,6 +206,10 @@ class LiveModelGateTests(unittest.TestCase):
             payload = json.loads(summary.read_text(encoding="utf-8"))
             self.assertEqual(payload["resolved_models"], ["gemma4:e4b"])
             self.assertEqual(payload["selected_default_model"], "gemma4:e4b")
+            mirror = Path("scratch") / "live-model-gate" / "live-model-gate-summary.json"
+            self.assertTrue(mirror.exists())
+            mirror_payload = json.loads(mirror.read_text(encoding="utf-8"))
+            self.assertEqual(mirror_payload["selected_default_model"], "gemma4:e4b")
 
     @patch("scripts.live_model_gate.run_gate", side_effect=RuntimeError("offline"))
     def test_main_writes_failure_summary_when_preflight_fails(self, _run_gate: object) -> None:
@@ -221,6 +225,19 @@ class LiveModelGateTests(unittest.TestCase):
             self.assertEqual(payload["benchmark_suite"], "local-small")
             self.assertEqual(payload["models"], [])
             self.assertIsNone(payload["selected_default_model"])
+
+    def test_summary_contract_requires_canonical_fields(self) -> None:
+        self.assertTrue(
+            live_model_gate.summary_contract_ok(
+                {
+                    "benchmark_suite": "local-small",
+                    "selected_default_model": "granite4.1:8b",
+                    "selection_reason": "Granite won the token tie-break.",
+                    "models": [],
+                }
+            )
+        )
+        self.assertFalse(live_model_gate.summary_contract_ok({"models": []}))
 
 
 if __name__ == "__main__":

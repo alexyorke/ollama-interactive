@@ -149,7 +149,7 @@ Artifacts land under:
 - `scratch/live-model-gate/coding-benchmark-<model>.json`
 
 The summary JSON records the detected `OLLAMA_HOST`, installed models, resolved models, exact commands, return codes, durations, and command output tails for each gate step.
-It also records the canonical release selection fields: `benchmark_suite`, `selected_default_model`, `selection_reason`, and per-model gate rows with benchmark pass/token/latency totals.
+It also records the canonical release selection fields: `benchmark_suite`, `selected_default_model`, `selection_reason`, and per-model gate rows with benchmark pass/token/latency totals. The fixed-path summary is now a canonical mirror of the latest live-gate run, even when the full run artifacts are written under a timestamped scratch directory.
 
 If you want to A/B a narrower profile such as `trajectory-guards`, pass it explicitly with `--benchmark-feature-profiles trajectory-guards`. Keep that separate from release gating, because the gate should reflect the actual shipped/default runtime profile.
 

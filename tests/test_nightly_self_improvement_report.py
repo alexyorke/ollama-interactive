@@ -1,5 +1,6 @@
 import argparse
 from contextlib import contextmanager
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -394,6 +395,40 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["live_gate"]["benchmark_suite"], "local-small")
         self.assertTrue(payload["summary"]["trajectory"]["available"])
         self.assertTrue(any("nvidia/SWE-Hero-openhands-trajectories" in item for item in payload["metrics"]["suggested_implementation_targets"]))
+
+    def test_live_model_gate_summary_rejects_incomplete_payload(self) -> None:
+        path = Path("scratch/live-model-gate/live-model-gate-summary.json")
+
+        summary = report._live_model_gate_summary({"models": []}, path=path)
+
+        self.assertFalse(summary["available"])
+        self.assertEqual(summary["path"], str(path))
+        self.assertIsNone(summary["benchmark_suite"])
+
+    def test_latest_live_gate_summary_path_skips_stale_incomplete_summary(self) -> None:
+        with _temp_root() as repo_root:
+            fixed_dir = repo_root / "scratch" / "live-model-gate"
+            fixed_dir.mkdir(parents=True, exist_ok=True)
+            fixed = fixed_dir / "live-model-gate-summary.json"
+            fixed.write_text(json.dumps({"models": []}), encoding="utf-8")
+            valid_dir = repo_root / "scratch" / "live-model-gate-20260629-local-small"
+            valid_dir.mkdir(parents=True, exist_ok=True)
+            valid = valid_dir / "live-model-gate-summary.json"
+            valid.write_text(
+                json.dumps(
+                    {
+                        "benchmark_suite": "local-small",
+                        "selected_default_model": "granite4.1:8b",
+                        "selection_reason": "Granite won the token tie-break.",
+                        "models": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            selected = report._latest_live_gate_summary_path(repo_root)
+
+        self.assertEqual(selected, valid)
 
     def test_build_report_ignores_malformed_explicit_compare_path(self) -> None:
         with _temp_root() as repo_root:

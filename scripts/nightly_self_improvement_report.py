@@ -348,6 +348,9 @@ def _latest_live_gate_summary_path(repo_root: Path) -> Path | None:
     if not scratch_root.exists():
         return None
     for path in scratch_root.glob("live-model-gate*/live-model-gate-summary.json"):
+        payload = _load_json(path)
+        if not live_model_gate.summary_contract_ok(payload):
+            continue
         try:
             mtime = path.stat().st_mtime
         except OSError:
@@ -360,7 +363,7 @@ def _latest_live_gate_summary_path(repo_root: Path) -> Path | None:
 
 
 def _live_model_gate_summary(payload: dict[str, Any], *, path: Path | None) -> dict[str, Any]:
-    if not payload:
+    if not payload or not live_model_gate.summary_contract_ok(payload):
         return {
             "available": False,
             "path": str(path) if path else None,
@@ -372,24 +375,12 @@ def _live_model_gate_summary(payload: dict[str, Any], *, path: Path | None) -> d
         }
     models = payload.get("models")
     model_rows = list(models) if isinstance(models, list) else []
-    if not model_rows:
-        resolved_models = payload.get("resolved_models")
-        step_results = payload.get("step_results")
-        if isinstance(resolved_models, list) and isinstance(step_results, list):
-            model_rows = live_model_gate.build_model_rows(
-                [str(item) for item in resolved_models if isinstance(item, str)],
-                [item for item in step_results if isinstance(item, dict)],
-            )
     selected_default_model = payload.get("selected_default_model")
     selection_reason = payload.get("selection_reason")
     if not isinstance(selected_default_model, str) or not selected_default_model.strip():
         selected_default_model = None
     if not isinstance(selection_reason, str) or not selection_reason.strip():
         selection_reason = None
-    if not selected_default_model and model_rows:
-        selected_default_model, selection_reason = live_model_gate.choose_default_model(
-            [row for row in model_rows if isinstance(row, dict)]
-        )
     return {
         "available": True,
         "path": str(path) if path else None,
