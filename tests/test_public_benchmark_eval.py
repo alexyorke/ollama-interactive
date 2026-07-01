@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import subprocess
 import tempfile
@@ -8,6 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts import public_benchmark_eval as public_bench
+
+
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
 
 
 class PublicBenchmarkEvalTests(unittest.TestCase):
@@ -45,8 +52,8 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertTrue(all(task in public_bench.public_task_set("all-python") for task in ("list-ops", "scale-generator")))
 
     def test_public_task_set_all_python_discovers_practice(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "polyglot"
+        with _temp_root() as root_base:
+            root = root_base / "polyglot"
             (root / "python" / "exercises" / "practice" / "task-one").mkdir(parents=True)
             (root / "python" / "exercises" / "practice" / ".local").mkdir(parents=True)
             tasks = public_bench.public_task_set("all-python", polyglot_root=root)
@@ -57,8 +64,7 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
             public_bench.public_task_set("no-such-set")
 
     def test_polyglot_task_path_validates_task(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             task = root / "python" / "exercises" / "practice" / "wordy"
             task.mkdir(parents=True)
 
@@ -145,8 +151,7 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(classes, [])
 
     def test_source_snapshots_exclude_tests_and_report_diffs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             source = root / "source"
             workspace = root / "workspace"
             source.mkdir()
@@ -165,8 +170,8 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in snippets], ["exercise.py"])
 
     def test_public_benchmark_detaches_meta_from_model_workspace(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp) / "workspace"
+        with _temp_root() as root:
+            workspace = root / "workspace"
             workspace.mkdir()
             (workspace / ".meta").mkdir()
             (workspace / ".meta" / "example.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
@@ -182,8 +187,8 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual([item["path"] for item in visible], ["exercise.py"])
 
     def test_public_benchmark_meta_detach_falls_back_to_copy(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp) / "workspace"
+        with _temp_root() as root:
+            workspace = root / "workspace"
             workspace.mkdir()
             (workspace / ".meta").mkdir()
             (workspace / ".meta" / "example.py").write_text("def answer():\n    return 42\n", encoding="utf-8")
@@ -212,8 +217,8 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(summary["total_tokens"], 25)
 
     def test_write_payload_marks_partial_and_comparisons(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            output = Path(tmp) / "result.json"
+        with _temp_root() as root:
+            output = root / "result.json"
 
             public_bench.write_payload(
                 output,
@@ -238,8 +243,7 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertTrue(summary["mechanical_only"])
 
     def test_public_agent_runner_requires_llm_turn_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             project_root = root / "project"
             polyglot_root = root / "polyglot"
             project_root.mkdir()
@@ -293,8 +297,7 @@ class PublicBenchmarkEvalTests(unittest.TestCase):
         self.assertIn("--require-llm-for-turn", cli_invocations[0])
 
     def test_public_agent_runner_can_explicitly_skip_llm_turn_requirement(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             project_root = root / "project"
             polyglot_root = root / "polyglot"
             project_root.mkdir()
