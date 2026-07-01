@@ -176,24 +176,39 @@ def summary_contract_ok(payload: dict[str, Any]) -> bool:
     selected_default_model = payload.get("selected_default_model")
     selection_reason = payload.get("selection_reason")
     models = payload.get("models")
+    ok = payload.get("ok")
     if not isinstance(benchmark_suite, str) or not benchmark_suite.strip():
         return False
+    if not isinstance(models, list):
+        return False
+    if ok is True:
+        if not isinstance(selected_default_model, str) or not selected_default_model.strip():
+            return False
+        if not isinstance(selection_reason, str) or not selection_reason.strip():
+            return False
+        return True
     if selected_default_model is not None and (not isinstance(selected_default_model, str) or not selected_default_model.strip()):
         return False
     if selection_reason is not None and (not isinstance(selection_reason, str) or not selection_reason.strip()):
         return False
-    if not isinstance(models, list):
-        return False
     return True
 
 
-def write_summary_artifacts(payload: dict[str, Any], output_dir: Path) -> list[Path]:
+def write_summary_artifacts(payload: dict[str, Any], output_dir: Path, *, repo_root: Path) -> list[Path]:
     summary_path = output_dir / SUMMARY_FILENAME
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     encoded = json.dumps(payload, indent=2)
     summary_path.write_text(encoded, encoding="utf-8")
     written = [summary_path]
-    canonical_path = DEFAULT_OUTPUT_DIR / SUMMARY_FILENAME
+    if DEFAULT_OUTPUT_DIR.is_absolute():
+        canonical_root = DEFAULT_OUTPUT_DIR
+    else:
+        scratch_root = (repo_root / "scratch").resolve(strict=False)
+        output_root = output_dir.resolve(strict=False)
+        if scratch_root not in {output_root, *output_root.parents}:
+            return written
+        canonical_root = repo_root / DEFAULT_OUTPUT_DIR
+    canonical_path = canonical_root / SUMMARY_FILENAME
     if canonical_path.resolve(strict=False) != summary_path.resolve(strict=False):
         canonical_path.parent.mkdir(parents=True, exist_ok=True)
         canonical_path.write_text(encoded, encoding="utf-8")
@@ -487,7 +502,7 @@ def main(argv: list[str] | None = None) -> int:
             "models": [],
             "step_results": [],
         }
-    written_paths = write_summary_artifacts(payload, args.output_dir)
+    written_paths = write_summary_artifacts(payload, args.output_dir, repo_root=repo_root)
     summary_path = written_paths[0]
     print(f"[live-model-gate] wrote {summary_path}")
     for mirror_path in written_paths[1:]:
