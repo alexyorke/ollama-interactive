@@ -3668,19 +3668,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_validate_implementation_candidate_uses_temp_workspace_and_preserves_signatures(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_python_tools(
+            {
+                "ops.py": "def add(left, right):\n    pass\n",
+                "ops_test.py": (
+                    "import unittest\nfrom ops import add\n\n"
+                    "class OpsTest(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(add(1, 2), 3)\n"
+                ),
+            }
+        ) as (root, tools, command):
             source = root / "ops.py"
-            source.write_text("def add(left, right):\n    pass\n", encoding="utf-8")
-            (root / "ops_test.py").write_text(
-                "import unittest\nfrom ops import add\n\n"
-                "class OpsTest(unittest.TestCase):\n"
-                "    def test_add(self):\n"
-                "        self.assertEqual(add(1, 2), 3)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
             changed_signature = tools.validate_implementation_candidate(
                 "ops.py",
                 "def add(left, right, extra=None):\n    return left + right\n",
@@ -3716,20 +3715,18 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("pass", final_text)
 
     def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            source = root / "list_ops.py"
-            source.write_text("def foldr(function, list, initial):\n    pass\n", encoding="utf-8")
-            (root / "list_ops_test.py").write_text(
-                "import unittest\nfrom list_ops import foldr\n\n"
-                "class ListOpsTest(unittest.TestCase):\n"
-                "    def test_foldr_direction(self):\n"
-                "        self.assertEqual(foldr(lambda acc, el: el / acc, [1, 2, 3, 4], 24), 9)\n"
-                "        self.assertEqual(foldr(lambda acc, el: el + acc, ['e', 'x'], '!'), 'ex!')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "list_ops.py": "def foldr(function, list, initial):\n    pass\n",
+                "list_ops_test.py": (
+                    "import unittest\nfrom list_ops import foldr\n\n"
+                    "class ListOpsTest(unittest.TestCase):\n"
+                    "    def test_foldr_direction(self):\n"
+                    "        self.assertEqual(foldr(lambda acc, el: el / acc, [1, 2, 3, 4], 24), 9)\n"
+                    "        self.assertEqual(foldr(lambda acc, el: el + acc, ['e', 'x'], '!'), 'ex!')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             result = tools.validate_implementation_candidate(
                 "list_ops.py",
                 "def foldr(function, list, initial):\n"
@@ -3751,21 +3748,20 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertGreaterEqual(float(result["total_ms"]), float(result["test_ms"]))
 
     def test_run_test_example_probes_report_value_and_type_mismatches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "variable_length_quantity.py").write_text(
-                "def encode(numbers):\n"
-                "    return bytes(numbers)\n",
-                encoding="utf-8",
-            )
-            (root / "variable_length_quantity_test.py").write_text(
-                "import unittest\nfrom variable_length_quantity import encode\n\n"
-                "class VlqTest(unittest.TestCase):\n"
-                "    def test_two_single_byte_values(self):\n"
-                "        self.assertEqual(encode([0x40, 0x7F]), [0x40, 0x7F])\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "variable_length_quantity.py": (
+                    "def encode(numbers):\n"
+                    "    return bytes(numbers)\n"
+                ),
+                "variable_length_quantity_test.py": (
+                    "import unittest\nfrom variable_length_quantity import encode\n\n"
+                    "class VlqTest(unittest.TestCase):\n"
+                    "    def test_two_single_byte_values(self):\n"
+                    "        self.assertEqual(encode([0x40, 0x7F]), [0x40, 0x7F])\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.run_test_example_probes("variable_length_quantity.py", "variable_length_quantity_test.py", limit=4)
 
         self.assertFalse(result["ok"], result)
