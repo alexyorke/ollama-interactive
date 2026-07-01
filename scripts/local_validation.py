@@ -334,6 +334,17 @@ def main(argv: list[str] | None = None) -> int:
             + f" elapsed_s={row['elapsed_s']}"
             + f" returncode={row['returncode']}"
         )
+    timing_summary = payload.get("timing_summary") or {}
+    slowest_commands = timing_summary.get("slowest_commands") or []
+    if slowest_commands:
+        slowest = slowest_commands[0]
+        print(
+            "[local-validation]"
+            + f" slowest={slowest.get('name')}"
+            + f" elapsed_s={slowest.get('elapsed_s')}"
+            + f" share_pct={next((row.get('elapsed_share_pct') for row in payload['commands'] if row.get('name') == slowest.get('name')), None)}"
+            + f" total_elapsed_s={timing_summary.get('total_elapsed_s')}"
+        )
     comparison = payload.get("baseline_compare") or {}
     if comparison.get("ran") and isinstance(comparison.get("unittest_discover"), dict):
         baseline = comparison["unittest_discover"]

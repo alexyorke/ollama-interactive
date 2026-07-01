@@ -1,5 +1,6 @@
 import sys
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -227,6 +228,46 @@ class LocalValidationTests(unittest.TestCase):
         self.assertTrue(comparison["requested"])
         self.assertFalse(comparison["ran"])
         self.assertEqual(comparison["skipped_reason"], "comparison only runs for the full tier")
+
+    def test_main_prints_slowest_timing_summary(self) -> None:
+        payload = {
+            "ok": True,
+            "commands": [
+                {
+                    "name": "smoke",
+                    "runner": "pytest",
+                    "resolved_jobs": "16",
+                    "ok": True,
+                    "elapsed_s": 6.5,
+                    "returncode": 0,
+                    "elapsed_share_pct": 100.0,
+                }
+            ],
+            "timing_summary": {
+                "total_elapsed_s": 6.5,
+                "slowest_commands": [
+                    {"name": "smoke", "elapsed_s": 6.5, "target_count": 10, "ok": True}
+                ],
+            },
+            "baseline_compare": {"requested": False, "ran": False, "skipped_reason": None},
+        }
+        output_path = Path.cwd() / "scratch" / "validation" / "test-local-validation-main.json"
+        written_text: dict[str, str] = {}
+
+        def fake_write_text(text: str, encoding: str = "utf-8") -> int:
+            written_text["value"] = text
+            return len(text)
+
+        stdout = StringIO()
+        with patch.object(local_validation, "run_validation", return_value=payload):
+            with patch.object(Path, "write_text", autospec=True, side_effect=lambda self, text, encoding="utf-8": fake_write_text(text, encoding)):
+                with patch.object(sys, "stdout", stdout):
+                    exit_code = local_validation.main(["--tier", "smoke", "--output", str(output_path)])
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn("slowest=smoke", stdout.getvalue())
+        self.assertIn("share_pct=100.0", stdout.getvalue())
+        self.assertIn('"timing_summary"', written_text["value"])
 
 
 if __name__ == "__main__":
