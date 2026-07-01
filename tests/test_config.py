@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 import shutil
@@ -17,6 +18,12 @@ from ollama_code.cli import build_agent, build_parser
 from ollama_code.config import DEFAULT_MODEL, load_config
 
 
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
+
+
 class ConfigTests(unittest.TestCase):
     def _workspace_scratch(self) -> Path:
         root = (Path.cwd() / "verify_scratch" / f"test-config-{uuid4().hex}").resolve()
@@ -25,8 +32,7 @@ class ConfigTests(unittest.TestCase):
         return root
 
     def test_build_agent_reads_workspace_config_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             (root / ".ollama-code").mkdir(parents=True)
             (root / ".ollama-code" / "config.json").write_text(
                 json.dumps({"host": "http://127.0.0.1:11435", "model": "config-model", "verifier_model": "config-verifier", "reconcile": "on"}),
@@ -44,8 +50,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(agent.reconcile_mode(), "on")
 
     def test_build_agent_reads_explicit_config_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config = root / "settings.json"
             config.write_text(
                 json.dumps({"ollama": {"host": "http://127.0.0.1:23456", "model": "nested-model"}}),
@@ -142,8 +147,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(loaded.host, "http://127.0.0.1:11435")
 
     def test_continue_session_model_overrides_config_model(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config_dir = root / ".ollama-code"
             session_dir = config_dir / "sessions"
             session_dir.mkdir(parents=True)
@@ -179,8 +183,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(agent.reconcile_mode(), "on")
 
     def test_env_overrides_workspace_config(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             (root / ".ollama-code").mkdir(parents=True)
             (root / ".ollama-code" / "config.json").write_text(
                 json.dumps({"host": "http://127.0.0.1:11435", "model": "config-model"}),
@@ -214,8 +217,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(agent.model, "bom-config-model")
 
     def test_missing_explicit_config_file_raises(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             parser = build_parser()
             args = parser.parse_args(["--cwd", str(root), "--config", "missing.json", "--quiet"])
             with self.assertRaisesRegex(ValueError, "Config file not found"):
@@ -251,8 +253,7 @@ class ConfigTests(unittest.TestCase):
                 build_agent(args)
 
     def test_integer_config_rejects_json_boolean(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config = root / ".ollama-code" / "config.json"
             config.parent.mkdir(parents=True)
             config.write_text(json.dumps({"timeout": True}), encoding="utf-8")
@@ -261,8 +262,7 @@ class ConfigTests(unittest.TestCase):
                 load_config(root)
 
     def test_build_agent_reads_tooling_config(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             (root / ".ollama-code").mkdir(parents=True)
             (root / ".ollama-code" / "config.json").write_text(
                 json.dumps(
@@ -347,8 +347,7 @@ def _start_test_server_thread(server: ThreadingHTTPServer) -> threading.Thread:
 
 class ConfigCliSmokeTests(unittest.TestCase):
     def test_one_shot_cli_uses_workspace_config_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config_dir = root / ".ollama-code"
             config_dir.mkdir(parents=True)
             _FakeOllamaHandler.requests = []
@@ -383,8 +382,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "config-model")
 
     def test_one_shot_cli_falls_back_to_installed_runtime_default_model(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config_dir = root / ".ollama-code"
             config_dir.mkdir(parents=True)
             _FakeOllamaHandler.requests = []
@@ -418,8 +416,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "gemma3:4b")
 
     def test_one_shot_cli_falls_back_when_configured_model_is_stale(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config_dir = root / ".ollama-code"
             config_dir.mkdir(parents=True)
             _FakeOllamaHandler.requests = []
@@ -453,8 +450,7 @@ class ConfigCliSmokeTests(unittest.TestCase):
         self.assertEqual(_FakeOllamaHandler.requests[0]["model"], "gemma3:4b")
 
     def test_one_shot_cli_does_not_fallback_to_unpreferred_custom_model(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with _temp_root() as root:
             config_dir = root / ".ollama-code"
             config_dir.mkdir(parents=True)
             _FakeOllamaHandler.requests = []
