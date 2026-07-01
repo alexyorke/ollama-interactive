@@ -1198,7 +1198,13 @@ class ToolExecutor:
             self._check_interrupted()
             rel = self.relative_label(file_path)
             seen.add(rel)
-            stat = file_path.stat()
+            try:
+                stat = file_path.stat()
+            except OSError:
+                if rel in files_payload:
+                    files_payload.pop(rel, None)
+                    changed = True
+                continue
             cached = files_payload.get(rel)
             if not (
                 isinstance(cached, dict)
@@ -3092,7 +3098,13 @@ class ToolExecutor:
             self._check_interrupted()
             rel = self.relative_label(file_path)
             seen.add(rel)
-            stat = file_path.stat()
+            try:
+                stat = file_path.stat()
+            except OSError:
+                if rel in files_payload:
+                    files_payload.pop(rel, None)
+                    changed = True
+                continue
             cached = files_payload.get(rel)
             if not self._repo_index_record_matches(cached, file_path, stat):
                 cached = self._code_index_record(file_path)
@@ -9137,7 +9149,10 @@ import string
             if file_path.suffix.lower() != ".py":
                 continue
             rel = self.relative_label(file_path)
-            text = file_path.read_text(encoding="utf-8", errors="replace")
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
             try:
                 tree = ast.parse(self._python_parse_text(text), filename=rel)
             except SyntaxError:
