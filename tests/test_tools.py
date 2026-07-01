@@ -4830,20 +4830,14 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"], result["output"])
 
     def test_lint_typecheck_reports_python_syntax_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "bad.py").write_text("def broken(:\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"bad.py": "def broken(:\n    pass\n"}) as (_root, tools):
             result = tools.lint_typecheck("bad.py")
 
         self.assertFalse(result["ok"])
         self.assertIn("bad.py:1", result["output"])
 
     def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "script.sh").write_text("if true; then\n  echo ok\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"script.sh": "if true; then\n  echo ok\n"}) as (_root, tools):
             completed = subprocess.CompletedProcess(
                 args=[],
                 returncode=2,
@@ -4860,10 +4854,7 @@ def double(value: int) -> int:
         self.assertIn("-n", run_process.call_args.args[0])
 
     def test_lint_typecheck_shell_only_target_skips_python_validators(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "script.sh").write_text("echo ok\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"script.sh": "echo ok\n"}) as (_root, tools):
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
@@ -4880,10 +4871,7 @@ def double(value: int) -> int:
         self.assertEqual(calls, [["bash", "-n", "script.sh"]])
 
     def test_lint_typecheck_returns_structured_timeout_for_python_validator(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pkg.py").write_text("print('ok')\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"pkg.py": "print('ok')\n"}) as (_root, tools):
             timeout = subprocess.TimeoutExpired(["ruff", "check", "--no-cache", "pkg.py"], 1, output="partial stdout", stderr="partial stderr")
             with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
                 with patch.object(tools, "_run_process", side_effect=timeout):
@@ -4899,10 +4887,7 @@ def double(value: int) -> int:
         self.assertIn("partial stderr", result["output"])
 
     def test_lint_typecheck_returns_structured_timeout_for_shell_validator(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "script.sh").write_text("echo ok\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"script.sh": "echo ok\n"}) as (_root, tools):
             timeout = subprocess.TimeoutExpired(["bash", "-n", "script.sh"], 1, output="", stderr="shell partial stderr")
             with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "bash" if name == "bash" else None):
                 with patch.object(tools, "_python_tool_command", return_value=None):
@@ -4918,13 +4903,13 @@ def double(value: int) -> int:
         self.assertIn("shell partial stderr", result["output"])
 
     def test_lint_typecheck_collapses_validator_targets_to_requested_directory(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "src" / "two.py").write_text("OTHER = 2\n", encoding="utf-8")
-            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/one.py": "VALUE = 1\n",
+                "src/two.py": "OTHER = 2\n",
+                "pyrightconfig.json": "{}\n",
+            }
+        ) as (_root, tools):
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
@@ -4959,12 +4944,12 @@ def double(value: int) -> int:
         self.assertEqual(float(result["shell_ms"]), 0.0)
 
     def test_lint_typecheck_preserves_workspace_scope_for_configured_full_repo_validation(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/one.py": "VALUE = 1\n",
+                "pyrightconfig.json": "{}\n",
+            }
+        ) as (_root, tools):
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
@@ -4985,11 +4970,7 @@ def double(value: int) -> int:
         )
 
     def test_lint_typecheck_skips_typechecker_for_unconfigured_test_only_workspace_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"tests/test_sample.py": "def test_ok():\n    assert True\n"}) as (_root, tools):
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
@@ -5009,14 +4990,10 @@ def double(value: int) -> int:
         self.assertEqual(python_tool.call_count, 0)
 
     def test_lint_typecheck_falls_back_to_requested_scope_for_large_python_batches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            src = root / "src"
-            src.mkdir()
-            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
-            for index in range(25):
-                (src / f"module_{index}.py").write_text(f"VALUE_{index} = {index}\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        large_batch_files = {"pyrightconfig.json": "{}\n"}
+        for index in range(25):
+            large_batch_files[f"src/module_{index}.py"] = f"VALUE_{index} = {index}\n"
+        with self._temp_files_tools(large_batch_files) as (_root, tools):
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
@@ -5037,13 +5014,13 @@ def double(value: int) -> int:
         )
 
     def test_lint_typecheck_caches_unchanged_validator_results(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "pyrightconfig.json").write_text("{}\n", encoding="utf-8")
+        with self._temp_files_tools(
+            {
+                "src/one.py": "VALUE = 1\n",
+                "pyrightconfig.json": "{}\n",
+            }
+        ) as (root, tools):
             target = root / "src" / "one.py"
-            target.write_text("VALUE = 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
@@ -5075,11 +5052,7 @@ def double(value: int) -> int:
         )
 
     def test_lint_typecheck_skips_typechecker_for_unconfigured_focused_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "src" / "one.py").write_text("VALUE = 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"src/one.py": "VALUE = 1\n"}) as (_root, tools):
             calls: list[list[str]] = []
 
             def fake_run(command: list[str], cwd: Path, timeout: int, shell: bool) -> subprocess.CompletedProcess[str]:
