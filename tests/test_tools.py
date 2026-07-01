@@ -2697,55 +2697,53 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_bowling_game_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "bowling.py").write_text(
-                "class BowlingGame:\n"
-                "    def __init__(self):\n"
-                "        pass\n\n"
-                "    def roll(self, pins):\n"
-                "        pass\n\n"
-                "    def score(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "bowling_test.py").write_text(
-                "import unittest\nfrom bowling import BowlingGame\n\n"
-                "class BowlingTest(unittest.TestCase):\n"
-                "    def roll_new_game(self, rolls):\n"
-                "        game = BowlingGame()\n"
-                "        for roll in rolls:\n"
-                "            game.roll(roll)\n"
-                "        return game\n"
-                "    def assertRaisesWithMessage(self, exception):\n"
-                "        return self.assertRaisesRegex(exception, r'.+')\n"
-                "    def test_all_zeros(self):\n"
-                "        self.assertEqual(self.roll_new_game([0] * 20).score(), 0)\n"
-                "    def test_spare_bonus(self):\n"
-                "        self.assertEqual(self.roll_new_game([6, 4, 3, 0] + [0] * 16).score(), 16)\n"
-                "    def test_strike_bonus(self):\n"
-                "        self.assertEqual(self.roll_new_game([10, 5, 3] + [0] * 16).score(), 26)\n"
-                "    def test_perfect_game(self):\n"
-                "        self.assertEqual(self.roll_new_game([10] * 12).score(), 300)\n"
-                "    def test_incomplete_game(self):\n"
-                "        with self.assertRaisesWithMessage(Exception):\n"
-                "            self.roll_new_game([0, 0]).score()\n"
-                "    def test_invalid_frame(self):\n"
-                "        game = self.roll_new_game([5])\n"
-                "        with self.assertRaisesWithMessage(Exception):\n"
-                "            game.roll(6)\n"
-                "    def test_invalid_last_strike_bonus(self):\n"
-                "        game = self.roll_new_game([0] * 18 + [10, 5])\n"
-                "        with self.assertRaisesWithMessage(Exception):\n"
-                "            game.roll(6)\n"
-                "    def test_cannot_roll_after_complete_game(self):\n"
-                "        game = self.roll_new_game([0] * 20)\n"
-                "        with self.assertRaisesWithMessage(Exception):\n"
-                "            game.roll(0)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "bowling.py": (
+                    "class BowlingGame:\n"
+                    "    def __init__(self):\n"
+                    "        pass\n\n"
+                    "    def roll(self, pins):\n"
+                    "        pass\n\n"
+                    "    def score(self):\n"
+                    "        pass\n"
+                ),
+                "bowling_test.py": (
+                    "import unittest\nfrom bowling import BowlingGame\n\n"
+                    "class BowlingTest(unittest.TestCase):\n"
+                    "    def roll_new_game(self, rolls):\n"
+                    "        game = BowlingGame()\n"
+                    "        for roll in rolls:\n"
+                    "            game.roll(roll)\n"
+                    "        return game\n"
+                    "    def assertRaisesWithMessage(self, exception):\n"
+                    "        return self.assertRaisesRegex(exception, r'.+')\n"
+                    "    def test_all_zeros(self):\n"
+                    "        self.assertEqual(self.roll_new_game([0] * 20).score(), 0)\n"
+                    "    def test_spare_bonus(self):\n"
+                    "        self.assertEqual(self.roll_new_game([6, 4, 3, 0] + [0] * 16).score(), 16)\n"
+                    "    def test_strike_bonus(self):\n"
+                    "        self.assertEqual(self.roll_new_game([10, 5, 3] + [0] * 16).score(), 26)\n"
+                    "    def test_perfect_game(self):\n"
+                    "        self.assertEqual(self.roll_new_game([10] * 12).score(), 300)\n"
+                    "    def test_incomplete_game(self):\n"
+                    "        with self.assertRaisesWithMessage(Exception):\n"
+                    "            self.roll_new_game([0, 0]).score()\n"
+                    "    def test_invalid_frame(self):\n"
+                    "        game = self.roll_new_game([5])\n"
+                    "        with self.assertRaisesWithMessage(Exception):\n"
+                    "            game.roll(6)\n"
+                    "    def test_invalid_last_strike_bonus(self):\n"
+                    "        game = self.roll_new_game([0] * 18 + [10, 5])\n"
+                    "        with self.assertRaisesWithMessage(Exception):\n"
+                    "            game.roll(6)\n"
+                    "    def test_cannot_roll_after_complete_game(self):\n"
+                    "        game = self.roll_new_game([0] * 20)\n"
+                    "        with self.assertRaisesWithMessage(Exception):\n"
+                    "            game.roll(0)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_bowling_game_candidate("bowling.py", "bowling_test.py")
             validation = tools.validate_implementation_candidate(
                 "bowling.py",
@@ -2759,20 +2757,19 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_noarg_literal_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "answers.py").write_text("def drinks_water():\n    pass\n\ndef owns_zebra():\n    pass\n", encoding="utf-8")
-            (root / "answers_test.py").write_text(
-                "import unittest\nfrom answers import drinks_water, owns_zebra\n\n"
-                "class AnswerTest(unittest.TestCase):\n"
-                "    def test_water(self):\n"
-                "        self.assertEqual(drinks_water(), 'Norwegian')\n"
-                "    def test_zebra(self):\n"
-                "        self.assertEqual(owns_zebra(), 'Japanese')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "answers.py": "def drinks_water():\n    pass\n\ndef owns_zebra():\n    pass\n",
+                "answers_test.py": (
+                    "import unittest\nfrom answers import drinks_water, owns_zebra\n\n"
+                    "class AnswerTest(unittest.TestCase):\n"
+                    "    def test_water(self):\n"
+                    "        self.assertEqual(drinks_water(), 'Norwegian')\n"
+                    "    def test_zebra(self):\n"
+                    "        self.assertEqual(owns_zebra(), 'Japanese')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_noarg_literal_candidate("answers.py", "answers_test.py")
             validation = tools.validate_implementation_candidate("answers.py", str(synthesized.get("candidate_source") or ""), test_path="answers_test.py", test_command=command)
 
@@ -2781,24 +2778,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_proverb_chain_candidate_allows_test_backed_signature_change(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "proverb.py").write_text("def proverb():\n    pass\n", encoding="utf-8")
-            (root / "proverb_test.py").write_text(
-                "import unittest\nfrom proverb import proverb\n\n"
-                "class ProverbTest(unittest.TestCase):\n"
-                "    def test_three(self):\n"
-                "        self.assertEqual(proverb('nail', 'shoe', 'horse', qualifier=None), [\n"
-                "            'For want of a nail the shoe was lost.',\n"
-                "            'For want of a shoe the horse was lost.',\n"
-                "            'And all for the want of a nail.',\n"
-                "        ])\n"
-                "    def test_qualifier(self):\n"
-                "        self.assertEqual(proverb('nail', qualifier='horseshoe'), ['And all for the want of a horseshoe nail.'])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "proverb.py": "def proverb():\n    pass\n",
+                "proverb_test.py": (
+                    "import unittest\nfrom proverb import proverb\n\n"
+                    "class ProverbTest(unittest.TestCase):\n"
+                    "    def test_three(self):\n"
+                    "        self.assertEqual(proverb('nail', 'shoe', 'horse', qualifier=None), [\n"
+                    "            'For want of a nail the shoe was lost.',\n"
+                    "            'For want of a shoe the horse was lost.',\n"
+                    "            'And all for the want of a nail.',\n"
+                    "        ])\n"
+                    "    def test_qualifier(self):\n"
+                    "        self.assertEqual(proverb('nail', qualifier='horseshoe'), ['And all for the want of a horseshoe nail.'])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_proverb_chain_candidate("proverb.py", "proverb_test.py")
             validation = tools.validate_implementation_candidate("proverb.py", str(synthesized.get("candidate_source") or ""), test_path="proverb_test.py", test_command=command)
 
@@ -2807,43 +2803,41 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_typed_graph_dsl_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "dot_dsl.py").write_text(
-                "NODE, EDGE, ATTR = range(3)\n\n"
-                "class Node:\n"
-                "    def __init__(self, name, attrs):\n"
-                "        self.name = name\n"
-                "        self.attrs = attrs\n"
-                "    def __eq__(self, other):\n"
-                "        return self.name == other.name and self.attrs == other.attrs\n\n"
-                "class Edge:\n"
-                "    def __init__(self, src, dst, attrs):\n"
-                "        self.src = src\n"
-                "        self.dst = dst\n"
-                "        self.attrs = attrs\n"
-                "    def __eq__(self, other):\n"
-                "        return self.src == other.src and self.dst == other.dst and self.attrs == other.attrs\n\n"
-                "class Graph:\n"
-                "    def __init__(self, data=None):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "dot_dsl_test.py").write_text(
-                "import unittest\nfrom dot_dsl import Graph, Node, Edge, NODE, EDGE, ATTR\n\n"
-                "class GraphTest(unittest.TestCase):\n"
-                "    def test_items(self):\n"
-                "        g = Graph([(ATTR, 'title', 'T'), (NODE, 'a', {}), (EDGE, 'a', 'b', {'x': '1'})])\n"
-                "        self.assertEqual(g.attrs, {'title': 'T'})\n"
-                "        self.assertEqual(g.nodes, [Node('a', {})])\n"
-                "        self.assertEqual(g.edges, [Edge('a', 'b', {'x': '1'})])\n"
-                "    def test_malformed(self):\n"
-                "        with self.assertRaisesRegex(TypeError, 'Graph data malformed'):\n"
-                "            Graph(1)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "dot_dsl.py": (
+                    "NODE, EDGE, ATTR = range(3)\n\n"
+                    "class Node:\n"
+                    "    def __init__(self, name, attrs):\n"
+                    "        self.name = name\n"
+                    "        self.attrs = attrs\n"
+                    "    def __eq__(self, other):\n"
+                    "        return self.name == other.name and self.attrs == other.attrs\n\n"
+                    "class Edge:\n"
+                    "    def __init__(self, src, dst, attrs):\n"
+                    "        self.src = src\n"
+                    "        self.dst = dst\n"
+                    "        self.attrs = attrs\n"
+                    "    def __eq__(self, other):\n"
+                    "        return self.src == other.src and self.dst == other.dst and self.attrs == other.attrs\n\n"
+                    "class Graph:\n"
+                    "    def __init__(self, data=None):\n"
+                    "        pass\n"
+                ),
+                "dot_dsl_test.py": (
+                    "import unittest\nfrom dot_dsl import Graph, Node, Edge, NODE, EDGE, ATTR\n\n"
+                    "class GraphTest(unittest.TestCase):\n"
+                    "    def test_items(self):\n"
+                    "        g = Graph([(ATTR, 'title', 'T'), (NODE, 'a', {}), (EDGE, 'a', 'b', {'x': '1'})])\n"
+                    "        self.assertEqual(g.attrs, {'title': 'T'})\n"
+                    "        self.assertEqual(g.nodes, [Node('a', {})])\n"
+                    "        self.assertEqual(g.edges, [Edge('a', 'b', {'x': '1'})])\n"
+                    "    def test_malformed(self):\n"
+                    "        with self.assertRaisesRegex(TypeError, 'Graph data malformed'):\n"
+                    "            Graph(1)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_typed_graph_dsl_candidate("dot_dsl.py", "dot_dsl_test.py")
             validation = tools.validate_implementation_candidate("dot_dsl.py", str(synthesized.get("candidate_source") or ""), test_path="dot_dsl_test.py", test_command=command)
 
@@ -2852,35 +2846,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_parent_record_tree_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tree_building.py").write_text(
-                "class Record:\n"
-                "    def __init__(self, record_id, parent_id):\n"
-                "        self.record_id = record_id\n"
-                "        self.parent_id = parent_id\n\n"
-                "class Node:\n"
-                "    def __init__(self, node_id):\n"
-                "        self.node_id = node_id\n"
-                "        self.children = []\n\n"
-                "def BuildTree(records):\n"
-                "    return None\n",
-                encoding="utf-8",
-            )
-            (root / "tree_building_test.py").write_text(
-                "import unittest\nfrom tree_building import Record, BuildTree\n\n"
-                "class TreeTest(unittest.TestCase):\n"
-                "    def test_tree(self):\n"
-                "        root = BuildTree([Record(2, 0), Record(1, 0), Record(0, 0)])\n"
-                "        self.assertEqual(root.node_id, 0)\n"
-                "        self.assertEqual([child.node_id for child in root.children], [1, 2])\n"
-                "    def test_invalid(self):\n"
-                "        with self.assertRaisesRegex(ValueError, 'Record id is invalid or out of order'):\n"
-                "            BuildTree([Record(1, 0)])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "tree_building.py": (
+                    "class Record:\n"
+                    "    def __init__(self, record_id, parent_id):\n"
+                    "        self.record_id = record_id\n"
+                    "        self.parent_id = parent_id\n\n"
+                    "class Node:\n"
+                    "    def __init__(self, node_id):\n"
+                    "        self.node_id = node_id\n"
+                    "        self.children = []\n\n"
+                    "def BuildTree(records):\n"
+                    "    return None\n"
+                ),
+                "tree_building_test.py": (
+                    "import unittest\nfrom tree_building import Record, BuildTree\n\n"
+                    "class TreeTest(unittest.TestCase):\n"
+                    "    def test_tree(self):\n"
+                    "        root = BuildTree([Record(2, 0), Record(1, 0), Record(0, 0)])\n"
+                    "        self.assertEqual(root.node_id, 0)\n"
+                    "        self.assertEqual([child.node_id for child in root.children], [1, 2])\n"
+                    "    def test_invalid(self):\n"
+                    "        with self.assertRaisesRegex(ValueError, 'Record id is invalid or out of order'):\n"
+                    "            BuildTree([Record(1, 0)])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_parent_record_tree_candidate("tree_building.py", "tree_building_test.py")
             validation = tools.validate_implementation_candidate("tree_building.py", str(synthesized.get("candidate_source") or ""), test_path="tree_building_test.py", test_command=command)
 
