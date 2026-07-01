@@ -3770,35 +3770,34 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("got b'@\\x7f' (bytes)", result["output"])
 
     def test_run_test_example_probes_handle_raises_and_stateful_scenarios(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "grade_school.py").write_text(
-                "class School:\n"
-                "    def __init__(self):\n"
-                "        self.students = []\n"
-                "    def add_student(self, name, grade):\n"
-                "        self.students.append(name)\n"
-                "    def roster(self):\n"
-                "        return self.students\n"
-                "\n"
-                "def fail():\n"
-                "    return 1\n",
-                encoding="utf-8",
-            )
-            (root / "grade_school_test.py").write_text(
-                "import unittest\nfrom grade_school import School, fail\n\n"
-                "class GradeSchoolTest(unittest.TestCase):\n"
-                "    def test_student_is_added(self):\n"
-                "        school = School()\n"
-                "        school.add_student(name='Aimee', grade=2)\n"
-                "        expected = ['Aimee']\n"
-                "        self.assertEqual(school.roster(), expected)\n"
-                "    def test_raises(self):\n"
-                "        with self.assertRaises(ValueError):\n"
-                "            fail()\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "grade_school.py": (
+                    "class School:\n"
+                    "    def __init__(self):\n"
+                    "        self.students = []\n"
+                    "    def add_student(self, name, grade):\n"
+                    "        self.students.append(name)\n"
+                    "    def roster(self):\n"
+                    "        return self.students\n"
+                    "\n"
+                    "def fail():\n"
+                    "    return 1\n"
+                ),
+                "grade_school_test.py": (
+                    "import unittest\nfrom grade_school import School, fail\n\n"
+                    "class GradeSchoolTest(unittest.TestCase):\n"
+                    "    def test_student_is_added(self):\n"
+                    "        school = School()\n"
+                    "        school.add_student(name='Aimee', grade=2)\n"
+                    "        expected = ['Aimee']\n"
+                    "        self.assertEqual(school.roster(), expected)\n"
+                    "    def test_raises(self):\n"
+                    "        with self.assertRaises(ValueError):\n"
+                    "            fail()\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.run_test_example_probes("grade_school.py", "grade_school_test.py", limit=4)
 
         self.assertFalse(result["ok"], result)
@@ -3806,24 +3805,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("school.roster() expected", result["output"])
 
     def test_run_test_example_probes_report_exception_message_mismatches(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "phone_number.py").write_text(
-                "class PhoneNumber:\n"
-                "    def __init__(self, number):\n"
-                "        raise ValueError('punctuations not permitted')\n",
-                encoding="utf-8",
-            )
-            (root / "phone_number_test.py").write_text(
-                "import unittest\nfrom phone_number import PhoneNumber\n\n"
-                "class PhoneNumberTest(unittest.TestCase):\n"
-                "    def test_invalid_with_letters(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('523-abc-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'letters not permitted')\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "phone_number.py": (
+                    "class PhoneNumber:\n"
+                    "    def __init__(self, number):\n"
+                    "        raise ValueError('punctuations not permitted')\n"
+                ),
+                "phone_number_test.py": (
+                    "import unittest\nfrom phone_number import PhoneNumber\n\n"
+                    "class PhoneNumberTest(unittest.TestCase):\n"
+                    "    def test_invalid_with_letters(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('523-abc-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'letters not permitted')\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.run_test_example_probes("phone_number.py", "phone_number_test.py", limit=4)
 
         self.assertFalse(result["ok"], result)
