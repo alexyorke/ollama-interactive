@@ -72,6 +72,22 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(row["target_count"], 1)
         self.assertTrue(row["ok"])
 
+    def test_run_counts_unittest_module_targets(self) -> None:
+        command = [sys.executable, "-m", "unittest", "tests.test_live_model_gate", "tests.test_nightly_self_improvement_report", "-q"]
+
+        with patch.object(local_validation.subprocess, "run", return_value=local_validation.subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")):
+            row = local_validation._run(Path.cwd(), "smoke", command, runner="unittest", resolved_jobs="off")
+
+        self.assertEqual(row["target_count"], 2)
+
+    def test_run_counts_unittest_discover_as_single_target(self) -> None:
+        command = [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]
+
+        with patch.object(local_validation.subprocess, "run", return_value=local_validation.subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")):
+            row = local_validation._run(Path.cwd(), "full-discover", command, runner="unittest", resolved_jobs="off")
+
+        self.assertEqual(row["target_count"], 1)
+
     def test_run_validation_records_remaining_tiers_after_failure(self) -> None:
         def fake_run(
             repo_root: Path,
@@ -107,6 +123,87 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(payload["remaining_tiers"], ["agent", "full-remaining"])
         self.assertTrue(payload["stopped_after_failure"])
         self.assertFalse(payload["ok"])
+
+    def test_run_validation_records_optional_unittest_baseline_compare(self) -> None:
+        def fake_run(
+            repo_root: Path,
+            name: str,
+            command: list[str],
+            *,
+            runner: str,
+            resolved_jobs: str,
+        ) -> dict[str, object]:
+            elapsed_s = 0.1
+            if name == "unittest-baseline":
+                elapsed_s = 0.6
+            return {
+                "name": name,
+                "command": command,
+                "runner": runner,
+                "resolved_jobs": resolved_jobs,
+                "target_count": 1,
+                "ok": True,
+                "returncode": 0,
+                "elapsed_s": elapsed_s,
+                "output_tail": "ok",
+            }
+
+        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            with patch.object(local_validation.os, "cpu_count", return_value=32):
+                with patch.object(local_validation, "_run", side_effect=fake_run):
+                    payload = local_validation.run_validation(
+                        "full",
+                        repo_root=Path.cwd(),
+                        runner="auto",
+                        jobs="auto",
+                        compare_unittest_baseline=True,
+                    )
+
+        comparison = payload["baseline_compare"]
+        self.assertTrue(comparison["requested"])
+        self.assertTrue(comparison["ran"])
+        self.assertEqual(comparison["preferred_elapsed_s"], 0.3)
+        self.assertEqual(comparison["preferred_vs_unittest_ratio"], 0.5)
+        self.assertEqual(comparison["preferred_minus_unittest_s"], -0.3)
+        self.assertTrue(comparison["preferred_faster_than_unittest"])
+        self.assertEqual(comparison["unittest_discover"]["name"], "unittest-baseline")
+
+    def test_run_validation_skips_unittest_baseline_compare_for_non_full_tier(self) -> None:
+        def fake_run(
+            repo_root: Path,
+            name: str,
+            command: list[str],
+            *,
+            runner: str,
+            resolved_jobs: str,
+        ) -> dict[str, object]:
+            return {
+                "name": name,
+                "command": command,
+                "runner": runner,
+                "resolved_jobs": resolved_jobs,
+                "target_count": 1,
+                "ok": True,
+                "returncode": 0,
+                "elapsed_s": 0.1,
+                "output_tail": "ok",
+            }
+
+        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            with patch.object(local_validation.os, "cpu_count", return_value=32):
+                with patch.object(local_validation, "_run", side_effect=fake_run):
+                    payload = local_validation.run_validation(
+                        "smoke",
+                        repo_root=Path.cwd(),
+                        runner="auto",
+                        jobs="auto",
+                        compare_unittest_baseline=True,
+                    )
+
+        comparison = payload["baseline_compare"]
+        self.assertTrue(comparison["requested"])
+        self.assertFalse(comparison["ran"])
+        self.assertEqual(comparison["skipped_reason"], "comparison only runs for the full tier")
 
 
 if __name__ == "__main__":

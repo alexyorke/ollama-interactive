@@ -175,6 +175,14 @@ python scripts/local_validation.py --tier full
 
 When `pytest` is installed, `full` uses the same bounded-worker `pytest` path for the broad final repo pass and skips the `smoke` and `agent` targets it already ran, instead of rerunning them inside a broad `pytest tests` command. Environments without `pytest` still fall back to the older `unittest` path.
 
+If local test runs feel slow and you want an apples-to-apples baseline, compare the preferred path against raw `unittest` discovery:
+
+```bash
+python scripts/local_validation.py --tier full --compare-unittest-baseline
+```
+
+That writes the normal JSON summary plus an opt-in `baseline_compare` block so you can see whether the slowdown is runner choice or a real suite regression.
+
 One-shot prompt:
 
 ```bash
