@@ -265,6 +265,7 @@ class ToolExecutor:
         self._tree_sitter_syntax_cache: dict[str, dict[str, Any]] = {}
         self._lint_typecheck_cache: dict[str, dict[str, Any]] = {}
         self._lint_typecheck_file_cache: dict[str, dict[str, Any]] = {}
+        self._repo_files_cache: dict[tuple[str, tuple[str, ...] | None], tuple[tuple[Path, ...], bool, int]] = {}
         self._python_tool_command_cache: dict[tuple[str, str, tuple[str, ...]], list[str] | None] = {}
         self._which_cache: dict[str, str | None] = {}
         self._fts_connection: sqlite3.Connection | None = None
@@ -861,6 +862,14 @@ class ToolExecutor:
             return True
         return any(pattern.match(lowered) for pattern in SKIP_GENERATED_DIR_PATTERNS)
 
+    def _repo_files_cache_key(self, base: Path, suffixes: set[str] | None) -> tuple[str, tuple[str, ...] | None]:
+        key_base = self.relative_label(base).replace("\\", "/") if base.exists() else str(base.resolve(strict=False)).replace("\\", "/")
+        key_suffixes = tuple(sorted(suffixes)) if suffixes is not None else None
+        return key_base, key_suffixes
+
+    def _invalidate_repo_files_cache(self) -> None:
+        self._repo_files_cache.clear()
+
     def _path_has_skipped_part(self, path: Path) -> bool:
         relative = self._fast_workspace_relative_label(path)
         if relative is not None:
@@ -951,15 +960,26 @@ class ToolExecutor:
 
     def _iter_repo_files(self, base: Path, *, limit: int = 50000, suffixes: set[str] | None = None) -> list[Path]:
         limit = max(1, int(limit))
+        cache_key = self._repo_files_cache_key(base, suffixes)
+        cached = self._repo_files_cache.get(cache_key)
+        if cached is not None:
+            cached_files, complete, cached_limit = cached
+            if complete or limit <= cached_limit:
+                return list(cached_files[:limit])
         if base.is_file():
-            return self._walk_repo_files(base, limit=limit, suffixes=suffixes)
-        try:
-            git_files = self._repo_files_from_git(base, limit=limit, suffixes=suffixes)
-        except OperationInterrupted:
-            raise
-        if git_files is not None:
-            return git_files
-        return self._walk_repo_files(base, limit=limit, suffixes=suffixes)
+            files = self._walk_repo_files(base, limit=limit, suffixes=suffixes)
+        else:
+            try:
+                git_files = self._repo_files_from_git(base, limit=limit, suffixes=suffixes)
+            except OperationInterrupted:
+                raise
+            if git_files is not None:
+                files = git_files
+            else:
+                files = self._walk_repo_files(base, limit=limit, suffixes=suffixes)
+        complete = len(files) < limit
+        self._repo_files_cache[cache_key] = (tuple(files), complete, limit)
+        return files
 
     def _ensure_git_repo(self, path: Path | None = None) -> tuple[bool, str | None]:
         if self._git_root_for_path(path) is not None:
@@ -11847,6 +11867,7 @@ import string
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         self._invalidate_python_bytecode_cache(target)
+        self._invalidate_repo_files_cache()
 
     def _single_full_python_function_name(self, source: str) -> str | None:
         stripped = textwrap.dedent(source or "").strip()

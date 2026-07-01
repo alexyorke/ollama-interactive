@@ -4330,6 +4330,20 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(second["ok"], second)
         self.assertEqual(calls.count("ruff"), 1)
 
+    def test_discover_validators_caches_repo_file_snapshot_and_invalidates_on_write(self) -> None:
+        with self._temp_git_tools({"src/app.py": "VALUE = 1\n"}) as (_root, tools):
+            with patch.object(tools, "_repo_files_from_git", wraps=tools._repo_files_from_git) as repo_files_from_git:
+                first = tools.discover_validators(limit=4)
+                second = tools.discover_validators(limit=4)
+                write_result = tools.write_file("notes.txt", "hello\n")
+                third = tools.discover_validators(limit=4)
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertTrue(write_result["ok"], write_result)
+        self.assertTrue(third["ok"], third)
+        self.assertEqual(repo_files_from_git.call_count, 2)
+
     def test_discover_validators_skips_cargo_nextest_without_plugin(self) -> None:
         with self._temp_files_tools(
             {"Cargo.toml": "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n"}
