@@ -697,6 +697,89 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(status, "pass")
 
+    def test_feature_delivery_cli_proof_validator_requires_code_docs_and_proof(self) -> None:
+        with self._temp_root() as workspace:
+            bench.prepare_feature_delivery_cli_proof(workspace)
+            (workspace / "task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "import argparse\nfrom collections import Counter\n\n"
+                "TASKS = [\n"
+                "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high'},\n"
+                "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low'},\n"
+                "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium'},\n"
+                "]\n\n"
+                "def list_tasks(priority: str | None = None) -> list[str]:\n"
+                "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+                "    return [f\"{task['title']}:{task['status']}:{task['priority']}\" for task in tasks]\n\n"
+                "def complete_task(title: str) -> str:\n"
+                "    for task in TASKS:\n"
+                "        if task['title'] == title:\n"
+                "            task['status'] = 'done'\n"
+                "            return f\"completed:{title}\"\n"
+                "    raise SystemExit(f\"unknown task: {title}\")\n\n"
+                "def stats_lines() -> list[str]:\n"
+                "    status_counts = Counter(task['status'] for task in TASKS)\n"
+                "    priority_counts = Counter(task['priority'] for task in TASKS)\n"
+                "    rows = [f\"{name}: {status_counts[name]}\" for name in sorted(status_counts)]\n"
+                "    rows.extend(f\"{name}: {priority_counts[name]}\" for name in sorted(priority_counts))\n"
+                "    return rows\n\n"
+                "def main(argv: list[str] | None = None) -> int:\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                "    list_parser = subparsers.add_parser('list')\n"
+                "    list_parser.add_argument('--priority')\n"
+                "    stats_parser = subparsers.add_parser('stats')\n"
+                "    stats_parser.set_defaults(_stats=True)\n"
+                "    complete_parser = subparsers.add_parser('complete')\n"
+                "    complete_parser.add_argument('title')\n"
+                "    args = parser.parse_args(argv)\n"
+                "    if args.command == 'list':\n"
+                "        print('\\n'.join(list_tasks(args.priority)))\n"
+                "        return 0\n"
+                "    if args.command == 'stats':\n"
+                "        print('\\n'.join(stats_lines()))\n"
+                "        return 0\n"
+                "    if args.command == 'complete':\n"
+                "        print(complete_task(args.title))\n"
+                "        return 0\n"
+                "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+                "if __name__ == '__main__':\n"
+                "    raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            (workspace / "README.md").write_text(
+                "# Task CLI\n\nCommands:\n- `list --priority high`\n- `stats`\n- `complete <title>`\n",
+                encoding="utf-8",
+            )
+            (workspace / "tests" / "test_task_cli.py").write_text(
+                "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                "ROOT = Path(__file__).resolve().parents[1]\n\n"
+                "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_stats(self) -> None:\n"
+                "        result = _run('stats')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('todo: 2', result.stdout)\n\n"
+                "    def test_priority_filter(self) -> None:\n"
+                "        result = _run('list', '--priority', 'high')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('write-docs:todo:high', result.stdout)\n"
+                "        self.assertNotIn('ship-cli', result.stdout)\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
+            session = {
+                "events": [
+                    {"type": "tool_result", "name": "run_test", "result": {"ok": True, "command": f"{sys.executable} -m unittest discover -s tests -v"}},
+                ]
+            }
+
+            status = bench.validate_feature_delivery_cli_proof(self._context(workspace, session))
+
+        self.assertEqual(status, "pass")
+
     def test_forbidden_tool_validator_rejects_read_file(self) -> None:
         with self._temp_root() as workspace:
             session = {

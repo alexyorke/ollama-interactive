@@ -1711,6 +1711,32 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("You now have current-turn grounding for src/core.py. Edit the grounded target now.", feedback)
 
+    def test_trajectory_ground_guard_falls_back_to_code_outline_after_failed_symbol_grounding(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"replace_symbol","arguments":{"path":"app.py","symbol":"TaskCLI","content":"def add(left, right):\\n    return left + right\\n"}}',
+                '{"type":"tool","name":"replace_symbol","arguments":{"path":"app.py","symbol":"TaskCLI","content":"def add(left, right):\\n    return left + right\\n"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return left - right","new":"return left + right"}}',
+                '{"type":"final","message":"Updated app.py."}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return left - right","new":"return left + right"}}',
+                '{"type":"final","message":"Updated app.py after grounding app.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py so add returns left + right.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("return left + right", (root / "app.py").read_text(encoding="utf-8"))
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_symbol", "code_outline", "read_file", "replace_in_file"])
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+
     def test_pathless_mutation_grounding_probe_does_not_auto_pick_when_request_names_multiple_sources(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -3930,6 +3956,91 @@ class AgentTests(AgentTestBase):
         self.assertEqual(result.message, "app.py updated and tests passed")
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
         self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
+    def test_post_edit_verification_rejects_docs_only_feature_completion_until_code_proof_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            (root / "README.md").write_text("Usage\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_app.py").write_text("import unittest\n\n\nclass AppTests(unittest.TestCase):\n    def test_placeholder(self) -> None:\n        self.assertTrue(True)\n\n\nif __name__ == '__main__':\n    unittest.main()\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"README.md","content":"Use the stats command.\\n"}}',
+                    '{"type":"final","message":"Added the stats command and updated README."}',
+                    '{"type":"final","message":"Added the stats command and updated README."}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Add a stats command to app.py and update README.md.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("grounded final verification", result.message)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertIn("write_file", tool_calls)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn('prove the "stats" command exists', feedback)
+
+    def test_final_verification_requires_read_proof_for_requested_command_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"def add(left, right):\\n    return left + right\\n","new":"def add(left, right):\\n    return left + right\\n\\ndef stats():\\n    return 1\\n"}}',
+                    '{"type":"final","message":"Added the stats command."}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                    '{"type":"final","message":"Added the stats command after verifying app.py."}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=7)
+
+            result = agent.handle_user("Add a stats command to app.py, but do not run tests.")
+
+        self.assertTrue(result.completed)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertIn("replace_in_file", tool_calls)
+        self.assertIn("read_file", tool_calls)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn('prove the "stats" command exists', feedback)
+
+    def test_request_obligations_persist_across_continue_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            (root / "README.md").write_text("Usage\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_app.py").write_text("import unittest\n\n\nclass AppTests(unittest.TestCase):\n    def test_placeholder(self) -> None:\n        self.assertTrue(True)\n\n\nif __name__ == '__main__':\n    unittest.main()\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"README.md","content":"Use the stats command.\\n"}}',
+                    '{"type":"final","message":"Added the stats command and updated README."}',
+                    '{"type":"final","message":"Added the stats command and updated README."}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                    '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"def add(left, right):\\n    return left + right\\n","new":"def add(left, right):\\n    return left + right\\n\\ndef stats():\\n    return 1\\n"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                    '{"type":"final","message":"Added the stats command after verifying app.py and README."}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                    '{"type":"final","message":"Added the stats command after verifying app.py and README final."}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+
+            first = agent.handle_user("Add a stats command to app.py and update README.md.")
+            second = agent.handle_user("Actually implement stats in app.py.")
+            final_source = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertFalse(first.completed)
+        self.assertTrue(second.completed)
+        self.assertIn("def stats()", final_source)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertIn("read_file", tool_calls)
+        self.assertIn("write_file", tool_calls)
 
     def test_agent_allows_explanatory_implementation_question_without_mutation(self) -> None:
         client = FakeClient(['{"type":"final","message":"explain plan"}'])
@@ -8786,6 +8897,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_trajectory_ground_guard_auto_reads_explicit_target_before_retry",
         "test_trajectory_ground_guard_requires_target_path_grounding_after_unrelated_read",
         "test_trajectory_ground_guard_auto_reads_symbol_before_symbol_edit_retry",
+        "test_trajectory_ground_guard_falls_back_to_code_outline_after_failed_symbol_grounding",
         "test_trajectory_ground_guard_auto_reads_symbol_for_pathless_edit_after_source_context",
         "test_trajectory_ground_guard_blocks_pathless_edit_after_unrelated_read_until_source_is_grounded",
         "test_trajectory_ground_guard_auto_searches_then_reads_symbol_for_pathless_edit_without_context",
@@ -8826,6 +8938,9 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests",
         "test_trajectory_final_chance_validation_discovers_repo_test_command_after_empty_targeted_selection",
         "test_trajectory_final_chance_validation_avoids_rediscovery_after_successful_lint",
+        "test_post_edit_verification_rejects_docs_only_feature_completion_until_code_proof_exists",
+        "test_final_verification_requires_read_proof_for_requested_command_token",
+        "test_request_obligations_persist_across_continue_requests",
     )
 )
 

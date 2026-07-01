@@ -26,7 +26,7 @@ External benchmark inspiration:
 ## Suites
 
 - `local-small`: 8 fast tasks for regular local checks.
-- `local-full`: current 33-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, validator-recovery, path/shell/git regressions, and token traps.
+- `local-full`: current 34-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, validator-recovery, path/shell/git regressions, token traps, and the `feature_delivery_cli_proof` case that fails unless a requested command/flag, docs update, and proof path all line up.
 - `external-smoke`: preflight checks for optional external harnesses; not CI-blocking and not leaderboard-comparable.
 - `scripts/public_benchmark_eval.py`: public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
 
@@ -62,6 +62,7 @@ python scripts/local_validation.py --tier smoke
 ```
 
 For `pytest` runs, the summary JSON includes a `coverage_summary` block that proves whether the repo-owned `smoke` plus `agent` plus `full-remaining` partition still covers the discovered test files exactly once.
+Use the `agent` tier before `local-full` when you are iterating on controller logic: it carries the focused grounding and post-edit-validation regressions that protect against README-only false success claims before you spend time on live-model runs.
 
 Run the full local validation stack before merging larger controller changes:
 

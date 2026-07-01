@@ -606,6 +606,100 @@ def validate_docs_sync_without_tests_still_validates(ctx: BenchmarkContext) -> s
     )
 
 
+def prepare_feature_delivery_cli_proof(workspace: Path) -> None:
+    _write(
+        workspace / "task_cli.py",
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high'},\n"
+        "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low'},\n"
+        "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium'},\n"
+        "]\n\n"
+        "def list_tasks(priority: str | None = None) -> list[str]:\n"
+        "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+        "    return [f\"{task['title']}:{task['status']}:{task['priority']}\" for task in tasks]\n\n"
+        "def complete_task(title: str) -> str:\n"
+        "    for task in TASKS:\n"
+        "        if task['title'] == title:\n"
+        "            task['status'] = 'done'\n"
+        "            return f\"completed:{title}\"\n"
+        "    raise SystemExit(f\"unknown task: {title}\")\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    subparsers.add_parser('list')\n"
+        "    complete_parser = subparsers.add_parser('complete')\n"
+        "    complete_parser.add_argument('title')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        print('\\n'.join(list_tasks()))\n"
+        "        return 0\n"
+        "    if args.command == 'complete':\n"
+        "        print(complete_task(args.title))\n"
+        "        return 0\n"
+        "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+    )
+    _write(
+        workspace / "README.md",
+        "# Task CLI\n\n"
+        "Commands:\n"
+        "- `list`\n"
+        "- `complete <title>`\n",
+    )
+    _write(
+        workspace / "tests" / "test_task_cli.py",
+        "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+        "ROOT = Path(__file__).resolve().parents[1]\n\n"
+        "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+        "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+        "class TaskCliTests(unittest.TestCase):\n"
+        "    def test_list(self) -> None:\n"
+        "        result = _run('list')\n"
+        "        self.assertEqual(result.returncode, 0)\n"
+        "        self.assertIn('write-docs:todo:high', result.stdout)\n\n"
+        "    def test_complete(self) -> None:\n"
+        "        result = _run('complete', 'write-docs')\n"
+        "        self.assertEqual(result.returncode, 0)\n"
+        "        self.assertIn('completed:write-docs', result.stdout)\n\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n",
+    )
+
+
+def validate_feature_delivery_cli_proof(ctx: BenchmarkContext) -> str:
+    source = (ctx.workspace / "task_cli.py").read_text(encoding="utf-8")
+    readme = (ctx.workspace / "README.md").read_text(encoding="utf-8")
+    tests = (ctx.workspace / "tests" / "test_task_cli.py").read_text(encoding="utf-8")
+    implementation_changed = ("add_parser('stats')" in source or 'add_parser("stats")' in source) and "--priority" in source
+    stats_result = _run([sys.executable, "task_cli.py", "stats"], ctx.workspace, timeout=120)
+    filter_result = _run([sys.executable, "task_cli.py", "list", "--priority", "high"], ctx.workspace, timeout=120)
+    stats_output = stats_result.stdout.lower()
+    filter_output = filter_result.stdout.lower()
+    behavior_ok = (
+        stats_result.returncode == 0
+        and filter_result.returncode == 0
+        and "todo: 2" in stats_output
+        and "done: 1" in stats_output
+        and "high: 1" in stats_output
+        and "write-docs:todo:high" in filter_output
+        and "ship-cli" not in filter_output
+        and "fix-bug" not in filter_output
+    )
+    readme_ok = "stats" in readme and "--priority" in readme
+    tests_cover = "stats" in tests and "--priority" in tests and _tool_success(ctx.session, "run_test")
+    direct_cli_proof = any(
+        "stats" in str(arguments.get("command", "")).lower() or "--priority" in str(arguments.get("command", "")).lower()
+        for arguments in tool_call_args(ctx.session, "run_shell")
+    )
+    return _status_or_fail_closed(
+        ctx,
+        implementation_changed and behavior_ok and readme_ok and (tests_cover or direct_cli_proof),
+    )
+
+
 def prepare_nested_package_import_fix(workspace: Path) -> None:
     _write(workspace / "src" / "pkg" / "__init__.py", "")
     _write(workspace / "src" / "pkg" / "core.py", "from helpers import label\n\ndef wrapped() -> str:\n    return label('ok')\n")
@@ -1005,6 +1099,16 @@ LOCAL_CASES: list[BenchmarkCase] = [
         validate=validate_docs_sync_without_tests_still_validates,
         budget_off=SMALL_BUDGET_OFF,
         budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="feature_delivery_cli_proof",
+        suite="local-full",
+        turns=("Add a stats command that prints counts by status and priority, add --priority filtering to list, update README.md, and keep tests green.",),
+        prepare=prepare_feature_delivery_cli_proof,
+        validate=validate_feature_delivery_cli_proof,
+        test_cmd=_python_test_cmd(),
+        budget_off=BenchmarkBudget(max_llm_calls=14, max_total_tokens=100_000),
+        budget_on=BenchmarkBudget(max_llm_calls=18, max_total_tokens=140_000),
     ),
     BenchmarkCase(
         name="nested_package_import_fix",

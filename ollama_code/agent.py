@@ -152,6 +152,7 @@ class OllamaCodeAgent:
         self._turn_cache_epoch = 0
         self._turn_evidence_counter = 0
         self._transcript_dirty = False
+        self._sticky_request_obligations: list[dict[str, Any]] = []
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
@@ -1095,6 +1096,288 @@ class OllamaCodeAgent:
             requested.difference_update(forbidden_tool_names)
         return requested
 
+    def _request_is_continue_prompt(self, text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", text.strip().lower())
+        return normalized in {
+            "continue",
+            "keep going",
+            "go on",
+            "resume",
+            "try again",
+            "fix it",
+            "finish it",
+        }
+
+    def _path_looks_like_doc_target(self, path: str) -> bool:
+        normalized = path.strip().replace("\\", "/").lstrip("./").lower()
+        if not normalized:
+            return False
+        if normalized == "readme.md" or normalized.endswith("/readme.md"):
+            return True
+        return normalized.startswith("docs/") or normalized.endswith((".md", ".rst", ".txt"))
+
+    def _merge_request_obligations(self, obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in obligations:
+            if not isinstance(item, dict):
+                continue
+            obligation_id = str(item.get("id") or "").strip()
+            if not obligation_id or obligation_id in seen:
+                continue
+            seen.add(obligation_id)
+            merged.append(dict(item))
+        return merged
+
+    def _derive_request_obligations(
+        self,
+        *,
+        request_text: str,
+        required_tool_names: set[str],
+        required_mutation_paths: set[str],
+        code_mutation_required: bool,
+        test_run_required: bool,
+    ) -> list[dict[str, Any]]:
+        obligations: list[dict[str, Any]] = []
+        lowered = request_text.lower()
+        for tool_name in sorted(required_tool_names):
+            obligations.append(
+                {
+                    "id": f"tool:{tool_name}",
+                    "kind": "named_tool",
+                    "label": f"use {tool_name}",
+                    "token": tool_name,
+                }
+            )
+        if code_mutation_required:
+            obligations.append(
+                {
+                    "id": "code-change",
+                    "kind": "code_change",
+                    "label": "implement the requested code change",
+                }
+            )
+        if test_run_required:
+            obligations.append(
+                {
+                    "id": "tests-run",
+                    "kind": "test_run",
+                    "label": "run tests successfully after the latest edit",
+                }
+            )
+        doc_targets = sorted(path for path in required_mutation_paths if self._path_looks_like_doc_target(path))
+        if doc_targets or re.search(r"\b(?:readme|docs?|documentation)\b", lowered):
+            obligations.append(
+                {
+                    "id": "docs-update",
+                    "kind": "docs_update",
+                    "label": "update the requested docs",
+                    "paths": doc_targets,
+                }
+            )
+        for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9_-]{1,40})\b\s+(?:subcommand|command)\b", request_text):
+            token = str(match.group(1)).strip()
+            if token:
+                obligations.append(
+                    {
+                        "id": f"command:{token.lower()}",
+                        "kind": "feature_token",
+                        "label": f'prove the "{token}" command exists',
+                        "token": token,
+                        "feature_class": "command",
+                    }
+                )
+        for token in sorted(set(re.findall(r"(--[A-Za-z0-9][A-Za-z0-9-]*)", request_text))):
+            obligations.append(
+                {
+                    "id": f"flag:{token.lower()}",
+                    "kind": "feature_token",
+                    "label": f'prove the "{token}" flag exists',
+                    "token": token,
+                    "feature_class": "flag",
+                }
+            )
+        return self._merge_request_obligations(obligations)
+
+    def _request_obligation_proof_status(
+        self,
+        *,
+        obligations: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        required_tool_names: set[str],
+    ) -> list[dict[str, Any]]:
+        statuses: list[dict[str, Any]] = []
+        successful_tool_names = {str(item.get("name", "")).strip() for item in successful_tool_results}
+        mutated_paths = self._mutated_paths_from_successful_results(successful_tool_results)
+        code_mutated = any(not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path) for path in mutated_paths)
+        docs_mutated = {path for path in mutated_paths if self._path_looks_like_doc_target(path)}
+        test_ran = self._latest_successful_tool_result(successful_tool_results, "run_test") is not None
+        source_reads: set[str] = set()
+        doc_reads: set[str] = set()
+        for item in successful_tool_results:
+            name = str(item.get("name", "")).strip()
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if not path or name not in {"read_file", "read_symbol", "code_outline"}:
+                continue
+            if self._path_looks_like_doc_target(path):
+                doc_reads.add(path)
+                continue
+            if not self._path_looks_like_test_file(path):
+                source_reads.add(path)
+        for obligation in obligations:
+            kind = str(obligation.get("kind") or "").strip()
+            label = str(obligation.get("label") or "").strip()
+            token = str(obligation.get("token") or "").strip()
+            status = {
+                "id": str(obligation.get("id") or "").strip(),
+                "kind": kind,
+                "label": label,
+                "status": "unproven",
+                "evidence": "",
+                "guidance": "",
+            }
+            if kind == "named_tool":
+                if token in successful_tool_names:
+                    status["status"] = "proven"
+                    status["evidence"] = token
+                else:
+                    status["guidance"] = f"Use {token} successfully before finishing."
+            elif kind == "code_change":
+                if code_mutated or source_reads:
+                    status["status"] = "proven"
+                    evidence_paths = sorted(path for path in mutated_paths if not self._path_looks_like_doc_target(path))[:3] or sorted(source_reads)[:3]
+                    status["evidence"] = ", ".join(evidence_paths)
+                else:
+                    status["guidance"] = "The task still needs a real code change, not only docs or narration."
+            elif kind == "test_run":
+                if test_ran:
+                    status["status"] = "proven"
+                    status["evidence"] = "run_test"
+                else:
+                    status["guidance"] = "Run tests after the latest edit before finishing."
+            elif kind == "docs_update":
+                requested_paths = [str(path).strip().replace("\\", "/") for path in list(obligation.get("paths") or []) if str(path).strip()]
+                if requested_paths:
+                    matching = sorted(path for path in docs_mutated if path in requested_paths)
+                    if not matching:
+                        matching = sorted(path for path in doc_reads if path in requested_paths)
+                    if matching:
+                        status["status"] = "proven"
+                        status["evidence"] = ", ".join(matching[:3])
+                    else:
+                        status["guidance"] = "Update the requested docs file and verify it from current evidence."
+                elif docs_mutated or doc_reads:
+                    status["status"] = "proven"
+                    status["evidence"] = ", ".join(sorted(docs_mutated or doc_reads)[:3])
+                else:
+                    status["guidance"] = "The request asked for docs updates, but no docs file has been changed yet."
+            elif kind == "feature_token":
+                token_lower = token.lower()
+                for item in reversed(successful_tool_results):
+                    name = str(item.get("name", "")).strip()
+                    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+                    arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+                    path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                    if name not in {"read_file", "read_symbol", "code_outline", "run_shell", "run_test"}:
+                        continue
+                    if name in {"read_file", "read_symbol", "code_outline"} and path and (
+                        self._path_looks_like_doc_target(path) or self._path_looks_like_test_file(path)
+                    ):
+                        continue
+                    samples = [
+                        str(result.get("output") or ""),
+                        str(result.get("summary") or ""),
+                        str(result.get("symbol") or arguments.get("symbol") or ""),
+                        str(arguments.get("command") or result.get("command") or ""),
+                    ]
+                    haystack = "\n".join(sample for sample in samples if sample).lower()
+                    if token_lower and token_lower in haystack:
+                        status["status"] = "proven"
+                        status["evidence"] = path or name
+                        break
+                if status["status"] != "proven":
+                    feature_class = str(obligation.get("feature_class") or "feature").strip()
+                    status["guidance"] = (
+                        f'The requested {feature_class} "{token}" is still unproven. '
+                        + "Read the relevant source file or run a direct command that demonstrates it before finishing."
+                    )
+            else:
+                continue
+            statuses.append(status)
+        unresolved_required_tools = sorted(required_tool_names - successful_tool_names)
+        for tool_name in unresolved_required_tools:
+            statuses.append(
+                {
+                    "id": f"tool:{tool_name}",
+                    "kind": "named_tool",
+                    "label": f"use {tool_name}",
+                    "status": "unproven",
+                    "evidence": "",
+                    "guidance": f"Use {tool_name} successfully before finishing.",
+                }
+            )
+        return self._merge_request_obligations(statuses)
+
+    def _apply_request_obligations_to_verification(
+        self,
+        decision: dict[str, Any],
+        *,
+        request_obligations: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        required_tool_names: set[str],
+    ) -> dict[str, Any]:
+        statuses = self._request_obligation_proof_status(
+            obligations=request_obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=required_tool_names,
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "") != "proven"]
+        normalized = dict(decision)
+        normalized["obligation_checks"] = statuses
+        if not unresolved:
+            return normalized
+        normalized["verdict"] = "retry"
+        normalized["rewrite_from_evidence"] = False
+        unresolved_labels = [str(item.get("label") or "").strip() for item in unresolved if str(item.get("label") or "").strip()]
+        normalized["reason"] = "Requested deliverables remain unproven: " + "; ".join(unresolved_labels[:3]) + "."
+        guidance = list(normalized.get("rewrite_guidance") or [])
+        for item in unresolved:
+            tip = str(item.get("guidance") or "").strip()
+            if tip and tip not in guidance:
+                guidance.append(tip)
+        normalized["rewrite_guidance"] = guidance[:AUDIT_TEXT_ITEM_LIMIT]
+        return normalized
+
+    def _recent_failed_read_symbol_without_path_fallback(self, *, path: str, symbol: str) -> bool:
+        normalized_path = path.strip().replace("\\", "/").lstrip("./")
+        normalized_symbol = symbol.strip()
+        if not normalized_path or not normalized_symbol:
+            return False
+        for event in reversed(self.events):
+            if event.get("type") != "tool_result":
+                continue
+            name = str(event.get("name", "")).strip()
+            result = event.get("result") if isinstance(event.get("result"), dict) else {}
+            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+            event_path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if event_path != normalized_path:
+                continue
+            if name in {"read_file", "code_outline"} and result.get("ok") is True:
+                return False
+            if name != "read_symbol":
+                continue
+            event_symbol = str(result.get("symbol") or arguments.get("symbol") or "").strip()
+            if event_symbol != normalized_symbol:
+                continue
+            if result.get("ok") is True:
+                return False
+            summary = str(result.get("summary") or result.get("output") or "").strip().lower()
+            if "symbol not found" in summary or "ambiguous symbol" in summary:
+                return True
+        return False
+
     def _verification_context_payload(
         self,
         *,
@@ -1106,6 +1389,7 @@ class OllamaCodeAgent:
         accepted_assumption_audits: list[dict[str, Any]],
         required_tool_names: set[str],
         forbidden_tool_names: set[str],
+        request_obligations: list[dict[str, Any]],
     ) -> dict[str, Any]:
         recent_messages = [
             {
@@ -1117,6 +1401,11 @@ class OllamaCodeAgent:
         ]
         candidate_claims = self._extract_candidate_claims(candidate_message)
         evidence_table = self._build_verification_evidence_table(successful_tool_results)
+        obligation_checks = self._request_obligation_proof_status(
+            obligations=request_obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=required_tool_names,
+        )
         return {
             "round": round_number,
             "model": self.model,
@@ -1130,6 +1419,8 @@ class OllamaCodeAgent:
             "forbidden_tools": sorted(forbidden_tool_names),
             "tool_calls": [self._compact_tool_call_for_verification(item) for item in tool_calls],
             "evidence_table": evidence_table,
+            "request_obligations": request_obligations,
+            "obligation_checks": obligation_checks,
             "accepted_assumption_audits": [self._compact_assumption_audit_for_context(item) for item in accepted_assumption_audits],
         }
 
@@ -1154,6 +1445,7 @@ class OllamaCodeAgent:
             "required_tools": sorted(set(required_tools)),
             "forbidden_tools": sorted(set(forbidden_tools)),
             "claim_checks": self._normalize_claim_checks(decision.get("claim_checks")),
+            "obligation_checks": self._normalize_claim_checks(decision.get("obligation_checks")),
             "rewrite_guidance": rewrite_guidance,
             "rewrite_from_evidence": bool(decision.get("rewrite_from_evidence")),
         }
@@ -1176,6 +1468,7 @@ class OllamaCodeAgent:
             "candidate_claims": self._extract_candidate_claims(candidate_message),
             "evidence_table": self._build_verification_evidence_table(successful_tool_results),
             "claim_checks": verification_decision.get("claim_checks", []),
+            "obligation_checks": verification_decision.get("obligation_checks", []),
             "rewrite_guidance": verification_decision.get("rewrite_guidance", []),
             "reason": self._truncate_text(str(verification_decision.get("reason", "")).strip(), limit=240),
         }
@@ -1217,6 +1510,7 @@ class OllamaCodeAgent:
         accepted_assumption_audits: list[dict[str, Any]],
         required_tool_names: set[str],
         forbidden_tool_names: set[str],
+        request_obligations: list[dict[str, Any]],
     ) -> FinalRewriteOutcome:
         payload = self._rewrite_context_payload(
             request_text=request_text,
@@ -1264,6 +1558,7 @@ class OllamaCodeAgent:
             accepted_assumption_audits=accepted_assumption_audits,
             required_tool_names=required_tool_names,
             forbidden_tool_names=forbidden_tool_names,
+            request_obligations=request_obligations,
         )
         self._record_event(
             "verification_rewrite",
@@ -1384,6 +1679,35 @@ class OllamaCodeAgent:
         expected_exact_file_line: str | None,
         expected_exact_reply_text: str | None,
     ) -> dict[str, Any]:
+        if proposed_tool_name in MUTATING_TOOL_NAMES:
+            symbol_target = self._mutation_symbol_grounding_target(name=proposed_tool_name, arguments=proposed_arguments)
+            if symbol_target is not None:
+                symbol_path, symbol_name = symbol_target
+                if self._recent_failed_read_symbol_without_path_fallback(path=symbol_path, symbol=symbol_name):
+                    fallback_tool = "code_outline" if self.tools.is_tool_enabled("code_outline") else "read_file"
+                    decision = {
+                        "verdict": "retry",
+                        "reason": f'Symbol grounding for "{symbol_name}" in {symbol_path} failed earlier; do not edit from an invented object model.',
+                        "assumptions": [f'"{symbol_name}" is still ungrounded in {symbol_path}'],
+                        "validation_steps": [f"Ground the file with {fallback_tool} before editing"],
+                        "required_tools": [],
+                        "forbidden_tools": [],
+                    }
+                    self._record_event(
+                        "assumption_audit",
+                        round=round_number,
+                        tool=proposed_tool_name,
+                        arguments=self._truncate_json_value(proposed_arguments, limit=800),
+                        verdict=decision["verdict"],
+                        reason=decision["reason"],
+                        assumptions=decision["assumptions"],
+                        validation_steps=decision["validation_steps"],
+                        required_tools=decision["required_tools"],
+                        forbidden_tools=decision["forbidden_tools"],
+                        auditor_model=self.model,
+                        auditor="deterministic-symbol-grounding-guard",
+                    )
+                    return decision
         context_payload = self._assumption_audit_context_payload(
             request_text=request_text,
             round_number=round_number,
@@ -1574,9 +1898,16 @@ class OllamaCodeAgent:
         accepted_assumption_audits: list[dict[str, Any]],
         required_tool_names: set[str],
         forbidden_tool_names: set[str],
+        request_obligations: list[dict[str, Any]],
     ) -> dict[str, Any]:
         if not self.debate_enabled or not self._candidate_eligible_for_verification(response.content):
-            return {"verdict": "accept", "reason": "", "required_tools": [], "forbidden_tools": []}
+            decision = {"verdict": "accept", "reason": "", "required_tools": [], "forbidden_tools": [], "claim_checks": [], "rewrite_guidance": [], "rewrite_from_evidence": False, "obligation_checks": []}
+            return self._apply_request_obligations_to_verification(
+                decision,
+                request_obligations=request_obligations,
+                successful_tool_results=successful_tool_results,
+                required_tool_names=required_tool_names,
+            )
         candidate_payload = self._normalize_payload(extract_json_response(response.content) or {})
         candidate_message = str(candidate_payload.get("message", "")).strip()
         context_payload = self._verification_context_payload(
@@ -1588,6 +1919,7 @@ class OllamaCodeAgent:
             accepted_assumption_audits=accepted_assumption_audits,
             required_tool_names=required_tool_names,
             forbidden_tool_names=forbidden_tool_names,
+            request_obligations=request_obligations,
         )
         try:
             self.status_printer("verifying final")
@@ -1600,6 +1932,12 @@ class OllamaCodeAgent:
         except OllamaError as exc:
             raise exc
         decision = self._normalize_verification_payload(extract_json_response(verdict_response.content))
+        decision = self._apply_request_obligations_to_verification(
+            decision,
+            request_obligations=request_obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=required_tool_names,
+        )
         if decision["verdict"] == "retry" and not decision["reason"]:
             decision["reason"] = "Final answer was not accepted by grounded verification."
         self._record_event(
@@ -1613,6 +1951,7 @@ class OllamaCodeAgent:
             candidate_claims=context_payload.get("candidate_claims", []),
             evidence_table=context_payload.get("evidence_table", []),
             claim_checks=decision.get("claim_checks", []),
+            obligation_checks=decision.get("obligation_checks", []),
             rewrite_guidance=decision.get("rewrite_guidance", []),
             rewrite_from_evidence=decision.get("rewrite_from_evidence", False),
             verifier_model=self.verification_model(),
@@ -1628,6 +1967,22 @@ class OllamaCodeAgent:
             "Do not contradict successful tool results, accepted assumption-audit evidence, or explicit user constraints.",
         ]
         claim_checks = decision.get("claim_checks") if isinstance(decision.get("claim_checks"), list) else []
+        obligation_checks = decision.get("obligation_checks") if isinstance(decision.get("obligation_checks"), list) else []
+        unresolved_obligations = [
+            item
+            for item in obligation_checks
+            if isinstance(item, dict) and str(item.get("status", "")).strip() != "proven"
+        ]
+        if unresolved_obligations:
+            parts.append(
+                "Unproven deliverables: "
+                + " | ".join(
+                    str(item.get("label") or "").strip()
+                    for item in unresolved_obligations[:3]
+                    if str(item.get("label") or "").strip()
+                )
+                + "."
+            )
         if claim_checks:
             corrections: list[str] = []
             for item in claim_checks:
@@ -2469,7 +2824,10 @@ class OllamaCodeAgent:
         forbidden_tool_names: set[str],
         mutation_verified_this_turn: bool,
         expected_exact_file_line: str | None,
+        request_obligations: list[dict[str, Any]],
     ) -> bool:
+        if request_obligations:
+            return True
         if required_tool_names or forbidden_tool_names:
             return True
         if mutation_verified_this_turn or self._final_claims_file_mutation(assistant_text):
@@ -5710,6 +6068,8 @@ class OllamaCodeAgent:
                 return "search_symbols", {"query": symbol_name, "path": "."}
             return None
         if symbol_name:
+            if self._recent_failed_read_symbol_without_path_fallback(path=candidate_source, symbol=symbol_name):
+                return "code_outline", {"path": candidate_source}
             return "read_symbol", {"path": candidate_source, "symbol": symbol_name, "include_context": 0}
         return "read_file", {"path": candidate_source}
 
@@ -5764,6 +6124,10 @@ class OllamaCodeAgent:
         symbol_target = self._mutation_symbol_grounding_target(name=name, arguments=arguments)
         if symbol_target is not None and "read_symbol" not in forbidden_tool_names:
             symbol_path, symbol_name = symbol_target
+            if self._recent_failed_read_symbol_without_path_fallback(path=symbol_path, symbol=symbol_name):
+                if "code_outline" not in forbidden_tool_names:
+                    return "code_outline", {"path": symbol_path}
+                return "read_file", {"path": symbol_path}
             return "read_symbol", {"path": symbol_path, "symbol": symbol_name, "include_context": 0}
         if not latest_run_test_failed:
             pathless_probe = self._pathless_mutation_grounding_probe(
@@ -6910,7 +7274,16 @@ class OllamaCodeAgent:
             satisfied_tool_names.add(name)
         if self._counts_as_real_tool_use(name, result):
             successful_tool_results.append({"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result), "evidence_id": evidence_id})
-        self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
+        self._record_event(
+            "tool_result",
+            name=name,
+            arguments=deepcopy(arguments),
+            result=result,
+            rounds=round_number,
+            cached=cache_hit,
+            duration_ms=duration_ms,
+            evidence_id=evidence_id,
+        )
         self.messages.append(
             {
                 "role": "user",
@@ -9578,6 +9951,20 @@ class OllamaCodeAgent:
         test_run_required = self._request_requires_test_run(text)
         test_mutation_forbidden = self._request_forbids_test_mutation(text)
         required_mutation_paths = self._requested_mutation_paths(text)
+        request_obligations = self._derive_request_obligations(
+            request_text=text,
+            required_tool_names=required_tool_names,
+            required_mutation_paths=required_mutation_paths,
+            code_mutation_required=code_mutation_required,
+            test_run_required=test_run_required,
+        )
+        if self._sticky_request_obligations and (self._request_is_continue_prompt(text) or mutation_required or code_mutation_required or test_run_required):
+            request_obligations = self._merge_request_obligations([*self._sticky_request_obligations, *request_obligations])
+        elif not (mutation_required or code_mutation_required or test_run_required):
+            self._sticky_request_obligations = []
+        if request_obligations:
+            self._sticky_request_obligations = self._merge_request_obligations(request_obligations)
+            self._record_event("request_obligations", obligations=request_obligations)
         primary_tool_names = self._primary_tool_names_for_request(
             text,
             requires_tools=requires_tools,
@@ -10306,6 +10693,7 @@ class OllamaCodeAgent:
                     forbidden_tool_names=forbidden_tool_names,
                     mutation_verified_this_turn=mutation_verified_this_turn,
                     expected_exact_file_line=expected_exact_file_line,
+                    request_obligations=request_obligations,
                 ):
                     decision = self._verify_final_candidate(
                         response,
@@ -10316,6 +10704,7 @@ class OllamaCodeAgent:
                         accepted_assumption_audits=accepted_assumption_audits,
                         required_tool_names=required_tool_names,
                         forbidden_tool_names=forbidden_tool_names,
+                        request_obligations=request_obligations,
                     )
                     if decision["verdict"] == "retry":
                         if assistant_text:
@@ -10345,6 +10734,7 @@ class OllamaCodeAgent:
                                 accepted_assumption_audits=accepted_assumption_audits,
                                 required_tool_names=required_tool_names,
                                 forbidden_tool_names=forbidden_tool_names,
+                                request_obligations=request_obligations,
                             )
                             if rewrite_outcome.accepted_message is not None:
                                 rewritten_message = rewrite_outcome.accepted_message
@@ -10357,6 +10747,7 @@ class OllamaCodeAgent:
                                     rounds=round_number,
                                 )
                                 self._record_event("assistant", content=rewritten_message, rounds=round_number)
+                                self._sticky_request_obligations = []
                                 self._flush_llm_call_events()
                                 return AgentResult(message=rewritten_message, rounds=round_number, completed=True)
                             if rewrite_outcome.rejected_message:
@@ -10376,6 +10767,7 @@ class OllamaCodeAgent:
                         continue
                 self._append_assistant_payload(payload)
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
+                self._sticky_request_obligations = []
                 self._flush_llm_call_events()
                 return AgentResult(message=assistant_text, rounds=round_number, completed=True)
             if response_type == "tool":
@@ -11411,7 +11803,16 @@ class OllamaCodeAgent:
                                         )
                                     else:
                                         unresolved_probe_diagnostics.pop(result_path, None)
-                self._record_event("tool_result", name=name, result=result, rounds=round_number, cached=cache_hit, duration_ms=duration_ms, evidence_id=evidence_id)
+                self._record_event(
+                    "tool_result",
+                    name=name,
+                    arguments=deepcopy(arguments),
+                    result=result,
+                    rounds=round_number,
+                    cached=cache_hit,
+                    duration_ms=duration_ms,
+                    evidence_id=evidence_id,
+                )
                 self.messages.append(
                     {
                         "role": "user",
@@ -11672,7 +12073,17 @@ class OllamaCodeAgent:
                     duration_ms = round((time.perf_counter() - started) * 1000, 3)
                     self._record_command_validation_event(name="run_test", result=auto_result, round_number=round_number, cached=False)
                     evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
-                    self._record_event("tool_result", name="run_test", result=auto_result, rounds=round_number, cached=False, auto=True, duration_ms=duration_ms, evidence_id=evidence_id)
+                    self._record_event(
+                        "tool_result",
+                        name="run_test",
+                        arguments=deepcopy(test_args),
+                        result=auto_result,
+                        rounds=round_number,
+                        cached=False,
+                        auto=True,
+                        duration_ms=duration_ms,
+                        evidence_id=evidence_id,
+                    )
                     tool_used_this_turn = True
                     satisfied_tool_names.add("run_test")
                     raw_output = str(auto_result.get("output") or auto_result.get("summary") or "").strip()
