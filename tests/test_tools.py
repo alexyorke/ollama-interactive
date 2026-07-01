@@ -3179,124 +3179,121 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_metered_io_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "paasio.py").write_text(
-                "import io\n\n"
-                "class MeteredFile(io.BufferedRandom):\n"
-                "    def __init__(self, *args, **kwargs):\n"
-                "        pass\n"
-                "    def __enter__(self):\n"
-                "        pass\n"
-                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
-                "        pass\n"
-                "    def __iter__(self):\n"
-                "        pass\n"
-                "    def __next__(self):\n"
-                "        pass\n"
-                "    def read(self, size=-1):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def read_bytes(self):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def read_ops(self):\n"
-                "        pass\n"
-                "    def write(self, b):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def write_bytes(self):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def write_ops(self):\n"
-                "        pass\n\n"
-                "class MeteredSocket:\n"
-                "    def __init__(self, socket):\n"
-                "        pass\n"
-                "    def __enter__(self):\n"
-                "        pass\n"
-                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
-                "        pass\n"
-                "    def recv(self, bufsize, flags=0):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def recv_bytes(self):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def recv_ops(self):\n"
-                "        pass\n"
-                "    def send(self, data, flags=0):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def send_bytes(self):\n"
-                "        pass\n"
-                "    @property\n"
-                "    def send_ops(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "test_utils.py").write_text(
-                "import inspect\nimport io\n\n"
-                "class MockFile(io.BytesIO):\n"
-                "    def __init__(self, *args, **kwargs):\n"
-                "        super().__init__(*args, **kwargs)\n"
-                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
-                "        return super().__exit__(exc_type, exc_val, exc_tb)\n\n"
-                "class MockSock:\n"
-                "    def __init__(self):\n"
-                "        self.payload = io.BytesIO(b'abcdef')\n"
-                "        self.sent = io.BytesIO()\n"
-                "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
-                "        return False\n"
-                "    def recv(self, bufsize, flags=0):\n"
-                "        return self.payload.read(bufsize)\n"
-                "    def send(self, data, flags=0):\n"
-                "        return self.sent.write(data)\n\n"
-                "class SuperMock:\n"
-                "    mock_object = None\n"
-                "    init_called = 0\n"
-                "    initialized = False\n"
-                "    def __init__(self, *args, **kwargs):\n"
-                "        if self.initialized:\n"
-                "            self.init_called += 1\n"
-                "        else:\n"
-                "            self.initialized = True\n"
-                "    def __call__(self, *args, **kwargs):\n"
-                "        frame = inspect.currentframe()\n"
-                "        stack = inspect.getouterframes(frame)\n"
-                "        if any(item[3] == '__init__' and 'paasio' in item[1] for item in stack):\n"
-                "            return self\n"
-                "        return self.mock_object\n",
-                encoding="utf-8",
-            )
-            (root / "paasio_test.py").write_text(
-                "import unittest\nfrom unittest.mock import NonCallableMagicMock, patch\n"
-                "from test_utils import MockFile, MockSock, SuperMock\nfrom paasio import MeteredFile, MeteredSocket\n\n"
-                "class PaasioTest(unittest.TestCase):\n"
-                "    def test_socket(self):\n"
-                "        mock = NonCallableMagicMock(wraps=MockSock(), autospec=True)\n"
-                "        with MeteredSocket(mock) as socket:\n"
-                "            self.assertEqual(socket.recv(3), b'abc')\n"
-                "            self.assertEqual(socket.send(b'xy'), 2)\n"
-                "        self.assertEqual(socket.recv_ops, 1)\n"
-                "        self.assertEqual(socket.recv_bytes, 3)\n"
-                "        self.assertEqual(socket.send_ops, 1)\n"
-                "        self.assertEqual(socket.send_bytes, 2)\n"
-                "    @patch('paasio.super', create=True, new_callable=SuperMock)\n"
-                "    def test_file(self, super_mock):\n"
-                "        mock = NonCallableMagicMock(wraps=MockFile(b'abcdef'), autospec=True)\n"
-                "        super_mock.mock_object = mock\n"
-                "        with MeteredFile() as file:\n"
-                "            self.assertEqual(file.read(2), b'ab')\n"
-                "            self.assertEqual(file.write(b'xy'), 2)\n"
-                "        self.assertEqual(file.read_ops, 1)\n"
-                "        self.assertEqual(file.read_bytes, 2)\n"
-                "        self.assertEqual(file.write_ops, 1)\n"
-                "        self.assertEqual(file.write_bytes, 2)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "paasio.py": (
+                    "import io\n\n"
+                    "class MeteredFile(io.BufferedRandom):\n"
+                    "    def __init__(self, *args, **kwargs):\n"
+                    "        pass\n"
+                    "    def __enter__(self):\n"
+                    "        pass\n"
+                    "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                    "        pass\n"
+                    "    def __iter__(self):\n"
+                    "        pass\n"
+                    "    def __next__(self):\n"
+                    "        pass\n"
+                    "    def read(self, size=-1):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def read_bytes(self):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def read_ops(self):\n"
+                    "        pass\n"
+                    "    def write(self, b):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def write_bytes(self):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def write_ops(self):\n"
+                    "        pass\n\n"
+                    "class MeteredSocket:\n"
+                    "    def __init__(self, socket):\n"
+                    "        pass\n"
+                    "    def __enter__(self):\n"
+                    "        pass\n"
+                    "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                    "        pass\n"
+                    "    def recv(self, bufsize, flags=0):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def recv_bytes(self):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def recv_ops(self):\n"
+                    "        pass\n"
+                    "    def send(self, data, flags=0):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def send_bytes(self):\n"
+                    "        pass\n"
+                    "    @property\n"
+                    "    def send_ops(self):\n"
+                    "        pass\n"
+                ),
+                "test_utils.py": (
+                    "import inspect\nimport io\n\n"
+                    "class MockFile(io.BytesIO):\n"
+                    "    def __init__(self, *args, **kwargs):\n"
+                    "        super().__init__(*args, **kwargs)\n"
+                    "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                    "        return super().__exit__(exc_type, exc_val, exc_tb)\n\n"
+                    "class MockSock:\n"
+                    "    def __init__(self):\n"
+                    "        self.payload = io.BytesIO(b'abcdef')\n"
+                    "        self.sent = io.BytesIO()\n"
+                    "    def __exit__(self, exc_type, exc_val, exc_tb):\n"
+                    "        return False\n"
+                    "    def recv(self, bufsize, flags=0):\n"
+                    "        return self.payload.read(bufsize)\n"
+                    "    def send(self, data, flags=0):\n"
+                    "        return self.sent.write(data)\n\n"
+                    "class SuperMock:\n"
+                    "    mock_object = None\n"
+                    "    init_called = 0\n"
+                    "    initialized = False\n"
+                    "    def __init__(self, *args, **kwargs):\n"
+                    "        if self.initialized:\n"
+                    "            self.init_called += 1\n"
+                    "        else:\n"
+                    "            self.initialized = True\n"
+                    "    def __call__(self, *args, **kwargs):\n"
+                    "        frame = inspect.currentframe()\n"
+                    "        stack = inspect.getouterframes(frame)\n"
+                    "        if any(item[3] == '__init__' and 'paasio' in item[1] for item in stack):\n"
+                    "            return self\n"
+                    "        return self.mock_object\n"
+                ),
+                "paasio_test.py": (
+                    "import unittest\nfrom unittest.mock import NonCallableMagicMock, patch\n"
+                    "from test_utils import MockFile, MockSock, SuperMock\nfrom paasio import MeteredFile, MeteredSocket\n\n"
+                    "class PaasioTest(unittest.TestCase):\n"
+                    "    def test_socket(self):\n"
+                    "        mock = NonCallableMagicMock(wraps=MockSock(), autospec=True)\n"
+                    "        with MeteredSocket(mock) as socket:\n"
+                    "            self.assertEqual(socket.recv(3), b'abc')\n"
+                    "            self.assertEqual(socket.send(b'xy'), 2)\n"
+                    "        self.assertEqual(socket.recv_ops, 1)\n"
+                    "        self.assertEqual(socket.recv_bytes, 3)\n"
+                    "        self.assertEqual(socket.send_ops, 1)\n"
+                    "        self.assertEqual(socket.send_bytes, 2)\n"
+                    "    @patch('paasio.super', create=True, new_callable=SuperMock)\n"
+                    "    def test_file(self, super_mock):\n"
+                    "        mock = NonCallableMagicMock(wraps=MockFile(b'abcdef'), autospec=True)\n"
+                    "        super_mock.mock_object = mock\n"
+                    "        with MeteredFile() as file:\n"
+                    "            self.assertEqual(file.read(2), b'ab')\n"
+                    "            self.assertEqual(file.write(b'xy'), 2)\n"
+                    "        self.assertEqual(file.read_ops, 1)\n"
+                    "        self.assertEqual(file.read_bytes, 2)\n"
+                    "        self.assertEqual(file.write_ops, 1)\n"
+                    "        self.assertEqual(file.write_bytes, 2)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_metered_io_candidate("paasio.py", "paasio_test.py")
             validation = tools.validate_implementation_candidate("paasio.py", str(synthesized.get("candidate_source") or ""), test_path="paasio_test.py", test_command=command)
 
@@ -3305,36 +3302,34 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_tree_pov_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "pov.py").write_text(
-                "class Tree:\n"
-                "    def __init__(self, label, children=None):\n"
-                "        self.label = label\n"
-                "        self.children = children if children is not None else []\n"
-                "    def __lt__(self, other):\n"
-                "        return self.label < other.label\n"
-                "    def __eq__(self, other):\n"
-                "        return self.label == other.label and self.children == other.children\n"
-                "    def from_pov(self, from_node):\n"
-                "        pass\n"
-                "    def path_to(self, from_node, to_node):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "pov_test.py").write_text(
-                "import unittest\nfrom pov import Tree\n\n"
-                "class PovTest(unittest.TestCase):\n"
-                "    def test_path(self):\n"
-                "        tree = Tree('parent', [Tree('a'), Tree('x'), Tree('b')])\n"
-                "        self.assertEqual(tree.path_to('a', 'b'), ['a', 'parent', 'b'])\n"
-                "    def test_from_pov(self):\n"
-                "        tree = Tree('parent', [Tree('x'), Tree('sibling')])\n"
-                "        self.assertEqual(tree.from_pov('x'), Tree('x', [Tree('parent', [Tree('sibling')])]))\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "pov.py": (
+                    "class Tree:\n"
+                    "    def __init__(self, label, children=None):\n"
+                    "        self.label = label\n"
+                    "        self.children = children if children is not None else []\n"
+                    "    def __lt__(self, other):\n"
+                    "        return self.label < other.label\n"
+                    "    def __eq__(self, other):\n"
+                    "        return self.label == other.label and self.children == other.children\n"
+                    "    def from_pov(self, from_node):\n"
+                    "        pass\n"
+                    "    def path_to(self, from_node, to_node):\n"
+                    "        pass\n"
+                ),
+                "pov_test.py": (
+                    "import unittest\nfrom pov import Tree\n\n"
+                    "class PovTest(unittest.TestCase):\n"
+                    "    def test_path(self):\n"
+                    "        tree = Tree('parent', [Tree('a'), Tree('x'), Tree('b')])\n"
+                    "        self.assertEqual(tree.path_to('a', 'b'), ['a', 'parent', 'b'])\n"
+                    "    def test_from_pov(self):\n"
+                    "        tree = Tree('parent', [Tree('x'), Tree('sibling')])\n"
+                    "        self.assertEqual(tree.from_pov('x'), Tree('x', [Tree('parent', [Tree('sibling')])]))\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_tree_pov_candidate("pov.py", "pov_test.py")
             validation = tools.validate_implementation_candidate("pov.py", str(synthesized.get("candidate_source") or ""), test_path="pov_test.py", test_command=command)
 
@@ -3342,44 +3337,42 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_binary_zipper_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "zipper.py").write_text(
-                "class Zipper:\n"
-                "    @staticmethod\n"
-                "    def from_tree(tree):\n"
-                "        pass\n"
-                "    def value(self):\n"
-                "        pass\n"
-                "    def set_value(self):\n"
-                "        pass\n"
-                "    def left(self):\n"
-                "        pass\n"
-                "    def set_left(self):\n"
-                "        pass\n"
-                "    def right(self):\n"
-                "        pass\n"
-                "    def set_right(self):\n"
-                "        pass\n"
-                "    def up(self):\n"
-                "        pass\n"
-                "    def to_tree(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "zipper_test.py").write_text(
-                "import unittest\nfrom zipper import Zipper\n\n"
-                "TREE = {'value': 1, 'left': {'value': 2, 'left': None, 'right': {'value': 3, 'left': None, 'right': None}}, 'right': {'value': 4, 'left': None, 'right': None}}\n"
-                "class ZipperTest(unittest.TestCase):\n"
-                "    def test_navigation(self):\n"
-                "        self.assertEqual(Zipper.from_tree(TREE).left().right().up().up().value(), 1)\n"
-                "    def test_set(self):\n"
-                "        result = Zipper.from_tree(TREE).left().set_value(5).to_tree()\n"
-                "        self.assertEqual(result['left']['value'], 5)\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "zipper.py": (
+                    "class Zipper:\n"
+                    "    @staticmethod\n"
+                    "    def from_tree(tree):\n"
+                    "        pass\n"
+                    "    def value(self):\n"
+                    "        pass\n"
+                    "    def set_value(self):\n"
+                    "        pass\n"
+                    "    def left(self):\n"
+                    "        pass\n"
+                    "    def set_left(self):\n"
+                    "        pass\n"
+                    "    def right(self):\n"
+                    "        pass\n"
+                    "    def set_right(self):\n"
+                    "        pass\n"
+                    "    def up(self):\n"
+                    "        pass\n"
+                    "    def to_tree(self):\n"
+                    "        pass\n"
+                ),
+                "zipper_test.py": (
+                    "import unittest\nfrom zipper import Zipper\n\n"
+                    "TREE = {'value': 1, 'left': {'value': 2, 'left': None, 'right': {'value': 3, 'left': None, 'right': None}}, 'right': {'value': 4, 'left': None, 'right': None}}\n"
+                    "class ZipperTest(unittest.TestCase):\n"
+                    "    def test_navigation(self):\n"
+                    "        self.assertEqual(Zipper.from_tree(TREE).left().right().up().up().value(), 1)\n"
+                    "    def test_set(self):\n"
+                    "        result = Zipper.from_tree(TREE).left().set_value(5).to_tree()\n"
+                    "        self.assertEqual(result['left']['value'], 5)\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_binary_zipper_candidate("zipper.py", "zipper_test.py")
             validation = tools.validate_implementation_candidate("zipper.py", str(synthesized.get("candidate_source") or ""), test_path="zipper_test.py", test_command=command)
 
@@ -3387,35 +3380,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_go_territory_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "go_counting.py").write_text(
-                "class Board:\n"
-                "    def __init__(self, board):\n"
-                "        pass\n"
-                "    def territory(self, x, y):\n"
-                "        pass\n"
-                "    def territories(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "go_counting_test.py").write_text(
-                "import unittest\nfrom go_counting import Board, WHITE, BLACK, NONE\n\n"
-                "class GoCountingTest(unittest.TestCase):\n"
-                "    def test_region(self):\n"
-                "        board = Board([' B ', 'B W', ' W '])\n"
-                "        stone, territory = board.territory(0, 0)\n"
-                "        self.assertEqual(stone, BLACK)\n"
-                "        self.assertEqual(territory, {(0, 0)})\n"
-                "    def test_invalid(self):\n"
-                "        with self.assertRaisesRegex(ValueError, 'Invalid coordinate'):\n"
-                "            Board([' ']).territory(-1, 0)\n"
-                "    def test_territories(self):\n"
-                "        self.assertIn(NONE, Board([' ']).territories())\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "go_counting.py": (
+                    "class Board:\n"
+                    "    def __init__(self, board):\n"
+                    "        pass\n"
+                    "    def territory(self, x, y):\n"
+                    "        pass\n"
+                    "    def territories(self):\n"
+                    "        pass\n"
+                ),
+                "go_counting_test.py": (
+                    "import unittest\nfrom go_counting import Board, WHITE, BLACK, NONE\n\n"
+                    "class GoCountingTest(unittest.TestCase):\n"
+                    "    def test_region(self):\n"
+                    "        board = Board([' B ', 'B W', ' W '])\n"
+                    "        stone, territory = board.territory(0, 0)\n"
+                    "        self.assertEqual(stone, BLACK)\n"
+                    "        self.assertEqual(territory, {(0, 0)})\n"
+                    "    def test_invalid(self):\n"
+                    "        with self.assertRaisesRegex(ValueError, 'Invalid coordinate'):\n"
+                    "            Board([' ']).territory(-1, 0)\n"
+                    "    def test_territories(self):\n"
+                    "        self.assertIn(NONE, Board([' ']).territories())\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_go_territory_candidate("go_counting.py", "go_counting_test.py")
             validation = tools.validate_implementation_candidate("go_counting.py", str(synthesized.get("candidate_source") or ""), test_path="go_counting_test.py", test_command=command)
 
@@ -3423,29 +3414,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_hex_connect_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "connect.py").write_text(
-                "class ConnectGame:\n"
-                "    def __init__(self, board):\n"
-                "        pass\n"
-                "    def get_winner(self):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "connect_test.py").write_text(
-                "import unittest\nfrom connect import ConnectGame\n\n"
-                "class ConnectTest(unittest.TestCase):\n"
-                "    def test_x_wins_crossing_from_left_to_right(self):\n"
-                "        self.assertEqual(ConnectGame('X X\\n . X').get_winner(), 'X')\n"
-                "    def test_o_wins_crossing_from_top_to_bottom(self):\n"
-                "        self.assertEqual(ConnectGame('O .\\n O X').get_winner(), 'O')\n"
-                "    def test_none(self):\n"
-                "        self.assertEqual(ConnectGame('. .\\n . .').get_winner(), '')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "connect.py": (
+                    "class ConnectGame:\n"
+                    "    def __init__(self, board):\n"
+                    "        pass\n"
+                    "    def get_winner(self):\n"
+                    "        pass\n"
+                ),
+                "connect_test.py": (
+                    "import unittest\nfrom connect import ConnectGame\n\n"
+                    "class ConnectTest(unittest.TestCase):\n"
+                    "    def test_x_wins_crossing_from_left_to_right(self):\n"
+                    "        self.assertEqual(ConnectGame('X X\\n . X').get_winner(), 'X')\n"
+                    "    def test_o_wins_crossing_from_top_to_bottom(self):\n"
+                    "        self.assertEqual(ConnectGame('O .\\n O X').get_winner(), 'O')\n"
+                    "    def test_none(self):\n"
+                    "        self.assertEqual(ConnectGame('. .\\n . .').get_winner(), '')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_hex_connect_candidate("connect.py", "connect_test.py")
             validation = tools.validate_implementation_candidate("connect.py", str(synthesized.get("candidate_source") or ""), test_path="connect_test.py", test_command=command)
 
