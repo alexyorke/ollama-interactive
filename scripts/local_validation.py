@@ -309,6 +309,41 @@ def _latest_live_gate_summary_path(repo_root: Path) -> Path | None:
     return candidates[-1] if candidates else None
 
 
+def _git_head_commit(repo_root: Path) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    value = completed.stdout.strip()
+    return value or None
+
+
+def _git_worktree_dirty(repo_root: Path) -> bool | None:
+    try:
+        completed = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    return bool(completed.stdout.strip())
+
+
 def _extract_release_token_claims(text: str, *, path: str) -> list[str] | None:
     if path in {"README.md", "TODO.md"}:
         match = re.search(r"fewest benchmark tokens \(`(\d+)` vs `(\d+)` and `(\d+)`\)", text)
@@ -366,14 +401,39 @@ def _live_gate_claim_consistency(repo_root: Path) -> dict[str, Any]:
                 "summary": "matched" if found_tokens == expected_tokens else f"expected {expected_tokens}, found {found_tokens}",
             }
         )
-    ok = all(bool(row.get("ok")) for row in file_rows)
+    summary_commit = payload.get("git_commit") if isinstance(payload.get("git_commit"), str) else None
+    summary_dirty = payload.get("git_dirty") if isinstance(payload.get("git_dirty"), bool) else None
+    current_commit = _git_head_commit(repo_root)
+    current_dirty = _git_worktree_dirty(repo_root)
+    git_metadata_ok = True
+    git_metadata_summary = None
+    if current_commit is not None and summary_commit != current_commit:
+        git_metadata_ok = False
+        git_metadata_summary = f"Live-gate summary commit {summary_commit or 'unknown'} does not match current HEAD {current_commit}."
+    elif current_dirty is not None and summary_dirty != current_dirty:
+        git_metadata_ok = False
+        state = "dirty" if current_dirty else "clean"
+        git_metadata_summary = (
+            f"Live-gate summary dirty flag {summary_dirty!r} does not match the current {state} worktree."
+        )
+    token_claims_ok = all(bool(row.get("ok")) for row in file_rows)
+    ok = token_claims_ok and git_metadata_ok
     return {
         "ok": ok,
         "available": True,
         "summary_path": str(summary_path),
         "expected_tokens": expected_tokens,
+        "summary_git_commit": summary_commit,
+        "summary_git_dirty": summary_dirty,
+        "current_git_commit": current_commit,
+        "current_git_dirty": current_dirty,
+        "git_metadata_ok": git_metadata_ok,
         "files": file_rows,
-        "summary": "All tracked live-gate token claims match the canonical summary." if ok else "Live-gate token claims drift from the canonical summary.",
+        "summary": (
+            "All tracked live-gate token claims match the canonical summary and current checkout."
+            if ok
+            else (git_metadata_summary or "Live-gate token claims drift from the canonical summary.")
+        ),
     }
 
 

@@ -259,6 +259,49 @@ class LocalValidationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["expected_tokens"], ["2048", "2436", "2532"])
         self.assertTrue(all(row["ok"] for row in result["files"]))
+        self.assertTrue(result["git_metadata_ok"])
+
+    def test_live_gate_claim_consistency_fails_for_stale_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            summary_dir = root / "scratch" / "live-model-gate"
+            summary_dir.mkdir(parents=True)
+            (summary_dir / "live-model-gate-summary.json").write_text(
+                json.dumps(
+                    {
+                        "git_commit": "395e10d",
+                        "git_dirty": True,
+                        "models": [
+                            {"model": "granite4.1:8b", "benchmark_total_tokens": 2048},
+                            {"model": "gemma4:e4b", "benchmark_total_tokens": 2436},
+                            {"model": "qwen3:8b", "benchmark_total_tokens": 2532},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
+            (root / "docs").mkdir()
+            (root / "docs" / "token-efficiency.md").write_text(
+                "`granite4.1:8b` (`2048`)\n`gemma4:e4b` (`2436`)\n`qwen3:8b` (`2532`)\n",
+                encoding="utf-8",
+            )
+            (root / "TODO.md").write_text("fewest benchmark tokens (`2048` vs `2436` and `2532`)\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_live_model_gate.py").write_text(
+                '"benchmark_total_tokens": 2048\n"benchmark_total_tokens": 2436\n"benchmark_total_tokens": 2532\n',
+                encoding="utf-8",
+            )
+
+            with patch.object(local_validation, "_git_head_commit", return_value="867a63c"):
+                with patch.object(local_validation, "_git_worktree_dirty", return_value=False):
+                    result = local_validation._live_gate_claim_consistency(root)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["git_metadata_ok"])
+        self.assertEqual(result["current_git_commit"], "867a63c")
+        self.assertEqual(result["summary_git_commit"], "395e10d")
+        self.assertIn("does not match current HEAD", result["summary"])
 
     def test_run_validation_fails_when_live_gate_claims_drift(self) -> None:
         def fake_run(
@@ -286,6 +329,11 @@ class LocalValidationTests(unittest.TestCase):
             "available": True,
             "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
             "expected_tokens": ["2048", "2436", "2532"],
+            "summary_git_commit": "abc1234",
+            "summary_git_dirty": False,
+            "current_git_commit": "abc1234",
+            "current_git_dirty": False,
+            "git_metadata_ok": True,
             "files": [{"path": "TODO.md", "ok": False, "found_tokens": ["2040", "2408", "2521"]}],
             "summary": "Live-gate token claims drift from the canonical summary.",
         }
@@ -332,13 +380,30 @@ class LocalValidationTests(unittest.TestCase):
         with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
             with patch.object(local_validation.os, "cpu_count", return_value=32):
                 with patch.object(local_validation, "_run", side_effect=fake_run):
-                    payload = local_validation.run_validation(
-                        "full",
-                        repo_root=Path.cwd(),
-                        runner="auto",
-                        jobs="auto",
-                        compare_unittest_baseline=True,
-                    )
+                    with patch.object(
+                        local_validation,
+                        "_live_gate_claim_consistency",
+                        return_value={
+                            "ok": True,
+                            "available": True,
+                            "summary_path": "scratch/live-model-gate/live-model-gate-summary.json",
+                            "expected_tokens": ["2048", "2436", "2532"],
+                            "summary_git_commit": "867a63c",
+                            "summary_git_dirty": False,
+                            "current_git_commit": "867a63c",
+                            "current_git_dirty": False,
+                            "git_metadata_ok": True,
+                            "files": [],
+                            "summary": "All tracked live-gate token claims match the canonical summary and current checkout.",
+                        },
+                    ):
+                        payload = local_validation.run_validation(
+                            "full",
+                            repo_root=Path.cwd(),
+                            runner="auto",
+                            jobs="auto",
+                            compare_unittest_baseline=True,
+                        )
 
         comparison = payload["baseline_compare"]
         self.assertTrue(comparison["requested"])
