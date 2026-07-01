@@ -287,6 +287,53 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
             self.assertEqual(case.validate(passing), "pass")
             self.assertEqual(case.validate(failing), "fail")
 
+    def test_changed_files_falls_back_to_snapshot_diff_without_git(self) -> None:
+        case = bench.BenchmarkCase(
+            name="snapshot-diff",
+            suite="local-small",
+            turns=("prompt",),
+            validate=lambda ctx: "pass",
+            prepare=lambda workspace: (workspace / "src").mkdir(parents=True, exist_ok=True),
+            requires_git=False,
+        )
+
+        def fake_run_cli(
+            repo_root: Path,
+            workspace: Path,
+            model: str,
+            prompt: str,
+            *,
+            session_file: Path,
+            timeout: int,
+            extra_args: list[str],
+            extra_env: dict[str, str],
+            require_llm_for_turn: bool,
+        ) -> subprocess.CompletedProcess[str]:
+            (workspace / "src" / "api.py").write_text("print('changed')\n", encoding="utf-8")
+            (workspace / ".ollama-code" / "index").mkdir(parents=True, exist_ok=True)
+            (workspace / ".ollama-code" / "index" / "file_index.json").write_text("{}", encoding="utf-8")
+            session_file.parent.mkdir(parents=True, exist_ok=True)
+            session_file.write_text(json.dumps({"events": [], "messages": []}), encoding="utf-8")
+            return subprocess.CompletedProcess(args=["codex"], returncode=0, stdout="ok", stderr="")
+
+        with self._temp_root() as repo_root:
+            with (
+                patch.object(bench, "run_cli", side_effect=fake_run_cli),
+                patch.object(bench, "build_workspace", return_value=True),
+            ):
+                outcome = bench.evaluate_case(
+                    repo_root,
+                    "granite4.1:8b",
+                    None,
+                    "off",
+                    case,
+                    60,
+                )
+
+        self.assertEqual(outcome["status"], "pass")
+        self.assertEqual(outcome["changed_files_source"], "snapshot_diff")
+        self.assertEqual(outcome["changed_files"], ["src/api.py"])
+
     def test_renamed_hidden_case_validators_enforce_hidden_behavior(self) -> None:
         cases = {case.name: case for case in bench.selected_cases("local-full")}
         correct_sources = {

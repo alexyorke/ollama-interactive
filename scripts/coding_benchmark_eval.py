@@ -360,17 +360,45 @@ def _status_or_fail_closed(ctx: BenchmarkContext, condition: bool) -> str:
     return "fail_closed" if is_fail_closed_message(final_assistant_message(ctx.session)) else "fail"
 
 
-def _git_status_short(workspace: Path) -> list[str]:
+def _git_status_short(workspace: Path) -> list[str] | None:
     env = {**os.environ, "GIT_CEILING_DIRECTORIES": str(workspace.parent)}
     result = subprocess.run(["git", "status", "--short"], cwd=workspace, capture_output=True, text=True, timeout=60, check=False, env=env)
     if result.returncode != 0:
-        return []
+        return None
     return [line for line in result.stdout.splitlines() if line.strip()]
 
 
-def _changed_files(workspace: Path) -> list[str]:
+def _workspace_snapshot(workspace: Path) -> dict[str, bytes]:
+    ignored_roots = {".git", ".ollama-code", "scratch", "__pycache__"}
+    snapshot: dict[str, bytes] = {}
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(workspace).as_posix()
+        if any(part in ignored_roots for part in Path(rel).parts):
+            continue
+        snapshot[rel] = path.read_bytes()
+    return snapshot
+
+
+def _snapshot_changed_files(before: dict[str, bytes], workspace: Path) -> list[str]:
+    after = _workspace_snapshot(workspace)
+    changed = [path for path in sorted(set(before) | set(after)) if before.get(path) != after.get(path)]
+    return changed
+
+
+def _changed_files_payload(workspace: Path, *, before_snapshot: dict[str, bytes] | None = None) -> dict[str, Any]:
+    git_status = _git_status_short(workspace)
+    if git_status is not None:
+        return {"changed_files": _changed_files_from_git_status(git_status), "changed_files_source": "git_status"}
+    if before_snapshot is not None:
+        return {"changed_files": _snapshot_changed_files(before_snapshot, workspace), "changed_files_source": "snapshot_diff"}
+    return {"changed_files": [], "changed_files_source": "unavailable"}
+
+
+def _changed_files_from_git_status(lines: list[str]) -> list[str]:
     files: list[str] = []
-    for line in _git_status_short(workspace):
+    for line in lines:
         path = line[3:].strip() if len(line) > 3 else line.strip()
         if path:
             files.append(path.replace("\\", "/"))
@@ -1313,6 +1341,7 @@ def _evaluate_case_once(
             }
         if case.prepare is not None:
             case.prepare(workspace)
+        before_snapshot = _workspace_snapshot(workspace)
         session_file = workspace / "scratch" / f"{case.name}-{mode}-{reconcile}.json"
         results: list[subprocess.CompletedProcess[str]] = []
         started = time.perf_counter()
@@ -1367,7 +1396,7 @@ def _evaluate_case_once(
                     "reconciliation_retries": event_count(session, "reconciliation", verdict="retry"),
                     "verification_retries": event_count(session, "verification", verdict="retry"),
                     "verification_rewrites": event_count(session, "verification_rewrite"),
-                    "changed_files": _changed_files(workspace),
+                    **_changed_files_payload(workspace, before_snapshot=before_snapshot),
                     "tests_run": tests_run(session),
                     "validator_output": _validator_output(BenchmarkContext(workspace, session, "", str(exc), tuple(), tuple(), case), "timeout"),
                     "final": final_assistant_message(session),
@@ -1417,7 +1446,7 @@ def _evaluate_case_once(
             "reconciliation_retries": event_count(session, "reconciliation", verdict="retry"),
             "verification_retries": event_count(session, "verification", verdict="retry"),
             "verification_rewrites": event_count(session, "verification_rewrite"),
-            "changed_files": _changed_files(workspace),
+            **_changed_files_payload(workspace, before_snapshot=before_snapshot),
             "tests_run": tests_run(session),
             "validator_output": _validator_output(ctx, status),
             "final": final_message,
