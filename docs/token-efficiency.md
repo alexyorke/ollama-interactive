@@ -128,8 +128,8 @@ Additional live smoke:
 | Model | Suite slice | Status |
 |---|---|---|
 | `gemma3:4b` | 18 deterministic/token-efficiency cases | 18/18 pass, 0 LLM calls |
-| `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass on the latest June 29, 2026 serial local-small live gate; lowest benchmark token total of the three active local coding models (`2048`) so it remains the default |
-| `gemma4:e4b` | 8 local coding smoke cases | 8/8 pass on the latest June 29, 2026 serial local-small live gate; higher benchmark token total than Granite (`2436`) so it remains a comparison model |
+| `granite4.1:8b` | 8 local coding smoke cases | 8/8 pass on the latest June 29, 2026 serial local-small live gate; lowest benchmark token total of the three active local coding models (`2050`) so it remains the default |
+| `gemma4:e4b` | 8 local coding smoke cases | 8/8 pass on the latest June 29, 2026 serial local-small live gate; higher benchmark token total than Granite (`2433`) so it remains a comparison model |
 | `qwen3:8b` | 8 local coding smoke cases | 8/8 pass on the latest June 29, 2026 serial local-small live gate, but higher token cost than Granite (`2532`) so it remains a comparison model rather than the default |
 
 Current larger-suite check: `granite4.1:8b` passed the June 29, 2026 runtime-profile `all` `local-full` regression sweep (`33/33`) in `scratch/coding-benchmark/local-full-granite-after-target-path-grounding.json`, with `12` total LLM calls and `6847` total tokens. This adds a small safety cost versus `scratch/coding-benchmark/local-full-granite-after-validation-feedback-all.json` (`6828` tokens) after explicit path edits were tightened to require target-path grounding.

@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
+    from test_imports import standard_test_import
     from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:
+    from scripts.test_imports import standard_test_import
     from scripts.workspace_temp import workspace_temp_dir
 
 
@@ -128,15 +130,6 @@ def _write(path: Path, text: str) -> None:
 def _nonce(prefix: str, *, width: int = 3) -> str:
     suffix = "".join(secrets.choice(string.digits) for _ in range(width))
     return f"{prefix}_{suffix}"
-
-
-def _standard_test_import(module: str) -> str:
-    return (
-        "import sys\n"
-        "from pathlib import Path\n"
-        "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
-        f"from {module} import *\n\n"
-    )
 
 
 def _run(command: list[str], cwd: Path, *, timeout: int = 180) -> subprocess.CompletedProcess[str]:
@@ -409,7 +402,7 @@ def scenario_issue_fix_hidden_tests(repo_root: Path, workspace: Path, model: str
     _write(workspace / "src" / "calculator.py", "def add(left: int, right: int) -> int:\n    return left - right\n")
     _write(
         workspace / "tests" / "test_calculator.py",
-        _standard_test_import("calculator")
+        standard_test_import("calculator")
         + "import unittest\n\n\nclass CalculatorTests(unittest.TestCase):\n"
         + "    def test_adds_positive_numbers(self) -> None:\n        self.assertEqual(add(2, 3), 5)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -438,7 +431,7 @@ def scenario_multi_file_refactor(repo_root: Path, workspace: Path, model: str) -
     _write(workspace / "src" / "pricing.py", "def total(prices: list[int]) -> int:\n    return sum(prices)\n")
     _write(
         workspace / "tests" / "test_pricing.py",
-        _standard_test_import("pricing")
+        standard_test_import("pricing")
         + "import unittest\n\n\nclass PricingTests(unittest.TestCase):\n"
         + "    def test_cart_total(self) -> None:\n        self.assertEqual(cart_total([2, 3, 4]), 9)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -526,7 +519,7 @@ def scenario_bad_test_command_recovery(repo_root: Path, workspace: Path, model: 
     _write(workspace / "src" / "inventory.py", "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n")
     _write(
         workspace / "tests" / "test_inventory.py",
-        _standard_test_import("inventory")
+        standard_test_import("inventory")
         + "import unittest\n\n\nclass InventoryTests(unittest.TestCase):\n"
         + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
         + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
@@ -576,7 +569,7 @@ def scenario_api_docs_callsite_sync(repo_root: Path, workspace: Path, model: str
     _write(workspace / "docs" / docs_name, f"`{fetch_user}(user_id, include_orders=False)` returns a user dict.\n")
     _write(
         workspace / "tests" / "test_api_dashboard.py",
-        _standard_test_import(api_module)
+        standard_test_import(api_module)
         + f"from {dashboard_module} import {build_summary}\n"
         + "import unittest\n\n\nclass ApiDashboardTests(unittest.TestCase):\n"
         + f"    def test_fetch_user_default(self) -> None:\n        self.assertEqual({fetch_user}('7'), {{'id': '7'}})\n"
@@ -622,7 +615,7 @@ def scenario_scoreboard_hidden(repo_root: Path, workspace: Path, model: str) -> 
     _write(workspace / "src" / f"{module}.py", f"def {function_name}(base: int, bonus: int) -> int:\n    pass\n")
     _write(
         workspace / "tests" / "test_scoreboard.py",
-        _standard_test_import(module)
+        standard_test_import(module)
         + "import unittest\n\n\nclass ScoreboardTests(unittest.TestCase):\n"
         + f"    def test_positive_values(self) -> None:\n        self.assertEqual({function_name}(2, 3), 5)\n"
         + f"    def test_mixed_values(self) -> None:\n        self.assertEqual({function_name}(-1, 4), 3)\n"
@@ -664,7 +657,7 @@ def scenario_checkout_callsite_refactor(repo_root: Path, workspace: Path, model:
     )
     _write(
         workspace / "tests" / "test_checkout_refactor.py",
-        _standard_test_import("pricing")
+        standard_test_import("pricing")
         + f"from checkout import {caller_name}\n"
         + "import unittest\n\n\nclass CheckoutRefactorTests(unittest.TestCase):\n"
         + f"    def test_public_pricing_api(self) -> None:\n        self.assertEqual({new_name}([2, 3, 4]), 9)\n"
@@ -715,7 +708,7 @@ def scenario_retry_policy_hidden(repo_root: Path, workspace: Path, model: str) -
     )
     _write(
         workspace / "tests" / "test_retry_policy.py",
-        _standard_test_import("retry")
+        standard_test_import("retry")
         + f"from client import {next_action}\n"
         + "import unittest\n\n\nclass RetryPolicyTests(unittest.TestCase):\n"
         + f"    def test_retries_initial_attempts(self) -> None:\n        self.assertTrue({should_retry}(503, 0))\n"
@@ -758,7 +751,7 @@ def scenario_balance_credit_hidden(repo_root: Path, workspace: Path, model: str)
     )
     _write(
         workspace / "tests" / "test_balance_credit.py",
-        _standard_test_import("balance")
+        standard_test_import("balance")
         + "from report import closing_balance\n"
         + "import unittest\n\n\nclass BalanceCreditTests(unittest.TestCase):\n"
         + "    def test_apply_credit(self) -> None:\n        self.assertEqual(apply_credit(10, 3), 13)\n"
@@ -794,7 +787,7 @@ def scenario_slug_repair_hidden(repo_root: Path, workspace: Path, model: str) ->
     _write(workspace / "src" / f"{module}.py", f"def {function_name}(value: str) -> str:\n    pass\n")
     _write(
         workspace / "tests" / "test_slug.py",
-        _standard_test_import(module)
+        standard_test_import(module)
         + "import unittest\n\n\nclass SlugTests(unittest.TestCase):\n"
         + f"    def test_slugifies_spaces(self) -> None:\n        self.assertEqual({function_name}('Hello Local Model'), 'hello-local-model')\n"
         + f"    def test_trims_edges(self) -> None:\n        self.assertEqual({function_name}('  Mixed Case  '), 'mixed-case')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
@@ -844,7 +837,7 @@ def scenario_flag_constant_sync(repo_root: Path, workspace: Path, model: str) ->
     )
     _write(
         workspace / "tests" / "test_flags_consumer.py",
-        _standard_test_import(module)
+        standard_test_import(module)
         + f"from {consumer_module} import {consumer_name}\n"
         + "import unittest\n\n\nclass FlagSyncTests(unittest.TestCase):\n"
         + f"    def test_public_function(self) -> None:\n        self.assertEqual({function_name}(), 'new')\n"

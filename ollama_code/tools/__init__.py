@@ -3641,9 +3641,6 @@ class ToolExecutor:
 
     def ast_search(self, pattern: str, path: str = ".", lang: str | None = None, limit: int = 50) -> dict[str, Any]:
         self._check_interrupted()
-        executable = self._ast_grep_executable()
-        if not executable:
-            return self._missing_dependency_result("ast_search", "ast-grep", "ast-grep is not installed. Install ast-grep or sg to use AST search.")
         base = self.resolve_path(path, allow_missing=False)
         clean_pattern = str(pattern or "").strip()
         if not clean_pattern:
@@ -3653,6 +3650,9 @@ class ToolExecutor:
             native_result = self._native_python_function_ast_search(pattern=clean_pattern, base=base, limit=limit)
             if native_result is not None:
                 return native_result
+        executable = self._ast_grep_executable()
+        if not executable:
+            return self._missing_dependency_result("ast_search", "ast-grep", "ast-grep is not installed. Install ast-grep or sg to use AST search.")
         command = [executable, "--json", "-p", clean_pattern]
         if clean_lang:
             command.extend(["--lang", clean_lang])

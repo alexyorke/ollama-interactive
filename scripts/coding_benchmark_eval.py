@@ -19,9 +19,11 @@ from typing import Any, Callable
 
 try:
     from e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from test_imports import standard_test_import
     from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:  # Imported as scripts.coding_benchmark_eval in unit tests.
     from scripts.e2e_suite import build_workspace, commit_all, installed_models, load_session, run_cli
+    from scripts.test_imports import standard_test_import
     from scripts.workspace_temp import workspace_temp_dir
 
 
@@ -341,15 +343,6 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _standard_test_import(module: str) -> str:
-    return (
-        "import sys\n"
-        "from pathlib import Path\n"
-        "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\n"
-        f"from {module} import *\n\n"
-    )
-
-
 def _tool_success(session: dict[str, Any], name: str) -> bool:
     return any(result.get("ok") is True for result in tool_results(session, name))
 
@@ -428,7 +421,7 @@ def prepare_issue_fix_hidden_tests(workspace: Path) -> None:
     _write(workspace / "src" / "calculator.py", "def add(left: int, right: int) -> int:\n    return left - right\n")
     _write(
         workspace / "tests" / "test_calculator.py",
-        _standard_test_import("calculator")
+        standard_test_import("calculator")
         + "import unittest\n\n\nclass CalculatorTests(unittest.TestCase):\n"
         + "    def test_adds_positive_numbers(self) -> None:\n        self.assertEqual(add(2, 3), 5)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -443,7 +436,7 @@ def prepare_multi_file_refactor(workspace: Path) -> None:
     _write(workspace / "src" / "pricing.py", "def total(prices: list[int]) -> int:\n    return sum(prices)\n")
     _write(
         workspace / "tests" / "test_pricing.py",
-        _standard_test_import("pricing")
+        standard_test_import("pricing")
         + "import unittest\n\n\nclass PricingTests(unittest.TestCase):\n"
         + "    def test_cart_total(self) -> None:\n        self.assertEqual(cart_total([2, 3, 4]), 9)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -481,7 +474,7 @@ def prepare_instructed_edit(workspace: Path) -> None:
     _write(workspace / "src" / "formatter.py", "def normalize_email(value: str) -> str:\n    return value.strip()\n")
     _write(
         workspace / "tests" / "test_formatter.py",
-        _standard_test_import("formatter")
+        standard_test_import("formatter")
         + "import unittest\n\n\nclass FormatterTests(unittest.TestCase):\n"
         + "    def test_normalizes_email(self) -> None:\n        self.assertEqual(normalize_email('  A@EXAMPLE.COM  '), 'a@example.com')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -507,7 +500,7 @@ def prepare_test_repair_task(workspace: Path) -> None:
     _write(workspace / "src" / "slug.py", "def slugify(value: str) -> str:\n    return value.strip().lower()\n")
     _write(
         workspace / "tests" / "test_slug.py",
-        _standard_test_import("slug")
+        standard_test_import("slug")
         + "import unittest\n\n\nclass SlugTests(unittest.TestCase):\n"
         + "    def test_slugifies_spaces(self) -> None:\n        self.assertEqual(slugify('Hello Local Model'), 'hello-local-model')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -539,7 +532,7 @@ def prepare_multi_turn_session_task(workspace: Path) -> None:
     _write(workspace / "src" / "session_task.py", "def session_value() -> str:\n    return 'todo'\n")
     _write(
         workspace / "tests" / "test_session_task.py",
-        _standard_test_import("session_task")
+        standard_test_import("session_task")
         + "import unittest\n\n\nclass SessionTaskTests(unittest.TestCase):\n"
         + "    def test_session_value(self) -> None:\n        self.assertEqual(session_value(), 'SESSION_OK')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -579,7 +572,7 @@ def prepare_replace_all_refactor(workspace: Path) -> None:
     _write(workspace / "src" / "flags.py", "OLD_FLAG = 'old'\n\ndef flag_name() -> str:\n    return OLD_FLAG\n")
     _write(
         workspace / "tests" / "test_flags.py",
-        _standard_test_import("flags")
+        standard_test_import("flags")
         + "import unittest\n\n\nclass FlagTests(unittest.TestCase):\n"
         + "    def test_new_flag(self) -> None:\n        self.assertEqual(flag_name(), 'new')\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
     )
@@ -640,7 +633,7 @@ def prepare_bad_test_command_recovery(workspace: Path) -> None:
     _write(workspace / "src" / "inventory.py", "def total_units(counts: list[int]) -> int:\n    return sum(counts) - 1\n")
     _write(
         workspace / "tests" / "test_inventory.py",
-        _standard_test_import("inventory")
+        standard_test_import("inventory")
         + "import unittest\n\n\nclass InventoryTests(unittest.TestCase):\n"
         + "    def test_sums_units(self) -> None:\n        self.assertEqual(total_units([2, 3, 4]), 9)\n"
         + "    def test_empty(self) -> None:\n        self.assertEqual(total_units([]), 0)\n\n\nif __name__ == '__main__':\n    unittest.main()\n",
@@ -662,7 +655,7 @@ def prepare_renamed_simple_expression_hidden(workspace: Path) -> None:
     _write(workspace / "src" / "scoreboard.py", "def score_delta(base: int, bonus: int) -> int:\n    pass\n")
     _write(
         workspace / "tests" / "test_scoreboard.py",
-        _standard_test_import("scoreboard")
+        standard_test_import("scoreboard")
         + "import unittest\n\n\nclass ScoreboardTests(unittest.TestCase):\n"
         + "    def test_positive_values(self) -> None:\n        self.assertEqual(score_delta(2, 3), 5)\n"
         + "    def test_mixed_values(self) -> None:\n        self.assertEqual(score_delta(-1, 4), 3)\n"
@@ -680,7 +673,7 @@ def prepare_renamed_prefix_rotation_hidden(workspace: Path) -> None:
     _write(workspace / "src" / "syllables.py", "def transform_words(text: str) -> str:\n    pass\n")
     _write(
         workspace / "tests" / "test_syllables.py",
-        _standard_test_import("syllables")
+        standard_test_import("syllables")
         + "import unittest\n\n\nclass SyllableTests(unittest.TestCase):\n"
         + "    def test_word_beginning_with_a_vowel(self) -> None:\n        self.assertEqual(transform_words('apple'), 'appleay')\n"
         + "    def test_word_beginning_with_p(self) -> None:\n        self.assertEqual(transform_words('pig'), 'igpay')\n"
@@ -705,7 +698,7 @@ def prepare_renamed_word_arithmetic_hidden(workspace: Path) -> None:
     _write(workspace / "src" / "story_solver.py", "def solve(question):\n    pass\n")
     _write(
         workspace / "tests" / "test_story_solver.py",
-        _standard_test_import("story_solver")
+        standard_test_import("story_solver")
         + "import unittest\n\n\nclass StorySolverTests(unittest.TestCase):\n"
         + "    def test_just_a_number(self) -> None:\n        self.assertEqual(solve('What is 5?'), 5)\n"
         + "    def test_addition(self) -> None:\n        self.assertEqual(solve('What is 1 plus 1?'), 2)\n"
@@ -735,7 +728,7 @@ def prepare_renamed_text_matrix_hidden(workspace: Path) -> None:
     _write(workspace / "src" / "text_grid.py", "def flip_text(block):\n    pass\n")
     _write(
         workspace / "tests" / "test_text_grid.py",
-        _standard_test_import("text_grid")
+        standard_test_import("text_grid")
         + "import unittest\n\n\nclass TextGridTests(unittest.TestCase):\n"
         + "    def test_empty(self) -> None:\n        self.assertEqual(flip_text(''), '')\n"
         + "    def test_single_row(self) -> None:\n        self.assertEqual(flip_text('A1'), 'A\\n1')\n"

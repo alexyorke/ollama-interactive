@@ -129,7 +129,7 @@ class ToolDependencyTests(unittest.TestCase):
         with self._temp_tools() as (root, tools):
             (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
             with patch("ollama_code.tools.shutil.which", return_value=None):
-                result = tools.ast_search("def $F($$$A): $$$B", lang="python")
+                result = tools.ast_search("class $C { $$$ }", lang="python")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["missing_dependency"], "ast-grep")

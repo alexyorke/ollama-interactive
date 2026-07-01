@@ -1034,12 +1034,12 @@ class ToolExecutorTests(unittest.TestCase):
             first_path = root / "src" / "alpha_report.txt"
             second_path = root / "src" / "beta_report.txt"
             first_path.write_text("one", encoding="utf-8")
-            first = tools.file_search("alpha report")
-            first_path.unlink()
-            second_path.write_text("two", encoding="utf-8")
-            second = tools.file_search("beta report")
+            first = tools.file_search("alpha")
+            write_result = tools.write_file("src/beta_report.txt", "two\n")
+            second = tools.file_search("beta")
 
         self.assertTrue(first["ok"])
+        self.assertTrue(write_result["ok"], write_result)
         self.assertTrue(second["ok"])
         self.assertIn("src/alpha_report.txt", first["output"])
         self.assertIn("src/beta_report.txt", second["output"])
@@ -1660,10 +1660,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["source"], "hybrid")
         self.assertEqual(embed.call_count, 2)
 
-    def test_ast_search_reports_missing_ast_grep(self) -> None:
+    def test_ast_search_reports_missing_ast_grep_for_non_native_pattern(self) -> None:
         with self._temp_files_tools({"ops.py": "def add(a, b):\n    return a + b\n"}) as (_root, tools):
             with patch("ollama_code.tools.shutil.which", return_value=None):
-                result = tools.ast_search("def $F($$$A): $$$B", lang="python")
+                result = tools.ast_search("class $C { $$$ }", lang="python")
 
         self.assertFalse(result["ok"])
         self.assertEqual(result["missing_dependency"], "ast-grep")
@@ -1679,7 +1679,7 @@ class ToolExecutorTests(unittest.TestCase):
                 )
             }
         ) as (_root, tools):
-            with patch.object(tools, "_ast_grep_executable", return_value="ast-grep"):
+            with patch.object(tools, "_ast_grep_executable", side_effect=AssertionError("ast-grep lookup should not run")):
                 with patch.object(tools, "_run_process", side_effect=AssertionError("ast-grep should not run")):
                     result = tools.ast_search("def $F($$$A): $$$B", "ops.py", lang="python")
 
