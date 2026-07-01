@@ -23,6 +23,11 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
 
         path.write_text("".join(render(row) + "\n" for row in rows), encoding="utf-8")
 
+    def _assert_single_row_summary(self, summary: dict[str, object], expected_kind: str | None = None) -> None:
+        self.assertEqual(summary["rows"], 1)
+        if expected_kind is not None:
+            self.assertEqual(summary["task_kind_counts"][0][0], expected_kind)
+
     def test_analyze_dataclaw_dataset_summarizes_tokens_and_tools(self) -> None:
         with TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp)
@@ -2574,7 +2579,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                 examples_per_family=2,
             )
 
-        self.assertEqual(summary["rows"], 1)
+        self._assert_single_row_summary(summary)
         self.assertEqual(summary["avg_tool_calls"], 2.0)
         self.assertEqual(summary["avg_input_tokens"], 320.0)
         self.assertEqual(summary["avg_output_tokens"], 80.0)
@@ -2632,8 +2637,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                 examples_per_family=2,
             )
 
-        self.assertEqual(summary["rows"], 1)
-        self.assertEqual(summary["task_kind_counts"][0][0], "feature")
+        self._assert_single_row_summary(summary, "feature")
         self.assertIn("video player", summary["examples"]["feature"][0].lower())
 
     def test_analyze_openai_turn_bundle_dataset_skips_orientation_turns_before_real_task(self) -> None:
@@ -2688,8 +2692,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                 examples_per_family=2,
             )
 
-        self.assertEqual(summary["rows"], 1)
-        self.assertEqual(summary["task_kind_counts"][0][0], "feature")
+        self._assert_single_row_summary(summary, "feature")
         self.assertIn("rss reader", summary["examples"]["feature"][0].lower())
 
     def test_analyze_nested_message_dataset_supports_mishig_style_claude_rows(self) -> None:
@@ -2734,8 +2737,7 @@ class WebDiscoveredAgentDatasetAnalysisTests(unittest.TestCase):
                 examples_per_family=2,
             )
 
-        self.assertEqual(summary["rows"], 1)
-        self.assertEqual(summary["task_kind_counts"][0][0], "frontend-ui")
+        self._assert_single_row_summary(summary, "frontend-ui")
         self.assertEqual(dict(summary["tool_counts"])["Read"], 1)
         self.assertEqual(dict(summary["tool_counts"])["Edit"], 1)
 

@@ -13,23 +13,25 @@ except ModuleNotFoundError:
     pq = None
 
 from scripts import trajectory_task_review as review
+from tests.test_question_quality_eval import assert_legacy_output_contract
 
 
 class TrajectoryTaskReviewPureTests(unittest.TestCase):
     def test_build_parser_accepts_legacy_output_flag(self) -> None:
-        args = review._build_parser().parse_args(["--output", "scratch/external/datasets/task-review.json"])
-
-        self.assertEqual(args.output, Path("scratch/external/datasets/task-review.json"))
-
-    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
-        output_json, output_md = review._resolve_output_paths(
-            output=Path("scratch/external/datasets/task-review.json"),
-            output_json=None,
-            output_md=None,
+        assert_legacy_output_contract(
+            self,
+            review,
+            Path("scratch/external/datasets/task-review.json"),
+            parser=True,
         )
 
-        self.assertEqual(output_json, Path("scratch/external/datasets/task-review.json"))
-        self.assertEqual(output_md, Path("scratch/external/datasets/task-review.md"))
+    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
+        assert_legacy_output_contract(
+            self,
+            review,
+            Path("scratch/external/datasets/task-review.json"),
+            resolve=True,
+        )
 
     def test_classify_task_family_prefers_bugfix(self) -> None:
         family = review.classify_task_family(

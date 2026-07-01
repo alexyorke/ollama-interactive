@@ -13,6 +13,7 @@ except ModuleNotFoundError:
     pq = None
 
 from scripts import trajectory_evidence_report as report
+from tests.test_question_quality_eval import assert_legacy_output_contract
 
 
 @contextmanager
@@ -23,19 +24,20 @@ def _temp_root():
 
 class TrajectoryEvidenceReportTests(unittest.TestCase):
     def test_build_parser_accepts_legacy_output_flag(self) -> None:
-        args = report._build_parser().parse_args(["--output", "scratch/evidence-report.json"])
-
-        self.assertEqual(args.output, Path("scratch/evidence-report.json"))
-
-    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
-        output_json, output_md = report._resolve_output_paths(
-            output=Path("scratch/evidence-report.json"),
-            output_json=None,
-            output_md=None,
+        assert_legacy_output_contract(
+            self,
+            report,
+            Path("scratch/evidence-report.json"),
+            parser=True,
         )
 
-        self.assertEqual(output_json, Path("scratch/evidence-report.json"))
-        self.assertEqual(output_md, Path("scratch/evidence-report.md"))
+    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
+        assert_legacy_output_contract(
+            self,
+            report,
+            Path("scratch/evidence-report.json"),
+            resolve=True,
+        )
 
     def test_iter_dataset_rows_preserves_openhands_messages_column(self) -> None:
         if pa is None or pq is None:

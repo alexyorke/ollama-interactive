@@ -2,8 +2,34 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 from scripts import question_quality_eval as question_eval
+
+
+def assert_legacy_output_contract(
+    testcase: unittest.TestCase,
+    module: Any,
+    legacy_output: Path,
+    *,
+    parser: bool = False,
+    resolve: bool = False,
+) -> None:
+    if not parser and not resolve:
+        raise ValueError("at least one legacy output contract check must be requested")
+
+    if parser:
+        args = module._build_parser().parse_args(["--output", str(legacy_output)])
+        testcase.assertEqual(args.output, legacy_output)
+
+    if resolve:
+        output_json, output_md = module._resolve_output_paths(
+            output=legacy_output,
+            output_json=None,
+            output_md=None,
+        )
+        testcase.assertEqual(output_json, legacy_output)
+        testcase.assertEqual(output_md, legacy_output.with_suffix(".md"))
 
 
 class QuestionQualityEvalTests(unittest.TestCase):
@@ -16,19 +42,20 @@ class QuestionQualityEvalTests(unittest.TestCase):
         self.assertEqual(matches, ["benchmark pass rate"])
 
     def test_build_parser_accepts_legacy_output_flag(self) -> None:
-        args = question_eval._build_parser().parse_args(["--output", "scratch/question-eval.json"])
-
-        self.assertEqual(args.output, Path("scratch/question-eval.json"))
-
-    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
-        output_json, output_md = question_eval._resolve_output_paths(
-            output=Path("scratch/question-eval.json"),
-            output_json=None,
-            output_md=None,
+        assert_legacy_output_contract(
+            self,
+            question_eval,
+            Path("scratch/question-eval.json"),
+            parser=True,
         )
 
-        self.assertEqual(output_json, Path("scratch/question-eval.json"))
-        self.assertEqual(output_md, Path("scratch/question-eval.md"))
+    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
+        assert_legacy_output_contract(
+            self,
+            question_eval,
+            Path("scratch/question-eval.json"),
+            resolve=True,
+        )
 
     def test_match_answer_to_choices_returns_unique_choice(self) -> None:
         matches = question_eval.match_answer_to_choices(

@@ -14,6 +14,7 @@ except ModuleNotFoundError:
     pq = None
 
 from scripts import trajectory_transcript_sampler as sampler
+from tests.test_question_quality_eval import assert_legacy_output_contract
 
 
 @contextmanager
@@ -25,19 +26,20 @@ def _temp_root():
 @unittest.skipIf(pa is None or pq is None, "pyarrow not installed")
 class TrajectoryTranscriptSamplerTests(unittest.TestCase):
     def test_build_parser_accepts_legacy_output_flag(self) -> None:
-        args = sampler._build_parser().parse_args(["--output", "scratch/external/datasets/transcript-review.json"])
-
-        self.assertEqual(args.output, Path("scratch/external/datasets/transcript-review.json"))
-
-    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
-        output_json, output_md = sampler._resolve_output_paths(
-            output=Path("scratch/external/datasets/transcript-review.json"),
-            output_json=None,
-            output_md=None,
+        assert_legacy_output_contract(
+            self,
+            sampler,
+            Path("scratch/external/datasets/transcript-review.json"),
+            parser=True,
         )
 
-        self.assertEqual(output_json, Path("scratch/external/datasets/transcript-review.json"))
-        self.assertEqual(output_md, Path("scratch/external/datasets/transcript-review.md"))
+    def test_resolve_output_paths_from_legacy_output_json_path(self) -> None:
+        assert_legacy_output_contract(
+            self,
+            sampler,
+            Path("scratch/external/datasets/transcript-review.json"),
+            resolve=True,
+        )
 
     def test_sample_dataset_reads_trace_commons_prompt_and_tools(self) -> None:
         with _temp_root() as root:
