@@ -12,6 +12,7 @@ from typing import Any, Iterable
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts import report_outputs
 from scripts import trajectory_profile
 
 
@@ -553,14 +554,13 @@ def _resolve_output_paths(
     output_json: Path | None,
     output_md: Path | None,
 ) -> tuple[Path, Path]:
-    if output is None:
-        return output_json or DEFAULT_OUTPUT_JSON, output_md or DEFAULT_OUTPUT_MD
-    suffix = output.suffix.lower()
-    if suffix == ".json":
-        return output_json or output, output_md or output.with_suffix(".md")
-    if suffix == ".md":
-        return output_json or output.with_suffix(".json"), output_md or output
-    return output_json or output.with_suffix(".json"), output_md or output.with_suffix(".md")
+    return report_outputs.resolve_output_paths(
+        output=output,
+        output_json=output_json,
+        output_md=output_md,
+        default_json=DEFAULT_OUTPUT_JSON,
+        default_md=DEFAULT_OUTPUT_MD,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -591,10 +591,7 @@ def main(argv: list[str] | None = None) -> int:
         max_rows=max_rows,
         samples_per_dataset=args.samples_per_dataset,
     )
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    output_md.parent.mkdir(parents=True, exist_ok=True)
-    output_md.write_text(_format_markdown(payload), encoding="utf-8")
+    report_outputs.write_report_outputs(payload, _format_markdown(payload), output_json=output_json, output_md=output_md)
     for summary in payload["datasets"]:
         print(
             "[trajectory-transcript-sampler] "

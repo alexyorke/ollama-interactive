@@ -15,6 +15,7 @@ from typing import Any, Iterable
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from scripts import report_outputs
 from scripts import trajectory_dataset_fetch, trajectory_error_profile, trajectory_profile
 
 
@@ -1896,14 +1897,13 @@ def _resolve_output_paths(
     output_json: Path | None,
     output_md: Path | None,
 ) -> tuple[Path, Path]:
-    if output is None:
-        return output_json or DEFAULT_JSON_OUTPUT, output_md or DEFAULT_MARKDOWN_OUTPUT
-    suffix = output.suffix.lower()
-    if suffix == ".json":
-        return output_json or output, output_md or output.with_suffix(".md")
-    if suffix == ".md":
-        return output_json or output.with_suffix(".json"), output_md or output
-    return output_json or output.with_suffix(".json"), output_md or output.with_suffix(".md")
+    return report_outputs.resolve_output_paths(
+        output=output,
+        output_json=output_json,
+        output_md=output_md,
+        default_json=DEFAULT_JSON_OUTPUT,
+        default_md=DEFAULT_MARKDOWN_OUTPUT,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1951,11 +1951,8 @@ def main(argv: list[str] | None = None) -> int:
         reference_trajectory_path=args.reference_trajectory_profile,
         reference_error_path=args.reference_error_profile,
     )
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     markdown = format_markdown(payload)
-    output_md.parent.mkdir(parents=True, exist_ok=True)
-    output_md.write_text(markdown, encoding="utf-8")
+    report_outputs.write_report_outputs(payload, markdown, output_json=output_json, output_md=output_md)
 
     print(f"Wrote JSON: {output_json}")
     print(f"Wrote Markdown: {output_md}")
