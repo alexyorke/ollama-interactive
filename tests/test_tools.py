@@ -5044,18 +5044,16 @@ def double(value: int) -> int:
         self.assertEqual(python_tool.call_count, 0)
 
     def test_select_tests_maps_python_source_to_importing_test(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "pricing.py").write_text("def cart_total(prices):\n    return sum(prices)\n", encoding="utf-8")
-            (root / "tests" / "test_pricing.py").write_text(
-                "from src.pricing import cart_total\n\n"
-                "def test_cart_total():\n"
-                "    assert cart_total([1, 2]) == 3\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "src/pricing.py": "def cart_total(prices):\n    return sum(prices)\n",
+                "tests/test_pricing.py": (
+                    "from src.pricing import cart_total\n\n"
+                    "def test_cart_total():\n"
+                    "    assert cart_total([1, 2]) == 3\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.select_tests(["src/pricing.py"], changed_symbols=["cart_total"])
 
         self.assertTrue(result["ok"])
@@ -5185,9 +5183,7 @@ def double(value: int) -> int:
         self.assertIn("already renamed", result["summary"])
 
     def test_generate_tests_from_spec_previews_patch_without_writing(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             result = tools.generate_tests_from_spec("ops.add", "adds two positive integers")
 
         self.assertTrue(result["ok"])
@@ -5196,8 +5192,7 @@ def double(value: int) -> int:
         self.assertFalse((root / "tests" / "test_add_spec.py").exists())
 
     def test_run_shell_returns_output(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             command = f'{sys.executable} -c "print(123)"'
             result = tools.run_shell(command)
         self.assertTrue(result["ok"])
@@ -5270,8 +5265,7 @@ def double(value: int) -> int:
         self.assertTrue(kwargs["shell"])
 
     def test_run_shell_rejects_dangerous_validated_git_before_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch("ollama_code.tools.shutil.which", return_value="git"):
                 with patch.object(ToolExecutor, "_run_process") as run_mock:
                     result = tools.run_shell("git reset --hard")
@@ -5282,8 +5276,7 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_rejects_unmatched_quotes_before_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch.object(ToolExecutor, "_run_process") as run_mock:
                 result = tools.run_shell('echo "unterminated')
 
@@ -5292,8 +5285,7 @@ def double(value: int) -> int:
         run_mock.assert_not_called()
 
     def test_run_shell_rejects_bash_syntax_error_before_execution(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             syntax_result = subprocess.CompletedProcess(
                 args=["bash", "-n", "-c", "if true; then echo hi"],
                 returncode=2,
