@@ -4693,61 +4693,57 @@ def double(value: int) -> int:
         self.assertIn("Missing adapters/verification", result["output"])
 
     def test_verify_function_contract_reports_missing_symbol(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "utils.py").write_text("def present():\n    return 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
-
+        with self._temp_files_tools({"utils.py": "def present():\n    return 1\n"}) as (_root, tools):
             result = tools.verify_function_contract("utils.py", "missing")
 
         self.assertFalse(result["ok"])
         self.assertIn("No Python function symbol", result["summary"])
 
     def test_contract_check_passes_compatible_pipeline(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def x() -> int:\n"
-                "    return 1\n\n"
-                "def y(value: int) -> int:\n"
-                "    return value + 1\n\n"
-                "def z() -> int:\n"
-                "    return y(x())\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def x() -> int:\n"
+                    "    return 1\n\n"
+                    "def y(value: int) -> int:\n"
+                    "    return value + 1\n\n"
+                    "def z() -> int:\n"
+                    "    return y(x())\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"])
 
         self.assertTrue(result["ok"], result["output"])
         self.assertIn("contract ok", result["output"])
 
     def test_contract_check_flags_arity_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def total(items: list[int], tax: int) -> int:\n"
-                "    return sum(items) + tax\n\n"
-                "def checkout() -> int:\n"
-                "    return total([1, 2])\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def total(items: list[int], tax: int) -> int:\n"
+                    "    return sum(items) + tax\n\n"
+                    "def checkout() -> int:\n"
+                    "    return total([1, 2])\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"], changed_symbols=["total"])
 
         self.assertFalse(result["ok"])
         self.assertIn("calls total with 1 supplied args", result["output"])
 
     def test_contract_check_flags_return_annotation_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def values() -> list[int]:\n"
-                "    return {'a': 1}\n\n"
-                "def missing() -> int:\n"
-                "    pass\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def values() -> list[int]:\n"
+                    "    return {'a': 1}\n\n"
+                    "def missing() -> int:\n"
+                    "    pass\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"])
 
         self.assertFalse(result["ok"])
@@ -4755,62 +4751,62 @@ def double(value: int) -> int:
         self.assertIn("may return None", result["output"])
 
     def test_contract_check_allows_returning_local_dict_variable(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def fetch_user(user_id: str) -> dict[str, str]:\n"
-                "    user_data = {'id': user_id}\n"
-                "    return user_data\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def fetch_user(user_id: str) -> dict[str, str]:\n"
+                    "    user_data = {'id': user_id}\n"
+                    "    return user_data\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"])
 
         self.assertTrue(result["ok"], result["output"])
         self.assertNotIn("returns shape name:user_data", result["output"])
 
     def test_contract_check_flags_caller_return_shape_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def y() -> dict[str, int]:\n"
-                "    return {'value': 1}\n\n"
-                "def z() -> int:\n"
-                "    return y()[0]\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def y() -> dict[str, int]:\n"
+                    "    return {'value': 1}\n\n"
+                    "def z() -> int:\n"
+                    "    return y()[0]\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"], changed_symbols=["y"])
 
         self.assertFalse(result["ok"])
         self.assertIn("expects y return as sequence", result["output"])
 
     def test_contract_check_allows_matching_caller_return_shape(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def y() -> dict[str, int]:\n"
-                "    return {'value': 1}\n\n"
-                "def z() -> int:\n"
-                "    return y()['value']\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def y() -> dict[str, int]:\n"
+                    "    return {'value': 1}\n\n"
+                    "def z() -> int:\n"
+                    "    return y()['value']\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"], changed_symbols=["y"])
 
         self.assertTrue(result["ok"], result["output"])
 
     def test_contract_check_flags_builtin_method_receiver_mismatch(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def names(items: list[str]) -> list[str]:\n"
-                "    return list(items.items())\n\n"
-                "def update(payload: dict[str, int]) -> None:\n"
-                "    payload.append(1)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def names(items: list[str]) -> list[str]:\n"
+                    "    return list(items.items())\n\n"
+                    "def update(payload: dict[str, int]) -> None:\n"
+                    "    payload.append(1)\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"])
 
         self.assertFalse(result["ok"])
@@ -4818,17 +4814,17 @@ def double(value: int) -> int:
         self.assertIn("calls .append() on dict; expected list receiver", result["output"])
 
     def test_contract_check_allows_matching_builtin_method_receivers(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text(
-                "def names(items: dict[str, int], labels: list[str]) -> list[str]:\n"
-                "    labels.append('x')\n"
-                "    return list(items.keys())\n\n"
-                "def normalize(value: str) -> str:\n"
-                "    return value.strip().lower()\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": (
+                    "def names(items: dict[str, int], labels: list[str]) -> list[str]:\n"
+                    "    labels.append('x')\n"
+                    "    return list(items.keys())\n\n"
+                    "def normalize(value: str) -> str:\n"
+                    "    return value.strip().lower()\n"
+                )
+            }
+        ) as (_root, tools):
             result = tools.contract_check(["app.py"])
 
         self.assertTrue(result["ok"], result["output"])
