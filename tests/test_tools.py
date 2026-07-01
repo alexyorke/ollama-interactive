@@ -5518,8 +5518,7 @@ def double(value: int) -> int:
         self.assertTrue(artifact_exists)
 
     def test_run_test_uses_configured_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, _base_tools):
             command = f'"{sys.executable}" -c "print(321)"'
             tools = ToolExecutor(root, approval_mode="auto", test_command=command)
             result = tools.run_test()
@@ -5569,9 +5568,7 @@ def double(value: int) -> int:
         self.assertTrue(validation["valid"])
 
     def test_validate_common_command_allows_cargo_nextest_run(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
 
             with patch.object(ToolExecutor, "_executable_available_for_cwd", return_value=True):
                 argv, validation = tools._validate_common_command("cargo nextest run", root)
@@ -5616,8 +5613,7 @@ def double(value: int) -> int:
         self.assertEqual(result["summary"], "Command timed out after 1 seconds.")
 
     def test_run_test_reports_inline_python_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, _base_tools):
             command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: None != 3'); sys.exit(1)"])
             tools = ToolExecutor(root, approval_mode="auto", test_command=command)
             result = tools.run_test()
@@ -5627,13 +5623,11 @@ def double(value: int) -> int:
         self.assertIn("AssertionError: None != 3", result["output"])
 
     def test_run_test_allows_unittest_discover_dot_start_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "sample_test.py").write_text(
-                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "sample_test.py": "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n"
+            }
+        ) as (_root, tools):
             result = tools.run_test(f"{sys.executable} -m unittest discover -s . -p *_test.py -v")
 
         self.assertTrue(result["ok"], result.get("summary") or result.get("output"))
@@ -5641,8 +5635,7 @@ def double(value: int) -> int:
         self.assertNotIn("path escapes workspace", str(result.get("summary", "")))
 
     def test_run_test_normalizes_escaped_cwd_to_workspace_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, _base_tools):
             command = f'"{sys.executable}" -c "print(789)"'
             tools = ToolExecutor(root, approval_mode="auto", test_command=command)
             result = tools.run_test(cwd=str(root.parent / "other-workspace"))
@@ -5653,31 +5646,28 @@ def double(value: int) -> int:
         self.assertIn("Ignored run_test cwd outside workspace", result["normalized"])
 
     def test_run_test_requires_configured_or_explicit_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             result = tools.run_test()
         self.assertFalse(result["ok"])
         self.assertIn("no runnable test validator", result["summary"])
 
     def test_run_test_discovers_unittest_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text("import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "tests/test_sample.py": "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n"
+            }
+        ) as (_root, tools):
             result = tools.run_test()
         self.assertTrue(result["ok"], result.get("output"))
         self.assertTrue(result["discovered"])
         self.assertIn("unittest discover", result["command"])
 
     def test_run_test_recovers_from_broken_configured_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text(
-                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
-                encoding="utf-8",
-            )
+        with self._temp_files_tools(
+            {
+                "tests/test_sample.py": "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n"
+            }
+        ) as (root, _tools):
             tools = ToolExecutor(root, approval_mode="auto", test_command="pytesst -q")
             result = tools.run_test()
 
@@ -5688,16 +5678,17 @@ def double(value: int) -> int:
         self.assertEqual(tools.default_test_command, result["command"])
 
     def test_run_test_does_not_recover_from_normal_test_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
-            (root / "app_test.py").write_text(
-                "import unittest\nfrom app import add\n\n"
-                "class SampleTests(unittest.TestCase):\n"
-                "    def test_add(self):\n"
-                "        self.assertEqual(add(1, 2), 3)\n",
-                encoding="utf-8",
-            )
+        with self._temp_files_tools(
+            {
+                "app.py": "def add(left, right):\n    pass\n",
+                "app_test.py": (
+                    "import unittest\nfrom app import add\n\n"
+                    "class SampleTests(unittest.TestCase):\n"
+                    "    def test_add(self):\n"
+                    "        self.assertEqual(add(1, 2), 3)\n"
+                ),
+            }
+        ) as (root, _tools):
             command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
             tools = ToolExecutor(root, approval_mode="auto", test_command=command)
             result = tools.run_test()
@@ -5709,16 +5700,16 @@ def double(value: int) -> int:
         self.assertEqual(tools.default_test_command, command)
 
     def test_run_test_does_not_recover_from_application_import_failure(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_app.py").write_text(
-                "import unittest\nfrom missing_app_module import value\n\n"
-                "class SampleTests(unittest.TestCase):\n"
-                "    def test_value(self):\n"
-                "        self.assertEqual(value(), 1)\n",
-                encoding="utf-8",
-            )
+        with self._temp_files_tools(
+            {
+                "tests/test_app.py": (
+                    "import unittest\nfrom missing_app_module import value\n\n"
+                    "class SampleTests(unittest.TestCase):\n"
+                    "    def test_value(self):\n"
+                    "        self.assertEqual(value(), 1)\n"
+                )
+            }
+        ) as (root, _tools):
             command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
             tools = ToolExecutor(root, approval_mode="auto", test_command=command)
             result = tools.run_test()
