@@ -268,6 +268,21 @@ class ToolDependencyTests(unittest.TestCase):
 
         self.assertEqual(calls, 2)
 
+    def test_resolve_tool_executable_prefers_python_script_roots_before_path_lookup(self) -> None:
+        clear_dependency_status_cache()
+        with tempfile.TemporaryDirectory() as tmp:
+            scripts_root = Path(tmp) / "Python312" / "Scripts"
+            scripts_root.mkdir(parents=True)
+            executable_name = "demo-tool.exe" if os.name == "nt" else "demo-tool"
+            executable = scripts_root / executable_name
+            executable.write_text("", encoding="utf-8")
+            with patch("ollama_code.tool_dependencies.sysconfig.get_path", return_value=""):
+                with patch("ollama_code.tool_dependencies.site.getuserbase", return_value=tmp):
+                    with patch("ollama_code.tool_dependencies.shutil.which", side_effect=AssertionError("path lookup should not run")):
+                        resolved = tool_dependencies.resolve_tool_executable("ruff", "demo-tool")
+
+        self.assertEqual(resolved, str(executable))
+
     def test_resolve_tool_executable_uses_winget_index_when_path_lookup_misses(self) -> None:
         clear_dependency_status_cache()
         with patch("ollama_code.tool_dependencies.shutil.which", return_value=None):

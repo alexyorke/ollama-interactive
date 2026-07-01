@@ -918,6 +918,21 @@ def _resolve_isolated_executable(workspace_root: str | Path | None, tool_id: str
 
 
 @lru_cache(maxsize=1)
+def _python_script_roots() -> tuple[Path, ...]:
+    roots: set[Path] = set()
+    for value in (sysconfig.get_path("scripts"), site.getuserbase()):
+        if not value:
+            continue
+        root = Path(value)
+        roots.add(root)
+        roots.add(root / "Scripts")
+        roots.add(root / "bin")
+        roots.add(root / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts")
+        roots.add(root / f"Python{sys.version_info.major}{sys.version_info.minor}" / "bin")
+    return tuple(sorted(roots))
+
+
+@lru_cache(maxsize=1)
 def _winget_executable_index() -> dict[str, str]:
     if os.name != "nt":
         return {}
@@ -943,25 +958,16 @@ def _resolve_host_executable(name: str) -> str | None:
     candidate = Path(name)
     if candidate.is_absolute() and candidate.exists():
         return str(candidate)
-    resolved = shutil.which(name)
-    if resolved:
-        return resolved
     if candidate.is_absolute():
         return None
-    script_roots: set[Path] = set()
-    for value in (sysconfig.get_path("scripts"), site.getuserbase()):
-        if value:
-            root = Path(value)
-            script_roots.add(root)
-            script_roots.add(root / "Scripts")
-            script_roots.add(root / "bin")
-            script_roots.add(root / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts")
-            script_roots.add(root / f"Python{sys.version_info.major}{sys.version_info.minor}" / "bin")
-    for root in script_roots:
+    for root in _python_script_roots():
         for executable_name in _executable_names(name):
             candidate = root / executable_name
             if candidate.exists():
                 return str(candidate)
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
     if os.name == "nt":
         winget_index = _winget_executable_index()
         for executable_name in _executable_names(name):
@@ -1156,6 +1162,7 @@ def _dependency_statuses_cached(
 def clear_dependency_status_cache() -> None:
     _dependency_statuses_cached.cache_clear()
     _resolve_host_executable.cache_clear()
+    _python_script_roots.cache_clear()
     _winget_executable_index.cache_clear()
 
 
