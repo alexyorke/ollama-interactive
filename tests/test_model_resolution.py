@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from scripts.model_resolution import resolve_requested_model
+from scripts.model_resolution import resolve_requested_model, resolve_requested_models
 
 
 class ModelResolutionTests(unittest.TestCase):
@@ -12,3 +12,12 @@ class ModelResolutionTests(unittest.TestCase):
     def test_falls_back_to_latest_alias(self) -> None:
         self.assertEqual(resolve_requested_model("qwen3", {"qwen3:latest"}), "qwen3:latest")
         self.assertIsNone(resolve_requested_model("missing", {"qwen3:latest"}))
+
+    def test_resolve_requested_models_dedupes_latest_aliases_while_preserving_order(self) -> None:
+        self.assertEqual(
+            resolve_requested_models(
+                ["gemma4:e4b", "gemma4:e4b:latest", "qwen3", "qwen3:latest", "gemma4:e4b"],
+                {"gemma4:e4b", "gemma4:e4b:latest", "qwen3:latest"},
+            ),
+            ["gemma4:e4b", "gemma4:e4b:latest", "qwen3:latest"],
+        )

@@ -26,7 +26,7 @@ class LiveModelGateTests(unittest.TestCase):
                     "model": "granite4.1:8b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2050,
+                    "benchmark_total_tokens": 2047,
                     "benchmark_median_latency_s": 9.1,
                 },
                 {
@@ -40,7 +40,7 @@ class LiveModelGateTests(unittest.TestCase):
                     "model": "qwen3:8b",
                     "benchmark_passes": 8,
                     "benchmark_runs": 8,
-                    "benchmark_total_tokens": 2531,
+                    "benchmark_total_tokens": 2534,
                     "benchmark_median_latency_s": 22.8,
                 },
             ]
@@ -278,7 +278,7 @@ class LiveModelGateTests(unittest.TestCase):
                             "model": "granite4.1:8b",
                             "benchmark_passes": 8,
                             "benchmark_runs": 8,
-                            "benchmark_total_tokens": 2050,
+                            "benchmark_total_tokens": 2047,
                             "benchmark_median_latency_s": 9.0,
                         }
                     ],
@@ -313,7 +313,7 @@ class LiveModelGateTests(unittest.TestCase):
                             "model": "granite4.1:8b",
                             "benchmark_passes": 8,
                             "benchmark_runs": 8,
-                            "benchmark_total_tokens": 2050,
+                            "benchmark_total_tokens": 2047,
                             "benchmark_median_latency_s": 9.0,
                         }
                     ],

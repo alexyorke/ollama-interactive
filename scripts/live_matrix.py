@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Callable
 
 try:
+    from model_resolution import resolve_requested_models
     from workspace_temp import workspace_temp_dir
 except ModuleNotFoundError:
+    from scripts.model_resolution import resolve_requested_models
     from scripts.workspace_temp import workspace_temp_dir
 
 
@@ -379,24 +381,6 @@ def installed_models() -> list[str]:
         if isinstance(item, dict) and item.get("name"):
             names.append(str(item["name"]))
     return names
-
-
-def resolve_requested_models(requested: list[str], available: set[str]) -> list[str]:
-    resolved: list[str] = []
-    seen: set[str] = set()
-    for model in requested:
-        candidate: str | None = None
-        if model in available:
-            candidate = model
-        else:
-            latest = f"{model}:latest"
-            if latest in available:
-                candidate = latest
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        resolved.append(candidate)
-    return resolved
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -14,8 +14,10 @@ from typing import Any
 
 try:
     from e2e_suite import installed_models, ollama_host
+    from model_resolution import resolve_requested_models
 except ModuleNotFoundError:
     from scripts.e2e_suite import installed_models, ollama_host
+    from scripts.model_resolution import resolve_requested_models
 
 
 DEFAULT_OUTPUT_DIR = Path("scratch") / "live-model-gate"
@@ -248,24 +250,6 @@ def write_summary_artifacts(payload: dict[str, Any], output_dir: Path, *, repo_r
         canonical_path.write_text(encoded, encoding="utf-8")
         written.append(canonical_path)
     return written
-
-
-def resolve_requested_models(requested: list[str], available: set[str]) -> list[str]:
-    resolved: list[str] = []
-    seen: set[str] = set()
-    for model in requested:
-        candidate: str | None = None
-        if model in available:
-            candidate = model
-        else:
-            latest = f"{model}:latest"
-            if latest in available:
-                candidate = latest
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        resolved.append(candidate)
-    return resolved
 
 
 def preflight(requested_models: list[str]) -> dict[str, Any]:
