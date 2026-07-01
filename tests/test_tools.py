@@ -2881,29 +2881,28 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_domino_chain_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "dominoes.py").write_text("def can_chain(dominoes):\n    pass\n", encoding="utf-8")
-            (root / "dominoes_test.py").write_text(
-                "import unittest\nfrom dominoes import can_chain\n\n"
-                "class DominoTest(unittest.TestCase):\n"
-                "    def assert_correct_chain(self, input_dominoes, output_chain):\n"
-                "        self.assertIsNotNone(output_chain)\n"
-                "        self.assertEqual(sorted(tuple(sorted(d)) for d in input_dominoes), sorted(tuple(sorted(d)) for d in output_chain))\n"
-                "        if output_chain:\n"
-                "            self.assertEqual(output_chain[0][0], output_chain[-1][1])\n"
-                "            for left, right in zip(output_chain, output_chain[1:]):\n"
-                "                self.assertEqual(left[1], right[0])\n"
-                "    def refute_correct_chain(self, input_dominoes, output_chain):\n"
-                "        self.assertIsNone(output_chain)\n"
-                "    def test_chain(self):\n"
-                "        self.assert_correct_chain([(1, 2), (3, 1), (2, 3)], can_chain([(1, 2), (3, 1), (2, 3)]))\n"
-                "    def test_no_chain(self):\n"
-                "        self.refute_correct_chain([(1, 2)], can_chain([(1, 2)]))\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "dominoes.py": "def can_chain(dominoes):\n    pass\n",
+                "dominoes_test.py": (
+                    "import unittest\nfrom dominoes import can_chain\n\n"
+                    "class DominoTest(unittest.TestCase):\n"
+                    "    def assert_correct_chain(self, input_dominoes, output_chain):\n"
+                    "        self.assertIsNotNone(output_chain)\n"
+                    "        self.assertEqual(sorted(tuple(sorted(d)) for d in input_dominoes), sorted(tuple(sorted(d)) for d in output_chain))\n"
+                    "        if output_chain:\n"
+                    "            self.assertEqual(output_chain[0][0], output_chain[-1][1])\n"
+                    "            for left, right in zip(output_chain, output_chain[1:]):\n"
+                    "                self.assertEqual(left[1], right[0])\n"
+                    "    def refute_correct_chain(self, input_dominoes, output_chain):\n"
+                    "        self.assertIsNone(output_chain)\n"
+                    "    def test_chain(self):\n"
+                    "        self.assert_correct_chain([(1, 2), (3, 1), (2, 3)], can_chain([(1, 2), (3, 1), (2, 3)]))\n"
+                    "    def test_no_chain(self):\n"
+                    "        self.refute_correct_chain([(1, 2)], can_chain([(1, 2)]))\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_domino_chain_candidate("dominoes.py", "dominoes_test.py")
             validation = tools.validate_implementation_candidate("dominoes.py", str(synthesized.get("candidate_source") or ""), test_path="dominoes_test.py", test_command=command)
 
@@ -2911,22 +2910,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_food_chain_song_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "food_chain.py").write_text("def recite(start, end):\n    pass\n", encoding="utf-8")
-            (root / "food_chain_test.py").write_text(
-                "import unittest\nfrom food_chain import recite\n\n"
-                "class FoodChainTest(unittest.TestCase):\n"
-                "    def test_fly(self):\n"
-                "        self.assertEqual(recite(1, 1), ['I know an old lady who swallowed a fly.', \"I don't know why she swallowed the fly. Perhaps she'll die.\"])\n"
-                "    def test_horse(self):\n"
-                "        self.assertEqual(recite(8, 8), ['I know an old lady who swallowed a horse.', \"She's dead, of course!\"])\n"
-                "    def test_range(self):\n"
-                "        self.assertIn('', recite(1, 3))\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "food_chain.py": "def recite(start, end):\n    pass\n",
+                "food_chain_test.py": (
+                    "import unittest\nfrom food_chain import recite\n\n"
+                    "class FoodChainTest(unittest.TestCase):\n"
+                    "    def test_fly(self):\n"
+                    "        self.assertEqual(recite(1, 1), ['I know an old lady who swallowed a fly.', \"I don't know why she swallowed the fly. Perhaps she'll die.\"])\n"
+                    "    def test_horse(self):\n"
+                    "        self.assertEqual(recite(8, 8), ['I know an old lady who swallowed a horse.', \"She's dead, of course!\"])\n"
+                    "    def test_range(self):\n"
+                    "        self.assertIn('', recite(1, 3))\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_food_chain_song_candidate("food_chain.py", "food_chain_test.py")
             validation = tools.validate_implementation_candidate("food_chain.py", str(synthesized.get("candidate_source") or ""), test_path="food_chain_test.py", test_command=command)
 
@@ -2934,24 +2932,23 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_grep_filter_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "grep.py").write_text("def grep(pattern, flags, files):\n    pass\n", encoding="utf-8")
-            (root / "grep_test.py").write_text(
-                "import io\nimport unittest\nfrom unittest import mock\nfrom grep import grep\n\n"
-                "DATA = {'a.txt': 'Alpha\\nbeta\\n', 'b.txt': 'alpha\\n'}\n"
-                "def open_mock(name, *args, **kwargs):\n"
-                "    return io.StringIO(DATA[name])\n"
-                "@mock.patch('grep.open', side_effect=open_mock, create=True)\n"
-                "class GrepTest(unittest.TestCase):\n"
-                "    def test_flags(self, _open):\n"
-                "        self.assertMultiLineEqual(grep('ALPHA', '-i -n', ['a.txt']), '1:Alpha\\n')\n"
-                "        self.assertMultiLineEqual(grep('alpha', '-l', ['a.txt', 'b.txt']), 'b.txt\\n')\n"
-                "        self.assertMultiLineEqual(grep('beta', '-v -x', ['a.txt']), 'Alpha\\n')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "grep.py": "def grep(pattern, flags, files):\n    pass\n",
+                "grep_test.py": (
+                    "import io\nimport unittest\nfrom unittest import mock\nfrom grep import grep\n\n"
+                    "DATA = {'a.txt': 'Alpha\\nbeta\\n', 'b.txt': 'alpha\\n'}\n"
+                    "def open_mock(name, *args, **kwargs):\n"
+                    "    return io.StringIO(DATA[name])\n"
+                    "@mock.patch('grep.open', side_effect=open_mock, create=True)\n"
+                    "class GrepTest(unittest.TestCase):\n"
+                    "    def test_flags(self, _open):\n"
+                    "        self.assertMultiLineEqual(grep('ALPHA', '-i -n', ['a.txt']), '1:Alpha\\n')\n"
+                    "        self.assertMultiLineEqual(grep('alpha', '-l', ['a.txt', 'b.txt']), 'b.txt\\n')\n"
+                    "        self.assertMultiLineEqual(grep('beta', '-v -x', ['a.txt']), 'Alpha\\n')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_grep_filter_candidate("grep.py", "grep_test.py")
             validation = tools.validate_implementation_candidate("grep.py", str(synthesized.get("candidate_source") or ""), test_path="grep_test.py", test_command=command)
 
@@ -2959,29 +2956,28 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_bucket_measure_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "two_bucket.py").write_text("def measure(bucket_one, bucket_two, goal, start_bucket):\n    pass\n", encoding="utf-8")
-            (root / "two_bucket_test.py").write_text(
-                "import unittest\nfrom two_bucket import measure\n\n"
-                "class BucketTest(unittest.TestCase):\n"
-                "    def assertRaisesWithMessage(self, exception):\n"
-                "        return self.assertRaisesRegex(exception, r'.+')\n"
-                "    def test_one(self):\n"
-                "        self.assertEqual(measure(3, 5, 1, 'one'), (4, 'one', 5))\n"
-                "    def test_start_two(self):\n"
-                "        self.assertEqual(measure(3, 5, 1, 'two'), (8, 'two', 3))\n"
-                "    def test_two(self):\n"
-                "        self.assertEqual(measure(1, 3, 3, 'two'), (1, 'two', 0))\n"
-                "    def test_goal_is_other_capacity(self):\n"
-                "        self.assertEqual(measure(2, 3, 3, 'one'), (2, 'two', 2))\n"
-                "    def test_impossible(self):\n"
-                "        with self.assertRaisesWithMessage(ValueError):\n"
-                "            measure(6, 15, 5, 'one')\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "two_bucket.py": "def measure(bucket_one, bucket_two, goal, start_bucket):\n    pass\n",
+                "two_bucket_test.py": (
+                    "import unittest\nfrom two_bucket import measure\n\n"
+                    "class BucketTest(unittest.TestCase):\n"
+                    "    def assertRaisesWithMessage(self, exception):\n"
+                    "        return self.assertRaisesRegex(exception, r'.+')\n"
+                    "    def test_one(self):\n"
+                    "        self.assertEqual(measure(3, 5, 1, 'one'), (4, 'one', 5))\n"
+                    "    def test_start_two(self):\n"
+                    "        self.assertEqual(measure(3, 5, 1, 'two'), (8, 'two', 3))\n"
+                    "    def test_two(self):\n"
+                    "        self.assertEqual(measure(1, 3, 3, 'two'), (1, 'two', 0))\n"
+                    "    def test_goal_is_other_capacity(self):\n"
+                    "        self.assertEqual(measure(2, 3, 3, 'one'), (2, 'two', 2))\n"
+                    "    def test_impossible(self):\n"
+                    "        with self.assertRaisesWithMessage(ValueError):\n"
+                    "            measure(6, 15, 5, 'one')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_bucket_measure_candidate("two_bucket.py", "two_bucket_test.py")
             validation = tools.validate_implementation_candidate("two_bucket.py", str(synthesized.get("candidate_source") or ""), test_path="two_bucket_test.py", test_command=command)
 
@@ -2989,38 +2985,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_reactive_cells_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "react.py").write_text(
-                "class InputCell:\n"
-                "    def __init__(self, initial_value):\n"
-                "        self.value = None\n\n"
-                "class ComputeCell:\n"
-                "    def __init__(self, inputs, compute_function):\n"
-                "        self.value = None\n"
-                "    def add_callback(self, callback):\n"
-                "        pass\n"
-                "    def remove_callback(self, callback):\n"
-                "        pass\n",
-                encoding="utf-8",
-            )
-            (root / "react_test.py").write_text(
-                "import unittest\nfrom react import InputCell, ComputeCell\n\n"
-                "class ReactTest(unittest.TestCase):\n"
-                "    def test_diamond(self):\n"
-                "        input = InputCell(1)\n"
-                "        plus_one = ComputeCell([input], lambda inputs: inputs[0] + 1)\n"
-                "        minus_one1 = ComputeCell([input], lambda inputs: inputs[0] - 1)\n"
-                "        minus_one2 = ComputeCell([minus_one1], lambda inputs: inputs[0] - 1)\n"
-                "        output = ComputeCell([plus_one, minus_one2], lambda inputs: inputs[0] * inputs[1])\n"
-                "        seen = []\n"
-                "        output.add_callback(lambda value: seen.append(value))\n"
-                "        input.value = 4\n"
-                "        self.assertEqual(seen, [10])\n",
-                encoding="utf-8",
-            )
-            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
-            tools = ToolExecutor(root, approval_mode="auto", test_command=command)
+        with self._temp_python_tools(
+            {
+                "react.py": (
+                    "class InputCell:\n"
+                    "    def __init__(self, initial_value):\n"
+                    "        self.value = None\n\n"
+                    "class ComputeCell:\n"
+                    "    def __init__(self, inputs, compute_function):\n"
+                    "        self.value = None\n"
+                    "    def add_callback(self, callback):\n"
+                    "        pass\n"
+                    "    def remove_callback(self, callback):\n"
+                    "        pass\n"
+                ),
+                "react_test.py": (
+                    "import unittest\nfrom react import InputCell, ComputeCell\n\n"
+                    "class ReactTest(unittest.TestCase):\n"
+                    "    def test_diamond(self):\n"
+                    "        input = InputCell(1)\n"
+                    "        plus_one = ComputeCell([input], lambda inputs: inputs[0] + 1)\n"
+                    "        minus_one1 = ComputeCell([input], lambda inputs: inputs[0] - 1)\n"
+                    "        minus_one2 = ComputeCell([minus_one1], lambda inputs: inputs[0] - 1)\n"
+                    "        output = ComputeCell([plus_one, minus_one2], lambda inputs: inputs[0] * inputs[1])\n"
+                    "        seen = []\n"
+                    "        output.add_callback(lambda value: seen.append(value))\n"
+                    "        input.value = 4\n"
+                    "        self.assertEqual(seen, [10])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_reactive_cells_candidate("react.py", "react_test.py")
             validation = tools.validate_implementation_candidate("react.py", str(synthesized.get("candidate_source") or ""), test_path="react_test.py", test_command=command)
 
