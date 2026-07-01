@@ -5413,18 +5413,14 @@ def double(value: int) -> int:
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_supports_powershell_cmdlets_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             result = tools.run_shell("Write-Output 123")
         self.assertTrue(result["ok"])
         self.assertEqual(result["output"], "123")
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_routes_powershell_aliases_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "note.txt").write_text("hello\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"note.txt": "hello\n"}) as (_root, tools):
             completed = subprocess.CompletedProcess(
                 args=["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", "cat note.txt"],
                 returncode=0,
@@ -5446,8 +5442,7 @@ def double(value: int) -> int:
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_routes_powershell_call_operator_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             command = '& ".\\script with spaces.ps1" -Name demo'
             completed = subprocess.CompletedProcess(
                 args=["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
@@ -5470,8 +5465,7 @@ def double(value: int) -> int:
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_does_not_misclassify_dollar_sign_inside_quoted_argument(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             command = f'{sys.executable} -c "print(\'a $HOME b\')"'
             result = tools.run_shell(command)
         self.assertTrue(result["ok"])
@@ -5479,9 +5473,7 @@ def double(value: int) -> int:
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_validate_common_command_preserves_inline_python_path_literals_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_tools() as (root, tools):
             command = subprocess.list2cmdline(
                 [
                     sys.executable,
@@ -5499,10 +5491,7 @@ def double(value: int) -> int:
 
     @unittest.skipUnless(os.name == "nt", "Windows only")
     def test_run_shell_preserves_inline_python_path_literals_on_windows(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "scratch").mkdir()
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"scratch/.keep": ""}) as (root, tools):
             command = subprocess.list2cmdline(
                 [
                     sys.executable,
@@ -5721,21 +5710,17 @@ def double(value: int) -> int:
         self.assertEqual(tools.default_test_command, command)
 
     def test_run_test_sees_immediate_same_size_python_write(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "balance.py").write_text(
-                "def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n",
-                encoding="utf-8",
-            )
-            (root / "tests" / "test_balance_credit.py").write_text(
-                "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom balance import *\nimport unittest\n\n"
-                "class BalanceTests(unittest.TestCase):\n"
-                "    def test_apply_credit(self):\n"
-                "        self.assertEqual(apply_credit(10, 3), 13)\n",
-                encoding="utf-8",
-            )
+        with self._temp_files_tools(
+            {
+                "src/balance.py": "def apply_credit(amount: int, credit: int) -> int:\n    return amount - credit\n",
+                "tests/test_balance_credit.py": (
+                    "import sys\nfrom pathlib import Path\nsys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))\nfrom balance import *\nimport unittest\n\n"
+                    "class BalanceTests(unittest.TestCase):\n"
+                    "    def test_apply_credit(self):\n"
+                    "        self.assertEqual(apply_credit(10, 3), 13)\n"
+                ),
+            }
+        ) as (root, tools):
             command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
             tools = ToolExecutor(root, approval_mode="auto", test_command=command)
 
@@ -5751,14 +5736,11 @@ def double(value: int) -> int:
         self.assertTrue(second["ok"], second.get("output"))
 
     def test_run_test_does_not_override_explicit_bad_command(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_sample.py").write_text(
-                "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "tests/test_sample.py": "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n"
+            }
+        ) as (_root, tools):
             result = tools.run_test("pytesst -q")
 
         self.assertFalse(result["ok"])
@@ -5766,8 +5748,7 @@ def double(value: int) -> int:
         self.assertEqual(result["command"], "pytesst -q")
 
     def test_diagnose_test_failure_classifies_common_errors(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             syntax = tools.diagnose_test_failure("SyntaxError: invalid syntax\n  File \"app.py\", line 1")
             missing = tools.diagnose_test_failure("ModuleNotFoundError: No module named 'requests_mock'")
             invalid = tools.diagnose_test_failure("usage: pytest [options]\nerror: unrecognized arguments: --wat")
@@ -5780,8 +5761,7 @@ def double(value: int) -> int:
         self.assertEqual(invalid["error_class"], "invalid_args")
 
     def test_read_only_blocks_shell(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="read-only")
+        with self._temp_tools(approval_mode="read-only") as (_root, tools):
             result = tools.run_shell("echo denied")
         self.assertFalse(result["ok"])
         self.assertIn("read-only", result["summary"])
