@@ -4300,10 +4300,9 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(calls.count("ruff"), 1)
 
     def test_discover_validators_skips_cargo_nextest_without_plugin(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "Cargo.toml").write_text("[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {"Cargo.toml": "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n"}
+        ) as (_root, tools):
             with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "cargo" if name == "cargo" else None):
                 result = tools.discover_validators(limit=20)
 
@@ -4313,15 +4312,13 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("cargo nextest run", output)
 
     def test_discover_validators_checks_local_wrappers_in_project_root(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
-            project = workspace / "service"
-            project.mkdir()
-            (project / "build.gradle").write_text("plugins { id 'java' }\n", encoding="utf-8")
-            (project / "gradlew").write_text("#!/bin/sh\n", encoding="utf-8")
-            (project / "gradlew.bat").write_text("@echo off\n", encoding="utf-8")
-            tools = ToolExecutor(workspace, approval_mode="auto")
-
+        with self._temp_files_tools(
+            {
+                "service/build.gradle": "plugins { id 'java' }\n",
+                "service/gradlew": "#!/bin/sh\n",
+                "service/gradlew.bat": "@echo off\n",
+            }
+        ) as (_workspace, tools):
             result = tools.discover_validators("service", limit=20)
 
         wrapper_command = "gradlew.bat test" if os.name == "nt" else "./gradlew test"
@@ -4329,16 +4326,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn(f"{wrapper_command} available=True", result["output"])
 
     def test_discover_validators_detects_python_tooling_configs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "tests").mkdir()
-            (root / "tests" / "test_app.py").write_text("def test_ok():\n    assert True\n", encoding="utf-8")
-            (root / "pyproject.toml").write_text(
-                "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n\n[tool.mypy]\npython_version='3.12'\n\n[tool.pyright]\ntypeCheckingMode='basic'\n\n[tool.tox]\nlegacy_tox_ini='[tox]\\nenvlist=py312'\n",
-                encoding="utf-8",
-            )
-            (root / "noxfile.py").write_text("import nox\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "tests/test_app.py": "def test_ok():\n    assert True\n",
+                "pyproject.toml": (
+                    "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n\n"
+                    "[tool.mypy]\npython_version='3.12'\n\n[tool.pyright]\ntypeCheckingMode='basic'\n\n"
+                    "[tool.tox]\nlegacy_tox_ini='[tox]\\nenvlist=py312'\n"
+                ),
+                "noxfile.py": "import nox\n",
+            }
+        ) as (_root, tools):
             result = tools.discover_validators(limit=20)
 
         output = result["output"]
@@ -4352,10 +4350,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("nox", output)
 
     def test_discover_validators_does_not_suggest_testmon_without_repo_test_signals(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"app.py": "VALUE = 1\n"}) as (_root, tools):
             result = tools.discover_validators(limit=20)
 
         output = result["output"]
@@ -4363,12 +4358,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("pytest --testmon", output)
 
     def test_discover_validators_does_not_suggest_unittest_for_helper_only_tests_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "tests").mkdir()
-            (root / "tests" / "helpers.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": "VALUE = 1\n",
+                "tests/helpers.py": "def add(a, b):\n    return a + b\n",
+            }
+        ) as (_root, tools):
             result = tools.discover_validators(limit=20)
 
         output = result["output"]
@@ -4376,14 +4371,12 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertNotIn("unittest discover -s tests -v", output)
 
     def test_discover_validators_reads_pyproject_tool_sections_without_toml_parser(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "pyproject.toml").write_text(
-                "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "app.py": "VALUE = 1\n",
+                "pyproject.toml": "[tool.pytest.ini_options]\naddopts='-q'\n\n[tool.ruff]\nline-length=100\n",
+            }
+        ) as (_root, tools):
             with patch("ollama_code.tools.tomllib", None):
                 result = tools.discover_validators(limit=20)
 
