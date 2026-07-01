@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import subprocess
 import sys
@@ -15,6 +16,11 @@ from scripts import public_benchmark_eval as public_bench
 
 
 class CodingBenchmarkEvalTests(unittest.TestCase):
+    @contextmanager
+    def _temp_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            yield Path(tmp)
+
     def _context(self, workspace: Path, session: dict[str, object], *, stdout: str = "") -> bench.BenchmarkContext:
         case = bench.BenchmarkCase(
             name="unit",
@@ -233,8 +239,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
     def test_docs_sync_without_tests_still_validates_requires_non_test_validation(self) -> None:
         cases = {case.name: case for case in bench.selected_cases("local-full")}
 
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_root() as root:
             case = cases["docs_sync_without_tests_still_validates"]
             assert case.prepare is not None
             case.prepare(root)
@@ -604,8 +609,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(summary["by_benchmark_class"]["controller"]["total_llm_calls"], 1)
 
     def test_issue_validator_passes_hidden_solution(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
+        with self._temp_root() as workspace:
             bench.prepare_issue_fix_hidden_tests(workspace)
             (workspace / "src" / "calculator.py").write_text("def add(left: int, right: int) -> int:\n    return left + right\n", encoding="utf-8")
 
@@ -614,8 +618,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(status, "pass")
 
     def test_multi_file_refactor_validator_checks_docs_and_hidden_import(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
+        with self._temp_root() as workspace:
             bench.prepare_multi_file_refactor(workspace)
             (workspace / "src" / "pricing.py").write_text("def cart_total(prices: list[int]) -> int:\n    return sum(prices)\n", encoding="utf-8")
             (workspace / "docs" / "pricing.md").write_text("Call `cart_total(prices)` to compute a cart total.\n", encoding="utf-8")
@@ -625,8 +628,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(status, "pass")
 
     def test_bad_test_command_recovery_validator_requires_fallback_and_hidden_pass(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
+        with self._temp_root() as workspace:
             bench.prepare_bad_test_command_recovery(workspace)
             (workspace / "src" / "inventory.py").write_text("def total_units(counts: list[int]) -> int:\n    return sum(counts)\n", encoding="utf-8")
             session = {
@@ -649,8 +651,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(status, "pass")
 
     def test_forbidden_tool_validator_rejects_read_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
+        with self._temp_root() as workspace:
             session = {
                 "events": [
                     {"type": "tool_call", "name": "read_file", "arguments": {"path": "src/app.py"}},
@@ -664,8 +665,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(status, "fail")
 
     def test_test_repair_validator_accepts_shell_test_runner(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
+        with self._temp_root() as workspace:
             bench.prepare_test_repair_task(workspace)
             (workspace / "src" / "slug.py").write_text(
                 "import re\n\n"
@@ -682,8 +682,7 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(status, "pass")
 
     def test_regression_token_trap_rejects_duplicate_symbol_read(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            workspace = Path(tmp)
+        with self._temp_root() as workspace:
             session = {
                 "events": [
                     {"type": "tool_call", "name": "search_symbols", "arguments": {"query": "trap_value"}},
