@@ -68,6 +68,19 @@ class ToolExecutorTests(unittest.TestCase):
         ) as (root, tools):
             yield root, tools, resolved_test_command
 
+    @contextmanager
+    def _temp_git_tools(
+        self,
+        files: dict[str, str],
+        *,
+        approval_mode: str = "auto",
+        message: str = "initial",
+        **kwargs: object,
+    ):
+        with self._temp_tools(approval_mode=approval_mode, **kwargs) as (root, tools):
+            self.init_git_repo_with_commit(root, files, message=message)
+            yield root, tools
+
     def _cross_platform_workspace_alias(self, root: Path) -> str:
         resolved = root.resolve()
         if resolved.drive:
@@ -1502,8 +1515,7 @@ class ToolExecutorTests(unittest.TestCase):
                 vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
             return vectors
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
                 with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed):
                     refresh = tools.python_sdk_refresh(limit=10, embedding_model="fake-embed")
@@ -1548,8 +1560,7 @@ class ToolExecutorTests(unittest.TestCase):
                 vectors.append([0.0, 1.0] if "wildcard" in lowered or "files" in lowered else [1.0, 0.0])
             return vectors
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
                 with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
                     refresh = tools.python_sdk_refresh(limit=10)
@@ -1586,8 +1597,7 @@ class ToolExecutorTests(unittest.TestCase):
             self.assertEqual(model, "fake-env-embed")
             return [[0.0, 1.0] for _ in texts]
 
-        with tempfile.TemporaryDirectory() as tmp:
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+        with self._temp_tools() as (_root, tools):
             with patch.dict("os.environ", {"OLLAMA_CODE_SDK_EMBED_MODEL": "fake-env-embed"}):
                 with patch.object(ToolExecutor, "_python_sdk_entries", return_value=entries):
                     with patch.object(ToolExecutor, "_ollama_embed_texts", side_effect=fake_embed) as embed:
@@ -5767,12 +5777,9 @@ def double(value: int) -> int:
         self.assertIn("read-only", result["summary"])
 
     def test_git_status_and_diff(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
+        with self._temp_git_tools({"tracked.txt": "before\n"}) as (root, tools):
             tracked = root / "tracked.txt"
             tracked.write_text("before\nafter\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             status = tools.git_status()
             diff = tools.git_diff(path="tracked.txt")
 
@@ -5782,14 +5789,11 @@ def double(value: int) -> int:
         self.assertIn("+after", diff["output"])
 
     def test_git_branch_and_log(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
+        with self._temp_git_tools({"tracked.txt": "before\n"}) as (root, tools):
             tracked = root / "tracked.txt"
             subprocess.run(["git", "checkout", "-b", "feature"], cwd=root, check=True, capture_output=True, text=True)
             tracked.write_text("after\n", encoding="utf-8")
             subprocess.run(["git", "commit", "-am", "feature update"], cwd=root, check=True, capture_output=True, text=True)
-            tools = ToolExecutor(root, approval_mode="auto")
             branches = tools.git_branch(all_branches=True)
             history = tools.git_log(max_count=5)
 
@@ -5800,11 +5804,8 @@ def double(value: int) -> int:
         self.assertIn("feature update", history["output"])
 
     def test_git_commit_creates_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
+        with self._temp_git_tools({"tracked.txt": "before\n"}) as (root, tools):
             tracked = root / "tracked.txt"
-            tools = ToolExecutor(root, approval_mode="auto")
             tracked.write_text("before\nafter\n", encoding="utf-8")
             result = tools.git_commit("Update tracked file")
             subject = subprocess.run(
@@ -5819,8 +5820,7 @@ def double(value: int) -> int:
         self.assertEqual(subject, "Update tracked file")
 
     def test_git_commit_add_all_refuses_preexisting_dirty_paths(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_tools() as (root, _tools):
             self.init_git_repo_with_commit(root, {"tracked.txt": "before\n", "notes.txt": "draft\n"})
             tracked = root / "tracked.txt"
             unrelated = root / "notes.txt"
@@ -5850,12 +5850,9 @@ def double(value: int) -> int:
         self.assertEqual(staged, "")
 
     def test_read_only_blocks_git_commit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            self.init_git_repo_with_commit(root, {"tracked.txt": "before\n"})
+        with self._temp_git_tools({"tracked.txt": "before\n"}, approval_mode="read-only") as (root, tools):
             tracked = root / "tracked.txt"
             tracked.write_text("before\nafter\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="read-only")
             result = tools.git_commit("Blocked commit")
         self.assertFalse(result["ok"])
         self.assertIn("read-only", result["summary"])
