@@ -6,6 +6,7 @@ import os
 import json
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -57,7 +58,11 @@ class ToolExecutorTests(unittest.TestCase):
     def _temp_tools(self, *, approval_mode: str = "auto", **kwargs: object):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            yield root, ToolExecutor(root, approval_mode=approval_mode, **kwargs)
+            tools = ToolExecutor(root, approval_mode=approval_mode, **kwargs)
+            try:
+                yield root, tools
+            finally:
+                tools.close()
 
     @contextmanager
     def _temp_files_tools(
@@ -947,6 +952,17 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(third["deleted"], 1)
         self.assertTrue(search["ok"], search)
         self.assertEqual(search["output"], "(no FTS matches)")
+
+    def test_fts_refresh_reuses_sqlite_connection_within_executor(self) -> None:
+        with self._temp_files_tools({"notes.md": "# Alpha\nReusable content\n"}) as (_root, tools):
+            real_connect = sqlite3.connect
+            with patch("ollama_code.tools.sqlite3.connect", side_effect=lambda *args, **kwargs: real_connect(*args, **kwargs)) as connect:
+                first = tools.fts_refresh()
+                second = tools.fts_refresh()
+
+        self.assertTrue(first["ok"], first)
+        self.assertTrue(second["ok"], second)
+        self.assertEqual(connect.call_count, 1)
 
     def test_fd_search_reports_missing_fd(self) -> None:
         with self._temp_tools() as (_root, tools):

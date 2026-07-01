@@ -83,18 +83,21 @@ def run_probe(generated_files: int) -> dict[str, Any]:
         root = Path(tmp)
         _write_fixture(root, generated_files=generated_files)
         tools = ToolExecutor(root, approval_mode="auto")
-        rows = [
-            _measure("file_search", lambda: tools.file_search("pricing")),
-            _measure("repo_index_search", lambda: tools.repo_index_search("calculate_discount")),
-            _measure("fts_refresh", lambda: tools.fts_refresh()),
-            _measure("fts_refresh_cached", lambda: tools.fts_refresh()),
-            _measure("context_pack", lambda: tools.context_pack("fix discount calculation")),
-            _measure("discover_validators", lambda: tools.discover_validators()),
-            _measure("tree_sitter_syntax", lambda: tools.tree_sitter_syntax("src")),
-            _measure("ast_search", lambda: tools.ast_search("def $F($$$A): $$$B", "src/pricing.py", lang="python")),
-            _measure("lint_typecheck", lambda: tools.lint_typecheck("src", timeout=120)),
-            _measure("lint_typecheck_cached", lambda: tools.lint_typecheck("src", timeout=120)),
-        ]
+        try:
+            rows = [
+                _measure("file_search", lambda: tools.file_search("pricing")),
+                _measure("repo_index_search", lambda: tools.repo_index_search("calculate_discount")),
+                _measure("fts_refresh", lambda: tools.fts_refresh()),
+                _measure("fts_refresh_cached", lambda: tools.fts_refresh()),
+                _measure("context_pack", lambda: tools.context_pack("fix discount calculation")),
+                _measure("discover_validators", lambda: tools.discover_validators()),
+                _measure("tree_sitter_syntax", lambda: tools.tree_sitter_syntax("src")),
+                _measure("ast_search", lambda: tools.ast_search("def $F($$$A): $$$B", "src/pricing.py", lang="python")),
+                _measure("lint_typecheck", lambda: tools.lint_typecheck("src", timeout=120)),
+                _measure("lint_typecheck_cached", lambda: tools.lint_typecheck("src", timeout=120)),
+            ]
+        finally:
+            tools.close()
     return {"generated_files": generated_files, "rows": rows}
 
 

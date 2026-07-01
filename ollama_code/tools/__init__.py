@@ -265,6 +265,8 @@ class ToolExecutor:
         self._lint_typecheck_cache: dict[str, dict[str, Any]] = {}
         self._python_tool_command_cache: dict[tuple[str, str, tuple[str, ...]], list[str] | None] = {}
         self._which_cache: dict[str, str | None] = {}
+        self._fts_connection: sqlite3.Connection | None = None
+        self._fts_connection_key: str | None = None
 
     def set_approval_mode(self, mode: ApprovalMode) -> None:
         self.approval_mode = mode
@@ -277,6 +279,17 @@ class ToolExecutor:
 
     def set_indexer(self, indexer: Any | None) -> None:
         self.indexer = indexer
+
+    def close(self) -> None:
+        conn = self._fts_connection
+        self._fts_connection = None
+        self._fts_connection_key = None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except sqlite3.Error:
+            return
 
     def todo_snapshot(self) -> list[dict[str, str]]:
         return deepcopy(self._todos)
@@ -2736,6 +2749,14 @@ class ToolExecutor:
 
     def _connect_fts(self) -> sqlite3.Connection:
         cache_key = str(self._fts_cache_path().resolve(strict=False))
+        cached = self._fts_connection
+        if cached is not None and self._fts_connection_key == cache_key:
+            try:
+                cached.execute("SELECT 1")
+                return cached
+            except sqlite3.Error:
+                self._fts_connection = None
+                self._fts_connection_key = None
         memory_conn = _MEMORY_FTS_CONNECTIONS.get(cache_key)
         if memory_conn is not None:
             return memory_conn
@@ -2755,9 +2776,13 @@ class ToolExecutor:
             self._initialize_fts_connection(memory_conn)
             _MEMORY_FTS_CONNECTIONS[cache_key] = memory_conn
             return memory_conn
+        self._fts_connection = conn
+        self._fts_connection_key = cache_key
         return conn
 
     def _close_fts(self, conn: sqlite3.Connection) -> None:
+        if conn is self._fts_connection:
+            return
         if conn in _MEMORY_FTS_CONNECTIONS.values():
             return
         conn.close()
@@ -2793,9 +2818,15 @@ class ToolExecutor:
                 break
         return " ".join(headings)
 
-    def _fts_record(self, file_path: Path) -> tuple[str, str, str, str, str, int, int]:
-        stat = file_path.stat()
-        rel = self.relative_label(file_path)
+    def _fts_record(
+        self,
+        file_path: Path,
+        *,
+        rel: str | None = None,
+        stat: os.stat_result | None = None,
+    ) -> tuple[str, str, str, str, str, int, int]:
+        stat_result = stat or file_path.stat()
+        relative = rel or self.relative_label(file_path)
         text = file_path.read_text(encoding="utf-8", errors="replace")
         if "\x00" in text[:4096]:
             text = ""
@@ -2811,13 +2842,13 @@ class ToolExecutor:
             except OSError:
                 symbols = ""
         return (
-            rel,
-            rel.replace("/", " "),
+            relative,
+            relative.replace("/", " "),
             symbols,
             self._fts_headings(file_path, text),
             text[:200_000],
-            int(stat.st_mtime_ns),
-            int(stat.st_size),
+            int(stat_result.st_mtime_ns),
+            int(stat_result.st_size),
         )
 
     def _fts_scope(self, base: Path) -> tuple[str, tuple[Any, ...]]:
@@ -2871,7 +2902,7 @@ class ToolExecutor:
                 conn.execute("DELETE FROM repo_fts WHERE path = ?", (rel,))
                 conn.execute(
                     "INSERT INTO repo_fts(path,path_text,symbols,headings,text,mtime_ns,size) VALUES(?,?,?,?,?,?,?)",
-                    self._fts_record(file_path),
+                    self._fts_record(file_path, rel=rel, stat=stat),
                 )
                 indexed += 1
             stale_paths = sorted(set(existing) - current_paths)
