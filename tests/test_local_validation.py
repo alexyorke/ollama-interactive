@@ -72,6 +72,24 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(row["target_count"], 1)
         self.assertTrue(row["ok"])
 
+    def test_timing_summary_orders_slowest_commands(self) -> None:
+        summary = local_validation._timing_summary(
+            [
+                {"name": "agent", "elapsed_s": 4.0, "target_count": 6, "ok": True},
+                {"name": "smoke", "elapsed_s": 1.5, "target_count": 10, "ok": True},
+                {"name": "full-remaining", "elapsed_s": 2.0, "target_count": 25, "ok": False},
+            ],
+            elapsed_s=7.5,
+        )
+
+        self.assertEqual(summary["command_count"], 3)
+        self.assertEqual(summary["successful_commands"], 2)
+        self.assertEqual(summary["failed_commands"], 1)
+        self.assertEqual(
+            [row["name"] for row in summary["slowest_commands"]],
+            ["agent", "full-remaining", "smoke"],
+        )
+
     def test_run_counts_unittest_module_targets(self) -> None:
         command = [sys.executable, "-m", "unittest", "tests.test_live_model_gate", "tests.test_nightly_self_improvement_report", "-q"]
 
@@ -123,6 +141,9 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(payload["remaining_tiers"], ["agent", "full-remaining"])
         self.assertTrue(payload["stopped_after_failure"])
         self.assertFalse(payload["ok"])
+        self.assertEqual(payload["commands"][0]["elapsed_share_pct"], 100.0)
+        self.assertEqual(payload["timing_summary"]["command_count"], 1)
+        self.assertEqual(payload["timing_summary"]["slowest_commands"][0]["name"], "smoke")
 
     def test_run_validation_records_optional_unittest_baseline_compare(self) -> None:
         def fake_run(
@@ -167,6 +188,8 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(comparison["preferred_minus_unittest_s"], -0.3)
         self.assertTrue(comparison["preferred_faster_than_unittest"])
         self.assertEqual(comparison["unittest_discover"]["name"], "unittest-baseline")
+        self.assertEqual([row["elapsed_share_pct"] for row in payload["commands"]], [33.3, 33.3, 33.3])
+        self.assertEqual(payload["timing_summary"]["slowest_commands"][0]["name"], "agent")
 
     def test_run_validation_skips_unittest_baseline_compare_for_non_full_tier(self) -> None:
         def fake_run(

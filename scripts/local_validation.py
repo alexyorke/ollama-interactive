@@ -154,6 +154,29 @@ def _run(
     }
 
 
+def _timing_summary(command_rows: list[dict[str, Any]], *, elapsed_s: float) -> dict[str, Any]:
+    total_elapsed = round(float(elapsed_s), 3)
+    slowest = sorted(
+        (
+            {
+                "name": str(row.get("name") or ""),
+                "elapsed_s": round(float(row.get("elapsed_s", 0.0) or 0.0), 3),
+                "target_count": int(row.get("target_count", 0) or 0),
+                "ok": bool(row.get("ok")),
+            }
+            for row in command_rows
+        ),
+        key=lambda item: (-item["elapsed_s"], item["name"]),
+    )
+    return {
+        "command_count": len(command_rows),
+        "successful_commands": sum(1 for row in command_rows if row.get("ok")),
+        "failed_commands": sum(1 for row in command_rows if not row.get("ok")),
+        "total_elapsed_s": total_elapsed,
+        "slowest_commands": slowest[:3],
+    }
+
+
 def _baseline_compare_payload(
     repo_root: Path,
     *,
@@ -242,6 +265,9 @@ def run_validation(
     remaining_tiers = planned_tiers[len(completed_tiers) :]
     elapsed_s = round(sum(float(row["elapsed_s"]) for row in command_rows), 3)
     ok = all(row["ok"] for row in command_rows)
+    for row in command_rows:
+        row_elapsed = round(float(row.get("elapsed_s", 0.0) or 0.0), 3)
+        row["elapsed_share_pct"] = round((row_elapsed / elapsed_s) * 100, 1) if elapsed_s > 0 else 0.0
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root.resolve(strict=False)),
@@ -258,6 +284,7 @@ def run_validation(
         "remaining_tiers": remaining_tiers,
         "stopped_after_failure": bool(command_rows and not command_rows[-1]["ok"] and remaining_tiers),
         "elapsed_s": elapsed_s,
+        "timing_summary": _timing_summary(command_rows, elapsed_s=elapsed_s),
         "baseline_compare": _baseline_compare_payload(
             repo_root,
             requested=compare_unittest_baseline,
