@@ -1,10 +1,17 @@
 import argparse
+from contextlib import contextmanager
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from scripts import nightly_self_improvement_report as report
+
+
+@contextmanager
+def _temp_root():
+    with tempfile.TemporaryDirectory() as tmp:
+        yield Path(tmp)
 
 
 class NightlySelfImprovementReportTests(unittest.TestCase):
@@ -30,8 +37,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         )
 
     def test_default_compare_path_uses_latest_prior_report(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             root = repo_root / "scratch" / "nightly-self-improvement"
             older = root / "20260101T000000Z"
             newer = root / "20260102T000000Z"
@@ -48,8 +54,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(selected, newer / "report.json")
 
     def test_default_compare_path_uses_latest_timestamped_report_for_custom_output_dir(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             root = repo_root / "scratch" / "nightly-self-improvement"
             older = root / "20260101T000000Z"
             newer = root / "20260102T000000Z"
@@ -65,8 +70,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(selected, newer / "report.json")
 
     def test_default_compare_path_falls_back_to_legacy_self_improvement_runs(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             legacy_root = repo_root / ".ollama-code" / "self-improvement-runs"
             older = legacy_root / "20260516-211548"
             newer = legacy_root / "20260516-224919"
@@ -82,8 +86,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(selected, newer / "report.json")
 
     def test_default_compare_path_does_not_select_future_timestamped_report(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             root = repo_root / "scratch" / "nightly-self-improvement"
             future = root / "20260102T000000Z"
             current = root / "20260101T000000Z"
@@ -97,8 +100,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertIsNone(selected)
 
     def test_default_compare_path_skips_malformed_latest_prior_report(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             root = repo_root / "scratch" / "nightly-self-improvement"
             older = root / "20260101T000000Z"
             malformed = root / "20260102T000000Z"
@@ -212,8 +214,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(summary["high_priority_public_missing"], [{"id": "x"}])
 
     def test_trajectory_local_manifest_summary_ignores_non_numeric_file_count(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            data_root = Path(tmp)
+        with _temp_root() as data_root:
             dataset_dir = data_root / "nebius-swe-agent-trajectories"
             dataset_dir.mkdir(parents=True)
             (
@@ -256,8 +257,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(selected, "http://[::1]:11434")
 
     def test_build_report_includes_question_and_trajectory_commands(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             live_gate_summary_path = repo_root / "scratch" / "live-model-gate" / "live-model-gate-summary.json"
@@ -396,8 +396,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertTrue(any("nvidia/SWE-Hero-openhands-trajectories" in item for item in payload["metrics"]["suggested_implementation_targets"]))
 
     def test_build_report_ignores_malformed_explicit_compare_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             compare_path = repo_root / "broken-report.json"
@@ -438,8 +437,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertEqual(payload["metrics"]["coding_benchmark"]["delta"], {})
 
     def test_build_report_records_skip_llm_reason(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             (data_root / "nebius-swe-agent-trajectories").mkdir(parents=True)
@@ -497,8 +495,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertTrue(payload["summary"]["trajectory"]["available"])
 
     def test_build_report_records_trajectory_skip_reason_when_no_local_datasets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             args = self._args(output_dir, data_root)
@@ -539,8 +536,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         self.assertFalse(payload["summary"]["trajectory"]["available"])
 
     def test_build_report_ignores_trajectory_dirs_without_valid_manifest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             (data_root / "nebius-swe-agent-trajectories").mkdir(parents=True)
@@ -584,8 +580,7 @@ class NightlySelfImprovementReportTests(unittest.TestCase):
         )
 
     def test_build_report_ignores_stale_trajectory_manifest_with_missing_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            repo_root = Path(tmp)
+        with _temp_root() as repo_root:
             output_dir = repo_root / "out"
             data_root = repo_root / "datasets"
             dataset_dir = data_root / "nebius-swe-agent-trajectories"
