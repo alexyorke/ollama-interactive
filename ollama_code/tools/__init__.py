@@ -263,6 +263,7 @@ class ToolExecutor:
         self._todos: list[dict[str, str]] = []
         self._tree_sitter_parsers: dict[str, Any] = {}
         self._lint_typecheck_cache: dict[str, dict[str, Any]] = {}
+        self._lint_typecheck_file_cache: dict[str, dict[str, Any]] = {}
         self._python_tool_command_cache: dict[tuple[str, str, tuple[str, ...]], list[str] | None] = {}
         self._which_cache: dict[str, str | None] = {}
         self._fts_connection: sqlite3.Connection | None = None
@@ -10792,6 +10793,41 @@ import string
         tool = payload.get("tool") if isinstance(payload, dict) else None
         return isinstance(tool, dict) and isinstance(tool.get(name), dict)
 
+    def _lint_typecheck_file_analysis(self, file_path: Path, *, timeout: int) -> dict[str, Any]:
+        rel = self.relative_label(file_path)
+        suffix = file_path.suffix.lower()
+        stat = file_path.stat()
+        signature = {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+        node_available = bool(self._which("node")) if suffix in {".js", ".jsx"} else None
+        cached = self._lint_typecheck_file_cache.get(rel)
+        if (
+            isinstance(cached, dict)
+            and cached.get("signature") == signature
+            and cached.get("suffix") == suffix
+            and cached.get("node_available") == node_available
+        ):
+            analysis = cached.get("analysis")
+            if isinstance(analysis, dict):
+                return dict(analysis)
+        analysis: dict[str, Any] = {"suffix": suffix, "diagnostic": None}
+        if suffix == ".py":
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            analysis["diagnostic"] = self._python_syntax_diagnostic(file_path, text)
+        elif suffix in {".js", ".jsx"} and node_available:
+            completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
+            if completed.returncode != 0:
+                analysis["diagnostic"] = self._truncate_text(self._collect_process_output(completed), limit=500)
+        elif self._tree_sitter_language_for_path(file_path) is not None:
+            text = file_path.read_text(encoding="utf-8", errors="replace")
+            analysis["diagnostic"] = self._tree_sitter_syntax_diagnostic(file_path, text)
+        self._lint_typecheck_file_cache[rel] = {
+            "signature": signature,
+            "suffix": suffix,
+            "node_available": node_available,
+            "analysis": dict(analysis),
+        }
+        return analysis
+
     def _ini_has_section(self, path: Path, prefixes: tuple[str, ...]) -> bool:
         if not path.exists():
             return False
@@ -11105,25 +11141,20 @@ import string
                 for file_path in files:
                     rel = self.relative_label(file_path)
                     checked.append(rel)
-                    text = file_path.read_text(encoding="utf-8", errors="replace")
-                    if file_path.suffix.lower() == ".py":
+                    analysis = self._lint_typecheck_file_analysis(file_path, timeout=timeout)
+                    suffix = file_path.suffix.lower()
+                    diagnostic = analysis.get("diagnostic")
+                    if suffix == ".py":
                         base_has_python = True
                         python_validator_files.add(rel)
-                        diagnostic = self._python_syntax_diagnostic(file_path, text)
                         if diagnostic:
-                            diagnostics.append(diagnostic)
+                            diagnostics.append(str(diagnostic))
                     elif file_path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
                         if rel not in seen_shell_targets:
                             shell_targets.append(rel)
                             seen_shell_targets.add(rel)
-                    elif file_path.suffix.lower() in {".js", ".jsx"} and self._which("node"):
-                        completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
-                        if completed.returncode != 0:
-                            diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=500))
-                    elif self._tree_sitter_language_for_path(file_path) is not None:
-                        diagnostic = self._tree_sitter_syntax_diagnostic(file_path, text)
-                        if diagnostic:
-                            diagnostics.append(diagnostic)
+                    elif diagnostic:
+                        diagnostics.append(str(diagnostic))
                 if base_has_python:
                     python_validator_scopes.add(self.relative_label(base))
             phase_timings_ms["scan_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)

@@ -5093,11 +5093,12 @@ def double(value: int) -> int:
 
             with patch("ollama_code.tools.shutil.which", side_effect=lambda name: "ruff" if name == "ruff" else None):
                 with patch.object(tools, "_python_tool_command", return_value=["basedpyright", "--level", "error"]):
-                    with patch.object(tools, "_run_process", side_effect=fake_run):
-                        first = tools.lint_typecheck("src")
-                        second = tools.lint_typecheck("src")
-                        target.write_text("VALUE = 2\n", encoding="utf-8")
-                        third = tools.lint_typecheck("src")
+                    with patch.object(tools, "_python_syntax_diagnostic", wraps=tools._python_syntax_diagnostic) as syntax_mock:
+                        with patch.object(tools, "_run_process", side_effect=fake_run):
+                            first = tools.lint_typecheck("src")
+                            second = tools.lint_typecheck("src")
+                            target.write_text("VALUE = 2\n", encoding="utf-8")
+                            third = tools.lint_typecheck("src")
 
         self.assertTrue(first["ok"], first["output"])
         self.assertTrue(second["ok"], second["output"])
@@ -5105,6 +5106,7 @@ def double(value: int) -> int:
         self.assertIsNone(first.get("cache_hit"))
         self.assertTrue(second.get("cache_hit"))
         self.assertIsNone(third.get("cache_hit"))
+        self.assertEqual(syntax_mock.call_count, 2)
         self.assertEqual(
             calls,
             [
