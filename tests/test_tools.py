@@ -1601,10 +1601,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(embed.call_count, 2)
 
     def test_ast_search_reports_missing_ast_grep(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"ops.py": "def add(a, b):\n    return a + b\n"}) as (_root, tools):
             with patch("ollama_code.tools.shutil.which", return_value=None):
                 result = tools.ast_search("def $F($$$A): $$$B", lang="python")
 
@@ -1612,16 +1609,16 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["missing_dependency"], "ast-grep")
 
     def test_ast_search_uses_native_python_function_fast_path(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text(
-                "def add(a, b):\n"
-                "    return a + b\n\n"
-                "async def fetch():\n"
-                "    return 1\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "ops.py": (
+                    "def add(a, b):\n"
+                    "    return a + b\n\n"
+                    "async def fetch():\n"
+                    "    return 1\n"
+                )
+            }
+        ) as (_root, tools):
             with patch.object(tools, "_ast_grep_executable", return_value="ast-grep"):
                 with patch.object(tools, "_run_process", side_effect=AssertionError("ast-grep should not run")):
                     result = tools.ast_search("def $F($$$A): $$$B", "ops.py", lang="python")
@@ -1633,10 +1630,7 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("ops.py:4: async def fetch():", result["output"])
 
     def test_lsp_navigation_reports_missing_language_server(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools({"ops.py": "def add(a, b):\n    return a + b\n"}) as (_root, tools):
             with patch("ollama_code.tools.shutil.which", return_value=None):
                 definition = tools.lsp_definition("ops.py", 1, 5)
                 references = tools.lsp_references("ops.py", 1, 5)
@@ -1647,11 +1641,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(references["missing_dependency"], "pyright")
 
     def test_edit_intent_routes_bad_symbol_target_to_text_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"pricing.py": "def total(prices):\n    return sum(prices)\n"}) as (root, tools):
             sample = root / "pricing.py"
-            sample.write_text("def total(prices):\n    return sum(prices)\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent("pricing.py", "replace_symbol", "return sum(prices)", "return 0")
 
             final_text = sample.read_text(encoding="utf-8")
@@ -1661,11 +1652,10 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return 0", final_text)
 
     def test_edit_intent_routes_freeform_function_fix_to_body_edit(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools(
+            {"calculator.py": "def add(left: int, right: int) -> int:\n    return left - right\n"}
+        ) as (root, tools):
             sample = root / "calculator.py"
-            sample.write_text("def add(left: int, right: int) -> int:\n    return left - right\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "calculator.py",
                 "fix the implementation of the add function",
@@ -1680,11 +1670,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("def add(left: int, right: int) -> int:\n    return left + right", final_text)
 
     def test_edit_intent_normalizes_signature_like_body_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"list_ops.py": "def append(list1, list2):\n    pass\n"}) as (root, tools):
             sample = root / "list_ops.py"
-            sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent("list_ops.py", "replace_body", "append(list1, list2)", "return list1 + list2")
 
             final_text = sample.read_text(encoding="utf-8")
@@ -1693,11 +1680,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return list1 + list2", final_text)
 
     def test_edit_intent_normalizes_def_like_body_targets(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"list_ops.py": "def append(list1, list2):\n    pass\n"}) as (root, tools):
             sample = root / "list_ops.py"
-            sample.write_text("def append(list1, list2):\n    pass\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent("list_ops.py", "replace_body", "def append(list1, list2):", "return list1 + list2")
 
             final_text = sample.read_text(encoding="utf-8")
@@ -1706,11 +1690,8 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return list1 + list2", final_text)
 
     def test_replace_body_full_matching_function_replaces_symbol_not_nested_def(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+        with self._temp_files_tools({"pig_latin.py": "def translate(text):\n    return None\n"}) as (root, tools):
             sample = root / "pig_latin.py"
-            sample.write_text("def translate(text):\n    return None\n", encoding="utf-8")
-            tools = ToolExecutor(root, approval_mode="auto")
             result = tools.edit_intent(
                 "pig_latin.py",
                 "replace_body",
