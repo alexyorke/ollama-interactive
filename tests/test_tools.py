@@ -4625,23 +4625,21 @@ def double(value: int) -> int:
         self.assertIn("expected 7 got 6", result["summary"])
 
     def test_promote_verified_function_with_focused_unittest(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "math_utils.py").write_text(
-                "def triple(value: int) -> int:\n"
-                "    return value * 3\n",
-                encoding="utf-8",
-            )
-            (root / "test_math_utils.py").write_text(
-                "import unittest\n"
-                "from math_utils import triple\n\n"
-                "class MathTests(unittest.TestCase):\n"
-                "    def test_triple(self):\n"
-                "        self.assertEqual(triple(3), 9)\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
-
+        with self._temp_files_tools(
+            {
+                "math_utils.py": (
+                    "def triple(value: int) -> int:\n"
+                    "    return value * 3\n"
+                ),
+                "test_math_utils.py": (
+                    "import unittest\n"
+                    "from math_utils import triple\n\n"
+                    "class MathTests(unittest.TestCase):\n"
+                    "    def test_triple(self):\n"
+                    "        self.assertEqual(triple(3), 9)\n"
+                ),
+            }
+        ) as (_root, tools):
             result = tools.promote_verified_function("math_utils.py", "triple")
 
         self.assertTrue(result["ok"], result.get("summary"))
@@ -4649,14 +4647,14 @@ def double(value: int) -> int:
         self.assertIn("focused_test=pass", result["card"]["properties"])
 
     def test_compose_verified_functions_labels_unverified_candidates(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "utils.py").write_text(
-                "def strip_name(value: str) -> str:\n"
-                "    return value.strip()\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_files_tools(
+            {
+                "utils.py": (
+                    "def strip_name(value: str) -> str:\n"
+                    "    return value.strip()\n"
+                )
+            }
+        ) as (_root, tools):
             search = tools.verified_function_search("strip name")
             card_id = search["cards"][0]["id"]
 
