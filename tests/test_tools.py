@@ -3819,62 +3819,62 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("actual_message='punctuations not permitted'", result["output"])
 
     def test_synthesize_string_normalizer_class_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "phone_number.py").write_text("class PhoneNumber:\n    def __init__(self, number):\n        pass\n", encoding="utf-8")
-            (root / "phone_number_test.py").write_text(
-                "import unittest\nfrom phone_number import PhoneNumber\n\n"
-                "class PhoneNumberTest(unittest.TestCase):\n"
-                "    def test_clean(self):\n"
-                "        self.assertEqual(PhoneNumber('(223) 456-7890').number, '2234567890')\n"
-                "        self.assertEqual(PhoneNumber('223.456.7890').number, '2234567890')\n"
-                "        self.assertEqual(PhoneNumber('+1 (223) 456-7890').number, '2234567890')\n"
-                "    def test_errors(self):\n"
-                "        for raw, message in []:\n"
-                "            with self.assertRaises(ValueError) as err:\n"
-                "                PhoneNumber(raw)\n"
-                "            self.assertEqual(err.exception.args[0], message)\n"
-                "    def test_error_cases(self):\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('123456789')\n"
-                "        self.assertEqual(err.exception.args[0], 'must not be fewer than 10 digits')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('22234567890')\n"
-                "        self.assertEqual(err.exception.args[0], '11 digits must start with 1')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('321234567890')\n"
-                "        self.assertEqual(err.exception.args[0], 'must not be greater than 11 digits')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('523-abc-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'letters not permitted')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('523-@:!-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'punctuations not permitted')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('(023) 456-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'area code cannot start with zero')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('(123) 456-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'area code cannot start with one')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('(223) 056-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'exchange code cannot start with zero')\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            PhoneNumber('(223) 156-7890')\n"
-                "        self.assertEqual(err.exception.args[0], 'exchange code cannot start with one')\n"
-                "    def test_area_code_and_pretty(self):\n"
-                "        number = PhoneNumber('12234567890')\n"
-                "        self.assertEqual(number.area_code, '223')\n"
-                "        self.assertEqual(number.pretty(), '(223)-456-7890')\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_python_tools(
+            {
+                "phone_number.py": "class PhoneNumber:\n    def __init__(self, number):\n        pass\n",
+                "phone_number_test.py": (
+                    "import unittest\nfrom phone_number import PhoneNumber\n\n"
+                    "class PhoneNumberTest(unittest.TestCase):\n"
+                    "    def test_clean(self):\n"
+                    "        self.assertEqual(PhoneNumber('(223) 456-7890').number, '2234567890')\n"
+                    "        self.assertEqual(PhoneNumber('223.456.7890').number, '2234567890')\n"
+                    "        self.assertEqual(PhoneNumber('+1 (223) 456-7890').number, '2234567890')\n"
+                    "    def test_errors(self):\n"
+                    "        for raw, message in []:\n"
+                    "            with self.assertRaises(ValueError) as err:\n"
+                    "                PhoneNumber(raw)\n"
+                    "            self.assertEqual(err.exception.args[0], message)\n"
+                    "    def test_error_cases(self):\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('123456789')\n"
+                    "        self.assertEqual(err.exception.args[0], 'must not be fewer than 10 digits')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('22234567890')\n"
+                    "        self.assertEqual(err.exception.args[0], '11 digits must start with 1')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('321234567890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'must not be greater than 11 digits')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('523-abc-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'letters not permitted')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('523-@:!-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'punctuations not permitted')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('(023) 456-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'area code cannot start with zero')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('(123) 456-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'area code cannot start with one')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('(223) 056-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'exchange code cannot start with zero')\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            PhoneNumber('(223) 156-7890')\n"
+                    "        self.assertEqual(err.exception.args[0], 'exchange code cannot start with one')\n"
+                    "    def test_area_code_and_pretty(self):\n"
+                    "        number = PhoneNumber('12234567890')\n"
+                    "        self.assertEqual(number.area_code, '223')\n"
+                    "        self.assertEqual(number.pretty(), '(223)-456-7890')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_string_normalizer_class_candidate("phone_number.py", "phone_number_test.py", limit=40)
             validation = tools.validate_implementation_candidate(
                 "phone_number.py",
                 str(synthesized.get("candidate_source") or ""),
                 test_path="phone_number_test.py",
-                test_command=subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"]),
+                test_command=command,
             )
 
         self.assertTrue(synthesized["ok"], synthesized)
@@ -3882,77 +3882,73 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("allowed_separators", synthesized)
 
     def test_synthesize_grouped_roster_candidate_from_stateful_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "grade_school.py").write_text(
-                "class School:\n"
-                "    def __init__(self):\n        pass\n"
-                "    def add_student(self, name, grade):\n        pass\n"
-                "    def roster(self):\n        pass\n"
-                "    def grade(self, grade_number):\n        pass\n"
-                "    def added(self):\n        pass\n",
-                encoding="utf-8",
-            )
-            (root / "grade_school_test.py").write_text(
-                "import unittest\nfrom grade_school import School\n\n"
-                "class GradeSchoolTest(unittest.TestCase):\n"
-                "    def test_roster(self):\n"
-                "        school = School()\n"
-                "        school.add_student(name='Peter', grade=2)\n"
-                "        school.add_student(name='Anna', grade=1)\n"
-                "        school.add_student(name='Alex', grade=2)\n"
-                "        self.assertEqual(school.roster(), ['Anna', 'Alex', 'Peter'])\n"
-                "    def test_grade_and_added(self):\n"
-                "        school = School()\n"
-                "        school.add_student(name='James', grade=2)\n"
-                "        school.add_student(name='James', grade=3)\n"
-                "        school.add_student(name='Paul', grade=3)\n"
-                "        self.assertEqual(school.added(), [True, False, True])\n"
-                "        self.assertEqual(school.grade(3), ['Paul'])\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_python_tools(
+            {
+                "grade_school.py": (
+                    "class School:\n"
+                    "    def __init__(self):\n        pass\n"
+                    "    def add_student(self, name, grade):\n        pass\n"
+                    "    def roster(self):\n        pass\n"
+                    "    def grade(self, grade_number):\n        pass\n"
+                    "    def added(self):\n        pass\n"
+                ),
+                "grade_school_test.py": (
+                    "import unittest\nfrom grade_school import School\n\n"
+                    "class GradeSchoolTest(unittest.TestCase):\n"
+                    "    def test_roster(self):\n"
+                    "        school = School()\n"
+                    "        school.add_student(name='Peter', grade=2)\n"
+                    "        school.add_student(name='Anna', grade=1)\n"
+                    "        school.add_student(name='Alex', grade=2)\n"
+                    "        self.assertEqual(school.roster(), ['Anna', 'Alex', 'Peter'])\n"
+                    "    def test_grade_and_added(self):\n"
+                    "        school = School()\n"
+                    "        school.add_student(name='James', grade=2)\n"
+                    "        school.add_student(name='James', grade=3)\n"
+                    "        school.add_student(name='Paul', grade=3)\n"
+                    "        self.assertEqual(school.added(), [True, False, True])\n"
+                    "        self.assertEqual(school.grade(3), ['Paul'])\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_grouped_roster_candidate("grade_school.py", "grade_school_test.py", limit=30)
             validation = tools.validate_implementation_candidate(
                 "grade_school.py",
                 str(synthesized.get("candidate_source") or ""),
                 test_path="grade_school_test.py",
-                test_command=subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"]),
+                test_command=command,
             )
 
         self.assertTrue(synthesized["ok"], synthesized)
         self.assertTrue(validation["ok"], validation)
 
     def test_synthesize_vlq_candidate_from_examples(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "variable_length_quantity.py").write_text(
-                "def encode(numbers):\n    pass\n\n\ndef decode(bytes_):\n    pass\n",
-                encoding="utf-8",
-            )
-            (root / "variable_length_quantity_test.py").write_text(
-                "import unittest\nfrom variable_length_quantity import encode, decode\n\n"
-                "class VariableLengthQuantityTest(unittest.TestCase):\n"
-                "    def test_encode(self):\n"
-                "        self.assertEqual(encode([0]), [0])\n"
-                "        self.assertEqual(encode([0x40, 0x7F]), [0x40, 0x7F])\n"
-                "        self.assertEqual(encode([0x80]), [0x81, 0x00])\n"
-                "        self.assertEqual(encode([0x2000]), [0xC0, 0x00])\n"
-                "    def test_decode(self):\n"
-                "        self.assertEqual(decode([0x7F]), [0x7F])\n"
-                "        self.assertEqual(decode([0xC0, 0x00]), [0x2000])\n"
-                "        with self.assertRaises(ValueError) as err:\n"
-                "            decode([0x80])\n"
-                "        self.assertEqual(err.exception.args[0], 'incomplete sequence')\n",
-                encoding="utf-8",
-            )
-            tools = ToolExecutor(root, approval_mode="auto")
+        with self._temp_python_tools(
+            {
+                "variable_length_quantity.py": "def encode(numbers):\n    pass\n\n\ndef decode(bytes_):\n    pass\n",
+                "variable_length_quantity_test.py": (
+                    "import unittest\nfrom variable_length_quantity import encode, decode\n\n"
+                    "class VariableLengthQuantityTest(unittest.TestCase):\n"
+                    "    def test_encode(self):\n"
+                    "        self.assertEqual(encode([0]), [0])\n"
+                    "        self.assertEqual(encode([0x40, 0x7F]), [0x40, 0x7F])\n"
+                    "        self.assertEqual(encode([0x80]), [0x81, 0x00])\n"
+                    "        self.assertEqual(encode([0x2000]), [0xC0, 0x00])\n"
+                    "    def test_decode(self):\n"
+                    "        self.assertEqual(decode([0x7F]), [0x7F])\n"
+                    "        self.assertEqual(decode([0xC0, 0x00]), [0x2000])\n"
+                    "        with self.assertRaises(ValueError) as err:\n"
+                    "            decode([0x80])\n"
+                    "        self.assertEqual(err.exception.args[0], 'incomplete sequence')\n"
+                ),
+            }
+        ) as (_root, tools, command):
             synthesized = tools.synthesize_vlq_candidate("variable_length_quantity.py", "variable_length_quantity_test.py", limit=30)
             validation = tools.validate_implementation_candidate(
                 "variable_length_quantity.py",
                 str(synthesized.get("candidate_source") or ""),
                 test_path="variable_length_quantity_test.py",
-                test_command=subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"]),
+                test_command=command,
             )
 
         self.assertTrue(synthesized["ok"], synthesized)
