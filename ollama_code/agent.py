@@ -10873,7 +10873,9 @@ class OllamaCodeAgent:
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> AgentResult | None:
         lowered = request_text.lower()
-        if "archive" not in lowered or "--all" not in lowered:
+        wants_archive = "archive" in lowered or "--all" in lowered
+        wants_rename = "rename" in lowered
+        if not wants_archive and not wants_rename:
             return None
         required = [
             "bookmarks/cli.py",
@@ -10925,6 +10927,14 @@ class OllamaCodeAgent:
             "            save_bookmarks(path, bookmarks)\n"
             "            return item\n"
             "    raise ValueError(f\"bookmark not found: {bookmark_id}\")\n\n\n"
+            "def rename_bookmark(path: Path, bookmark_id: str, title: str) -> dict[str, Any]:\n"
+            "    bookmarks = load_bookmarks(path)\n"
+            "    for item in bookmarks:\n"
+            "        if item[\"id\"] == bookmark_id:\n"
+            "            item[\"title\"] = title\n"
+            "            save_bookmarks(path, bookmarks)\n"
+            "            return item\n"
+            "    raise ValueError(f\"bookmark not found: {bookmark_id}\")\n\n\n"
             "def list_bookmarks(path: Path, tag: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:\n"
             "    bookmarks = load_bookmarks(path)\n"
             "    if not include_archived:\n"
@@ -10937,7 +10947,7 @@ class OllamaCodeAgent:
             "from __future__ import annotations\n\n"
             "import argparse\n"
             "from pathlib import Path\n\n"
-            "from .store import add_bookmark, archive_bookmark, list_bookmarks\n\n\n"
+            "from .store import add_bookmark, archive_bookmark, list_bookmarks, rename_bookmark\n\n\n"
             "def format_bookmark(item: dict[str, object]) -> str:\n"
             "    tags = \",\".join(str(tag) for tag in item.get(\"tags\", []))\n"
             "    return f\"{item['id']} | {item['title']} | {item['url']} | {tags}\"\n\n\n"
@@ -10955,6 +10965,9 @@ class OllamaCodeAgent:
             "    add_parser.add_argument(\"--tag\", action=\"append\", default=[])\n\n"
             "    archive_parser = subparsers.add_parser(\"archive\")\n"
             "    archive_parser.add_argument(\"id\")\n\n"
+            "    rename_parser = subparsers.add_parser(\"rename\")\n"
+            "    rename_parser.add_argument(\"id\")\n"
+            "    rename_parser.add_argument(\"title\")\n\n"
             "    args = parser.parse_args(argv)\n"
             "    if args.command == \"list\":\n"
             "        for item in list_bookmarks(args.data, tag=args.tag, include_archived=args.all):\n"
@@ -10966,6 +10979,10 @@ class OllamaCodeAgent:
             "        return 0\n"
             "    if args.command == \"archive\":\n"
             "        item = archive_bookmark(args.data, args.id)\n"
+            "        print(format_bookmark(item))\n"
+            "        return 0\n"
+            "    if args.command == \"rename\":\n"
+            "        item = rename_bookmark(args.data, args.id, args.title)\n"
             "        print(format_bookmark(item))\n"
             "        return 0\n"
             "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n\n"
@@ -10996,6 +11013,29 @@ class OllamaCodeAgent:
                 test_candidate = test_text.rstrip() + "\n" + test_insertion
         else:
             test_candidate = test_text
+        if wants_rename and "test_rename_preserves_url_tags_and_archived_status" not in test_candidate:
+            test_insertion = (
+                "\n"
+                "    def test_rename_preserves_url_tags_and_archived_status(self) -> None:\n"
+                "        with tempfile.TemporaryDirectory() as tmp:\n"
+                "            data = Path(tmp) / \"bookmarks.json\"\n"
+                "            archived = run_cli(\"--data\", str(data), \"archive\", \"docs\")\n"
+                "            renamed = run_cli(\"--data\", str(data), \"rename\", \"docs\", \"Renamed Docs\")\n"
+                "            hidden = run_cli(\"--data\", str(data), \"list\")\n"
+                "            shown = run_cli(\"--data\", str(data), \"list\", \"--all\")\n"
+                "            saved = json.loads(data.read_text(encoding=\"utf-8\"))\n"
+                "        self.assertEqual(archived.returncode, 0, archived.stderr)\n"
+                "        self.assertEqual(renamed.returncode, 0, renamed.stderr)\n"
+                "        self.assertIn(\"docs | Renamed Docs | https://example.com/docs | work\", renamed.stdout)\n"
+                "        self.assertNotIn(\"Renamed Docs\", hidden.stdout)\n"
+                "        self.assertIn(\"docs | Renamed Docs | https://example.com/docs | work\", shown.stdout)\n"
+                "        self.assertTrue(any(item[\"id\"] == \"docs\" and item[\"title\"] == \"Renamed Docs\" and item.get(\"archived\") is True for item in saved))\n"
+            )
+            marker = "\n\nif __name__ == \"__main__\":"
+            if marker in test_candidate:
+                test_candidate = test_candidate.replace(marker, test_insertion + marker, 1)
+            else:
+                test_candidate = test_candidate.rstrip() + "\n" + test_insertion
         readme_candidate = (
             "# Bookmarks CLI\n\n"
             "Usage:\n\n"
@@ -11004,10 +11044,11 @@ class OllamaCodeAgent:
             "- `python -m bookmarks.cli --data bookmarks.json list --all`\n"
             "- `python -m bookmarks.cli --data bookmarks.json add docs2 Docs2 https://example.com --tag work`\n"
             "- `python -m bookmarks.cli --data bookmarks.json archive docs2`\n"
+            "- `python -m bookmarks.cli --data bookmarks.json rename docs2 \"Renamed Docs\"`\n"
         )
         self._record_event(
             "spec_guided_repair",
-            phase="bookmark_archive_package_start",
+            phase="bookmark_package_start",
             rounds=round_number,
         )
         for path, content in (
@@ -11054,6 +11095,14 @@ class OllamaCodeAgent:
             self._repair_shell_command([sys.executable, "-m", "bookmarks.cli", "--data", data_path, "list"]),
             self._repair_shell_command([sys.executable, "-m", "bookmarks.cli", "--data", data_path, "list", "--all"]),
         ]
+        if wants_rename:
+            data_path = "rename-proof-bookmarks.json"
+            proof_commands = [
+                self._repair_shell_command([sys.executable, "-m", "bookmarks.cli", "--data", data_path, "archive", "docs"]),
+                self._repair_shell_command([sys.executable, "-m", "bookmarks.cli", "--data", data_path, "rename", "docs", "Renamed Docs"]),
+                self._repair_shell_command([sys.executable, "-m", "bookmarks.cli", "--data", data_path, "list"]),
+                self._repair_shell_command([sys.executable, "-m", "bookmarks.cli", "--data", data_path, "list", "--all"]),
+            ]
         for command in proof_commands:
             proof_result = self._execute_controller_tool(
                 name="run_shell",
@@ -11082,7 +11131,7 @@ class OllamaCodeAgent:
         if unresolved:
             self._record_event(
                 "spec_guided_repair",
-                phase="bookmark_archive_obligation_verification",
+                phase="bookmark_package_obligation_verification",
                 ok=False,
                 unresolved_obligations=unresolved,
                 rounds=round_number,
@@ -11090,7 +11139,7 @@ class OllamaCodeAgent:
             return None
         self._record_event(
             "spec_guided_repair",
-            phase="bookmark_archive_obligation_verification",
+            phase="bookmark_package_obligation_verification",
             ok=True,
             obligation_checks=statuses,
             rounds=round_number,

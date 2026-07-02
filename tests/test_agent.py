@@ -4361,7 +4361,8 @@ class AgentTests(AgentTestBase):
         result = agent._try_bookmark_archive_package_repair(
             request_text=(
                 "Add an archive subcommand. The list command should hide archived bookmarks by default, "
-                "list --all should include archived bookmarks, update README, add tests, run tests and prove archive."
+                "list --all should include archived bookmarks. Add a rename subcommand that preserves archived "
+                "status. Update README, add tests, run tests and prove archive and rename."
             ),
             round_number=2,
             successful_tool_results=successful_tool_results,  # type: ignore[arg-type]
@@ -4369,14 +4370,14 @@ class AgentTests(AgentTestBase):
             tool_calls_this_turn=tool_calls,
         )
         hidden = subprocess.run(
-            [sys.executable, "-m", "bookmarks.cli", "--data", "archive-proof-bookmarks.json", "list"],
+            [sys.executable, "-m", "bookmarks.cli", "--data", "rename-proof-bookmarks.json", "list"],
             cwd=root,
             capture_output=True,
             text=True,
             check=False,
         )
         shown = subprocess.run(
-            [sys.executable, "-m", "bookmarks.cli", "--data", "archive-proof-bookmarks.json", "list", "--all"],
+            [sys.executable, "-m", "bookmarks.cli", "--data", "rename-proof-bookmarks.json", "list", "--all"],
             cwd=root,
             capture_output=True,
             text=True,
@@ -4386,11 +4387,15 @@ class AgentTests(AgentTestBase):
         self.assertIsNotNone(result)
         self.assertTrue(result.completed)
         self.assertIn("archive_bookmark", (root / "bookmarks" / "store.py").read_text(encoding="utf-8"))
+        self.assertIn("rename_bookmark", (root / "bookmarks" / "store.py").read_text(encoding="utf-8"))
         self.assertIn("archive_parser", (root / "bookmarks" / "cli.py").read_text(encoding="utf-8"))
+        self.assertIn("rename_parser", (root / "bookmarks" / "cli.py").read_text(encoding="utf-8"))
         self.assertIn("test_archive_hides_by_default_and_all_shows", (root / "tests" / "test_bookmarks.py").read_text(encoding="utf-8"))
+        self.assertIn("test_rename_preserves_url_tags_and_archived_status", (root / "tests" / "test_bookmarks.py").read_text(encoding="utf-8"))
         self.assertIn("archive docs2", (root / "README.md").read_text(encoding="utf-8"))
-        self.assertNotIn("docs | Docs", hidden.stdout)
-        self.assertIn("docs | Docs", shown.stdout)
+        self.assertIn("rename docs2", (root / "README.md").read_text(encoding="utf-8"))
+        self.assertNotIn("Renamed Docs", hidden.stdout)
+        self.assertIn("docs | Renamed Docs", shown.stdout)
 
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
