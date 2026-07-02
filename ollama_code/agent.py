@@ -10082,7 +10082,6 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
-                        allow_workspace_fallback=True,
                     )
                     if final_result.get("ok") is True:
                         message = "Spec-guided mechanical repair applied and tests passed."
@@ -10409,7 +10408,6 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
-                        allow_workspace_fallback=True,
                     )
                     if final_result.get("ok") is True:
                         message = "Spec-guided mechanical repair applied and tests passed."
@@ -11910,7 +11908,6 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
-                        allow_workspace_fallback=True,
                     )
                     if diagnosis_result.get("ok") is True:
                         last_failed_run_test_diagnosis_key = last_failed_run_test_key
@@ -12514,6 +12511,17 @@ class OllamaCodeAgent:
                         "arguments": deepcopy(arguments),
                     }
                 )
+                pre_mutation_python_sources: dict[str, str] = {}
+                if name in MUTATING_TOOL_NAMES:
+                    for raw_path in self._mutation_target_paths(arguments):
+                        rel_path = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+                        if not rel_path.endswith(".py") or rel_path in pre_mutation_python_sources:
+                            continue
+                        try:
+                            source_path = self.tools.resolve_path(rel_path, allow_missing=False)
+                            pre_mutation_python_sources[rel_path] = source_path.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            continue
                 started = time.perf_counter()
                 result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
                 duration_ms = round((time.perf_counter() - started) * 1000, 3)
@@ -12668,6 +12676,29 @@ class OllamaCodeAgent:
                         unresolved_syntax_diagnostics[result_path] = syntax_diagnostic
                         unresolved_static_diagnostics.pop(result_path, None)
                         unresolved_probe_diagnostics.pop(result_path, None)
+                        previous_source = pre_mutation_python_sources.get(result_path)
+                        if previous_source is not None:
+                            try:
+                                restored_path = self.tools.resolve_path(result_path, allow_missing=False)
+                                restored_path.write_text(previous_source, encoding="utf-8", newline="\n")
+                            except Exception as exc:
+                                self._record_event(
+                                    "controller_guard",
+                                    guard="syntax-error-rollback-failed",
+                                    path=result_path,
+                                    error_class=exc.__class__.__name__,
+                                    rounds=round_number,
+                                )
+                            else:
+                                self._invalidate_turn_cache_if_needed(name, {"path": result_path, "ok": True})
+                                result["restored_after_syntax_error"] = True
+                                result["summary"] = str(result.get("summary") or "").rstrip() + " Restored previous syntax-valid source."
+                                self._record_event(
+                                    "controller_guard",
+                                    guard="syntax-error-rollback",
+                                    path=result_path,
+                                    rounds=round_number,
+                                )
                         post_tool_feedback.append(
                             "Post-edit syntax check failed: "
                             + self._truncate_text(syntax_diagnostic or "Python syntax error", limit=620)

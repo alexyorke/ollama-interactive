@@ -3243,6 +3243,10 @@ class AgentTests(AgentTestBase):
             agent.handle_user("Fix app.py and run validation.")
 
         self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "def value() -> str:\n    return 'ok'\n")
+        self.assertTrue(
+            any(event.get("type") == "controller_guard" and event.get("guard") == "syntax-error-rollback" for event in agent.events)
+        )
         lint_tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "lint_typecheck"]
         lint_auto_validations = [event for event in agent.events if event.get("type") == "auto_validation" and event.get("name") == "lint_typecheck"]
         self.assertEqual(len(lint_tool_calls), len(lint_auto_validations))
