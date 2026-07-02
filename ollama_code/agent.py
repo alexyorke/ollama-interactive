@@ -10410,10 +10410,10 @@ class OllamaCodeAgent:
                 tree = ast.parse(source_text)
             except Exception:
                 continue
-            if len(source_text.splitlines()) > 260 or "argparse" not in source_text or "TASKS" not in source_text:
+            if len(source_text.splitlines()) > 260 or "argparse" not in source_text:
                 continue
             function_names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-            if not {"list_tasks", "complete_task", "main"}.issubset(function_names):
+            if "main" not in function_names:
                 continue
             related_tests = self._related_tests_for_source(rel_source)
             if not related_tests:
@@ -10442,6 +10442,10 @@ class OllamaCodeAgent:
                 if "subprocess" not in test_text and "_run(" not in test_text:
                     continue
                 score = 10
+                if "TASKS" in source_text and {"list_tasks", "complete_task"}.issubset(function_names):
+                    score += 10
+                if "@dataclass" in source_text and "--tag" in source_text:
+                    score += 8
                 if Path(rel_source).stem.lower() in Path(test_path).name.lower():
                     score += 10
                 candidates.append((score, rel_source, test_path))
@@ -10454,10 +10458,15 @@ class OllamaCodeAgent:
         commands: list[str] = []
         has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
         has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
+        has_json_flag = "--json" in candidate_source
         if has_stats:
             commands.append(self._repair_shell_command([sys.executable, source_path, "stats"]))
         if has_priority_filter:
             commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--priority", "high"]))
+        if has_json_flag:
+            commands.append(self._repair_shell_command([sys.executable, source_path, "--json"]))
+            if "--tag" in candidate_source:
+                commands.append(self._repair_shell_command([sys.executable, source_path, "--tag", "work", "--json"]))
         return commands
 
     def _maybe_update_cli_readme_docs(
@@ -10474,7 +10483,8 @@ class OllamaCodeAgent:
             return
         has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
         has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
-        if not has_stats and not has_priority_filter:
+        has_json_flag = "--json" in candidate_source
+        if not has_stats and not has_priority_filter and not has_json_flag:
             return
         try:
             readme_path = self.tools.resolve_path("README.md", allow_missing=False)
@@ -10487,6 +10497,8 @@ class OllamaCodeAgent:
             additions.append("- `list --priority high` filters tasks by priority.")
         if has_stats and "stats" not in lowered:
             additions.append("- `stats` prints counts by status and priority.")
+        if has_json_flag and "--json" not in lowered:
+            additions.append("- `--json` prints the selected items as JSON objects.")
         if not additions:
             return
         separator = "" if readme_text.endswith("\n") else "\n"
@@ -10494,6 +10506,55 @@ class OllamaCodeAgent:
         self._execute_controller_tool(
             name="write_file",
             arguments={"path": "README.md", "content": content},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+
+    def _maybe_update_cli_json_tests(
+        self,
+        *,
+        candidate_source: str,
+        test_path: str,
+        round_number: int,
+        request_text: str,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> None:
+        if "--json" not in candidate_source:
+            return
+        try:
+            test_file = self.tools.resolve_path(test_path, allow_missing=False)
+            test_text = test_file.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return
+        if "--json" in test_text:
+            return
+        helper_match = re.search(r"(?m)^def\s+(?P<name>[_A-Za-z]\w*)\(\*args:\s*str\)", test_text)
+        if not helper_match:
+            return
+        helper_name = helper_match.group("name")
+        insertion = (
+            "\n"
+            "    def test_json_output(self) -> None:\n"
+            f"        result = {helper_name}('--json')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('\"title\"', result.stdout)\n"
+            "        self.assertIn('\"body\"', result.stdout)\n"
+            "        self.assertIn('\"tags\"', result.stdout)\n"
+            "\n"
+        )
+        marker = "\n\nif __name__ == '__main__':"
+        if marker in test_text:
+            content = test_text.replace(marker, insertion + marker, 1)
+        else:
+            content = test_text.rstrip() + insertion
+        self._execute_controller_tool(
+            name="write_file",
+            arguments={"path": test_path, "content": content},
             request_text=request_text,
             round_number=round_number,
             successful_tool_results=successful_tool_results,
@@ -10569,6 +10630,15 @@ class OllamaCodeAgent:
                 request_text=request_text,
                 candidate_source=candidate_to_apply,
                 round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            self._maybe_update_cli_json_tests(
+                candidate_source=candidate_to_apply,
+                test_path=test_path,
+                round_number=round_number,
+                request_text=request_text,
                 successful_tool_results=successful_tool_results,
                 satisfied_tool_names=satisfied_tool_names,
                 tool_calls_this_turn=tool_calls_this_turn,

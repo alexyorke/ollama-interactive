@@ -3822,6 +3822,81 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("write-docs:todo:high", filtered.stdout)
         self.assertNotIn("ship-cli", filtered.stdout)
 
+    def test_synthesize_argparse_dataclass_json_cli_candidate_for_tagged_notes(self) -> None:
+        with self._temp_python_tools(
+            {
+                "notes_cli.py": (
+                    "from __future__ import annotations\n\n"
+                    "import argparse\n"
+                    "from dataclasses import dataclass\n\n\n"
+                    "@dataclass\n"
+                    "class Note:\n"
+                    "    title: str\n"
+                    "    body: str\n"
+                    "    tags: list[str]\n\n\n"
+                    "NOTES = [\n"
+                    "    Note('ship-cli', 'finish command line UX', ['work', 'todo']),\n"
+                    "    Note('buy-milk', 'remember oat milk', ['home']),\n"
+                    "    Note('fix-bug', 'handle empty input', ['work']),\n"
+                    "]\n\n\n"
+                    "def list_notes(tag: str | None = None) -> list[str]:\n"
+                    "    notes = NOTES if tag is None else [note for note in NOTES if tag in note.tags]\n"
+                    "    return [f'{note.title}: {note.body}' for note in notes]\n\n\n"
+                    "def main(argv: list[str] | None = None) -> int:\n"
+                    "    parser = argparse.ArgumentParser()\n"
+                    "    parser.add_argument('--tag', help='Only show notes with this tag')\n"
+                    "    args = parser.parse_args(argv)\n"
+                    "    for line in list_notes(args.tag):\n"
+                    "        print(line)\n"
+                    "    return 0\n\n\n"
+                    "if __name__ == '__main__':\n"
+                    "    raise SystemExit(main())\n"
+                ),
+                "tests/test_notes_cli.py": (
+                    "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                    "ROOT = Path(__file__).resolve().parents[1]\n\n"
+                    "def run_cli(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                    "    return subprocess.run([sys.executable, str(ROOT / 'notes_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                    "class NotesCliTests(unittest.TestCase):\n"
+                    "    def test_lists_notes(self) -> None:\n"
+                    "        result = run_cli()\n"
+                    "        self.assertEqual(result.returncode, 0)\n"
+                    "        self.assertIn('ship-cli: finish command line UX', result.stdout)\n\n"
+                    "    def test_filters_by_tag(self) -> None:\n"
+                    "        result = run_cli('--tag', 'home')\n"
+                    "        self.assertEqual(result.returncode, 0)\n"
+                    "        self.assertIn('buy-milk', result.stdout)\n"
+                    "        self.assertNotIn('ship-cli', result.stdout)\n"
+                ),
+            },
+            test_discover_args=("-s", "tests", "-v"),
+        ) as (root, tools, command):
+            synthesized = tools.synthesize_argparse_dataclass_json_cli_candidate("notes_cli.py", "tests/test_notes_cli.py")
+            source = str(synthesized.get("candidate_source") or "")
+            validation = tools.validate_implementation_candidate(
+                "notes_cli.py",
+                source,
+                test_path="tests/test_notes_cli.py",
+                test_command=command,
+            )
+            (root / "notes_cli.py").write_text(source, encoding="utf-8")
+            all_json = subprocess.run([sys.executable, str(root / "notes_cli.py"), "--json"], capture_output=True, text=True, check=False)
+            filtered_json = subprocess.run(
+                [sys.executable, str(root / "notes_cli.py"), "--tag", "work", "--json"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("parser.add_argument('--json'", source)
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(all_json.returncode, 0, all_json.stderr)
+        self.assertIn('"title": "ship-cli"', all_json.stdout)
+        self.assertEqual(filtered_json.returncode, 0, filtered_json.stderr)
+        self.assertIn('"title": "fix-bug"', filtered_json.stdout)
+        self.assertNotIn("buy-milk", filtered_json.stdout)
+
     def test_validate_implementation_candidate_uses_temp_workspace_and_preserves_signatures(self) -> None:
         with self._temp_python_tools(
             {

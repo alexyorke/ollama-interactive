@@ -3952,6 +3952,88 @@ class AgentTests(AgentTestBase):
         self.assertTrue(any(" stats" in command for command in run_shell_commands))
         self.assertTrue(any("--priority" in command for command in run_shell_commands))
 
+    def test_spec_guided_dataclass_cli_repair_updates_tests_docs_and_json_proof(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        source = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "from dataclasses import dataclass\n\n\n"
+            "@dataclass\n"
+            "class Note:\n"
+            "    title: str\n"
+            "    body: str\n"
+            "    tags: list[str]\n\n\n"
+            "NOTES = [\n"
+            "    Note('ship-cli', 'finish command line UX', ['work', 'todo']),\n"
+            "    Note('buy-milk', 'remember oat milk', ['home']),\n"
+            "    Note('fix-bug', 'handle empty input', ['work']),\n"
+            "]\n\n\n"
+            "def list_notes(tag: str | None = None) -> list[str]:\n"
+            "    notes = NOTES if tag is None else [note for note in NOTES if tag in note.tags]\n"
+            "    return [f'{note.title}: {note.body}' for note in notes]\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--tag', help='Only show notes with this tag')\n"
+            "    args = parser.parse_args(argv)\n"
+            "    for line in list_notes(args.tag):\n"
+            "        print(line)\n"
+            "    return 0\n\n\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        test_source = (
+            "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+            "ROOT = Path(__file__).resolve().parents[1]\n\n"
+            "def run_cli(*args: str) -> subprocess.CompletedProcess[str]:\n"
+            "    return subprocess.run([sys.executable, str(ROOT / 'notes_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+            "class NotesCliTests(unittest.TestCase):\n"
+            "    def test_lists_notes(self) -> None:\n"
+            "        result = run_cli()\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('ship-cli: finish command line UX', result.stdout)\n\n"
+            "    def test_filters_by_tag(self) -> None:\n"
+            "        result = run_cli('--tag', 'home')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('buy-milk', result.stdout)\n"
+            "        self.assertNotIn('ship-cli', result.stdout)\n"
+        )
+        (root / "notes_cli.py").write_text(source, encoding="utf-8")
+        (root / "README.md").write_text("# Notes CLI\n\n- `python notes_cli.py --tag work` filters by tag.\n", encoding="utf-8")
+        (root / "tests" / "test_notes_cli.py").write_text(test_source, encoding="utf-8")
+        command = f"{sys.executable} -m unittest discover -s tests -p test_notes_cli.py"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+        successful_tool_results = [
+            {"name": "read_file", "arguments": {"path": "notes_cli.py"}, "result": {"ok": True, "path": "notes_cli.py", "output": source}},
+            {"name": "read_file", "arguments": {"path": "tests/test_notes_cli.py"}, "result": {"ok": True, "path": "tests/test_notes_cli.py", "output": test_source}},
+        ]
+        tool_calls: list[dict[str, object]] = []
+
+        result = agent._try_spec_guided_repair(
+            request_text="Add a --json flag to notes_cli.py, update README.md and tests, run tests, and prove --tag work --json from the shell.",
+            round_number=3,
+            failed_run_test_result={"ok": False, "tool": "run_test", "summary": "json behavior missing", "output": "json behavior missing"},
+            run_test_arguments={"command": command},
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=set(),
+            tool_calls_this_turn=tool_calls,
+            allow_workspace_fallback=True,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.completed)
+        self.assertIn("--json", (root / "notes_cli.py").read_text(encoding="utf-8"))
+        self.assertIn("--json", (root / "README.md").read_text(encoding="utf-8"))
+        self.assertIn("test_json_output", (root / "tests" / "test_notes_cli.py").read_text(encoding="utf-8"))
+        run_shell_commands = [
+            str(call.get("arguments", {}).get("command", ""))
+            for call in tool_calls
+            if call.get("name") == "run_shell" and isinstance(call.get("arguments"), dict)
+        ]
+        self.assertTrue(any("--json" in command for command in run_shell_commands))
+        self.assertTrue(any("--tag work --json" in command for command in run_shell_commands))
+
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
         tools = ToolExecutor(root, approval_mode="auto")
@@ -10924,6 +11006,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_respects_explicit_skip_validation_request",
         "test_synthesized_final_runs_post_edit_validation_for_no_test_request",
         "test_post_edit_validation_feedback_includes_validator_diagnostic",
+        "test_spec_guided_dataclass_cli_repair_updates_tests_docs_and_json_proof",
         "test_failed_proactive_run_test_invokes_spec_guided_repair",
         "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
         "test_final_repair_spec_stop_attempts_spec_guided_repair",

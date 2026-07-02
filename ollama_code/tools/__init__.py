@@ -8792,6 +8792,149 @@ import string
             "summary": f"argparse task CLI candidate for {rel_source}",
         }
 
+    def synthesize_argparse_dataclass_json_cli_candidate(self, source_path: str, test_path: str | None = None, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        if "argparse" not in source_text or "--tag" not in source_text:
+            return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": "Requires argparse CLI with tag filtering."}
+        test_text = ""
+        if test_path:
+            try:
+                test_text = self.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                test_text = ""
+        combined = source_text + "\n" + test_text
+        if "subprocess" not in combined and "run_cli(" not in combined and "_run(" not in combined:
+            return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": "Requires CLI subprocess-style tests or evidence."}
+
+        dataclasses: dict[str, list[tuple[str, str]]] = {}
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef):
+                continue
+            if not any(
+                isinstance(decorator, ast.Name) and decorator.id == "dataclass"
+                or isinstance(decorator, ast.Attribute) and decorator.attr == "dataclass"
+                for decorator in node.decorator_list
+            ):
+                continue
+            fields: list[tuple[str, str]] = []
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    annotation = ast.get_source_segment(source_text, item.annotation) or "Any"
+                    fields.append((item.target.id, annotation))
+            if fields:
+                dataclasses[node.name] = fields
+        if not dataclasses:
+            return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": "Requires a dataclass model."}
+
+        collection_name = ""
+        class_name = ""
+        rows: list[dict[str, Any]] = []
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.List):
+                continue
+            target_names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+            if not target_names:
+                continue
+            calls = [item for item in node.value.elts if isinstance(item, ast.Call) and isinstance(item.func, ast.Name)]
+            if not calls or calls[0].func.id not in dataclasses:
+                continue
+            candidate_class = calls[0].func.id
+            fields = [field for field, _annotation in dataclasses[candidate_class]]
+            if not {"title", "body", "tags"}.issubset(fields):
+                continue
+            parsed_rows: list[dict[str, Any]] = []
+            for call in calls:
+                if not isinstance(call.func, ast.Name) or call.func.id != candidate_class:
+                    parsed_rows = []
+                    break
+                row: dict[str, Any] = {}
+                for field, value_node in zip(fields, call.args):
+                    try:
+                        row[field] = ast.literal_eval(value_node)
+                    except (ValueError, SyntaxError):
+                        parsed_rows = []
+                        break
+                if not parsed_rows and len(row) != min(len(fields), len(call.args)):
+                    break
+                for keyword in call.keywords:
+                    if keyword.arg is None:
+                        parsed_rows = []
+                        break
+                    try:
+                        row[keyword.arg] = ast.literal_eval(keyword.value)
+                    except (ValueError, SyntaxError):
+                        parsed_rows = []
+                        break
+                if not {"title", "body", "tags"}.issubset(row):
+                    parsed_rows = []
+                    break
+                parsed_rows.append(row)
+            if parsed_rows:
+                collection_name = target_names[0]
+                class_name = candidate_class
+                rows = parsed_rows
+                break
+        if not collection_name or not class_name or not rows:
+            return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": "Requires a literal dataclass collection with title, body, and tags."}
+
+        fields = dataclasses[class_name]
+        list_function = "list_notes" if "def list_notes" in source_text else "list_items"
+        item_name = class_name[:1].lower() + class_name[1:]
+        constructor_rows = ",\n".join(
+            "    " + class_name + "(" + ", ".join(f"{field}={row[field]!r}" for field, _annotation in fields if field in row) + ")"
+            for row in rows
+        )
+        field_lines = "\n".join(f"    {field}: {annotation}" for field, annotation in fields)
+        candidate = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "import json\n"
+            "from dataclasses import asdict, dataclass\n\n\n"
+            "@dataclass\n"
+            f"class {class_name}:\n"
+            f"{field_lines}\n\n\n"
+            f"{collection_name} = [\n"
+            f"{constructor_rows}\n"
+            "]\n\n\n"
+            f"def selected_{collection_name.lower()}(tag: str | None = None) -> list[{class_name}]:\n"
+            "    if tag is None:\n"
+            f"        return list({collection_name})\n"
+            f"    return [{item_name} for {item_name} in {collection_name} if tag in {item_name}.tags]\n\n\n"
+            f"def {list_function}(tag: str | None = None) -> list[str]:\n"
+            f"    return [f'{{{item_name}.title}}: {{{item_name}.body}}' for {item_name} in selected_{collection_name.lower()}(tag)]\n\n\n"
+            "def json_items(tag: str | None = None) -> str:\n"
+            f"    return json.dumps([asdict({item_name}) for {item_name} in selected_{collection_name.lower()}(tag)])\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--tag', help='Only show items with this tag')\n"
+            "    parser.add_argument('--json', action='store_true', help='Print selected items as JSON')\n"
+            "    args = parser.parse_args(argv)\n"
+            "    if args.json:\n"
+            "        print(json_items(args.tag))\n"
+            "        return 0\n"
+            f"    for line in {list_function}(args.tag):\n"
+            "        print(line)\n"
+            "    return 0\n\n\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        return {
+            "ok": True,
+            "tool": "synthesize_argparse_dataclass_json_cli_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": f"argparse dataclass JSON CLI candidate for {rel_source}",
+        }
+
     def implementation_spec(self, source_path: str, test_path: str | None = None, limit: int = 40) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)
