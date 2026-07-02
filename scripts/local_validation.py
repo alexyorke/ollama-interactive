@@ -39,6 +39,7 @@ AGENT_MODULES = (
 )
 
 MAX_AUTO_PYTEST_WORKERS = 16
+DEFAULT_COMMAND_TIMEOUT_S = 900.0
 LIVE_GATE_SUMMARY_NAME = "live-model-gate-summary.json"
 LIVE_GATE_CLAIM_PATHS = (
     "README.md",
@@ -138,11 +139,23 @@ def _run(
     *,
     runner: str,
     resolved_jobs: str,
+    timeout_s: float | None = DEFAULT_COMMAND_TIMEOUT_S,
 ) -> dict[str, Any]:
     started = time.perf_counter()
-    completed = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, check=False)
+    timed_out = False
+    try:
+        completed = subprocess.run(command, cwd=repo_root, capture_output=True, text=True, check=False, timeout=timeout_s)
+        stdout = completed.stdout or ""
+        stderr = completed.stderr or ""
+        returncode = completed.returncode
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")
+        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else str(exc.stderr or "")
+        stderr = "\n".join(part for part in (stderr, f"Command timed out after {timeout_s} seconds.") if part)
+        returncode = 124
     elapsed_s = round(time.perf_counter() - started, 3)
-    combined = "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
+    combined = "\n".join(part for part in (stdout.strip(), stderr.strip()) if part)
     target_args = []
     if runner == "pytest":
         target_args = command[6:] if resolved_jobs != "off" else command[4:]
@@ -154,8 +167,10 @@ def _run(
         "runner": runner,
         "resolved_jobs": resolved_jobs,
         "target_count": len(target_args),
-        "ok": completed.returncode == 0,
-        "returncode": completed.returncode,
+        "ok": returncode == 0,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "timeout_s": timeout_s,
         "elapsed_s": elapsed_s,
         "output_tail": combined[-4000:],
     }
@@ -164,9 +179,10 @@ def _run(
 def _looks_like_xdist_infrastructure_failure(row: dict[str, Any]) -> bool:
     output = str(row.get("output_tail") or "").lower()
     return bool(
-        row.get("returncode") == 3
+        (row.get("returncode") == 3 or row.get("timed_out") is True)
         and (
-            "xdist" in output
+            row.get("timed_out") is True
+            or "xdist" in output
             or "execnet" in output
             or "internalerror" in output
             or "eoferror" in output
@@ -527,6 +543,7 @@ def run_validation(
     runner: str = "auto",
     jobs: str = "auto",
     compare_unittest_baseline: bool = False,
+    command_timeout_s: float | None = DEFAULT_COMMAND_TIMEOUT_S,
 ) -> dict[str, Any]:
     command_rows: list[dict[str, Any]] = []
     resolved_runner = _resolved_runner(runner)
@@ -534,13 +551,14 @@ def run_validation(
     planned_commands = _tier_commands(tier, runner=runner, jobs=jobs)
     planned_tiers = [name for name, _ in planned_commands]
     for name, command in planned_commands:
-        row = _run(repo_root, name, command, runner=resolved_runner, resolved_jobs=resolved_jobs)
+        row = _run(repo_root, name, command, runner=resolved_runner, resolved_jobs=resolved_jobs, timeout_s=command_timeout_s)
         if resolved_runner == "pytest" and resolved_jobs != "off" and _looks_like_xdist_infrastructure_failure(row):
             fallback_command = _pytest_serial_command(command)
-            fallback_row = _run(repo_root, name, fallback_command, runner=resolved_runner, resolved_jobs="off")
+            fallback_row = _run(repo_root, name, fallback_command, runner=resolved_runner, resolved_jobs="off", timeout_s=command_timeout_s)
             fallback_row["fallback_for"] = "xdist_infrastructure_failure"
             fallback_row["original_returncode"] = row.get("returncode")
             fallback_row["original_output_tail"] = row.get("output_tail")
+            fallback_row["original_timed_out"] = row.get("timed_out")
             row = fallback_row
         command_rows.append(row)
         if not row["ok"]:
@@ -569,6 +587,7 @@ def run_validation(
         "resolved_runner": resolved_runner,
         "jobs": jobs,
         "resolved_jobs": resolved_jobs,
+        "command_timeout_s": command_timeout_s,
         **_runtime_capabilities(),
         "ok": ok,
         "command_ok": command_ok,
@@ -596,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tier", choices=["smoke", "agent", "full"], default="smoke")
     parser.add_argument("--runner", choices=["auto", "pytest", "unittest"], default="auto")
     parser.add_argument("--jobs", default="auto", help="Pytest xdist workers: auto, off, 1, or an integer > 1. auto uses a bounded worker count.")
+    parser.add_argument("--command-timeout-s", type=float, default=DEFAULT_COMMAND_TIMEOUT_S, help="Per-validation-command timeout in seconds; use 0 to disable.")
     parser.add_argument(
         "--compare-unittest-baseline",
         action="store_true",
@@ -608,6 +628,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("pytest runner requested, but pytest is not installed in this environment.")
     if args.jobs and args.runner != "unittest":
         _pytest_worker_args(args.jobs)
+    command_timeout_s = None if args.command_timeout_s <= 0 else float(args.command_timeout_s)
 
     payload = run_validation(
         args.tier,
@@ -615,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         runner=args.runner,
         jobs=args.jobs,
         compare_unittest_baseline=args.compare_unittest_baseline,
+        command_timeout_s=command_timeout_s,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

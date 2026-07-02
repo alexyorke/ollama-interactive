@@ -93,6 +93,7 @@ class LocalValidationTests(unittest.TestCase):
             *,
             runner: str,
             resolved_jobs: str,
+            timeout_s: float | None = None,
         ) -> dict[str, object]:
             calls.append((name, resolved_jobs))
             if len(calls) == 1:
@@ -104,6 +105,7 @@ class LocalValidationTests(unittest.TestCase):
                     "target_count": 1,
                     "ok": False,
                     "returncode": 3,
+                    "timed_out": False,
                     "elapsed_s": 0.1,
                     "output_tail": "INTERNALERROR xdist execnet EOFError",
                 }
@@ -115,6 +117,7 @@ class LocalValidationTests(unittest.TestCase):
                 "target_count": 1,
                 "ok": True,
                 "returncode": 0,
+                "timed_out": False,
                 "elapsed_s": 0.2,
                 "output_tail": "ok",
             }
@@ -128,6 +131,56 @@ class LocalValidationTests(unittest.TestCase):
         self.assertTrue(payload["command_ok"])
         self.assertEqual(payload["commands"][0]["fallback_for"], "xdist_infrastructure_failure")
         self.assertEqual(payload["commands"][0]["original_returncode"], 3)
+        self.assertFalse(payload["commands"][0]["original_timed_out"])
+
+    def test_run_validation_retries_xdist_timeout_serially(self) -> None:
+        calls: list[tuple[str, str, float | None]] = []
+
+        def fake_run(
+            repo_root: Path,
+            name: str,
+            command: list[str],
+            *,
+            runner: str,
+            resolved_jobs: str,
+            timeout_s: float | None = None,
+        ) -> dict[str, object]:
+            calls.append((name, resolved_jobs, timeout_s))
+            if len(calls) == 1:
+                return {
+                    "name": name,
+                    "command": command,
+                    "runner": runner,
+                    "resolved_jobs": resolved_jobs,
+                    "target_count": 1,
+                    "ok": False,
+                    "returncode": 124,
+                    "timed_out": True,
+                    "elapsed_s": 2.0,
+                    "output_tail": "Command timed out after 2.0 seconds.",
+                }
+            return {
+                "name": name,
+                "command": command,
+                "runner": runner,
+                "resolved_jobs": resolved_jobs,
+                "target_count": 1,
+                "ok": True,
+                "returncode": 0,
+                "timed_out": False,
+                "elapsed_s": 0.2,
+                "output_tail": "ok",
+            }
+
+        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            with patch.object(local_validation.os, "cpu_count", return_value=32):
+                with patch.object(local_validation, "_run", side_effect=fake_run):
+                    payload = local_validation.run_validation("smoke", repo_root=Path.cwd(), runner="auto", jobs="auto", command_timeout_s=2.0)
+
+        self.assertEqual(calls, [("smoke", "16", 2.0), ("smoke", "off", 2.0)])
+        self.assertTrue(payload["command_ok"])
+        self.assertEqual(payload["command_timeout_s"], 2.0)
+        self.assertTrue(payload["commands"][0]["original_timed_out"])
 
     def test_timing_summary_orders_slowest_commands(self) -> None:
         summary = local_validation._timing_summary(
@@ -193,6 +246,20 @@ class LocalValidationTests(unittest.TestCase):
 
         self.assertEqual(row["target_count"], 1)
 
+    def test_run_records_timeout_as_bounded_failure(self) -> None:
+        command = [sys.executable, "-m", "pytest", "-q", "tests/test_local_validation.py"]
+        timeout = local_validation.subprocess.TimeoutExpired(command, timeout=1.5, output="partial", stderr="still running")
+
+        with patch.object(local_validation.subprocess, "run", side_effect=timeout):
+            row = local_validation._run(Path.cwd(), "smoke", command, runner="pytest", resolved_jobs="off", timeout_s=1.5)
+
+        self.assertFalse(row["ok"])
+        self.assertTrue(row["timed_out"])
+        self.assertEqual(row["returncode"], 124)
+        self.assertEqual(row["timeout_s"], 1.5)
+        self.assertIn("partial", row["output_tail"])
+        self.assertIn("Command timed out after 1.5 seconds.", row["output_tail"])
+
     def test_run_validation_records_remaining_tiers_after_failure(self) -> None:
         def fake_run(
             repo_root: Path,
@@ -201,6 +268,7 @@ class LocalValidationTests(unittest.TestCase):
             *,
             runner: str,
             resolved_jobs: str,
+            timeout_s: float | None = None,
         ) -> dict[str, object]:
             return {
                 "name": name,
@@ -242,6 +310,7 @@ class LocalValidationTests(unittest.TestCase):
             *,
             runner: str,
             resolved_jobs: str,
+            timeout_s: float | None = None,
         ) -> dict[str, object]:
             return {
                 "name": name,
@@ -377,6 +446,7 @@ class LocalValidationTests(unittest.TestCase):
             *,
             runner: str,
             resolved_jobs: str,
+            timeout_s: float | None = None,
         ) -> dict[str, object]:
             return {
                 "name": name,
@@ -429,6 +499,7 @@ class LocalValidationTests(unittest.TestCase):
             *,
             runner: str,
             resolved_jobs: str,
+            timeout_s: float | None = None,
         ) -> dict[str, object]:
             elapsed_s = 0.1
             if name == "unittest-baseline":
@@ -495,6 +566,7 @@ class LocalValidationTests(unittest.TestCase):
             *,
             runner: str,
             resolved_jobs: str,
+            timeout_s: float | None = None,
         ) -> dict[str, object]:
             return {
                 "name": name,
