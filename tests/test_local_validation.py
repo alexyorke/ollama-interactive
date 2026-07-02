@@ -75,6 +75,60 @@ class LocalValidationTests(unittest.TestCase):
         self.assertEqual(row["target_count"], 1)
         self.assertTrue(row["ok"])
 
+    def test_pytest_serial_command_strips_xdist_worker_args(self) -> None:
+        command = [sys.executable, "-m", "pytest", "-q", "-n", "16", "tests/test_local_validation.py"]
+
+        self.assertEqual(
+            local_validation._pytest_serial_command(command),
+            [sys.executable, "-m", "pytest", "-q", "tests/test_local_validation.py"],
+        )
+
+    def test_run_validation_retries_xdist_infrastructure_failure_serially(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_run(
+            repo_root: Path,
+            name: str,
+            command: list[str],
+            *,
+            runner: str,
+            resolved_jobs: str,
+        ) -> dict[str, object]:
+            calls.append((name, resolved_jobs))
+            if len(calls) == 1:
+                return {
+                    "name": name,
+                    "command": command,
+                    "runner": runner,
+                    "resolved_jobs": resolved_jobs,
+                    "target_count": 1,
+                    "ok": False,
+                    "returncode": 3,
+                    "elapsed_s": 0.1,
+                    "output_tail": "INTERNALERROR xdist execnet EOFError",
+                }
+            return {
+                "name": name,
+                "command": command,
+                "runner": runner,
+                "resolved_jobs": resolved_jobs,
+                "target_count": 1,
+                "ok": True,
+                "returncode": 0,
+                "elapsed_s": 0.2,
+                "output_tail": "ok",
+            }
+
+        with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
+            with patch.object(local_validation.os, "cpu_count", return_value=32):
+                with patch.object(local_validation, "_run", side_effect=fake_run):
+                    payload = local_validation.run_validation("smoke", repo_root=Path.cwd(), runner="auto", jobs="auto")
+
+        self.assertEqual(calls, [("smoke", "16"), ("smoke", "off")])
+        self.assertTrue(payload["command_ok"])
+        self.assertEqual(payload["commands"][0]["fallback_for"], "xdist_infrastructure_failure")
+        self.assertEqual(payload["commands"][0]["original_returncode"], 3)
+
     def test_timing_summary_orders_slowest_commands(self) -> None:
         summary = local_validation._timing_summary(
             [

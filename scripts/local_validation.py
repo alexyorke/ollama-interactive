@@ -161,6 +161,31 @@ def _run(
     }
 
 
+def _looks_like_xdist_infrastructure_failure(row: dict[str, Any]) -> bool:
+    output = str(row.get("output_tail") or "").lower()
+    return bool(
+        row.get("returncode") == 3
+        and (
+            "xdist" in output
+            or "execnet" in output
+            or "internalerror" in output
+            or "eoferror" in output
+        )
+    )
+
+
+def _pytest_serial_command(command: list[str]) -> list[str]:
+    serial: list[str] = []
+    index = 0
+    while index < len(command):
+        if command[index] == "-n" and index + 1 < len(command):
+            index += 2
+            continue
+        serial.append(command[index])
+        index += 1
+    return serial
+
+
 def _command_targets(command: list[str], *, runner: str, resolved_jobs: str) -> list[str]:
     if runner == "pytest":
         return command[6:] if resolved_jobs != "off" else command[4:]
@@ -510,6 +535,13 @@ def run_validation(
     planned_tiers = [name for name, _ in planned_commands]
     for name, command in planned_commands:
         row = _run(repo_root, name, command, runner=resolved_runner, resolved_jobs=resolved_jobs)
+        if resolved_runner == "pytest" and resolved_jobs != "off" and _looks_like_xdist_infrastructure_failure(row):
+            fallback_command = _pytest_serial_command(command)
+            fallback_row = _run(repo_root, name, fallback_command, runner=resolved_runner, resolved_jobs="off")
+            fallback_row["fallback_for"] = "xdist_infrastructure_failure"
+            fallback_row["original_returncode"] = row.get("returncode")
+            fallback_row["original_output_tail"] = row.get("output_tail")
+            row = fallback_row
         command_rows.append(row)
         if not row["ok"]:
             break

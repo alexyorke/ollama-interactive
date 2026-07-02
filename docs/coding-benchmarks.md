@@ -71,7 +71,7 @@ Run the full local validation stack before merging larger controller changes:
 python scripts/local_validation.py --tier full
 ```
 
-When `pytest` and `xdist` are available, the local validation script resolves `--jobs auto` to a bounded worker count instead of delegating to unrestricted `xdist auto`. If `coverage_summary.full_plan_covers_all_discovered_targets` is false, `scripts/local_validation.py` exits nonzero even when the subprocesses themselves passed.
+When `pytest` and `xdist` are available, the local validation script resolves `--jobs auto` to a bounded worker count instead of delegating to unrestricted `xdist auto`. If xdist itself fails with an infrastructure-level internal/execnet/EOF error, the same pytest target is retried once serially and the command row records `fallback_for=xdist_infrastructure_failure`. If `coverage_summary.full_plan_covers_all_discovered_targets` is false, `scripts/local_validation.py` exits nonzero even when the subprocesses themselves passed.
 
 Run A/B feature profiles without changing prompts:
 
