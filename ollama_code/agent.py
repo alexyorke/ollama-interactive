@@ -10497,6 +10497,20 @@ class OllamaCodeAgent:
                 commands.append(self._repair_shell_command([sys.executable, source_path, "--tag", "work", "--json"]))
         return commands
 
+    def _mechanical_obligation_repair_failed_for(self, source_path: str, test_path: str) -> bool:
+        normalized_source = str(source_path or "").strip().replace("\\", "/").lstrip("./")
+        normalized_test = str(test_path or "").strip().replace("\\", "/").lstrip("./")
+        for event in reversed(self.events):
+            if event.get("type") != "spec_guided_repair":
+                continue
+            if event.get("phase") != "mechanical_obligation_verification":
+                continue
+            event_source = str(event.get("source_path") or "").strip().replace("\\", "/").lstrip("./")
+            event_test = str(event.get("test_path") or "").strip().replace("\\", "/").lstrip("./")
+            if event_source == normalized_source and event_test == normalized_test and event.get("ok") is False:
+                return True
+        return False
+
     def _maybe_update_cli_readme_docs(
         self,
         *,
@@ -10602,6 +10616,8 @@ class OllamaCodeAgent:
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> AgentResult | None:
+        if self._mechanical_obligation_repair_failed_for(source_path, test_path):
+            return None
         for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
                 synthesize = getattr(self.tools, synthesis_name)
@@ -10696,6 +10712,41 @@ class OllamaCodeAgent:
                 )
                 if proof_result.get("ok") is not True:
                     return None
+            request_obligations = self._derive_request_obligations(
+                request_text=request_text,
+                required_tool_names=set(),
+                required_mutation_paths=self._requested_mutation_paths(request_text),
+                code_mutation_required=True,
+                test_run_required=bool(test_command),
+            )
+            obligation_statuses = self._request_obligation_proof_status(
+                obligations=request_obligations,
+                successful_tool_results=successful_tool_results,
+                required_tool_names=set(),
+            )
+            unresolved_obligations = [
+                item for item in obligation_statuses if str(item.get("status") or "").strip() != "proven"
+            ]
+            if unresolved_obligations:
+                self._record_event(
+                    "spec_guided_repair",
+                    phase="mechanical_obligation_verification",
+                    ok=False,
+                    source_path=source_path,
+                    test_path=test_path,
+                    unresolved_obligations=unresolved_obligations,
+                    rounds=round_number,
+                )
+                return None
+            self._record_event(
+                "spec_guided_repair",
+                phase="mechanical_obligation_verification",
+                ok=True,
+                source_path=source_path,
+                test_path=test_path,
+                obligation_checks=obligation_statuses,
+                rounds=round_number,
+            )
             message = "Spec-guided mechanical repair applied and tests passed."
             if proof_commands:
                 message = "Spec-guided mechanical repair applied; tests and direct CLI proof passed."
@@ -10726,6 +10777,8 @@ class OllamaCodeAgent:
         if paths is None:
             return None
         source_path, test_path = paths
+        if self._mechanical_obligation_repair_failed_for(source_path, test_path):
+            return None
         self._record_event(
             "spec_guided_repair",
             phase="post_context_cli_mechanical_start",

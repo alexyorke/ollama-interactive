@@ -4131,6 +4131,145 @@ class AgentTests(AgentTestBase):
         self.assertTrue(any("--json" in command for command in run_shell_commands))
         self.assertTrue(any("--tag work --json" in command for command in run_shell_commands))
 
+    def test_spec_guided_mechanical_repair_rejects_unproven_requested_flag(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        source = (
+            "from __future__ import annotations\n\n"
+            "import argparse\nimport json\n"
+            "from dataclasses import asdict, dataclass\n\n\n"
+            "@dataclass\n"
+            "class Note:\n"
+            "    title: str\n"
+            "    body: str\n"
+            "    tags: list[str]\n\n\n"
+            "NOTES = [\n"
+            "    Note('ship-cli', 'finish command line UX', ['work', 'todo']),\n"
+            "    Note('buy-milk', 'remember oat milk', ['home']),\n"
+            "    Note('fix-bug', 'handle empty input', ['work']),\n"
+            "]\n\n\n"
+            "def selected_notes(tag: str | None = None) -> list[Note]:\n"
+            "    if tag is None:\n"
+            "        return list(NOTES)\n"
+            "    return [note for note in NOTES if tag in note.tags]\n\n\n"
+            "def list_notes(tag: str | None = None) -> list[str]:\n"
+            "    return [f'{note.title}: {note.body}' for note in selected_notes(tag)]\n\n\n"
+            "def json_items(tag: str | None = None) -> str:\n"
+            "    return json.dumps([asdict(note) for note in selected_notes(tag)])\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    parser.add_argument('--tag', help='Only show notes with this tag')\n"
+            "    parser.add_argument('--json', action='store_true', help='Print selected items as JSON')\n"
+            "    args = parser.parse_args(argv)\n"
+            "    if args.json:\n"
+            "        print(json_items(args.tag))\n"
+            "        return 0\n"
+            "    for line in list_notes(args.tag):\n"
+            "        print(line)\n"
+            "    return 0\n\n\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        test_source = (
+            "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+            "ROOT = Path(__file__).resolve().parents[1]\n\n"
+            "def run_cli(*args: str) -> subprocess.CompletedProcess[str]:\n"
+            "    return subprocess.run([sys.executable, str(ROOT / 'notes_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+            "class NotesCliTests(unittest.TestCase):\n"
+            "    def test_json_output(self) -> None:\n"
+            "        result = run_cli('--json')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('\"title\"', result.stdout)\n"
+        )
+        (root / "notes_cli.py").write_text(source, encoding="utf-8")
+        (root / "README.md").write_text("# Notes CLI\n\n- `python notes_cli.py --json` prints JSON.\n", encoding="utf-8")
+        (root / "tests" / "test_notes_cli.py").write_text(test_source, encoding="utf-8")
+        command = f"{sys.executable} -m unittest discover -s tests -p test_notes_cli.py"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+        successful_tool_results = [
+            {"name": "read_file", "arguments": {"path": "notes_cli.py"}, "result": {"ok": True, "path": "notes_cli.py", "output": source}},
+            {"name": "read_file", "arguments": {"path": "tests/test_notes_cli.py"}, "result": {"ok": True, "path": "tests/test_notes_cli.py", "output": test_source}},
+        ]
+        tool_calls: list[dict[str, object]] = []
+
+        result = agent._try_spec_guided_mechanical_repair(
+            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            round_number=3,
+            source_path="notes_cli.py",
+            test_path="tests/test_notes_cli.py",
+            test_command=command,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=set(),
+            tool_calls_this_turn=tool_calls,
+        )
+
+        self.assertIsNone(result)
+        self.assertFalse(any(event.get("type") == "assistant_synthesized" for event in agent.events))
+        obligation_events = [
+            event
+            for event in agent.events
+            if event.get("type") == "spec_guided_repair"
+            and event.get("phase") == "mechanical_obligation_verification"
+        ]
+        self.assertEqual(obligation_events[-1].get("ok"), False)
+        unresolved_labels = [
+            str(item.get("label") or "")
+            for item in obligation_events[-1].get("unresolved_obligations", [])
+            if isinstance(item, dict)
+        ]
+        self.assertTrue(any('"--limit" flag' in label for label in unresolved_labels))
+        repeat_direct = agent._try_spec_guided_mechanical_repair(
+            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            round_number=4,
+            source_path="notes_cli.py",
+            test_path="tests/test_notes_cli.py",
+            test_command=command,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=set(),
+            tool_calls_this_turn=tool_calls,
+        )
+        obligation_events_after_repeat = [
+            event
+            for event in agent.events
+            if event.get("type") == "spec_guided_repair"
+            and event.get("phase") == "mechanical_obligation_verification"
+        ]
+        self.assertIsNone(repeat_direct)
+        self.assertEqual(len(obligation_events_after_repeat), len(obligation_events))
+        prior_mechanical_starts = [
+            event
+            for event in agent.events
+            if event.get("type") == "spec_guided_repair"
+            and event.get("phase") == "post_context_cli_mechanical_start"
+        ]
+        request_obligations = agent._derive_request_obligations(
+            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+
+        repeat = agent._try_post_context_cli_feature_repair(
+            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            round_number=4,
+            request_obligations=request_obligations,
+            forbidden_tool_names=set(),
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=set(),
+            tool_calls_this_turn=tool_calls,
+        )
+        later_mechanical_starts = [
+            event
+            for event in agent.events
+            if event.get("type") == "spec_guided_repair"
+            and event.get("phase") == "post_context_cli_mechanical_start"
+        ]
+
+        self.assertIsNone(repeat)
+        self.assertEqual(len(later_mechanical_starts), len(prior_mechanical_starts))
+
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
         tools = ToolExecutor(root, approval_mode="auto")
@@ -11173,6 +11312,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_synthesized_final_runs_post_edit_validation_for_no_test_request",
         "test_post_edit_validation_feedback_includes_validator_diagnostic",
         "test_spec_guided_dataclass_cli_repair_updates_tests_docs_and_json_proof",
+        "test_spec_guided_mechanical_repair_rejects_unproven_requested_flag",
         "test_failed_proactive_run_test_invokes_spec_guided_repair",
         "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
         "test_final_repair_spec_stop_attempts_spec_guided_repair",
