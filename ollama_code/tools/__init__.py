@@ -11116,6 +11116,7 @@ import string
         self._check_interrupted()
         base = self.resolve_path(path, allow_missing=False)
         root = self._project_root_for(base)
+        requested_rel = self.relative_label(base).replace("\\", "/") if base.is_file() else ""
         validators: list[dict[str, Any]] = []
         limit_value = max(1, int(limit))
 
@@ -11155,6 +11156,23 @@ import string
         sql_file = ""
         schema_file = ""
         python_tests = False
+        if requested_rel:
+            requested_suffix = Path(requested_rel).suffix.lower()
+            requested_name = Path(requested_rel).name.lower()
+            if requested_suffix in {".yml", ".yaml"}:
+                yaml_file = requested_rel
+                if requested_rel.lower().startswith(".github/workflows/"):
+                    workflow_file = requested_rel
+            if requested_suffix in SHELL_SCRIPT_SUFFIXES:
+                shell_script = requested_rel
+            if requested_name == "dockerfile" or requested_name.endswith(".dockerfile"):
+                dockerfile = requested_rel
+            if requested_suffix in {".md", ".markdown"}:
+                markdown_file = requested_rel
+            if requested_suffix == ".sql":
+                sql_file = requested_rel
+            if requested_name.endswith(".schema.json") or requested_name.endswith(".jsonschema"):
+                schema_file = requested_rel
         for file_path in repo_files:
             suffix = file_path.suffix.lower()
             name = file_path.name.lower()
@@ -11294,11 +11312,18 @@ import string
                 add("test", "cpp", "ctest --test-dir build --output-on-failure", "CMake build directory found.")
             add("setup", "cpp", "cmake -S . -B build", "CMake project detected; creates/updates build dir if run.")
         if workflow_file:
-            add("lint", "github-actions", "actionlint", "GitHub Actions workflow files found.")
+            actionlint_command = command_to_text(("actionlint", workflow_file)) if requested_rel else "actionlint"
+            add("lint", "github-actions", actionlint_command, "GitHub Actions workflow files found.")
             add(
                 "schema",
                 "github-actions",
-                python_tool_command_text("check-jsonschema", "check_jsonschema", "--builtin-schema", "vendor.github-workflows", ".github/workflows"),
+                python_tool_command_text(
+                    "check-jsonschema",
+                    "check_jsonschema",
+                    "--builtin-schema",
+                    "vendor.github-workflows",
+                    workflow_file if requested_rel else ".github/workflows",
+                ),
                 "GitHub Actions workflow files found.",
             )
         if yaml_file:

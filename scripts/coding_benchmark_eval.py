@@ -606,6 +606,44 @@ def validate_docs_sync_without_tests_still_validates(ctx: BenchmarkContext) -> s
     )
 
 
+def prepare_workflow_config_validation(ctx_workspace: Path) -> None:
+    _write(
+        ctx_workspace / ".github" / "workflows" / "ci.yml",
+        "name: CI\n"
+        "on:\n"
+        "  push:\n"
+        "    branches: [main]\n"
+        "jobs:\n"
+        "  test:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: python -m unittest\n",
+    )
+    _write(ctx_workspace / "README.md", "# Workflow Demo\n\nCI runs unittest.\n")
+    _write(ctx_workspace / "tests" / "test_placeholder.py", "import unittest\n\nclass PlaceholderTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n")
+
+
+def validate_workflow_config_validation(ctx: BenchmarkContext) -> str:
+    workflow = (ctx.workspace / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    workflow_changed = "pull_request:" in workflow and "python -m unittest discover -s tests -v" in workflow
+    run_test_calls = tool_call_args(ctx.session, "run_test")
+    actionlint_proof = any("actionlint" in str(arguments.get("command", "")).lower() for arguments in run_test_calls)
+    generic_test_only = any(
+        "unittest discover" in str(arguments.get("command", "")).lower()
+        and "actionlint" not in str(arguments.get("command", "")).lower()
+        for arguments in run_test_calls
+    )
+    validators_discovered = any(
+        result.get("ok") is True and "github-actions" in str(result.get("output", "")).lower()
+        for result in tool_results(ctx.session, "discover_validators")
+    )
+    return _status_or_fail_closed(
+        ctx,
+        workflow_changed and validators_discovered and actionlint_proof and not generic_test_only,
+    )
+
+
 def prepare_feature_delivery_cli_proof(workspace: Path) -> None:
     _write(
         workspace / "task_cli.py",
@@ -1097,6 +1135,16 @@ LOCAL_CASES: list[BenchmarkCase] = [
         turns=("Add an optional include_orders: bool = False parameter to fetch_user in src/api.py and update docs/api.md with that parameter, but do not run tests.",),
         prepare=prepare_docs_sync_without_tests_still_validates,
         validate=validate_docs_sync_without_tests_still_validates,
+        budget_off=SMALL_BUDGET_OFF,
+        budget_on=SMALL_BUDGET_ON,
+    ),
+    BenchmarkCase(
+        name="workflow_config_validation",
+        suite="local-full",
+        turns=("Update .github/workflows/ci.yml to also run on pull_request and change its unittest command to `python -m unittest discover -s tests -v`. Do not run Python tests; validate the workflow config.",),
+        prepare=prepare_workflow_config_validation,
+        validate=validate_workflow_config_validation,
+        test_cmd=_python_test_cmd(),
         budget_off=SMALL_BUDGET_OFF,
         budget_on=SMALL_BUDGET_ON,
     ),

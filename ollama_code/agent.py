@@ -7418,7 +7418,7 @@ class OllamaCodeAgent:
     def _request_forbids_tests(self, text: str) -> bool:
         lowered = text.lower()
         explicit_skip_patterns = [
-            r"\b(?:do not|don't|dont|skip)\s+(?:run|rerun|execute)(?:\s+the)?\s+(?:tests?|test suite)\b",
+            r"\b(?:do not|don't|dont|skip)\s+(?:run|rerun|execute)(?:\s+the)?\s+(?:(?:[\w-]+)\s+){0,4}(?:tests?|test suite)\b",
             r"\b(?:do not|don't|dont|skip)\s+(?:use\s+)?(?:pytest|unittest)\b",
             r"\bwithout\s+(?:running\s+)?(?:tests?|test suite)\b",
             r"\bwithout\s+(?:using\s+)?(?:pytest|unittest)\b",
@@ -7430,7 +7430,7 @@ class OllamaCodeAgent:
         lowered = text.lower()
         return bool(
             re.search(
-                r"\b(?:do not|don't|dont|skip|without|no)\b[^.?!\n]{0,80}\b(?:validation|validate|validator|validators|lint|linter|typecheck|type\s+check|sanity\s+check)\b",
+                r"\b(?:do not|don't|dont|skip|without|no)\b[^.?!;\n]{0,80}\b(?:validation|validate|validator|validators|lint|linter|typecheck|type\s+check|sanity\s+check)\b",
                 lowered,
             )
         )
@@ -7464,7 +7464,9 @@ class OllamaCodeAgent:
         if code_paths and allow_tests and "select_tests" not in forbidden_tool_names:
             return "select_tests", {"changed_files": code_paths}, "select targeted tests for changed file(s)"
         if mutated_paths and allow_non_test_validation and "discover_validators" not in forbidden_tool_names:
-            return "discover_validators", {"path": "."}, "discover validators for non-code edit"
+            non_code_paths = sorted(path for path in mutated_paths if Path(path).suffix.lower() not in CODE_EDIT_SUFFIXES)
+            validator_path = non_code_paths[0] if len(non_code_paths) == 1 else "."
+            return "discover_validators", {"path": validator_path}, "discover validators for non-code edit"
         if allow_tests and self.tools.default_test_command and "run_test" not in forbidden_tool_names:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
@@ -7491,6 +7493,21 @@ class OllamaCodeAgent:
             elif name == "dockerfile" or name.endswith(".dockerfile"):
                 add("dockerfile")
         return preferred
+
+    def _run_test_command_matches_preferred_non_code_validator(self, command: str, preferred_langs: list[str]) -> bool:
+        lowered = str(command or "").strip().lower()
+        if not lowered:
+            return False
+        validator_markers = {
+            "github-actions": ("actionlint", "check-jsonschema", "vendor.github-workflows"),
+            "yaml": ("yamllint",),
+            "shell": ("shellcheck", "bash -n", "bash.exe -n"),
+            "dockerfile": ("hadolint",),
+        }
+        for lang in preferred_langs:
+            if any(marker in lowered for marker in validator_markers.get(lang, ())):
+                return True
+        return False
 
     def _discover_validators_followup(
         self,
@@ -12231,6 +12248,62 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if name == "run_test":
+                    allow_tests_now, allow_non_test_validation_now = self._validation_preferences(text)
+                    preferred_validator_langs = self._preferred_non_code_validator_langs(mutated_paths_this_turn)
+                    if (
+                        not allow_tests_now
+                        and allow_non_test_validation_now
+                        and preferred_validator_langs
+                        and not self._run_test_command_matches_preferred_non_code_validator(
+                            str(arguments.get("command") or ""),
+                            preferred_validator_langs,
+                        )
+                    ):
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="config-validator-required",
+                            candidate_tool=name,
+                            forced_next_classes=["validator_discovery", "config_validation"],
+                            rounds=round_number,
+                        )
+                        validation_name, _validation_arguments, validation_result = self._execute_auto_validation_plan(
+                            request_text=text,
+                            round_number=round_number,
+                            mutated_paths=mutated_paths_this_turn,
+                            forbidden_tool_names=forbidden_tool_names,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                            mutation_version=mutation_version,
+                            reason_prefix="config validator required after forbidden generic test: ",
+                        )
+                        if validation_result is not None and validation_result.get("ok") is True:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"Do not run generic Python tests for this config edit. {validation_name} already produced "
+                                        "the required config-validation proof. Continue from that evidence. Next JSON only."
+                                    ),
+                                }
+                            )
+                        elif validation_result is not None:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "The request forbids generic Python tests for this config edit, and config validation failed. Repair the config before finishing. Next JSON only.",
+                                }
+                            )
+                        else:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": "Do not run generic Python tests for this config edit. Discover and run the matching config validator instead. Next JSON only.",
+                                }
+                            )
+                        continue
                 if name == "run_test" and last_failed_run_test_key == self._run_test_repeat_key(arguments, mutation_version):
                     self._append_assistant_payload(payload)
                     diagnosis_ran = False

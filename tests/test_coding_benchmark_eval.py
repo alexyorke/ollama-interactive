@@ -225,8 +225,10 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertIn("bad_test_command_recovery", cases)
         self.assertIn("docs_sync_without_tests_still_validates", cases)
+        self.assertIn("workflow_config_validation", cases)
         self.assertEqual(cases["bad_test_command_recovery"].benchmark_kind, "coding_accuracy")
         self.assertEqual(cases["docs_sync_without_tests_still_validates"].benchmark_kind, "coding_accuracy")
+        self.assertEqual(cases["workflow_config_validation"].benchmark_kind, "coding_accuracy")
         for name in (
             "renamed_simple_expression_hidden",
             "renamed_prefix_rotation_hidden",
@@ -274,6 +276,69 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
                         {"type": "tool_call", "name": "lint_typecheck", "arguments": {"paths": ["src/api.py"]}},
                         {"type": "tool_result", "name": "lint_typecheck", "result": {"ok": True}},
                         {"type": "tool_call", "name": "run_test", "arguments": {"command": "python -m unittest discover -s tests"}},
+                        {"type": "tool_result", "name": "run_test", "result": {"ok": True}},
+                    ]
+                },
+                stdout="",
+                stderr="",
+                returncodes=(),
+                results=(),
+                case=case,
+            )
+
+            self.assertEqual(case.validate(passing), "pass")
+            self.assertEqual(case.validate(failing), "fail")
+
+    def test_workflow_config_validation_requires_workflow_validator_proof(self) -> None:
+        cases = {case.name: case for case in bench.selected_cases("local-full")}
+
+        with self._temp_root() as root:
+            case = cases["workflow_config_validation"]
+            assert case.prepare is not None
+            case.prepare(root)
+            (root / ".github" / "workflows" / "ci.yml").write_text(
+                "name: CI\n"
+                "on:\n"
+                "  push:\n"
+                "    branches: [main]\n"
+                "  pull_request:\n"
+                "jobs:\n"
+                "  test:\n"
+                "    runs-on: ubuntu-latest\n"
+                "    steps:\n"
+                "      - uses: actions/checkout@v4\n"
+                "      - run: python -m unittest discover -s tests -v\n",
+                encoding="utf-8",
+            )
+            passing = bench.BenchmarkContext(
+                workspace=root,
+                session={
+                    "events": [
+                        {
+                            "type": "tool_result",
+                            "name": "discover_validators",
+                            "result": {"ok": True, "output": "lint github-actions: actionlint available=True"},
+                        },
+                        {"type": "tool_call", "name": "run_test", "arguments": {"command": "actionlint"}},
+                        {"type": "tool_result", "name": "run_test", "result": {"ok": True, "command": "actionlint"}},
+                    ]
+                },
+                stdout="",
+                stderr="",
+                returncodes=(),
+                results=(),
+                case=case,
+            )
+            failing = bench.BenchmarkContext(
+                workspace=root,
+                session={
+                    "events": [
+                        {
+                            "type": "tool_result",
+                            "name": "discover_validators",
+                            "result": {"ok": True, "output": "lint github-actions: actionlint available=True"},
+                        },
+                        {"type": "tool_call", "name": "run_test", "arguments": {"command": f"{sys.executable} -m unittest discover -s tests -v"}},
                         {"type": "tool_result", "name": "run_test", "result": {"ok": True}},
                     ]
                 },

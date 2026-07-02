@@ -2636,6 +2636,54 @@ class AgentTests(AgentTestBase):
         auto_validation = [event for event in agent.events if event.get("type") == "auto_validation"]
         self.assertEqual(auto_validation[1].get("reason"), "github-actions validator command selected after validator discovery")
 
+    def test_post_edit_validation_blocks_generic_tests_after_workflow_edit_when_tests_forbidden(self) -> None:
+        root = self._workspace_scratch()
+        workflow_dir = root / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        workflow_path = workflow_dir / "ci.yml"
+        workflow_path.write_text(
+            "name: CI\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: python -m unittest\n",
+            encoding="utf-8",
+        )
+        workflow_command = subprocess.list2cmdline([sys.executable, "-c", "print('actionlint ok')"])
+        default_test_command = subprocess.list2cmdline([sys.executable, "-c", "print('tests ok')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":".github/workflows/ci.yml"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":".github/workflows/ci.yml","old":"python -m unittest","new":"python -m unittest discover -s tests -v"}}',
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": default_test_command}}),
+                '{"type":"final","message":"Updated workflow validation."}',
+                '{"type":"final","message":"Updated workflow validation."}',
+            ]
+        )
+        tools = WorkflowValidatorToolExecutor(
+            root,
+            approval_mode="auto",
+            test_command=default_test_command,
+            workflow_command=workflow_command,
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=7)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Update .github/workflows/ci.yml to use unittest discovery. Do not run Python tests; validate the workflow config.")
+
+        self.assertTrue(result.completed)
+        run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertTrue(run_tests)
+        self.assertEqual(run_tests[0].get("arguments", {}).get("command"), workflow_command)
+        self.assertFalse(any(event.get("arguments", {}).get("command") == default_test_command for event in run_tests))
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "config-validator-required" for event in agent.events))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not run generic Python tests for this config edit", feedback)
+
     def test_hidden_mutation_paths_preserve_dot_prefix_for_validation_tracking(self) -> None:
         root = self._workspace_scratch()
         agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
@@ -10760,6 +10808,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_runs_before_extra_context_read",
         "test_post_edit_validation_runs_after_non_code_edit_before_final",
         "test_post_edit_validation_prefers_workflow_validator_after_workflow_edit",
+        "test_post_edit_validation_blocks_generic_tests_after_workflow_edit_when_tests_forbidden",
         "test_hidden_mutation_paths_preserve_dot_prefix_for_validation_tracking",
         "test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests",
         "test_post_edit_validation_runs_non_test_validator_when_request_skips_tests",

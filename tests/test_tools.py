@@ -4641,6 +4641,21 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("trivy fs", output)
         self.assertIn("grype dir:.", output)
 
+    def test_discover_validators_scopes_workflow_file_validator_commands(self) -> None:
+        with self._temp_files_tools(
+            {
+                ".github/workflows/ci.yml": "name: ci\non: push\n",
+                ".github/workflows/release.yml": "name: release\non: workflow_dispatch\n",
+            }
+        ) as (_root, tools):
+            result = tools.discover_validators(".github/workflows/ci.yml", limit=20)
+
+        output = result["output"]
+        self.assertTrue(result["ok"], result)
+        self.assertIn("actionlint .github/workflows/ci.yml", output)
+        self.assertIn("vendor.github-workflows .github/workflows/ci.yml", output)
+        self.assertNotIn("lint github-actions: actionlint available", output)
+
     def test_select_tests_returns_language_level_validator_for_go(self) -> None:
         with self._temp_files_tools(
             {
