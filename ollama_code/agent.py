@@ -8331,6 +8331,50 @@ class OllamaCodeAgent:
                 tool_calls_this_turn=tool_calls_this_turn,
                 tests_passed_message=f"Updated {source_paths[0]}; tests passed.",
             )
+        workflow_config_ops = self._workflow_config_update_operations(request_text)
+        if workflow_config_ops and not any(tool_name in forbidden_tool_names for tool_name, _ in workflow_config_ops):
+            pending_workflow_config_ops = [
+                (tool_name, args)
+                for tool_name, args in workflow_config_ops
+                if not self._successful_tool_call_already_satisfied(
+                    name=tool_name,
+                    arguments=args,
+                    successful_tool_results=successful_tool_results,
+                )
+            ]
+            if not pending_workflow_config_ops:
+                edited_paths = sorted({str(args.get("path", "")) for _, args in workflow_config_ops if args.get("path")})
+                return self._finalize_mutation_result(
+                    request_text=request_text,
+                    message=f"Updated and validated {', '.join(edited_paths)}.",
+                    tool=str(workflow_config_ops[-1][0]),
+                    round_number=round_number,
+                    forbidden_tool_names=forbidden_tool_names,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+            round_number, last_result = self._execute_tool_operations(
+                operations=pending_workflow_config_ops,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if last_result is None:
+                return None
+            edited_paths = sorted({str(args.get("path", "")) for _, args in workflow_config_ops if args.get("path")})
+            return self._finalize_mutation_result(
+                request_text=request_text,
+                message=f"Updated and validated {', '.join(edited_paths)}.",
+                tool=str(last_result.get("tool") if last_result else workflow_config_ops[-1][0]),
+                round_number=round_number,
+                forbidden_tool_names=forbidden_tool_names,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
         optional_parameter_ops = self._optional_parameter_update_operations(request_text)
         if optional_parameter_ops and "edit_intent" not in forbidden_tool_names:
             pending_optional_parameter_ops = [
@@ -8560,6 +8604,73 @@ class OllamaCodeAgent:
             if result.get("ok") is True:
                 return True
         return False
+
+    def _workflow_config_update_operations(self, request_text: str) -> list[tuple[str, dict[str, Any]]] | None:
+        lowered = request_text.lower()
+        if "pull_request" not in lowered or "workflow" not in lowered:
+            return None
+        if not re.search(r"\b(?:change|update|set)\b", lowered):
+            return None
+        path_match = re.search(r"\b(?P<path>(?:\.github|github)/workflows/[\w.-]+\.ya?ml)\b", request_text, flags=re.IGNORECASE)
+        command_match = re.search(
+            r"\b(?:command|run(?:test)?|unittest)\b(?:(?!\n\n).){0,160}?\bto\s+`(?P<command>[^`]+)`",
+            request_text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not path_match or not command_match:
+            return None
+        path = path_match.group("path").strip().replace("\\", "/")
+        if path.startswith("./"):
+            path = path[2:]
+        if path.lower().startswith("github/workflows/"):
+            path = "." + path
+        if not path.lower().startswith(".github/workflows/"):
+            return None
+        new_command = command_match.group("command").strip()
+        if not path or not new_command:
+            return None
+        try:
+            source_path = self.tools.resolve_path(path, allow_missing=False)
+            source = source_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+
+        operations: list[tuple[str, dict[str, Any]]] = [("read_file", {"path": path})]
+        lines = source.splitlines()
+        if "pull_request:" not in source:
+            on_index = next((index for index, line in enumerate(lines) if line.strip() == "on:"), None)
+            if on_index is None:
+                return None
+            insert_index = len(lines)
+            for index in range(on_index + 1, len(lines)):
+                if lines[index] and not lines[index].startswith((" ", "\t")):
+                    insert_index = index
+                    break
+            old_block = "\n".join(lines[on_index:insert_index])
+            new_block = old_block.rstrip("\n") + "\n  pull_request:"
+            operations.append(("replace_in_file", {"path": path, "old": old_block, "new": new_block}))
+
+        command_line = next(
+            (
+                line
+                for line in lines
+                if "python -m unittest" in line and new_command not in line and re.search(r"\b(?:run|command)\s*:", line)
+            ),
+            None,
+        )
+        if command_line is None:
+            return None if len(operations) == 1 else operations
+        indent = command_line[: len(command_line) - len(command_line.lstrip())]
+        marker_match = re.match(r"(?P<prefix>\s*-\s*run:\s*|\s*run:\s*)", command_line)
+        if not marker_match:
+            return None
+        new_line = f"{indent}{marker_match.group('prefix').strip()} {new_command}"
+        if marker_match.group("prefix").lstrip().startswith("-"):
+            new_line = f"{indent}- run: {new_command}"
+        else:
+            new_line = f"{indent}run: {new_command}"
+        operations.append(("replace_in_file", {"path": path, "old": command_line, "new": new_line}))
+        return operations if len(operations) > 1 else None
 
     def _test_grounded_symbol_return_rewrite_spec(self, request_text: str) -> dict[str, str] | None:
         match = re.search(

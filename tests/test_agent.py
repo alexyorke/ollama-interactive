@@ -2684,6 +2684,112 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Do not run generic Python tests for this config edit", feedback)
 
+    def test_deterministic_workflow_config_update_runs_scoped_validator(self) -> None:
+        root = self._workspace_scratch()
+        workflow_dir = root / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        workflow_path = workflow_dir / "ci.yml"
+        workflow_path.write_text(
+            "name: CI\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+            "      - run: python -m unittest\n",
+            encoding="utf-8",
+        )
+        workflow_command = subprocess.list2cmdline([sys.executable, "-c", "print('actionlint ok')"])
+        default_test_command = subprocess.list2cmdline([sys.executable, "-c", "print('tests ok')"])
+        client = FakeClient([])
+        tools = WorkflowValidatorToolExecutor(
+            root,
+            approval_mode="auto",
+            test_command=default_test_command,
+            workflow_command=workflow_command,
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=7)
+
+        result = agent.handle_user(
+            "Update .github/workflows/ci.yml to also run on pull_request and change its unittest command to `python -m unittest discover -s tests -v`. Do not run Python tests; validate the workflow config."
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(len(client.calls), 0)
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("python -m unittest discover -s tests -v", workflow)
+        run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertEqual(run_tests[0].get("arguments", {}).get("command"), workflow_command)
+        self.assertFalse(any(event.get("arguments", {}).get("command") == default_test_command for event in run_tests))
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:5], ["read_file", "replace_in_file", "replace_in_file", "discover_validators", "run_test"])
+
+    def test_require_llm_for_turn_uses_deterministic_workflow_config_update_after_context_probe(self) -> None:
+        root = self._workspace_scratch()
+        workflow_dir = root / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        workflow_path = workflow_dir / "ci.yml"
+        workflow_path.write_text(
+            "name: CI\n"
+            "on:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n"
+            "      - run: python -m unittest\n",
+            encoding="utf-8",
+        )
+        workflow_command = subprocess.list2cmdline([sys.executable, "-c", "print('actionlint ok')"])
+        default_test_command = subprocess.list2cmdline([sys.executable, "-c", "print('tests ok')"])
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "context_pack",
+                        "arguments": {"request": "workflow config", "path": ".", "limit": 6},
+                    }
+                )
+            ]
+        )
+        tools = WorkflowValidatorToolExecutor(
+            root,
+            approval_mode="auto",
+            test_command=default_test_command,
+            workflow_command=workflow_command,
+        )
+        agent = OllamaCodeAgent(
+            client=client,
+            tools=tools,
+            model="fake-model",
+            debate_enabled=False,
+            require_llm_for_turn=True,
+            max_tool_rounds=7,
+        )
+
+        result = agent.handle_user(
+            "Update .github/workflows/ci.yml to also run on pull_request and change its unittest command to `python -m unittest discover -s tests -v`. Do not run Python tests; validate the workflow config."
+        )
+        workflow = workflow_path.read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("pull_request:", workflow)
+        self.assertIn("python -m unittest discover -s tests -v", workflow)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        non_context_tool_names = [name for name in tool_names if name != "context_pack"]
+        self.assertEqual(non_context_tool_names[:5], ["read_file", "replace_in_file", "replace_in_file", "discover_validators", "run_test"])
+        run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertEqual(run_tests[0].get("arguments", {}).get("command"), workflow_command)
+        self.assertFalse(any(event.get("arguments", {}).get("command") == default_test_command for event in run_tests))
+
     def test_hidden_mutation_paths_preserve_dot_prefix_for_validation_tracking(self) -> None:
         root = self._workspace_scratch()
         agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
@@ -10809,6 +10915,8 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_runs_after_non_code_edit_before_final",
         "test_post_edit_validation_prefers_workflow_validator_after_workflow_edit",
         "test_post_edit_validation_blocks_generic_tests_after_workflow_edit_when_tests_forbidden",
+        "test_deterministic_workflow_config_update_runs_scoped_validator",
+        "test_require_llm_for_turn_uses_deterministic_workflow_config_update_after_context_probe",
         "test_hidden_mutation_paths_preserve_dot_prefix_for_validation_tracking",
         "test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests",
         "test_post_edit_validation_runs_non_test_validator_when_request_skips_tests",
