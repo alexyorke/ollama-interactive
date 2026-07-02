@@ -1238,6 +1238,29 @@ class AgentTests(AgentTestBase):
         self.assertEqual(normalized[0].get("normalized_name"), "search")
         self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle", "path": ".", "file_glob": "*.py"})
 
+    def test_shell_find_dot_exec_grep_h_normalizes_to_filtered_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+        (root / "README.md").write_text("def main(): docs only\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"find. -name \\"*.py\\" -exec grep -H \\"def main(\\" {} ;"}}',
+                '{"type":"final","message":"main is in app.py"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Find Python files containing def main( and summarize.")
+
+        self.assertIn("app.py", result.message)
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "def main(", "path": ".", "file_glob": "*.py"})
+
     def test_shell_find_exec_grep_with_unsupported_flags_does_not_normalize(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("needle\n", encoding="utf-8")
@@ -1252,6 +1275,22 @@ class AgentTests(AgentTestBase):
 
         self.assertEqual(normalized_name, "run_shell")
         self.assertEqual(normalized_arguments, {"command": 'find . -name "*.py" -exec grep -i needle {} ;'})
+        self.assertIsNone(reason)
+
+    def test_shell_find_dot_exec_grep_unsupported_flags_does_not_normalize(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("needle\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        normalized_name, normalized_arguments, reason = agent._normalize_shell_inspection_call(
+            "run_shell",
+            {"command": 'find. -name "*.py" -exec grep -i needle {} ;'},
+            request_text="Find Python files containing needle.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(normalized_name, "run_shell")
+        self.assertEqual(normalized_arguments, {"command": 'find. -name "*.py" -exec grep -i needle {} ;'})
         self.assertIsNone(reason)
 
     def test_context_planner_does_not_auto_outline_ambiguous_list_files_code_paths(self) -> None:
@@ -10469,6 +10508,8 @@ EXTRACTED_FAILURE_COMPRESSION_TESTS = _extract_agent_tests(
 
 EXTRACTED_SHELL_COMMAND_PREFLIGHT_TESTS = _extract_agent_tests(
     (
+        "test_shell_find_dot_exec_grep_h_normalizes_to_filtered_search",
+        "test_shell_find_dot_exec_grep_unsupported_flags_does_not_normalize",
         "test_tool_error_guard_auto_diagnoses_repeated_missing_dependency_failure",
         "test_tool_error_guard_blocks_repeated_shell_syntax_failure",
         "test_tool_error_guard_blocks_repeated_timeout_failure_with_service_guidance",

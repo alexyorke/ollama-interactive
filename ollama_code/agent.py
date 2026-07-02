@@ -5253,9 +5253,10 @@ class OllamaCodeAgent:
         return {"query": query, "path": path}
 
     def _normalize_find_exec_grep_shell_command(self, command: str) -> dict[str, Any] | None:
+        command = re.sub(r"(?i)^find\.(?=\s)", "find .", command.strip(), count=1)
         if not command.lower().startswith("find "):
             return None
-        if re.search(r"[|&<>`$()\r\n]", command):
+        if re.search(r"[|&<>`$\r\n]", command):
             return None
         try:
             argv = shlex.split(command, posix=True)
@@ -5272,8 +5273,10 @@ class OllamaCodeAgent:
             if argv[index] != "-type" or argv[index + 1].lower() not in {"f", "file"}:
                 return None
             index += 2
-        expected = ["-exec", "grep", "-l"]
-        if argv[index : index + 3] != expected:
+        if argv[index : index + 2] != ["-exec", "grep"]:
+            return None
+        grep_flag = argv[index + 2]
+        if grep_flag not in {"-l", "-H"}:
             return None
         query = argv[index + 3]
         if argv[index + 4] != "{}" or argv[index + 5] != ";":
