@@ -3992,12 +3992,30 @@ class ToolExecutor:
             status = self.git_status()
             if status.get("ok"):
                 git_summary = self._truncate_text(str(status.get("output", "")).replace("\n", " | "), limit=220)
-        suggested = "repo_index_search"
         ranked_output = str(ranked.get("output", ""))
+        ranked_paths = [
+            path
+            for path in ranked.get("ranked_paths", [])
+            if isinstance(path, str) and path.endswith(".py") and not self._path_looks_like_test(Path(path))
+        ]
+        ranked_symbols = [
+            item
+            for item in ranked.get("ranked_symbols", [])
+            if isinstance(item, dict)
+            and isinstance(item.get("path"), str)
+            and str(item.get("path")).endswith(".py")
+            and not self._path_looks_like_test(Path(str(item.get("path"))))
+        ]
+        suggested = "repo_index_search"
         if re.search(r"\b(?:test|tests|pytest|unittest|failing|failure)\b", query, flags=re.IGNORECASE):
             suggested = "run_test"
         elif re.search(r"\b(?:fix|implement|refactor|change|edit|update)\b", query, flags=re.IGNORECASE):
             suggested = "read_symbol" if re.search(r"\b(?:function|method|class|symbol)\b", ranked_output) else "read_file"
+        elif (
+            len(ranked_paths) == 1
+            and re.search(r"\b(?:inspect|summari[sz]e|structure|outline|implementation|where|find)\b", query, flags=re.IGNORECASE)
+        ):
+            suggested = "code_outline"
         lines = [
             "context_pack:",
             f"request_terms={', '.join(self._extract_index_terms(query, limit=12))}",
@@ -4016,19 +4034,8 @@ class ToolExecutor:
             "count": ranked.get("count", 0),
             "suggested_next_tool": suggested,
             "test_files": test_files,
-            "ranked_paths": [
-                path
-                for path in ranked.get("ranked_paths", [])
-                if isinstance(path, str) and path.endswith(".py") and not self._path_looks_like_test(Path(path))
-            ],
-            "ranked_symbols": [
-                item
-                for item in ranked.get("ranked_symbols", [])
-                if isinstance(item, dict)
-                and isinstance(item.get("path"), str)
-                and str(item.get("path")).endswith(".py")
-                and not self._path_looks_like_test(Path(str(item.get("path"))))
-            ],
+            "ranked_paths": ranked_paths,
+            "ranked_symbols": ranked_symbols,
             "output": "\n".join(lines),
         }
 

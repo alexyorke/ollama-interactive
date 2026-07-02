@@ -868,6 +868,70 @@ class AgentTests(AgentTestBase):
 
         self.assertEqual(probe, ("read_symbol", {"path": "src/pricing.py", "symbol": "calculate_discount", "include_context": 0}))
 
+    def test_context_planner_probe_prefers_unique_context_pack_outline_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "context_pack",
+                "arguments": {"request": "Inspect implementation structure", "path": ".", "limit": 8},
+                "result": {
+                    "ok": True,
+                    "tool": "context_pack",
+                    "suggested_next_tool": "code_outline",
+                    "ranked_paths": ["src/pricing.py"],
+                    "ranked_symbols": [{"path": "src/pricing.py", "qualname": "calculate_discount"}],
+                    "output": "context_pack:\nsuggested_next_tool=code_outline",
+                },
+            }
+        ]
+
+        self.assertTrue(
+            agent._context_planner_blocks(
+                name="search",
+                tool_calls=[],
+                latest_run_test_failed=False,
+                successful_tool_results=successful_tool_results,
+            )
+        )
+        probe = agent._context_planner_probe(
+            successful_tool_results=successful_tool_results,
+            forbidden_tool_names=set(),
+        )
+
+        self.assertEqual(probe, ("code_outline", {"path": "src/pricing.py"}))
+
+    def test_context_pack_auto_outlines_unique_ranked_source_before_broad_search(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"implementation structure"}}',
+                '{"type":"final","message":"src/core.py contains wrapped."}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text(
+            "# implementation structure\n\n"
+            "def wrapped():\n"
+            "    return 'ok'\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack,trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and summarize implementation structure.")
+
+        self.assertEqual(result.message, "src/core.py contains wrapped.")
+        self.assertEqual(tools.execute_counts.get("context_pack"), 1)
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        self.assertIsNone(tools.execute_counts.get("search"))
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:2], ["context_pack", "code_outline"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the code outline for src/core.py.", feedback)
+
     def test_context_planner_auto_outlines_narrowed_repo_search_without_source_context(self) -> None:
         client = FakeClient(
             [
@@ -10308,6 +10372,8 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_trajectory_ground_guard_prefers_explicit_request_source_path_over_unrelated_recent_source",
         "test_pathless_mutation_grounding_probe_does_not_auto_pick_when_request_names_multiple_sources",
         "test_pathless_mutation_grounding_probe_uses_unique_context_pack_symbol_before_repo_search",
+        "test_context_planner_probe_prefers_unique_context_pack_outline_without_source_context",
+        "test_context_pack_auto_outlines_unique_ranked_source_before_broad_search",
         "test_pathless_mutation_grounding_probe_prefers_unique_symbol_match_among_multiple_explicit_sources",
         "test_trajectory_grounding_probe_keeps_ambiguous_multiple_explicit_sources_unresolved_without_context_pack",
         "test_trajectory_grounding_probe_uses_context_pack_for_ambiguous_multiple_explicit_sources",

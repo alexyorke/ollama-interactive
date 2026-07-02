@@ -3096,6 +3096,8 @@ class OllamaCodeAgent:
             if suggested_next_tool == "read_symbol" and len(ranked_symbols) == 1:
                 path, qualname = ranked_symbols[0]
                 return "read_symbol", {"path": path, "symbol": qualname, "include_context": 0}
+            if suggested_next_tool == "code_outline" and len(ranked_paths) == 1:
+                return "code_outline", {"path": ranked_paths[0]}
             if suggested_next_tool in {"read_symbol", "read_file"} and len(ranked_paths) == 1:
                 return "read_file", {"path": ranked_paths[0]}
             return None
@@ -3224,6 +3226,27 @@ class OllamaCodeAgent:
             return False
         for item in reversed(successful_tool_results):
             if item.get("name") != "read_file":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            result_path = str(result.get("path") or arguments_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if result_path == normalized_path:
+                return True
+        return False
+
+    def _has_successful_code_outline(
+        self,
+        *,
+        path: str,
+        successful_tool_results: list[dict[str, Any]],
+    ) -> bool:
+        normalized_path = str(path or "").strip().replace("\\", "/").lstrip("./")
+        if not normalized_path:
+            return False
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "code_outline":
                 continue
             result = item.get("result") if isinstance(item.get("result"), dict) else {}
             if result.get("ok") is not True:
@@ -5590,6 +5613,15 @@ class OllamaCodeAgent:
                     )
                 ):
                     return probe_name, probe_arguments
+            elif probe_name == "code_outline":
+                if (
+                    "code_outline" not in forbidden_tool_names
+                    and not self._has_successful_code_outline(
+                        path=str(probe_arguments.get("path") or ""),
+                        successful_tool_results=successful_tool_results,
+                    )
+                ):
+                    return probe_name, probe_arguments
             elif (
                 "read_file" not in forbidden_tool_names
                 and not self._has_successful_read_file(
@@ -6130,6 +6162,11 @@ class OllamaCodeAgent:
                     return not self._has_successful_read_symbol(
                         path=str(target_arguments.get("path") or ""),
                         symbol=str(target_arguments.get("symbol") or ""),
+                        successful_tool_results=successful_tool_results,
+                    )
+                if target_name == "code_outline":
+                    return not self._has_successful_code_outline(
+                        path=str(target_arguments.get("path") or ""),
                         successful_tool_results=successful_tool_results,
                     )
                 return not self._has_successful_read_file(
