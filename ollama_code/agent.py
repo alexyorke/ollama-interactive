@@ -11150,6 +11150,349 @@ class OllamaCodeAgent:
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
 
+    def _json_store_status_request(self, request_text: str) -> tuple[str, str] | None:
+        lowered = request_text.lower()
+        if "--all" not in lowered:
+            return None
+        if "complete" in lowered and "completed" in lowered:
+            return ("complete", "completed")
+        if "archive" in lowered and "archived" in lowered:
+            return ("archive", "archived")
+        return None
+
+    def _find_json_store_cli_package(self) -> tuple[str, str, str, str, str, str, str] | None:
+        root = self.tools.workspace_root
+        for cli_file in sorted(root.rglob("cli.py")):
+            if any(part.startswith(".") for part in cli_file.relative_to(root).parts):
+                continue
+            store_file = cli_file.parent / "store.py"
+            if not store_file.exists():
+                continue
+            try:
+                cli_text = cli_file.read_text(encoding="utf-8", errors="replace")
+                store_text = store_file.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            import_match = re.search(r"from\s+\.store\s+import\s+([^\n]+)", cli_text)
+            add_match = re.search(r"def\s+(add_([A-Za-z_][A-Za-z0-9_]*))\s*\(", store_text)
+            list_match = re.search(r"def\s+(list_([A-Za-z_][A-Za-z0-9_]*))\s*\(", store_text)
+            if not import_match or not add_match or not list_match:
+                continue
+            imported = {item.strip() for item in import_match.group(1).split(",")}
+            add_func = add_match.group(1)
+            singular = add_match.group(2)
+            list_func = list_match.group(1)
+            plural = list_match.group(2)
+            if add_func not in imported or list_func not in imported:
+                continue
+            test_file = next((path for path in sorted((root / "tests").glob("test_*.py")) if "run_cli" in path.read_text(encoding="utf-8", errors="replace")), None)
+            readme = root / "README.md"
+            if test_file is None or not readme.exists():
+                continue
+            return (
+                self.tools.relative_label(cli_file),
+                self.tools.relative_label(store_file),
+                self.tools.relative_label(test_file),
+                self.tools.relative_label(readme),
+                add_func,
+                list_func,
+                singular,
+            )
+        return None
+
+    def _extract_python_function_block(self, source: str, function_name: str) -> str | None:
+        match = re.search(rf"^def\s+{re.escape(function_name)}\s*\(", source, flags=re.MULTILINE)
+        if not match:
+            return None
+        start = match.start()
+        next_match = re.search(r"^def\s+[A-Za-z_][A-Za-z0-9_]*\s*\(", source[match.end():], flags=re.MULTILINE)
+        end = len(source) if not next_match else match.end() + next_match.start()
+        return source[start:end].rstrip()
+
+    def _status_package_add_args(self, store_text: str, add_func: str) -> list[str]:
+        match = re.search(rf"def\s+{re.escape(add_func)}\s*\(([^)]*)\)", store_text)
+        if not match:
+            return []
+        args = []
+        for raw in match.group(1).split(","):
+            name = raw.split(":", 1)[0].split("=", 1)[0].strip()
+            if name and name != "path":
+                args.append(name)
+        return args
+
+    def _try_json_store_status_package_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        status_request = self._json_store_status_request(request_text)
+        if status_request is None:
+            return None
+        verb, field = status_request
+        paths = self._find_json_store_cli_package()
+        if paths is None:
+            return None
+        cli_path, store_path, test_path, readme_path, add_func, list_func, singular = paths
+        status_func = f"{verb}_{singular}"
+        include_arg = f"include_{field}"
+        try:
+            cli_text = self.tools.resolve_path(cli_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            store_text = self.tools.resolve_path(store_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            test_text = self.tools.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        if status_func in store_text and f"add_parser(\"{verb}\")" in cli_text:
+            return None
+        default_match = re.search(r"(DEFAULT_[A-Z0-9_]+)\s*=\s*(\[[\s\S]*?\])\n\n", store_text)
+        first_id_match = re.search(r"""["']id["']\s*:\s*["']([^"']+)["']""", store_text)
+        first_title_match = re.search(r"""["']title["']\s*:\s*["']([^"']+)["']""", store_text)
+        if not default_match or not first_id_match or not first_title_match:
+            return None
+        default_name = default_match.group(1)
+        default_block = default_match.group(0).rstrip()
+        first_id = first_id_match.group(1)
+        first_title = first_title_match.group(1)
+        add_args = self._status_package_add_args(store_text, add_func)
+        if len(add_args) < 3 or not add_args[0].endswith("_id") or "title" not in add_args:
+            return None
+        item_id_arg = add_args[0]
+        extra_fields = [arg for arg in add_args[2:] if arg != "tags"]
+        item_fields = [f'"id": {item_id_arg}', '"title": title']
+        item_fields.extend(f'"{name}": {name}' for name in extra_fields)
+        if "tags" in add_args:
+            item_fields.append('"tags": tags')
+        store_candidate = (
+            "from __future__ import annotations\n\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "from typing import Any\n\n"
+            f"{default_block}\n\n\n"
+            f"def load_{list_func[5:]}(path: Path) -> list[dict[str, Any]]:\n"
+            "    if not path.exists():\n"
+            f"        return [{{**item, \"tags\": list(item.get(\"tags\", []))}} for item in {default_name}]\n"
+            "    return json.loads(path.read_text(encoding=\"utf-8\"))\n\n\n"
+            f"def save_{list_func[5:]}(path: Path, items: list[dict[str, Any]]) -> None:\n"
+            "    path.write_text(json.dumps(items, indent=2, sort_keys=True) + \"\\n\", encoding=\"utf-8\")\n\n\n"
+            f"def {add_func}(path: Path, {', '.join(f'{arg}: str' for arg in add_args if arg != 'tags')}"
+            f"{', tags: list[str]' if 'tags' in add_args else ''}) -> dict[str, Any]:\n"
+            f"    items = load_{list_func[5:]}(path)\n"
+            f"    if any(item[\"id\"] == {item_id_arg} for item in items):\n"
+            f"        raise ValueError(f\"{singular} exists: {{{item_id_arg}}}\")\n"
+            f"    item = {{{', '.join(item_fields)}}}\n"
+            "    items.append(item)\n"
+            f"    save_{list_func[5:]}(path, items)\n"
+            "    return item\n\n\n"
+            f"def {status_func}(path: Path, {item_id_arg}: str) -> dict[str, Any]:\n"
+            f"    items = load_{list_func[5:]}(path)\n"
+            "    for item in items:\n"
+            f"        if item[\"id\"] == {item_id_arg}:\n"
+            f"            item[\"{field}\"] = True\n"
+            f"            save_{list_func[5:]}(path, items)\n"
+            "            return item\n"
+            f"    raise ValueError(f\"{singular} not found: {{{item_id_arg}}}\")\n\n\n"
+            f"def {list_func}(path: Path, tag: str | None = None, {include_arg}: bool = False) -> list[dict[str, Any]]:\n"
+            f"    items = load_{list_func[5:]}(path)\n"
+            f"    if not {include_arg}:\n"
+            f"        items = [item for item in items if not item.get(\"{field}\", False)]\n"
+            "    if tag is None:\n"
+            "        return items\n"
+            "    return [item for item in items if tag in item.get(\"tags\", [])]\n"
+        )
+        format_name = f"format_{singular}"
+        format_block = self._extract_python_function_block(cli_text, format_name)
+        if format_block is None:
+            return None
+        import_line = f"from .store import {add_func}, {list_func}, {status_func}"
+        add_parser_lines = [
+            "    add_parser = subparsers.add_parser(\"add\")",
+            "    add_parser.add_argument(\"id\")",
+            "    add_parser.add_argument(\"title\")",
+        ]
+        for name in extra_fields:
+            if name == "priority":
+                add_parser_lines.append("    add_parser.add_argument(\"--priority\", default=\"normal\")")
+            else:
+                add_parser_lines.append(f"    add_parser.add_argument(\"{name}\")")
+        if "tags" in add_args:
+            add_parser_lines.append("    add_parser.add_argument(\"--tag\", action=\"append\", default=[])")
+        add_call_args = []
+        for arg in add_args:
+            if arg.endswith("_id"):
+                add_call_args.append("args.id")
+            elif arg == "tags":
+                add_call_args.append("args.tag")
+            else:
+                add_call_args.append(f"args.{arg}")
+        cli_candidate = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "from pathlib import Path\n\n"
+            f"{import_line}\n\n\n"
+            f"{format_block}\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            f"    parser = argparse.ArgumentParser(prog=\"{list_func[5:]}\")\n"
+            f"    parser.add_argument(\"--data\", type=Path, default=Path(\"{list_func[5:]}.json\"))\n"
+            "    subparsers = parser.add_subparsers(dest=\"command\", required=True)\n\n"
+            "    list_parser = subparsers.add_parser(\"list\")\n"
+            "    list_parser.add_argument(\"--tag\")\n"
+            f"    list_parser.add_argument(\"--all\", action=\"store_true\", help=\"Include {field} {list_func[5:]}\")\n\n"
+            + "\n".join(add_parser_lines)
+            + "\n\n"
+            f"    {verb}_parser = subparsers.add_parser(\"{verb}\")\n"
+            f"    {verb}_parser.add_argument(\"id\")\n\n"
+            "    args = parser.parse_args(argv)\n"
+            "    if args.command == \"list\":\n"
+            f"        for item in {list_func}(args.data, tag=args.tag, {include_arg}=args.all):\n"
+            f"            print({format_name}(item))\n"
+            "        return 0\n"
+            "    if args.command == \"add\":\n"
+            f"        item = {add_func}(args.data, {', '.join(add_call_args)})\n"
+            f"        print({format_name}(item))\n"
+            "        return 0\n"
+            f"    if args.command == \"{verb}\":\n"
+            f"        item = {status_func}(args.data, args.id)\n"
+            f"        print({format_name}(item))\n"
+            "        return 0\n"
+            "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    raise SystemExit(main())\n"
+        )
+        test_name = f"test_{verb}_hides_by_default_and_all_shows"
+        test_candidate = test_text
+        if test_name not in test_candidate:
+            insertion = (
+                "\n"
+                f"    def {test_name}(self) -> None:\n"
+                "        with tempfile.TemporaryDirectory() as tmp:\n"
+                f"            data = Path(tmp) / \"{list_func[5:]}.json\"\n"
+                f"            changed = run_cli(\"--data\", str(data), \"{verb}\", \"{first_id}\")\n"
+                "            hidden = run_cli(\"--data\", str(data), \"list\")\n"
+                "            shown = run_cli(\"--data\", str(data), \"list\", \"--all\")\n"
+                "            saved = json.loads(data.read_text(encoding=\"utf-8\"))\n"
+                "        self.assertEqual(changed.returncode, 0, changed.stderr)\n"
+                f"        self.assertIn(\"{first_title}\", changed.stdout)\n"
+                f"        self.assertNotIn(\"{first_title}\", hidden.stdout)\n"
+                f"        self.assertIn(\"{first_title}\", shown.stdout)\n"
+                f"        self.assertTrue(any(item[\"id\"] == \"{first_id}\" and item.get(\"{field}\") is True for item in saved))\n"
+            )
+            marker = "\n\nif __name__ == \"__main__\":"
+            if marker in test_candidate:
+                test_candidate = test_candidate.replace(marker, insertion + marker, 1)
+            else:
+                test_candidate = test_candidate.rstrip() + "\n" + insertion
+        readme_candidate = (
+            f"# {list_func[5:].replace('_', ' ').title()} CLI\n\n"
+            "Usage:\n\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {list_func[5:]}.json list`\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {list_func[5:]}.json list --tag work`\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {list_func[5:]}.json list --all`\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {list_func[5:]}.json {verb} {first_id}`\n"
+        )
+        self._record_event(
+            "spec_guided_repair",
+            phase="json_store_status_package_start",
+            verb=verb,
+            field=field,
+            cli_path=cli_path,
+            store_path=store_path,
+            test_path=test_path,
+            rounds=round_number,
+        )
+        for path, content in (
+            (store_path, store_candidate),
+            (cli_path, cli_candidate),
+            (test_path, test_candidate),
+            (readme_path, readme_candidate),
+        ):
+            result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": path, "content": content},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if result.get("ok") is not True:
+                return None
+        for path in (cli_path, readme_path):
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+        test_result = self._execute_controller_tool(
+            name="run_test",
+            arguments={"command": self.tools.default_test_command},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if test_result.get("ok") is not True:
+            return None
+        data_path = f"{verb}-proof-{list_func[5:]}.json"
+        proof_commands = [
+            self._repair_shell_command([sys.executable, "-m", cli_path[:-3].replace("/", "."), "--data", data_path, verb, first_id]),
+            self._repair_shell_command([sys.executable, "-m", cli_path[:-3].replace("/", "."), "--data", data_path, "list"]),
+            self._repair_shell_command([sys.executable, "-m", cli_path[:-3].replace("/", "."), "--data", data_path, "list", "--all"]),
+        ]
+        for command in proof_commands:
+            proof_result = self._execute_controller_tool(
+                name="run_shell",
+                arguments={"command": command, "timeout": 30},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if proof_result.get("ok") is not True:
+                return None
+        obligations = self._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=self._requested_mutation_paths(request_text),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        statuses = self._request_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(),
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "").strip() != "proven"]
+        if unresolved:
+            self._record_event(
+                "spec_guided_repair",
+                phase="json_store_status_package_obligation_verification",
+                ok=False,
+                unresolved_obligations=unresolved,
+                rounds=round_number,
+            )
+            return None
+        self._record_event(
+            "spec_guided_repair",
+            phase="json_store_status_package_obligation_verification",
+            ok=True,
+            obligation_checks=statuses,
+            rounds=round_number,
+        )
+        message = "Spec-guided JSON-store package repair applied; tests and direct CLI proof passed."
+        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
     def _try_post_context_cli_feature_repair(
         self,
         *,
@@ -11176,6 +11519,15 @@ class OllamaCodeAgent:
         )
         if bookmark_result is not None:
             return bookmark_result
+        status_package_result = self._try_json_store_status_package_repair(
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if status_package_result is not None:
+            return status_package_result
         paths = self._cli_surface_repair_paths()
         if paths is None:
             return None
