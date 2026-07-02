@@ -160,6 +160,13 @@ class OllamaCodeAgent:
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
+    @staticmethod
+    def _strip_relative_prefix(path: str) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        return normalized
+
     def _base_messages(self) -> list[dict[str, str]]:
         return [
             {
@@ -1113,7 +1120,7 @@ class OllamaCodeAgent:
         }
 
     def _path_looks_like_doc_target(self, path: str) -> bool:
-        normalized = path.strip().replace("\\", "/").lstrip("./").lower()
+        normalized = self._strip_relative_prefix(path).lower()
         if not normalized:
             return False
         if normalized == "readme.md" or normalized.endswith("/readme.md"):
@@ -4526,8 +4533,8 @@ class OllamaCodeAgent:
         if not self._request_requires_mutation(text):
             return set()
         paths: set[str] = set()
-        for raw_path in re.findall(r"\b(?:[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]+\b", text):
-            normalized = raw_path.strip().strip("`'\".,;:").replace("\\", "/").lstrip("./")
+        for raw_path in re.findall(r"(?<![\w./\\-])(?:\.?[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]+\b", text):
+            normalized = self._strip_relative_prefix(raw_path.strip().strip("`'\"").rstrip(".,;:"))
             if normalized:
                 paths.add(normalized)
         return paths
@@ -7470,7 +7477,7 @@ class OllamaCodeAgent:
                 preferred.append(lang)
 
         for raw_path in sorted(mutated_paths):
-            normalized = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+            normalized = self._strip_relative_prefix(str(raw_path or ""))
             lowered = normalized.lower()
             suffix = Path(lowered).suffix
             name = Path(lowered).name
@@ -8014,7 +8021,7 @@ class OllamaCodeAgent:
             result = item.get("result") if isinstance(item.get("result"), dict) else {}
             if result.get("ok") is not True:
                 continue
-            path = str(result.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            path = self._strip_relative_prefix(str(result.get("path") or ""))
             if path:
                 mutated_paths.add(path)
         return mutated_paths
@@ -13099,7 +13106,7 @@ class OllamaCodeAgent:
                         last_failed_run_test_diagnosis_key = None
                         failed_test_context_reads = 0
                         failed_test_mutation_version = None
-                        result_path = str(result.get("path", "")).strip().replace("\\", "/").lstrip("./")
+                        result_path = self._strip_relative_prefix(str(result.get("path", "")))
                         if result_path:
                             mutated_paths_this_turn.add(result_path)
                     if (

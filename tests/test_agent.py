@@ -2636,6 +2636,25 @@ class AgentTests(AgentTestBase):
         auto_validation = [event for event in agent.events if event.get("type") == "auto_validation"]
         self.assertEqual(auto_validation[1].get("reason"), "github-actions validator command selected after validator discovery")
 
+    def test_hidden_mutation_paths_preserve_dot_prefix_for_validation_tracking(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        requested = agent._requested_mutation_paths("Update .github/workflows/ci.yml to use unittest discovery.")
+        mutated = agent._mutated_paths_from_successful_results(
+            [
+                {
+                    "name": "replace_in_file",
+                    "arguments": {"path": ".github/workflows/ci.yml"},
+                    "result": {"ok": True, "path": ".github/workflows/ci.yml"},
+                }
+            ]
+        )
+
+        self.assertEqual(requested, {".github/workflows/ci.yml"})
+        self.assertEqual(mutated, {".github/workflows/ci.yml"})
+        self.assertEqual(agent._preferred_non_code_validator_langs(mutated), ["github-actions", "yaml"])
+
     def test_placeholder_completion_reprompts_after_stub_like_code_edit_without_failed_tests(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -10741,6 +10760,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_runs_before_extra_context_read",
         "test_post_edit_validation_runs_after_non_code_edit_before_final",
         "test_post_edit_validation_prefers_workflow_validator_after_workflow_edit",
+        "test_hidden_mutation_paths_preserve_dot_prefix_for_validation_tracking",
         "test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests",
         "test_post_edit_validation_runs_non_test_validator_when_request_skips_tests",
         "test_post_edit_validation_runs_code_sanity_when_request_skips_tests",
