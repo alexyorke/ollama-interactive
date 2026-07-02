@@ -3255,6 +3255,127 @@ class AgentTests(AgentTestBase):
             )
         )
 
+    def test_invalid_add_function_payload_is_rejected_before_tool_execution(self) -> None:
+        root = self._workspace_scratch()
+        (root / "reports").mkdir()
+        (root / "reports" / "exporter.py").write_text(
+            "from dataclasses import dataclass\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class ReportRow:\n"
+            "    name: str\n"
+            "    count: int\n"
+            "    active: bool\n",
+            encoding="utf-8",
+        )
+        invalid_replacement = (
+            "def export_ndjson(rows):\n"
+            "    \"Serialize rows to NDJSON.\n"
+            "    return \"\"\n"
+        )
+        valid_replacement = (
+            "def export_ndjson(rows: list[ReportRow]) -> str:\n"
+            "    import json\n"
+            "    if not rows:\n"
+            "        return \"\"\n"
+            "    return \"\\n\".join(json.dumps({\"name\": row.name, \"count\": row.count, \"active\": row.active}) for row in rows) + \"\\n\"\n"
+        )
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "reports/exporter.py",
+                            "intent": "add_function",
+                            "target": "export_ndjson",
+                            "replacement": invalid_replacement,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "reports/exporter.py",
+                            "intent": "add_function",
+                            "target": "export_ndjson",
+                            "replacement": valid_replacement,
+                        },
+                    }
+                ),
+                json.dumps({"type": "final", "message": "added export_ndjson"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        result = agent.handle_user("Add export_ndjson to reports/exporter.py.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        final_text = (root / "reports" / "exporter.py").read_text(encoding="utf-8")
+        self.assertIn("def export_ndjson(rows: list[ReportRow]) -> str:", final_text)
+        guard_events = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "invalid-python-mutation-payload"
+        ]
+        self.assertEqual(len(guard_events), 1)
+        self.assertEqual(guard_events[0].get("tool"), "edit_intent")
+        self.assertIn("unterminated string literal", str(guard_events[0].get("diagnostic") or ""))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("syntactically invalid before execution", feedback)
+        self.assertIn("omit docstrings and prose strings", feedback)
+        self.assertIn("escaped '\\n' string literals", feedback)
+
+    def test_repeated_invalid_add_function_payload_pivots_to_spec_guided_repair(self) -> None:
+        root = self._workspace_scratch()
+        (root / "reports").mkdir()
+        (root / "tests").mkdir()
+        (root / "reports" / "exporter.py").write_text("def export_csv(rows):\n    return \"\"\n", encoding="utf-8")
+        (root / "tests" / "test_exporter.py").write_text("def test_placeholder():\n    assert True\n", encoding="utf-8")
+        invalid_replacement = (
+            "def export_ndjson(rows):\n"
+            "    \"Serialize rows to NDJSON.\n"
+            "    return \"\"\n"
+        )
+        invalid_call = {
+            "type": "tool",
+            "name": "edit_intent",
+            "arguments": {
+                "path": "reports/exporter.py",
+                "intent": "add_function",
+                "target": "export_ndjson",
+                "replacement": invalid_replacement,
+            },
+        }
+        client = FakeClient([json.dumps(invalid_call), json.dumps(invalid_call)])
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.object(
+            agent,
+            "_try_spec_guided_repair",
+            return_value=AgentResult(message="spec-guided repair", rounds=2, completed=True),
+        ) as repair:
+            result = agent.handle_user("Add export_ndjson to reports/exporter.py and run tests.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "spec-guided repair")
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertEqual(repair.call_count, 1)
+        call_kwargs = repair.call_args.kwargs
+        self.assertTrue(call_kwargs["allow_workspace_fallback"])
+        self.assertEqual(call_kwargs["failed_run_test_result"]["tool"], "edit_intent")
+        guard_events = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "invalid-python-mutation-payload"
+        ]
+        self.assertEqual(len(guard_events), 1)
+
     def test_keep_tests_green_creates_test_run_obligation(self) -> None:
         tools = ToolExecutor(self._workspace_scratch(), approval_mode="auto")
         agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)

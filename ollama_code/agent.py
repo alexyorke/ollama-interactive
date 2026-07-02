@@ -6413,6 +6413,46 @@ class OllamaCodeAgent:
             paths.append(normalized)
         return paths
 
+    def _python_mutation_payload_syntax_diagnostic(self, name: str, arguments: dict[str, Any]) -> str:
+        path = ""
+        for raw_path in self._mutation_target_paths(arguments):
+            if raw_path.endswith(".py"):
+                path = raw_path
+                break
+        if not path:
+            return ""
+        source = ""
+        if name == "write_file":
+            source = str(arguments.get("content") or "")
+        elif name == "edit_intent":
+            intent = str(arguments.get("intent") or "").strip().lower().replace("-", "_")
+            if intent in {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
+                source = str(arguments.get("replacement") or "")
+        if not source.strip():
+            return ""
+        try:
+            ast.parse(source[1:] if source.startswith("\ufeff") else source, filename=path)
+        except SyntaxError as exc:
+            return f"SyntaxError at {path}:{exc.lineno or 1}: {exc.msg}"
+        return ""
+
+    def _python_mutation_payload_syntax_feedback(self, diagnostic: str) -> str:
+        lowered = diagnostic.lower()
+        guidance = ""
+        if "unterminated string literal" in lowered:
+            guidance = (
+                " For generated function payloads, omit docstrings and prose strings; use comments if needed. "
+                "Represent newlines as escaped '\\n' string literals, not raw line breaks inside quotes."
+            )
+        elif "unexpected character after line continuation" in lowered:
+            guidance = " Remove transcript quote markers and backslash-escaped source text; send plain Python source only."
+        return (
+            f"The proposed Python mutation is syntactically invalid before execution: {diagnostic}. "
+            "Do not write or audit this malformed source."
+            + guidance
+            + " Re-read the target if needed, then send one complete syntactically valid Python payload with balanced delimiters. Next JSON only."
+        )
+
     def _has_targeted_grounding_evidence(
         self,
         *,
@@ -13174,6 +13214,7 @@ class OllamaCodeAgent:
         diagnosed_tool_error_keys: set[tuple[str, str, str]] = set()
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
+        invalid_python_mutation_payload_counts: dict[tuple[str, str], int] = {}
         context_only_exhausted_for_mutation = False
         repair_pivot_prompt_pending = False
         last_repair_pivot_message = ""
@@ -14315,6 +14356,52 @@ class OllamaCodeAgent:
                             {
                                 "role": "user",
                                 "content": "write_file content must be the exact file contents, without BEGIN/END EDITED CONTENT markers or transcript delimiters. Re-read the target file, then send clean source text only. Next JSON only.",
+                            }
+                        )
+                        continue
+                if name == "edit_intent":
+                    syntax_diagnostic = self._python_mutation_payload_syntax_diagnostic(name, arguments)
+                    if syntax_diagnostic:
+                        target_key = ",".join(self._mutation_target_paths(arguments)) or "."
+                        invalid_key = (name, target_key)
+                        invalid_python_mutation_payload_counts[invalid_key] = invalid_python_mutation_payload_counts.get(invalid_key, 0) + 1
+                        if (
+                            invalid_python_mutation_payload_counts[invalid_key] >= 2
+                            and not spec_guided_repair_attempted
+                            and (mutation_required or code_mutation_required)
+                            and test_run_required
+                            and "write_file" not in forbidden_tool_names
+                        ):
+                            repair_result = self._try_spec_guided_repair(
+                                request_text=text,
+                                round_number=round_number,
+                                failed_run_test_result={
+                                    "ok": False,
+                                    "tool": name,
+                                    "summary": f"Rejected repeated invalid Python mutation payload. {syntax_diagnostic}",
+                                    "output": f"Rejected repeated invalid Python mutation payload. {syntax_diagnostic}",
+                                },
+                                run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+                                successful_tool_results=successful_tool_results,
+                                satisfied_tool_names=satisfied_tool_names,
+                                tool_calls_this_turn=tool_calls_this_turn,
+                                allow_workspace_fallback=True,
+                            )
+                            if repair_result is not None:
+                                spec_guided_repair_attempted = True
+                                return repair_result
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="invalid-python-mutation-payload",
+                            tool=name,
+                            diagnostic=syntax_diagnostic,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": self._python_mutation_payload_syntax_feedback(syntax_diagnostic),
                             }
                         )
                         continue
