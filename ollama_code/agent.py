@@ -3510,13 +3510,15 @@ class OllamaCodeAgent:
 
     def _edit_intent_failure_follow_up(self, result: dict[str, Any], arguments: dict[str, Any] | None = None) -> str:
         summary = str(result.get("summary") or "")
-        if "symbol not found" not in summary.lower():
+        lowered = summary.lower()
+        if "symbol not found" not in lowered and "function not found" not in lowered:
             return "Tool failed; not required success. Fix or choose another. Next JSON only."
         target = str((arguments or {}).get("target") or "").strip()
         target_text = f" `{target}`" if target else ""
         return (
             f"Edit target{target_text} was not found. Do not invent helper symbols or keep targeting missing symbols. "
-            "Re-read the file and edit an existing symbol such as main, or use write_file only after reading the complete file. Next JSON only."
+            "Imported names are not implementation symbols in the current file; edit the defining module, edit an existing symbol such as main, "
+            "or use write_file only after reading the complete file. Next JSON only."
         )
 
     def _tool_result_feedback_message(
@@ -5712,6 +5714,15 @@ class OllamaCodeAgent:
                 "search_symbols/read_symbol/code_outline for a concrete symbol, find_implementation_target for tests/traceback, "
                 "discover_validators/run_test for evidence, or answer/edit from current evidence. Next JSON only."
             )
+        if mutation_required or code_mutation_required:
+            next_step = "Use edit_intent, replace_in_file, replace_symbol, or write_file on the grounded source now"
+            if test_run_required:
+                next_step += ", then run_test"
+            return (
+                "Too many context-only tool steps. Do not call read_file, search, file_search, code_outline, read_symbol, "
+                "or context_pack again in this turn. "
+                f"{next_step}. If you cannot make a grounded edit from current evidence, fail closed instead of gathering more context. Next JSON only."
+            )
         return (
             "Too many context-only tool steps. Choose one narrower next step: read_symbol/code_outline for a specific symbol, "
             "find_implementation_target for tests/traceback, edit grounded target, run validation, or answer from current evidence. Next JSON only."
@@ -5944,7 +5955,10 @@ class OllamaCodeAgent:
             path = str(probe_result.get("path") or probe_arguments.get("path") or "").strip()
             if path:
                 if mutation_required or code_mutation_required:
-                    next_step = f"Use the code outline for {path}. Read or edit the exact implementation symbol now"
+                    next_step = (
+                        f"Use the code outline for {path}. Only edit functions/classes listed in the outline; imports are dependencies, "
+                        "not implementation symbols. If the needed target is imported, use the defining module or edit the local CLI entrypoint such as main"
+                    )
                     if test_run_required:
                         next_step += ", then run_test"
                     return next_step + ". Next JSON only."
@@ -11522,6 +11536,7 @@ class OllamaCodeAgent:
         diagnosed_tool_error_keys: set[tuple[str, str, str]] = set()
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
+        context_only_exhausted_for_mutation = False
         repair_pivot_prompt_pending = False
         last_repair_pivot_message = ""
         last_successful_mutation: dict[str, Any] | None = None
@@ -13109,6 +13124,30 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if context_only_exhausted_for_mutation and name in CONTEXT_GATHERING_TOOL_NAMES and (mutation_required or code_mutation_required):
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="context-exhausted",
+                        candidate_tool=name,
+                        forced_next_classes=["edit", "validation", "final"],
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._context_guard_retry_message(
+                                mutation_required=mutation_required,
+                                code_mutation_required=code_mutation_required,
+                                test_run_required=test_run_required,
+                                required_mutation_paths=required_mutation_paths,
+                                mutated_paths_this_turn=mutated_paths_this_turn,
+                                successful_tool_results=successful_tool_results,
+                                broad=False,
+                            ),
+                        }
+                    )
+                    continue
                 if (
                     not context_planner_prompted
                     and self._context_planner_blocks(
@@ -13195,6 +13234,8 @@ class OllamaCodeAgent:
                         rounds=round_number,
                     )
                     self._append_assistant_payload(payload)
+                    if mutation_required or code_mutation_required:
+                        context_only_exhausted_for_mutation = True
                     self.messages.append(
                         {
                             "role": "user",
@@ -14134,7 +14175,7 @@ class OllamaCodeAgent:
                     self._record_event(
                         "tool_result",
                         name="run_test",
-                        arguments=deepcopy(test_args),
+                        arguments=deepcopy(auto_arguments),
                         result=auto_result,
                         rounds=round_number,
                         cached=False,

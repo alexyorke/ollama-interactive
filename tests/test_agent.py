@@ -8148,6 +8148,93 @@ class AgentTests(AgentTestBase):
         self.assertIn("Do not invent helper symbols", feedback)
         self.assertIn("existing symbol such as main", feedback)
 
+    def test_agent_missing_edit_function_feedback_rejects_import_target(self) -> None:
+        agent = self._cwd_agent()
+
+        feedback = agent._tool_result_feedback_message(
+            "edit_intent",
+            {"ok": False, "summary": "replace Python function body: Function not found: list_bookmarks"},
+            real_tool_use=False,
+            arguments={"path": "bookmarks/cli.py", "intent": "replace_body", "target": "list_bookmarks"},
+        )
+
+        self.assertIn("Edit target `list_bookmarks` was not found", feedback)
+        self.assertIn("Imported names are not implementation symbols", feedback)
+        self.assertIn("edit the defining module", feedback)
+
+    def test_code_outline_retry_message_distinguishes_imports_from_implementation_symbols(self) -> None:
+        agent = self._cwd_agent()
+
+        feedback = agent._context_planner_probe_retry_message(
+            probe_name="code_outline",
+            probe_arguments={"path": "bookmarks/cli.py"},
+            probe_result={
+                "ok": True,
+                "path": "bookmarks/cli.py",
+                "output": "imports: from .store import list_bookmarks\n9-12 function main",
+            },
+            mutation_required=True,
+            code_mutation_required=True,
+            test_run_required=True,
+            required_mutation_paths=set(),
+            mutated_paths_this_turn=set(),
+            successful_tool_results=[],
+            broad=False,
+        )
+
+        self.assertIn("Only edit functions/classes listed in the outline", feedback)
+        self.assertIn("imports are dependencies", feedback)
+        self.assertIn("defining module", feedback)
+
+    def test_context_guard_for_mutation_forbids_more_context_after_limit(self) -> None:
+        agent = self._cwd_agent()
+
+        feedback = agent._context_guard_retry_message(
+            mutation_required=True,
+            code_mutation_required=True,
+            test_run_required=True,
+            required_mutation_paths=set(),
+            mutated_paths_this_turn=set(),
+            successful_tool_results=[],
+            broad=False,
+        )
+
+        self.assertIn("Do not call read_file", feedback)
+        self.assertIn("Use edit_intent", feedback)
+        self.assertIn("then run_test", feedback)
+        self.assertIn("fail closed", feedback)
+
+    def test_final_chance_auto_run_test_records_auto_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+            command = f"{sys.executable} -c \"print('ok')\""
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {"path": "app.py", "content": "VALUE = 2\n"},
+                        }
+                    )
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=1)
+
+            result = agent.handle_user("Change app.py and run tests.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Ran tests after the latest edit", result.message)
+        auto_run_tests = [
+            event
+            for event in agent.events
+            if event.get("type") == "tool_result" and event.get("name") == "run_test" and event.get("auto") is True
+        ]
+        self.assertTrue(auto_run_tests)
+        self.assertEqual(auto_run_tests[-1].get("arguments"), {})
+
     def test_candidate_cli_proof_commands_include_requested_limit_flag(self) -> None:
         agent = self._cwd_agent()
 
