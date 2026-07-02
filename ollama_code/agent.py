@@ -1705,6 +1705,40 @@ class OllamaCodeAgent:
                 "shell",
                 "cli",
             }
+            function_tokens: set[str] = set()
+            function_patterns = [
+                r"\b(?:add|implement|create|introduce|support)\s+(?:an?\s+)?([A-Za-z_][A-Za-z0-9_]{1,80})\s*\(",
+                r"\b(?:add|implement|create|introduce|support)\s+(?:an?\s+)?([A-Za-z_][A-Za-z0-9_]{1,80})\s+function\b",
+                r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]{1,80})\s*\(",
+            ]
+            function_token_stopwords = {
+                "a",
+                "an",
+                "the",
+                "new",
+                "function",
+                "method",
+                "command",
+                "flag",
+                "tests",
+                "test",
+            }
+            for pattern in function_patterns:
+                for match in re.finditer(pattern, request_text, flags=re.IGNORECASE):
+                    token = str(match.group(1)).strip()
+                    if token.lower() in function_token_stopwords:
+                        continue
+                    function_tokens.add(token)
+            for token in sorted(function_tokens, key=str.lower):
+                obligations.append(
+                    {
+                        "id": f"function:{token.lower()}",
+                        "kind": "feature_token",
+                        "label": f'prove the "{token}" function exists',
+                        "token": token,
+                        "feature_class": "function",
+                    }
+                )
             for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9_-]{1,40})\b\s+(?:subcommand|command)\b", request_text):
                 token = str(match.group(1)).strip()
                 if not token or token.lower() in command_token_stopwords:

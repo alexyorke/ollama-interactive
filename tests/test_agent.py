@@ -1163,6 +1163,24 @@ class AgentTests(AgentTestBase):
 
         self.assertEqual(feature_ids, ["command:archive", "flag:--all"])
 
+    def test_function_obligation_tracks_requested_new_function(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        obligations = agent._derive_request_obligations(
+            request_text=(
+                "Add an export_ndjson(rows) function to this report exporter. "
+                "Update README and add tests."
+            ),
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        feature_ids = sorted(item["id"] for item in obligations if item.get("kind") == "feature_token")
+
+        self.assertEqual(feature_ids, ["function:export_ndjson"])
+
     def test_read_only_command_check_does_not_create_feature_obligation(self) -> None:
         root = self._workspace_scratch()
         agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
@@ -1176,6 +1194,45 @@ class AgentTests(AgentTestBase):
         )
 
         self.assertFalse(any(item.get("kind") == "feature_token" for item in obligations))
+
+    def test_function_obligation_requires_source_proof(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        obligation = {
+            "id": "function:export_ndjson",
+            "kind": "feature_token",
+            "label": 'prove the "export_ndjson" function exists',
+            "token": "export_ndjson",
+            "feature_class": "function",
+        }
+
+        unproven = agent._request_obligation_proof_status(
+            obligations=[obligation],
+            successful_tool_results=[
+                {
+                    "name": "write_file",
+                    "arguments": {"path": "reports/exporter.py", "content": "def export_ndjson(rows):\n    return ''\n"},
+                    "result": {"ok": True, "path": "reports/exporter.py", "summary": "Wrote reports/exporter.py."},
+                }
+            ],
+            required_tool_names=set(),
+        )
+        proven = agent._request_obligation_proof_status(
+            obligations=[obligation],
+            successful_tool_results=[
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "reports/exporter.py"},
+                    "result": {"ok": True, "path": "reports/exporter.py", "output": "def export_ndjson(rows):\n    return ''\n"},
+                }
+            ],
+            required_tool_names=set(),
+        )
+
+        self.assertEqual(unproven[0]["status"], "unproven")
+        self.assertIn('function "export_ndjson" is still unproven', unproven[0]["guidance"])
+        self.assertEqual(proven[0]["status"], "proven")
+        self.assertEqual(proven[0]["evidence"], "reports/exporter.py")
 
     def test_passing_old_tests_do_not_satisfy_package_feature_request(self) -> None:
         root = self._workspace_scratch()
@@ -12582,7 +12639,9 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_request_obligation_code_change_requires_mutation_not_source_read",
         "test_readme_inspection_does_not_create_docs_update_obligation",
         "test_command_obligation_ignores_descriptive_command_words",
+        "test_function_obligation_tracks_requested_new_function",
         "test_read_only_command_check_does_not_create_feature_obligation",
+        "test_function_obligation_requires_source_proof",
         "test_final_verification_requires_read_proof_for_requested_command_token",
         "test_final_verification_requires_behavior_proof_for_cli_command_and_flag",
         "test_request_obligations_persist_across_continue_requests",
