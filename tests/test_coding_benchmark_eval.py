@@ -745,6 +745,9 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(summary["process"]["total_verification_retries"], 1)
         self.assertEqual(len(summary["process"]["passed_with_process_warnings"]), 1)
         self.assertEqual(summary["process"]["passed_with_process_warnings"][0]["case"], "feature")
+        self.assertEqual(summary["cost"]["agent_top_by_tokens"][0]["case"], "feature")
+        self.assertEqual(summary["cost"]["agent_top_by_llm_calls"][0]["llm_calls"], 2)
+        self.assertNotIn("tool_contract", {row.get("benchmark_class") for row in summary["cost"]["agent_top_by_tokens"]})
 
     def test_issue_validator_passes_hidden_solution(self) -> None:
         with self._temp_root() as workspace:

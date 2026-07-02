@@ -1828,6 +1828,31 @@ def process_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def cost_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    agent_rows = [item for item in results if benchmark_class_for_outcome(item) == "agent"]
+
+    def compact(item: dict[str, Any]) -> dict[str, Any]:
+        usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+        return {
+            "case": item.get("case"),
+            "benchmark_class": benchmark_class_for_outcome(item),
+            "status": item.get("status"),
+            "llm_calls": int(usage.get("llm_calls", 0)),
+            "total_tokens": int(usage.get("total_tokens", 0)),
+            "latency_s": float(item.get("latency_s", 0.0) or 0.0),
+            "tool_calls": list(item.get("tool_calls") or [])[:12],
+        }
+
+    top_by_tokens = sorted(agent_rows, key=lambda item: int((item.get("usage") or {}).get("total_tokens", 0)), reverse=True)
+    top_by_llm_calls = sorted(agent_rows, key=lambda item: int((item.get("usage") or {}).get("llm_calls", 0)), reverse=True)
+    top_by_latency = sorted(agent_rows, key=lambda item: float(item.get("latency_s", 0.0) or 0.0), reverse=True)
+    return {
+        "agent_top_by_tokens": [compact(item) for item in top_by_tokens[:5]],
+        "agent_top_by_llm_calls": [compact(item) for item in top_by_llm_calls[:5]],
+        "agent_top_by_latency": [compact(item) for item in top_by_latency[:5]],
+    }
+
+
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total_tokens = [int(item["usage"]["total_tokens"]) for item in results if isinstance(item.get("usage"), dict)]
     by_kind_rows: dict[str, list[dict[str, Any]]] = {}
@@ -1846,6 +1871,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_tokens": sum(total_tokens),
         "median_total_tokens": median(total_tokens),
         "process": process_summary(results),
+        "cost": cost_summary(results),
         "by_benchmark_kind": {name: _summary_bucket(rows) for name, rows in sorted(by_kind_rows.items())},
         "by_benchmark_class": {name: _summary_bucket(rows) for name, rows in sorted(by_class_rows.items())},
     }
