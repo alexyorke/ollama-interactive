@@ -717,20 +717,33 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
                 "failed_tools": [{"name": "run_test"}],
                 "verification_retries": 1,
             },
+            {
+                "case": "expected-diagnostic",
+                "status": "pass",
+                "benchmark_kind": "coding_accuracy",
+                "benchmark_class": "agent",
+                "usage": {"llm_calls": 1, "total_tokens": 5},
+                "failed_tools": [{"name": "run_test"}],
+                "expected_failed_tools": ["run_test"],
+            },
             {"status": "pass", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 0, "total_tokens": 0}},
             {"status": "fail", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 1, "total_tokens": 3}},
         ]
 
         summary = bench.summarize(results)
 
-        self.assertEqual(summary["by_benchmark_class"]["agent"]["runs"], 1)
-        self.assertEqual(summary["by_benchmark_class"]["agent"]["total_tokens"], 10)
+        self.assertEqual(summary["by_benchmark_class"]["agent"]["runs"], 2)
+        self.assertEqual(summary["by_benchmark_class"]["agent"]["total_tokens"], 15)
         self.assertEqual(summary["by_benchmark_class"]["controller"]["runs"], 2)
         self.assertEqual(summary["by_benchmark_class"]["controller"]["total_llm_calls"], 1)
-        self.assertEqual(summary["process"]["runs_with_failed_tools"], 1)
-        self.assertEqual(summary["process"]["total_failed_tool_results"], 1)
+        self.assertEqual(summary["process"]["runs_with_failed_tools"], 2)
+        self.assertEqual(summary["process"]["total_failed_tool_results"], 2)
+        self.assertEqual(summary["process"]["runs_with_unexpected_failed_tools"], 1)
+        self.assertEqual(summary["process"]["total_expected_failed_tool_results"], 1)
+        self.assertEqual(summary["process"]["total_unexpected_failed_tool_results"], 1)
         self.assertEqual(summary["process"]["runs_with_retry_churn"], 1)
         self.assertEqual(summary["process"]["total_verification_retries"], 1)
+        self.assertEqual(len(summary["process"]["passed_with_process_warnings"]), 1)
         self.assertEqual(summary["process"]["passed_with_process_warnings"][0]["case"], "feature")
 
     def test_issue_validator_passes_hidden_solution(self) -> None:

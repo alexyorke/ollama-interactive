@@ -46,7 +46,7 @@ Each result records:
 - prompt profile: chars by role and largest prompt messages
 - feature profile: `baseline`, `schema`, `context-pack`, `evidence-handles`, `num-predict-caps`, `structured-edits`, `trajectory-guards`, `contract-guards`, or `all`
 - benchmark class summary: agent vs controller runs, passes, LLM calls, and token totals are reported separately
-- `summary.process`: a top-level process-discipline rollup for green-but-sloppy runs, including failed tool counts, retry churn, verification rewrites, and the highest-warning passing cases
+- `summary.process`: a top-level process-discipline rollup for green-but-sloppy runs, including expected vs unexpected failed tool counts, retry churn, verification rewrites, and the highest-warning passing cases
 
 ## Commands
 

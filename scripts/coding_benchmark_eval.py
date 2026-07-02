@@ -119,6 +119,7 @@ class BenchmarkCase:
     budget_on: BenchmarkBudget = BenchmarkBudget(max_llm_calls=16, max_total_tokens=120_000)
     timeout: int | None = None
     requires_git: bool = False
+    expected_failed_tools: tuple[str, ...] = ()
 
 
 def benchmark_class_for_kind(kind: str | None) -> str:
@@ -1167,6 +1168,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         test_cmd=_python_test_cmd(),
         budget_off=SMALL_BUDGET_OFF,
         budget_on=SMALL_BUDGET_ON,
+        expected_failed_tools=("run_test",),
     ),
     BenchmarkCase(
         name="bad_test_command_recovery",
@@ -1177,6 +1179,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         test_cmd="pytesst -q",
         budget_off=SMALL_BUDGET_OFF,
         budget_on=SMALL_BUDGET_ON,
+        expected_failed_tools=("run_test",),
     ),
     BenchmarkCase(
         name="renamed_simple_expression_hidden",
@@ -1337,6 +1340,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         validate=validate_path_escape_error,
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
+        expected_failed_tools=("read_file",),
     ),
     BenchmarkCase(
         name="shell_failure_exact_command",
@@ -1346,6 +1350,7 @@ LOCAL_CASES: list[BenchmarkCase] = [
         validate=validate_shell_failure_exact_command,
         budget_off=ZERO_LLM,
         budget_on=ZERO_LLM,
+        expected_failed_tools=("run_shell",),
     ),
     BenchmarkCase(
         name="run_test_summary",
@@ -1523,6 +1528,7 @@ def _evaluate_case_once(
                     "feature_profile": feature_profile,
                     "status": "fail",
                     "acceptable": list(case.acceptable),
+                    "expected_failed_tools": list(case.expected_failed_tools),
                     "latency_s": round(elapsed, 2),
                     "usage": usage_totals(session),
                     "tool_calls": tool_calls(session),
@@ -1573,6 +1579,7 @@ def _evaluate_case_once(
             "feature_profile": feature_profile,
             "status": status,
             "acceptable": list(case.acceptable),
+            "expected_failed_tools": list(case.expected_failed_tools),
             "latency_s": round(elapsed, 2),
             "usage": usage_totals(session),
             "tool_calls": tool_calls(session),
@@ -1757,44 +1764,61 @@ def _summary_bucket(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def process_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     warning_rows: list[dict[str, Any]] = []
     total_failed_tools = 0
+    total_expected_failed_tools = 0
+    total_unexpected_failed_tools = 0
     total_assumption_audit_retries = 0
     total_reconciliation_retries = 0
     total_verification_retries = 0
     total_verification_rewrites = 0
     runs_with_failed_tools = 0
+    runs_with_unexpected_failed_tools = 0
     runs_with_retry_churn = 0
     for item in results:
-        failed_count = len(item.get("failed_tools") if isinstance(item.get("failed_tools"), list) else [])
+        failed_items = item.get("failed_tools") if isinstance(item.get("failed_tools"), list) else []
+        expected_failed_tools = set(item.get("expected_failed_tools") if isinstance(item.get("expected_failed_tools"), list) else [])
+        failed_names = [str(tool.get("name") or "") for tool in failed_items if isinstance(tool, dict)]
+        failed_count = len(failed_names)
+        expected_failed_count = sum(1 for name in failed_names if name in expected_failed_tools)
+        unexpected_failed_count = failed_count - expected_failed_count
         assumption_retries = int(item.get("assumption_audit_retries") or 0)
         reconciliation_retries = int(item.get("reconciliation_retries") or 0)
         verification_retries = int(item.get("verification_retries") or 0)
         verification_rewrites = int(item.get("verification_rewrites") or 0)
         retry_churn = assumption_retries + reconciliation_retries + verification_retries + verification_rewrites
         total_failed_tools += failed_count
+        total_expected_failed_tools += expected_failed_count
+        total_unexpected_failed_tools += unexpected_failed_count
         total_assumption_audit_retries += assumption_retries
         total_reconciliation_retries += reconciliation_retries
         total_verification_retries += verification_retries
         total_verification_rewrites += verification_rewrites
         if failed_count:
             runs_with_failed_tools += 1
+        if unexpected_failed_count:
+            runs_with_unexpected_failed_tools += 1
         if retry_churn:
             runs_with_retry_churn += 1
-        if item.get("status") == "pass" and (failed_count or retry_churn):
+        if item.get("status") == "pass" and (unexpected_failed_count or retry_churn):
             usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
             warning_rows.append(
                 {
                     "case": item.get("case"),
                     "benchmark_class": benchmark_class_for_outcome(item),
                     "failed_tools": failed_count,
+                    "expected_failed_tools": expected_failed_count,
+                    "unexpected_failed_tools": unexpected_failed_count,
                     "retry_churn": retry_churn,
                     "llm_calls": int(usage.get("llm_calls", 0)),
                     "total_tokens": int(usage.get("total_tokens", 0)),
                 }
             )
-    warning_rows.sort(key=lambda row: (int(row["failed_tools"]) + int(row["retry_churn"]), int(row["llm_calls"]), int(row["total_tokens"])), reverse=True)
+    warning_rows.sort(key=lambda row: (int(row["unexpected_failed_tools"]) + int(row["retry_churn"]), int(row["llm_calls"]), int(row["total_tokens"])), reverse=True)
     return {
         "runs_with_failed_tools": runs_with_failed_tools,
         "total_failed_tool_results": total_failed_tools,
+        "runs_with_unexpected_failed_tools": runs_with_unexpected_failed_tools,
+        "total_expected_failed_tool_results": total_expected_failed_tools,
+        "total_unexpected_failed_tool_results": total_unexpected_failed_tools,
         "runs_with_retry_churn": runs_with_retry_churn,
         "total_assumption_audit_retries": total_assumption_audit_retries,
         "total_reconciliation_retries": total_reconciliation_retries,
