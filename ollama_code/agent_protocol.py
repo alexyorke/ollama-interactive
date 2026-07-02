@@ -73,6 +73,7 @@ PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
     "synthesize_sequence_utilities_candidate",
 )
 SPEC_GUIDED_SYNTHESIS_TOOL_NAMES = (
+    "synthesize_argparse_task_cli_candidate",
     "synthesize_bowling_game_candidate",
     "synthesize_discounted_set_pricing_candidate",
     "synthesize_countdown_song_candidate",

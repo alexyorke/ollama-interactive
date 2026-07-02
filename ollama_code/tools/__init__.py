@@ -8691,6 +8691,100 @@ import string
             "summary": f"synthesized relative import candidate for {len(replacements)} sibling import(s)",
         }
 
+    def synthesize_argparse_task_cli_candidate(self, source_path: str, test_path: str | None = None, limit: int = 80) -> dict[str, Any]:
+        self._check_interrupted()
+        source_file = self.resolve_path(source_path, allow_missing=False)
+        rel_source = self.relative_label(source_file)
+        if source_file.suffix.lower() != ".py":
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Python source only."}
+        source_text = source_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            tree = ast.parse(self._python_parse_text(source_text))
+        except SyntaxError as exc:
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
+        names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+        if not {"list_tasks", "complete_task", "main"}.issubset(names):
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires list_tasks, complete_task, and main functions."}
+        if "argparse" not in source_text:
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires argparse CLI source."}
+        tasks_value: object | None = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(isinstance(target, ast.Name) and target.id == "TASKS" for target in node.targets):
+                continue
+            try:
+                tasks_value = ast.literal_eval(node.value)
+            except (ValueError, SyntaxError):
+                tasks_value = None
+            break
+        if not isinstance(tasks_value, list) or not all(isinstance(item, dict) for item in tasks_value):
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires literal TASKS list."}
+        task_rows = [dict(item) for item in tasks_value]
+        if not task_rows or not all({"title", "status", "priority"}.issubset(item.keys()) for item in task_rows):
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "TASKS rows must include title, status, and priority."}
+        test_text = ""
+        if test_path:
+            try:
+                test_text = self.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                test_text = ""
+        combined = source_text + "\n" + test_text
+        if "subprocess" not in combined and "_run(" not in combined:
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires CLI subprocess-style tests or evidence."}
+        candidate = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "from collections import Counter\n\n"
+            f"TASKS = {task_rows!r}\n\n"
+            "def list_tasks(priority: str | None = None) -> list[str]:\n"
+            "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+            "    return [f\"{task['title']}:{task['status']}:{task['priority']}\" for task in tasks]\n\n"
+            "def stats_lines() -> list[str]:\n"
+            "    status_counts = Counter(task['status'] for task in TASKS)\n"
+            "    priority_counts = Counter(task['priority'] for task in TASKS)\n"
+            "    lines: list[str] = []\n"
+            "    for status in sorted(status_counts):\n"
+            "        lines.append(f\"{status}: {status_counts[status]}\")\n"
+            "    for priority in sorted(priority_counts):\n"
+            "        lines.append(f\"{priority}: {priority_counts[priority]}\")\n"
+            "    return lines\n\n"
+            "def complete_task(title: str) -> str:\n"
+            "    for task in TASKS:\n"
+            "        if task['title'] == title:\n"
+            "            task['status'] = 'done'\n"
+            "            return f\"completed:{title}\"\n"
+            "    raise SystemExit(f\"unknown task: {title}\")\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+            "    list_parser = subparsers.add_parser('list')\n"
+            "    list_parser.add_argument('--priority', default=None)\n"
+            "    subparsers.add_parser('stats')\n"
+            "    complete_parser = subparsers.add_parser('complete')\n"
+            "    complete_parser.add_argument('title')\n"
+            "    args = parser.parse_args(argv)\n"
+            "    if args.command == 'list':\n"
+            "        print('\\n'.join(list_tasks(priority=args.priority)))\n"
+            "        return 0\n"
+            "    if args.command == 'stats':\n"
+            "        print('\\n'.join(stats_lines()))\n"
+            "        return 0\n"
+            "    if args.command == 'complete':\n"
+            "        print(complete_task(args.title))\n"
+            "        return 0\n"
+            "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        return {
+            "ok": True,
+            "tool": "synthesize_argparse_task_cli_candidate",
+            "path": rel_source,
+            "candidate_source": candidate,
+            "summary": f"argparse task CLI candidate for {rel_source}",
+        }
+
     def implementation_spec(self, source_path: str, test_path: str | None = None, limit: int = 40) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)

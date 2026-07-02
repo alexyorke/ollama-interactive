@@ -13151,6 +13151,29 @@ class OllamaCodeAgent:
                 pending_final_repair_state = dict(repair_state)
                 break
         if pending_final_repair_state is not None:
+            if (
+                latest_run_test_failed
+                and not spec_guided_repair_attempted
+                and self._spec_guided_repair_enabled()
+                and (mutation_required or code_mutation_required)
+                and test_run_required
+                and "write_file" not in forbidden_tool_names
+                and self._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True) is not None
+            ):
+                failed_output = latest_run_test_failure_output or latest_run_test_failure_summary
+                repair_result = self._try_spec_guided_repair(
+                    request_text=text,
+                    round_number=self.max_tool_rounds,
+                    failed_run_test_result={"ok": False, "tool": "run_test", "summary": failed_output, "output": failed_output},
+                    run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                    allow_workspace_fallback=True,
+                )
+                if repair_result is not None:
+                    spec_guided_repair_attempted = True
+                    return repair_result
             failure = self._repair_spec_validation_retry_message(pending_final_repair_state)
             self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
             self._flush_llm_call_events()

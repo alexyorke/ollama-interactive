@@ -3744,6 +3744,84 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("from .helpers import label", synthesized["candidate_source"])
         self.assertTrue(validation["ok"], validation)
 
+    def test_synthesize_argparse_task_cli_candidate_for_stats_and_priority(self) -> None:
+        with self._temp_python_tools(
+            {
+                "task_cli.py": (
+                    "from __future__ import annotations\n\n"
+                    "import argparse\n\n"
+                    "TASKS = [\n"
+                    "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high'},\n"
+                    "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low'},\n"
+                    "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium'},\n"
+                    "]\n\n"
+                    "def list_tasks(priority: str | None = None) -> list[str]:\n"
+                    "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+                    "    return [f\"{task['title']}:{task['status']}:{task['priority']}\" for task in tasks]\n\n"
+                    "def complete_task(title: str) -> str:\n"
+                    "    for task in TASKS:\n"
+                    "        if task['title'] == title:\n"
+                    "            task['status'] = 'done'\n"
+                    "            return f\"completed:{title}\"\n"
+                    "    raise SystemExit(f\"unknown task: {title}\")\n\n"
+                    "def main(argv: list[str] | None = None) -> int:\n"
+                    "    parser = argparse.ArgumentParser()\n"
+                    "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                    "    subparsers.add_parser('list')\n"
+                    "    complete_parser = subparsers.add_parser('complete')\n"
+                    "    complete_parser.add_argument('title')\n"
+                    "    args = parser.parse_args(argv)\n"
+                    "    if args.command == 'list':\n"
+                    "        print('\\n'.join(list_tasks()))\n"
+                    "        return 0\n"
+                    "    if args.command == 'complete':\n"
+                    "        print(complete_task(args.title))\n"
+                    "        return 0\n"
+                    "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+                    "if __name__ == '__main__':\n"
+                    "    raise SystemExit(main())\n"
+                ),
+                "tests/test_task_cli.py": (
+                    "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                    "ROOT = Path(__file__).resolve().parents[1]\n\n"
+                    "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                    "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                    "class TaskCliTests(unittest.TestCase):\n"
+                    "    def test_list(self) -> None:\n"
+                    "        result = _run('list')\n"
+                    "        self.assertEqual(result.returncode, 0)\n"
+                    "        self.assertIn('write-docs:todo:high', result.stdout)\n\n"
+                    "    def test_complete(self) -> None:\n"
+                    "        result = _run('complete', 'write-docs')\n"
+                    "        self.assertEqual(result.returncode, 0)\n"
+                    "        self.assertIn('completed:write-docs', result.stdout)\n"
+                ),
+            },
+            test_discover_args=("-s", "tests", "-v"),
+        ) as (root, tools, command):
+            synthesized = tools.synthesize_argparse_task_cli_candidate("task_cli.py", "tests/test_task_cli.py")
+            validation = tools.validate_implementation_candidate(
+                "task_cli.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="tests/test_task_cli.py",
+                test_command=command,
+            )
+            source = str(synthesized.get("candidate_source") or "")
+            (root / "task_cli.py").write_text(source, encoding="utf-8")
+            stats = subprocess.run([sys.executable, str(root / "task_cli.py"), "stats"], capture_output=True, text=True, check=False)
+            filtered = subprocess.run([sys.executable, str(root / "task_cli.py"), "list", "--priority", "high"], capture_output=True, text=True, check=False)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("subparsers.add_parser('stats')", source)
+        self.assertIn("list_parser.add_argument('--priority'", source)
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(stats.returncode, 0, stats.stderr)
+        self.assertIn("todo: 2", stats.stdout)
+        self.assertIn("high: 1", stats.stdout)
+        self.assertEqual(filtered.returncode, 0, filtered.stderr)
+        self.assertIn("write-docs:todo:high", filtered.stdout)
+        self.assertNotIn("ship-cli", filtered.stdout)
+
     def test_validate_implementation_candidate_uses_temp_workspace_and_preserves_signatures(self) -> None:
         with self._temp_python_tools(
             {

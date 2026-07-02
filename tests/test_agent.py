@@ -3223,6 +3223,47 @@ class AgentTests(AgentTestBase):
         )
         self.assertIn("drops existing top-level symbols", calls[-1]["failed_run_test_result"]["summary"])
 
+    def test_final_repair_spec_stop_attempts_spec_guided_repair(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "app.py").write_text("def value() -> int:\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_app.py").write_text(
+            "import unittest\nfrom app import value\n\n"
+            "class AppTests(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        self.assertEqual(value(), 1)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return 0","new":"return 2"}}',
+                '{"type":"tool","name":"run_test","arguments":{}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_app.py"}}',
+                '{"type":"final","message":"done"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+        calls: list[dict[str, object]] = []
+
+        def fake_spec_guided_repair(**kwargs: object) -> AgentResult | None:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                return None
+            return AgentResult(message="final repair spec called", rounds=int(kwargs["round_number"]), completed=False)
+
+        agent._try_spec_guided_repair = fake_spec_guided_repair  # type: ignore[method-assign]
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.message, "final repair spec called")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[-1]["failed_run_test_result"]["tool"], "run_test")
+        self.assertTrue(calls[-1].get("allow_workspace_fallback"))
+
     def test_known_syntax_error_blocks_lint_validator_until_repair(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("def value() -> str:\n    return 'ok'\n", encoding="utf-8")
@@ -10168,6 +10209,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_feedback_includes_validator_diagnostic",
         "test_failed_proactive_run_test_invokes_spec_guided_repair",
         "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
+        "test_final_repair_spec_stop_attempts_spec_guided_repair",
         "test_known_syntax_error_blocks_lint_validator_until_repair",
         "test_syntax_bad_mutation_invokes_spec_guided_repair_with_workspace_fallback",
         "test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request",
