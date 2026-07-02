@@ -3524,6 +3524,166 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Read and edit the backing implementation module `logtools/summary.py` first", feedback)
 
+    def test_package_init_wildcard_export_is_rejected_before_write(self) -> None:
+        root = self._workspace_scratch()
+        (root / "analytics").mkdir()
+        (root / "analytics" / "__init__.py").write_text(
+            "from .events import RequestEvent, summarize_status\n\n"
+            "__all__ = [\"RequestEvent\", \"summarize_status\"]\n",
+            encoding="utf-8",
+        )
+        (root / "analytics" / "events.py").write_text(
+            "class RequestEvent:\n"
+            "    pass\n\n\n"
+            "def summarize_status(events):\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "write_file",
+                        "arguments": {"path": "analytics/__init__.py", "content": "from .events import *\n"},
+                    }
+                ),
+                *[json.dumps({"type": "final", "message": "exported"}) for _ in range(4)],
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        result = agent.handle_user("Add percentile_latency to the package and export it from analytics/__init__.py.")
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual(
+            (root / "analytics" / "__init__.py").read_text(encoding="utf-8"),
+            "from .events import RequestEvent, summarize_status\n\n__all__ = [\"RequestEvent\", \"summarize_status\"]\n",
+        )
+        guards = [event for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertTrue(any(event.get("guard") == "package-init-wildcard-export" for event in guards))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use explicit named imports and update `__all__`", feedback)
+
+    def test_repeated_add_function_after_success_routes_to_remaining_obligations(self) -> None:
+        root = self._workspace_scratch()
+        (root / "analytics").mkdir()
+        (root / "analytics" / "__init__.py").write_text(
+            "from .events import RequestEvent, summarize_status\n\n"
+            "__all__ = [\"RequestEvent\", \"summarize_status\"]\n",
+            encoding="utf-8",
+        )
+        (root / "analytics" / "events.py").write_text(
+            "class RequestEvent:\n"
+            "    def __init__(self, duration_ms):\n"
+            "        self.duration_ms = duration_ms\n\n\n"
+            "def summarize_status(events):\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        (root / "tests").mkdir()
+        (root / "tests" / "test_events.py").write_text(
+            "from analytics import summarize_status\n\n\n"
+            "def test_summarize_status():\n"
+            "    assert summarize_status([]) == {}\n",
+            encoding="utf-8",
+        )
+        valid_add = (
+            "def percentile_latency(events, percentile=95):\n"
+            "    durations = sorted(event.duration_ms for event in events if event.duration_ms >= 0)\n"
+            "    return durations[-1] if durations else None\n"
+        )
+        invalid_repeat = (
+            "def percentile_latency(events, percentile=95):\n"
+            "    \"Return nearest rank percentile.\n"
+            "    return None\n"
+        )
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "analytics/events.py",
+                            "intent": "add_function",
+                            "target": "percentile_latency",
+                            "replacement": valid_add,
+                        },
+                    }
+                ),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": "python -m unittest discover -s tests -v"}}),
+                json.dumps({"type": "final", "message": "Implemented percentile_latency."}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "analytics/events.py",
+                            "intent": "add_function",
+                            "target": "percentile_latency",
+                            "replacement": invalid_repeat,
+                        },
+                    }
+                ),
+                json.dumps({"type": "final", "message": "done"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command="python -m unittest discover -s tests -v")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        result = agent.handle_user(
+            "Add percentile_latency, update README, add tests for it, run tests, and prove it with a shell command."
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        guards = [event for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertTrue(any(event.get("guard") == "repeated-add-function-after-success" for event in guards))
+        self.assertFalse(any(event.get("guard") == "invalid-python-mutation-payload" for event in guards))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not use add_function for the same symbol again", feedback)
+        self.assertIn("Remaining unproven deliverables", feedback)
+
+    def test_replace_body_full_function_payload_is_rejected_before_tool_execution(self) -> None:
+        root = self._workspace_scratch()
+        (root / "analytics.py").write_text(
+            "def percentile_latency(events, percentile=95):\n"
+            "    return None\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "analytics.py",
+                            "intent": "replace_body",
+                            "target": "percentile_latency",
+                            "replacement": "def percentile_latency(events, percentile=95):\n    return 1\n",
+                        },
+                    }
+                ),
+                *[json.dumps({"type": "final", "message": "updated"}) for _ in range(3)],
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        result = agent.handle_user("Fix percentile_latency in analytics.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        guards = [event for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertTrue(any(event.get("guard") == "replace-body-full-definition-payload" for event in guards))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("replace_body", feedback)
+        self.assertIn("use replace_symbol", feedback)
+
     def test_write_file_with_edit_markers_is_rejected_before_execution(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
@@ -12834,6 +12994,9 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_path_missing_on_single_source_repo_auto_grounds_real_source",
         "test_missing_mutation_target_blocks_before_python_payload_syntax_guard",
         "test_add_function_to_package_init_redirects_to_backing_module",
+        "test_package_init_wildcard_export_is_rejected_before_write",
+        "test_repeated_add_function_after_success_routes_to_remaining_obligations",
+        "test_replace_body_full_function_payload_is_rejected_before_tool_execution",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_repair_pivot_model_timeout_fails_closed",
         "test_final_round_repeated_mutating_failure_fails_closed",

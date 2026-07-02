@@ -6553,6 +6553,63 @@ class OllamaCodeAgent:
         except Exception:
             return "", ""
 
+    def _package_init_wildcard_export_target(self, arguments: dict[str, Any]) -> tuple[str, str]:
+        paths = self._mutation_target_paths(arguments)
+        init_paths = [path for path in paths if path.endswith("__init__.py")]
+        if not init_paths:
+            return "", ""
+        payload = "\n".join(
+            str(arguments.get(key) or "")
+            for key in ("content", "replacement", "new")
+            if str(arguments.get(key) or "")
+        )
+        match = re.search(r"(?m)^\s*from\s+(\.[A-Za-z_][\w.]*)\s+import\s+\*\s*(?:#.*)?$", payload)
+        if not match:
+            return "", ""
+        return init_paths[0], match.group(1)
+
+    def _successful_add_function_target_repeated(
+        self,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> tuple[str, str]:
+        intent = str(arguments.get("intent") or "").strip().lower().replace("-", "_")
+        if intent not in {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
+            return "", ""
+        paths = self._mutation_target_paths(arguments)
+        if len(paths) != 1:
+            return "", ""
+        target = str(arguments.get("target") or arguments.get("symbol") or "").strip().split(".")[-1]
+        if not target:
+            return "", ""
+        path = paths[0]
+        for item in reversed(successful_tool_results):
+            if item.get("name") != "edit_intent":
+                continue
+            result = item.get("result") if isinstance(item.get("result"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            prior_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+            prior_intent = str(prior_arguments.get("intent") or "").strip().lower().replace("-", "_")
+            if prior_intent not in {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
+                continue
+            prior_paths = self._mutation_target_paths(prior_arguments)
+            prior_target = str(prior_arguments.get("target") or prior_arguments.get("symbol") or result.get("symbol") or "").strip().split(".")[-1]
+            if prior_paths == [path] and prior_target == target:
+                return path, target
+        return "", ""
+
+    def _replace_body_full_definition_target(self, arguments: dict[str, Any]) -> tuple[str, str]:
+        intent = str(arguments.get("intent") or "").strip().lower().replace("-", "_")
+        if intent not in {"replace_body", "replace_function_body", "function_body", "replace_method_body"}:
+            return "", ""
+        replacement = str(arguments.get("replacement") or arguments.get("body") or "")
+        if not re.match(r"^\s*(?:async\s+def|def|class)\s+[A-Za-z_]\w*\b", replacement):
+            return "", ""
+        paths = self._mutation_target_paths(arguments)
+        target = str(arguments.get("target") or arguments.get("symbol") or "").strip()
+        return (paths[0] if paths else ""), target
+
     def _python_mutation_payload_syntax_diagnostic(self, name: str, arguments: dict[str, Any]) -> str:
         path = ""
         for raw_path in self._mutation_target_paths(arguments):
@@ -14769,6 +14826,87 @@ class OllamaCodeAgent:
                                     f"Do not implement{target_text} inside package re-export file `{init_path}`. "
                                     f"Read and edit the backing implementation module `{implementation_path}` first. "
                                     f"After the implementation exists, update `{init_path}` only to export it. Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
+                if name in MUTATING_TOOL_NAMES:
+                    init_path, wildcard_module = self._package_init_wildcard_export_target(arguments)
+                    if init_path:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="package-init-wildcard-export",
+                            init_path=init_path,
+                            wildcard_module=wildcard_module,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Do not rewrite package export file `{init_path}` with `from {wildcard_module} import *`; "
+                                    "that creates ambiguous exports and fails linting. Use explicit named imports and update `__all__` "
+                                    "for the requested symbols instead. Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
+                if name == "edit_intent":
+                    repeated_path, repeated_target = self._successful_add_function_target_repeated(arguments, successful_tool_results)
+                    if repeated_path and repeated_target:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="repeated-add-function-after-success",
+                            path=repeated_path,
+                            target=repeated_target,
+                            rounds=round_number,
+                        )
+                        obligation_statuses = self._request_obligation_proof_status(
+                            obligations=request_obligations,
+                            successful_tool_results=successful_tool_results,
+                            required_tool_names=required_tool_names,
+                        ) if request_obligations else []
+                        unresolved = [
+                            str(item.get("label") or item.get("id") or "").strip()
+                            for item in obligation_statuses
+                            if str(item.get("status") or "").strip() != "proven"
+                            and str(item.get("label") or item.get("id") or "").strip()
+                        ]
+                        suffix = f" Remaining unproven deliverables: {', '.join(unresolved[:4])}." if unresolved else ""
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"`{repeated_target}` was already added successfully to `{repeated_path}` in this turn. "
+                                    "Do not use add_function for the same symbol again. If the implementation is wrong, use "
+                                    "edit_intent replace_body or replace_symbol on that existing symbol; otherwise switch to the "
+                                    "unmet test, docs, validation, or shell-proof work."
+                                    + suffix
+                                    + " Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
+                    replace_body_path, replace_body_target = self._replace_body_full_definition_target(arguments)
+                    if replace_body_path or replace_body_target:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="replace-body-full-definition-payload",
+                            path=replace_body_path,
+                            target=replace_body_target,
+                            rounds=round_number,
+                        )
+                        target_text = f" for `{replace_body_target}`" if replace_body_target else ""
+                        path_text = f" in `{replace_body_path}`" if replace_body_path else ""
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"edit_intent replace_body{target_text}{path_text} must contain only the function body, not a full `def` or `class` definition. "
+                                    "Send only the indented body statements, or use replace_symbol when replacing a complete function definition. Next JSON only."
                                 ),
                             }
                         )
