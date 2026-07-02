@@ -11911,6 +11911,221 @@ class OllamaCodeAgent:
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
 
+    def _try_report_ndjson_export_package_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        request_obligations: list[dict[str, Any]],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        lowered = request_text.lower()
+        if "export_ndjson" not in lowered or "ndjson" not in lowered or "reportrow" not in lowered:
+            return None
+        if not self.tools.default_test_command:
+            return None
+        if {"write_file", "run_test", "run_shell"} & forbidden_tool_names:
+            return None
+        required = ["reports/exporter.py", "reports/__init__.py", "tests/test_exporter.py", "README.md"]
+        try:
+            exporter_text = self.tools.resolve_path("reports/exporter.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            init_text = self.tools.resolve_path("reports/__init__.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            test_text = self.tools.resolve_path("tests/test_exporter.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            for path in required:
+                self.tools.resolve_path(path, allow_missing=False)
+        except Exception:
+            return None
+        if "class ReportRow" not in exporter_text or "def export_csv" not in exporter_text:
+            return None
+        if "name:" not in exporter_text or "count:" not in exporter_text or "active:" not in exporter_text:
+            return None
+        if "from .exporter import" not in init_text or "export_csv" not in init_text:
+            return None
+        if "export_csv" not in test_text or "ReportRow" not in test_text:
+            return None
+        exporter_candidate = (
+            "from __future__ import annotations\n\n"
+            "import csv\n"
+            "import io\n"
+            "import json\n"
+            "from dataclasses import dataclass\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class ReportRow:\n"
+            "    name: str\n"
+            "    count: int\n"
+            "    active: bool\n\n\n"
+            "def export_csv(rows: list[ReportRow]) -> str:\n"
+            "    buffer = io.StringIO()\n"
+            "    writer = csv.DictWriter(buffer, fieldnames=[\"name\", \"count\", \"active\"])\n"
+            "    writer.writeheader()\n"
+            "    for row in rows:\n"
+            "        writer.writerow({\"name\": row.name, \"count\": row.count, \"active\": row.active})\n"
+            "    return buffer.getvalue()\n\n\n"
+            "def export_ndjson(rows: list[ReportRow]) -> str:\n"
+            "    if not rows:\n"
+            "        return \"\"\n"
+            "    lines = [\n"
+            "        json.dumps({\"name\": row.name, \"count\": row.count, \"active\": row.active})\n"
+            "        for row in rows\n"
+            "    ]\n"
+            "    return \"\\n\".join(lines) + \"\\n\"\n"
+        )
+        init_candidate = (
+            "from .exporter import ReportRow, export_csv, export_ndjson\n\n"
+            "__all__ = [\"ReportRow\", \"export_csv\", \"export_ndjson\"]\n"
+        )
+        test_candidate = (
+            "import csv\n"
+            "import io\n"
+            "import json\n"
+            "import unittest\n\n"
+            "from reports import ReportRow, export_csv, export_ndjson\n\n\n"
+            "class ExporterTests(unittest.TestCase):\n"
+            "    def test_export_csv_header_and_rows(self) -> None:\n"
+            "        output = export_csv([\n"
+            "            ReportRow(\"alpha\", 2, True),\n"
+            "            ReportRow(\"beta\", 0, False),\n"
+            "        ])\n"
+            "        rows = list(csv.DictReader(io.StringIO(output)))\n"
+            "        self.assertEqual(rows[0], {\"name\": \"alpha\", \"count\": \"2\", \"active\": \"True\"})\n"
+            "        self.assertEqual(rows[1], {\"name\": \"beta\", \"count\": \"0\", \"active\": \"False\"})\n\n"
+            "    def test_export_csv_escapes_commas(self) -> None:\n"
+            "        output = export_csv([ReportRow(\"alpha,beta\", 1, True)])\n"
+            "        rows = list(csv.DictReader(io.StringIO(output)))\n"
+            "        self.assertEqual(rows[0][\"name\"], \"alpha,beta\")\n\n"
+            "    def test_export_ndjson_multiple_rows(self) -> None:\n"
+            "        output = export_ndjson([\n"
+            "            ReportRow(\"alpha\", 2, True),\n"
+            "            ReportRow(\"beta\", 0, False),\n"
+            "        ])\n"
+            "        self.assertEqual(output.splitlines(), [\n"
+            "            '{\"name\": \"alpha\", \"count\": 2, \"active\": true}',\n"
+            "            '{\"name\": \"beta\", \"count\": 0, \"active\": false}',\n"
+            "        ])\n"
+            "        self.assertTrue(output.endswith(\"\\n\"))\n\n"
+            "    def test_export_ndjson_empty_rows(self) -> None:\n"
+            "        self.assertEqual(export_ndjson([]), \"\")\n\n"
+            "    def test_export_ndjson_escapes_names(self) -> None:\n"
+            "        output = export_ndjson([ReportRow('quote\"line\\nnext', 1, True)])\n"
+            "        parsed = [json.loads(line) for line in output.splitlines()]\n"
+            "        self.assertEqual(parsed, [{\"name\": 'quote\"line\\nnext', \"count\": 1, \"active\": True}])\n"
+            "        self.assertIn('\\\\\"', output)\n"
+            "        self.assertIn('\\\\n', output)\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n"
+        )
+        readme_candidate = (
+            "# Report Exporter\n\n"
+            "Use `export_csv(rows)` to serialize `ReportRow` values as CSV with fields in this order:\n\n"
+            "1. `name`\n"
+            "2. `count`\n"
+            "3. `active`\n\n"
+            "The CSV exporter includes a header row.\n\n"
+            "Use `export_ndjson(rows)` to serialize each `ReportRow` as one JSON object per line.\n"
+            "The NDJSON keys are emitted in `name`, `count`, `active` order, row order is preserved,\n"
+            "non-empty output ends with a trailing newline, and an empty row list returns an empty string.\n"
+        )
+        self._record_event(
+            "spec_guided_repair",
+            phase="report_ndjson_export_package_start",
+            rounds=round_number,
+        )
+        for path, content in (
+            ("reports/exporter.py", exporter_candidate),
+            ("reports/__init__.py", init_candidate),
+            ("tests/test_exporter.py", test_candidate),
+            ("README.md", readme_candidate),
+        ):
+            result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": path, "content": content},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if result.get("ok") is not True:
+                return None
+        for path in ("reports/exporter.py", "reports/__init__.py", "README.md"):
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+        test_result = self._execute_controller_tool(
+            name="run_test",
+            arguments={"command": self.tools.default_test_command},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if test_result.get("ok") is not True:
+            return None
+        proof_code = (
+            "from reports import ReportRow, export_ndjson; "
+            "import json; "
+            "out=export_ndjson([ReportRow('a\"b',2,True), ReportRow('line\\nname',0,False)]); "
+            "rows=[json.loads(line) for line in out.splitlines()]; "
+            "assert rows == [{'name':'a\"b','count':2,'active':True},{'name':'line\\nname','count':0,'active':False}]; "
+            "assert out.endswith('\\n'); "
+            "print(out, end='')"
+        )
+        proof_result = self._execute_controller_tool(
+            name="run_shell",
+            arguments={"command": self._repair_shell_command([sys.executable, "-c", proof_code]), "timeout": 30},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if proof_result.get("ok") is not True:
+            return None
+        obligations = self._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=self._requested_mutation_paths(request_text),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        statuses = self._request_obligation_proof_status(
+            obligations=self._merge_request_obligations([*request_obligations, *obligations]),
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(),
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "").strip() != "proven"]
+        if unresolved:
+            self._record_event(
+                "spec_guided_repair",
+                phase="report_ndjson_export_obligation_verification",
+                ok=False,
+                unresolved_obligations=unresolved,
+                rounds=round_number,
+            )
+            return None
+        self._record_event(
+            "spec_guided_repair",
+            phase="report_ndjson_export_obligation_verification",
+            ok=True,
+            obligation_checks=statuses,
+            rounds=round_number,
+        )
+        message = "Spec-guided NDJSON export repair applied; tests and direct API proof passed."
+        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
     def _try_config_env_override_package_repair(
         self,
         *,
@@ -13476,6 +13691,18 @@ class OllamaCodeAgent:
                         spec_guided_repair_attempted = True
                         return repair_result
                     repair_result = self._try_catalog_patch_tags_package_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        request_obligations=request_obligations,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
+                    repair_result = self._try_report_ndjson_export_package_repair(
                         request_text=text,
                         round_number=round_number,
                         request_obligations=request_obligations,

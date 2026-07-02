@@ -1408,6 +1408,86 @@ class AgentTests(AgentTestBase):
             )
         )
 
+    def test_report_ndjson_export_package_repair_updates_code_tests_docs_and_shell_proof(self) -> None:
+        root = self._workspace_scratch()
+        (root / "reports").mkdir()
+        (root / "tests").mkdir()
+        (root / "reports" / "__init__.py").write_text(
+            "from .exporter import ReportRow, export_csv\n\n"
+            "__all__ = [\"ReportRow\", \"export_csv\"]\n",
+            encoding="utf-8",
+        )
+        (root / "reports" / "exporter.py").write_text(
+            "from __future__ import annotations\n\n"
+            "import csv\n"
+            "import io\n"
+            "from dataclasses import dataclass\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class ReportRow:\n"
+            "    name: str\n"
+            "    count: int\n"
+            "    active: bool\n\n\n"
+            "def export_csv(rows: list[ReportRow]) -> str:\n"
+            "    buffer = io.StringIO()\n"
+            "    writer = csv.DictWriter(buffer, fieldnames=[\"name\", \"count\", \"active\"])\n"
+            "    writer.writeheader()\n"
+            "    for row in rows:\n"
+            "        writer.writerow({\"name\": row.name, \"count\": row.count, \"active\": row.active})\n"
+            "    return buffer.getvalue()\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_exporter.py").write_text(
+            "import csv\nimport io\nimport unittest\n\n"
+            "from reports import ReportRow, export_csv\n\n\n"
+            "class ExporterTests(unittest.TestCase):\n"
+            "    def test_export_csv_header_and_rows(self) -> None:\n"
+            "        output = export_csv([ReportRow(\"alpha\", 2, True)])\n"
+            "        rows = list(csv.DictReader(io.StringIO(output)))\n"
+            "        self.assertEqual(rows[0], {\"name\": \"alpha\", \"count\": \"2\", \"active\": \"True\"})\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n",
+            encoding="utf-8",
+        )
+        (root / "README.md").write_text("# Report Exporter\n\nUse `export_csv(rows)` for CSV output.\n", encoding="utf-8")
+        command = f"{sys.executable} -m unittest discover -s tests -v"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+        request_text = (
+            "Add an export_ndjson(rows) function to this report exporter. It should serialize each ReportRow "
+            "as one JSON object per line with keys name, count, and active in that order, preserve row order, "
+            "and end the output with a trailing newline when rows are present. It should return an empty string "
+            "for no rows. Export it from the package __init__.py. Update README with the new NDJSON export "
+            "behavior. Add tests for multiple rows, empty rows, and escaping names with quotes or newlines. "
+            "Run the tests and prove the behavior with a shell command."
+        )
+
+        result = agent.handle_user(request_text)
+
+        self.assertTrue(result.completed)
+        self.assertIn("NDJSON export repair", result.message)
+        exporter_text = (root / "reports" / "exporter.py").read_text(encoding="utf-8")
+        init_text = (root / "reports" / "__init__.py").read_text(encoding="utf-8")
+        test_text = (root / "tests" / "test_exporter.py").read_text(encoding="utf-8")
+        readme_text = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("def export_ndjson(rows: list[ReportRow]) -> str:", exporter_text)
+        self.assertIn("import json", exporter_text)
+        self.assertIn("export_ndjson", init_text)
+        self.assertIn("test_export_ndjson_multiple_rows", test_text)
+        self.assertIn("test_export_ndjson_empty_rows", test_text)
+        self.assertIn("test_export_ndjson_escapes_names", test_text)
+        self.assertIn("Use `export_ndjson(rows)`", readme_text)
+        self.assertGreaterEqual(tools.execute_counts.get("write_file", 0), 4)
+        self.assertGreaterEqual(tools.execute_counts.get("run_test", 0), 1)
+        self.assertEqual(tools.execute_counts.get("run_shell"), 1)
+        self.assertTrue(
+            any(
+                event.get("type") == "spec_guided_repair"
+                and event.get("phase") == "report_ndjson_export_obligation_verification"
+                and event.get("ok") is True
+                for event in agent.events
+            )
+        )
+
     def test_shell_recursive_grep_inspection_normalizes_to_search(self) -> None:
         client = FakeClient(
             [
@@ -12750,6 +12830,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_requested_tests_and_shell_proof_require_matching_tool_evidence",
         "test_final_verification_requires_read_proof_for_requested_command_token",
         "test_final_verification_requires_behavior_proof_for_cli_command_and_flag",
+        "test_report_ndjson_export_package_repair_updates_code_tests_docs_and_shell_proof",
         "test_request_obligations_persist_across_continue_requests",
         "test_failed_edit_recovery_state_persists_across_continue_requests",
         "test_failed_edit_recovery_blocks_validation_only_loop_before_repair",
