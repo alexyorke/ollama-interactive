@@ -3804,6 +3804,54 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Remove every leading `>` quote marker", feedback)
 
+    def test_write_file_dropping_existing_symbols_is_rejected_before_execution(self) -> None:
+        root = self._workspace_scratch()
+        original = (
+            "class RequestEvent:\n"
+            "    pass\n\n\n"
+            "def summarize_status(events):\n"
+            "    return {}\n"
+        )
+        (root / "analytics.py").write_text(original, encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "analytics.py",
+                            "content": (
+                                "class RequestEvent:\n"
+                                "    pass\n\n\n"
+                                "def percentile_latency(events, percentile=95):\n"
+                                "    return None\n"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        agent.handle_user("Add percentile_latency to analytics.py without removing existing behavior.")
+
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual((root / "analytics.py").read_text(encoding="utf-8"), original)
+        self.assertTrue(
+            any(
+                event.get("type") == "controller_guard"
+                and event.get("guard") == "write-file-drops-existing-python-symbols"
+                and event.get("dropped_symbols") == ["summarize_status"]
+                for event in agent.events
+            )
+        )
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("summarize_status", feedback)
+        self.assertIn("preserve existing public API", feedback)
+
     def test_invalid_add_function_payload_is_rejected_before_tool_execution(self) -> None:
         root = self._workspace_scratch()
         (root / "reports").mkdir()
@@ -4593,37 +4641,27 @@ class AgentTests(AgentTestBase):
             "            raise AssertionError(f'{value()} != 1')\n",
             encoding="utf-8",
         )
-        client = FakeClient(
-            [
-                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
-                '{"type":"tool","name":"write_file","arguments":{"path":"app.py","content":"def value() -> int:\\n    return 1\\n"}}',
-                '{"type":"final","message":"Updated app.py and tests passed."}',
-            ]
-        )
+        client = FakeClient([])
         tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
-        calls: list[dict[str, object]] = []
 
-        def fake_spec_guided_repair(**kwargs: object) -> AgentResult | None:
-            calls.append(dict(kwargs))
-            failed = kwargs.get("failed_run_test_result")
-            if isinstance(failed, dict) and failed.get("tool") == "preemptive_spec_repair":
-                return None
-            return AgentResult(message="spec repair after failed overwrite", rounds=int(kwargs["round_number"]), completed=False)
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "app.py"},
+                "result": {
+                    "ok": True,
+                    "tool": "read_file",
+                    "path": "app.py",
+                    "content": (root / "app.py").read_text(encoding="utf-8"),
+                },
+            }
+        ]
 
-        agent._try_spec_guided_repair = fake_spec_guided_repair  # type: ignore[method-assign]
-
-        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
-            result = agent.handle_user("Fix app.py and run tests.")
-
-        self.assertFalse(result.completed)
-        self.assertEqual(result.message, "spec repair after failed overwrite")
-        self.assertEqual(len(calls), 1)
         self.assertEqual(
-            agent._spec_guided_repair_paths(calls[-1]["successful_tool_results"], allow_workspace_fallback=True),
+            agent._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True),
             ("app.py", "tests/test_app.py"),
         )
-        self.assertIn("drops existing top-level symbols", calls[-1]["failed_run_test_result"]["summary"])
 
     def test_spec_guided_repair_paths_reroute_package_init_to_backing_module(self) -> None:
         root = self._workspace_scratch()
@@ -13150,6 +13188,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_repeated_add_function_after_success_routes_to_remaining_obligations",
         "test_replace_body_full_function_payload_is_rejected_before_tool_execution",
         "test_write_file_with_quote_prefixed_source_is_rejected_before_execution",
+        "test_write_file_dropping_existing_symbols_is_rejected_before_execution",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_repair_pivot_model_timeout_fails_closed",
         "test_final_round_repeated_mutating_failure_fails_closed",

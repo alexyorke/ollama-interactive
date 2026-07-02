@@ -6491,6 +6491,62 @@ class OllamaCodeAgent:
             paths.append(normalized)
         return paths
 
+    def _python_top_level_symbol_names_from_text(self, text: str, *, regex_fallback: bool = False) -> list[str]:
+        source = text[1:] if text.startswith("\ufeff") else text
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            if not regex_fallback:
+                return []
+            names: list[str] = []
+            seen: set[str] = set()
+            for match in re.finditer(r"(?m)^(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b", source):
+                name = match.group(1)
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+            return names
+        return [
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        ]
+
+    def _write_file_dropped_python_symbols(self, arguments: dict[str, Any]) -> tuple[str, list[str]]:
+        paths = [
+            path
+            for path in self._mutation_target_paths(arguments)
+            if path.endswith(".py") and not self._path_looks_like_test_file(path)
+        ]
+        content = str(arguments.get("content") or "")
+        if not paths or not content.strip():
+            return "", []
+        path = paths[0]
+        try:
+            target = self.tools.resolve_path(path, allow_missing=False)
+        except Exception:
+            return "", []
+        try:
+            existing = target.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return "", []
+        existing_names = {
+            name
+            for name in self._python_top_level_symbol_names_from_text(existing)
+            if not name.startswith("_")
+        }
+        updated_names = {
+            name
+            for name in self._python_top_level_symbol_names_from_text(content, regex_fallback=True)
+            if not name.startswith("_")
+        }
+        if not existing_names or not updated_names:
+            return "", []
+        dropped = sorted(existing_names - updated_names)
+        if not dropped:
+            return "", []
+        return path, dropped
+
     def _missing_mutation_target_suggestions(self, arguments: dict[str, Any]) -> tuple[str, list[str]]:
         for path in self._mutation_target_paths(arguments):
             if not path or path == ".":
@@ -14849,6 +14905,30 @@ class OllamaCodeAgent:
                             {
                                 "role": "user",
                                 "content": "write_file content must be clean file text, not Markdown blockquote or transcript text. Remove every leading `>` quote marker, re-read the target if needed, then send exact file contents only. Next JSON only.",
+                            }
+                        )
+                        continue
+                    dropped_path, dropped_symbols = self._write_file_dropped_python_symbols(arguments)
+                    if dropped_path and dropped_symbols:
+                        preview_names = ", ".join(dropped_symbols[:6])
+                        if len(dropped_symbols) > 6:
+                            preview_names = f"{preview_names}, ..."
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="write-file-drops-existing-python-symbols",
+                            path=dropped_path,
+                            dropped_symbols=dropped_symbols,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"write_file would drop existing top-level symbols from {dropped_path}: {preview_names}. "
+                                    "The task has not proven those removals are requested. Re-read the file, then use a targeted edit "
+                                    "or provide complete file contents that preserve existing public API while adding the requested behavior. Next JSON only."
+                                ),
                             }
                         )
                         continue
