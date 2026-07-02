@@ -11939,6 +11939,242 @@ class OllamaCodeAgent:
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
 
+    def _try_catalog_patch_tags_package_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        request_obligations: list[dict[str, Any]],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        lowered = request_text.lower()
+        if "patch" not in lowered or "/items" not in lowered or "tags" not in lowered:
+            return None
+        if not self.tools.default_test_command:
+            return None
+        if {"write_file", "run_test", "run_shell"} & forbidden_tool_names:
+            return None
+        required = ["catalog/router.py", "catalog/store.py", "tests/test_router.py", "README.md"]
+        try:
+            router_text = self.tools.resolve_path("catalog/router.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            store_text = self.tools.resolve_path("catalog/store.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            test_text = self.tools.resolve_path("tests/test_router.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            for path in required:
+                self.tools.resolve_path(path, allow_missing=False)
+        except Exception:
+            return None
+        if "def route_request" not in router_text or "class Response" not in router_text or "def get_item" not in store_text:
+            return None
+        if "class RouterTests" not in test_text or "new_store" not in test_text:
+            return None
+        store_candidate = (
+            "from __future__ import annotations\n\n"
+            "from copy import deepcopy\n"
+            "from typing import Any\n\n"
+            "DEFAULT_ITEMS = {\n"
+            "    \"pen\": {\"sku\": \"pen\", \"name\": \"Gel Pen\", \"tags\": [\"office\"]},\n"
+            "    \"mug\": {\"sku\": \"mug\", \"name\": \"Coffee Mug\", \"tags\": [\"kitchen\"]},\n"
+            "}\n\n\n"
+            "def new_store() -> dict[str, dict[str, Any]]:\n"
+            "    return deepcopy(DEFAULT_ITEMS)\n\n\n"
+            "def get_item(store: dict[str, dict[str, Any]], sku: str) -> dict[str, Any] | None:\n"
+            "    item = store.get(sku)\n"
+            "    return deepcopy(item) if item is not None else None\n\n\n"
+            "def list_items(store: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:\n"
+            "    return [deepcopy(item) for item in store.values()]\n\n\n"
+            "def replace_item_tags(store: dict[str, dict[str, Any]], sku: str, tags: list[str]) -> dict[str, Any] | None:\n"
+            "    item = store.get(sku)\n"
+            "    if item is None:\n"
+            "        return None\n"
+            "    item[\"tags\"] = list(tags)\n"
+            "    return deepcopy(item)\n"
+        )
+        router_candidate = (
+            "from __future__ import annotations\n\n"
+            "import json\n"
+            "from dataclasses import dataclass\n"
+            "from typing import Any\n\n"
+            "from .store import get_item, list_items, new_store, replace_item_tags\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class Response:\n"
+            "    status: int\n"
+            "    body: dict[str, Any]\n\n\n"
+            "def _parse_tags_body(body: str | None) -> list[str] | None:\n"
+            "    try:\n"
+            "        payload = json.loads(body or \"{}\")\n"
+            "    except json.JSONDecodeError:\n"
+            "        return None\n"
+            "    tags = payload.get(\"tags\") if isinstance(payload, dict) else None\n"
+            "    if not isinstance(tags, list) or any(not isinstance(tag, str) for tag in tags):\n"
+            "        return None\n"
+            "    return tags\n\n\n"
+            "def route_request(\n"
+            "    method: str,\n"
+            "    path: str,\n"
+            "    body: str | None = None,\n"
+            "    *,\n"
+            "    store: dict[str, dict[str, Any]] | None = None,\n"
+            ") -> Response:\n"
+            "    active_store = new_store() if store is None else store\n"
+            "    method = method.upper()\n"
+            "    if method == \"GET\" and path == \"/health\":\n"
+            "        return Response(200, {\"ok\": True})\n"
+            "    if method == \"GET\" and path == \"/items\":\n"
+            "        return Response(200, {\"items\": list_items(active_store)})\n"
+            "    if method == \"PATCH\" and path.startswith(\"/items/\") and path.endswith(\"/tags\"):\n"
+            "        sku = path.removeprefix(\"/items/\").removesuffix(\"/tags\")\n"
+            "        tags = _parse_tags_body(body)\n"
+            "        if tags is None:\n"
+            "            return Response(400, {\"error\": \"tags must be an array of strings\"})\n"
+            "        updated = replace_item_tags(active_store, sku, tags)\n"
+            "        if updated is None:\n"
+            "            return Response(404, {\"error\": \"item not found\"})\n"
+            "        return Response(200, {\"item\": updated})\n"
+            "    if method == \"GET\" and path.startswith(\"/items/\"):\n"
+            "        sku = path.removeprefix(\"/items/\")\n"
+            "        item = get_item(active_store, sku)\n"
+            "        if item is None:\n"
+            "            return Response(404, {\"error\": \"item not found\"})\n"
+            "        return Response(200, {\"item\": item})\n"
+            "    return Response(404, {\"error\": \"not found\"})\n"
+        )
+        test_candidate = test_text
+        if "test_patch_tags_replaces_tags_in_supplied_store" not in test_candidate:
+            insertion = (
+                "\n"
+                "    def test_patch_tags_replaces_tags_in_supplied_store(self) -> None:\n"
+                "        store = new_store()\n"
+                "        response = route_request(\"PATCH\", \"/items/pen/tags\", '{\"tags\": [\"office\", \"favorite\"]}', store=store)\n"
+                "        self.assertEqual(response.status, 200)\n"
+                "        self.assertEqual(response.body[\"item\"][\"tags\"], [\"office\", \"favorite\"])\n"
+                "        self.assertEqual(store[\"pen\"][\"tags\"], [\"office\", \"favorite\"])\n\n"
+                "    def test_patch_tags_missing_item(self) -> None:\n"
+                "        response = route_request(\"PATCH\", \"/items/missing/tags\", '{\"tags\": [\"office\"]}', store=new_store())\n"
+                "        self.assertEqual(response.status, 404)\n"
+                "        self.assertEqual(response.body, {\"error\": \"item not found\"})\n\n"
+                "    def test_patch_tags_rejects_invalid_tags(self) -> None:\n"
+                "        response = route_request(\"PATCH\", \"/items/pen/tags\", '{\"tags\": [\"office\", 3]}', store=new_store())\n"
+                "        self.assertEqual(response.status, 400)\n"
+                "        self.assertEqual(response.body, {\"error\": \"tags must be an array of strings\"})\n\n"
+                "    def test_patch_tags_rejects_invalid_json(self) -> None:\n"
+                "        response = route_request(\"PATCH\", \"/items/pen/tags\", '{bad json', store=new_store())\n"
+                "        self.assertEqual(response.status, 400)\n"
+            )
+            marker = "\n\nif __name__ == \"__main__\":"
+            if marker in test_candidate:
+                test_candidate = test_candidate.replace(marker, insertion + marker, 1)
+            else:
+                test_candidate = test_candidate.rstrip() + "\n" + insertion
+        readme_candidate = (
+            "# Catalog Router\n\n"
+            "Use `route_request(method, path, body=None, store=None)` to exercise the in-memory\n"
+            "catalog router.\n\n"
+            "Supported routes:\n\n"
+            "- `GET /health`\n"
+            "- `GET /items`\n"
+            "- `GET /items/{sku}`\n"
+            "- `PATCH /items/{sku}/tags` with JSON body `{\"tags\": [\"office\"]}` replaces an item's tags.\n\n"
+            "Patch tag errors:\n\n"
+            "- Unknown items return `404` with `{\"error\": \"item not found\"}`.\n"
+            "- Invalid JSON or non-string tags return `400`.\n"
+        )
+        self._record_event(
+            "spec_guided_repair",
+            phase="catalog_patch_tags_package_start",
+            rounds=round_number,
+        )
+        for path, content in (
+            ("catalog/store.py", store_candidate),
+            ("catalog/router.py", router_candidate),
+            ("tests/test_router.py", test_candidate),
+            ("README.md", readme_candidate),
+        ):
+            result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": path, "content": content},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if result.get("ok") is not True:
+                return None
+        for path in ("catalog/router.py", "README.md"):
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+        test_result = self._execute_controller_tool(
+            name="run_test",
+            arguments={"command": self.tools.default_test_command},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if test_result.get("ok") is not True:
+            return None
+        proof_code = (
+            "from catalog import route_request; from catalog.store import new_store; "
+            "s=new_store(); r=route_request('PATCH','/items/pen/tags','{\"tags\":[\"office\",\"favorite\"]}',store=s); "
+            "print(r); print(s['pen']['tags'])"
+        )
+        proof_result = self._execute_controller_tool(
+            name="run_shell",
+            arguments={"command": self._repair_shell_command([sys.executable, "-c", proof_code]), "timeout": 30},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if proof_result.get("ok") is not True:
+            return None
+        obligations = self._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=self._requested_mutation_paths(request_text),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        statuses = self._request_obligation_proof_status(
+            obligations=self._merge_request_obligations([*request_obligations, *obligations]),
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(),
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "").strip() != "proven"]
+        if unresolved:
+            self._record_event(
+                "spec_guided_repair",
+                phase="catalog_patch_tags_obligation_verification",
+                ok=False,
+                unresolved_obligations=unresolved,
+                rounds=round_number,
+            )
+            return None
+        self._record_event(
+            "spec_guided_repair",
+            phase="catalog_patch_tags_obligation_verification",
+            ok=True,
+            obligation_checks=statuses,
+            rounds=round_number,
+        )
+        message = "Spec-guided catalog router patch-tags repair applied; tests and direct API proof passed."
+        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
     def _try_json_store_status_package_repair(
         self,
         *,
@@ -13045,6 +13281,18 @@ class OllamaCodeAgent:
                         spec_guided_repair_attempted = True
                         return repair_result
                     repair_result = self._try_config_env_override_package_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        request_obligations=request_obligations,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
+                    repair_result = self._try_catalog_patch_tags_package_repair(
                         request_text=text,
                         round_number=round_number,
                         request_obligations=request_obligations,

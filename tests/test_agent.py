@@ -4872,6 +4872,134 @@ class AgentTests(AgentTestBase):
         self.assertIn("port=9100", proof.stdout)
         self.assertIn("debug=True", proof.stdout)
 
+    def test_catalog_patch_tags_package_repair_updates_router_tests_docs_and_proof(self) -> None:
+        root = self._workspace_scratch()
+        (root / "catalog").mkdir()
+        (root / "tests").mkdir()
+        (root / "catalog" / "__init__.py").write_text(
+            "from .router import Response, route_request\n\n"
+            "__all__ = [\"Response\", \"route_request\"]\n",
+            encoding="utf-8",
+        )
+        (root / "catalog" / "store.py").write_text(
+            "from __future__ import annotations\n\n"
+            "from copy import deepcopy\n"
+            "from typing import Any\n\n"
+            "DEFAULT_ITEMS = {\n"
+            "    \"pen\": {\"sku\": \"pen\", \"name\": \"Gel Pen\", \"tags\": [\"office\"]},\n"
+            "    \"mug\": {\"sku\": \"mug\", \"name\": \"Coffee Mug\", \"tags\": [\"kitchen\"]},\n"
+            "}\n\n\n"
+            "def new_store() -> dict[str, dict[str, Any]]:\n"
+            "    return deepcopy(DEFAULT_ITEMS)\n\n\n"
+            "def get_item(store: dict[str, dict[str, Any]], sku: str) -> dict[str, Any] | None:\n"
+            "    item = store.get(sku)\n"
+            "    return deepcopy(item) if item is not None else None\n\n\n"
+            "def list_items(store: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:\n"
+            "    return [deepcopy(item) for item in store.values()]\n",
+            encoding="utf-8",
+        )
+        (root / "catalog" / "router.py").write_text(
+            "from __future__ import annotations\n\n"
+            "import json\n"
+            "from dataclasses import dataclass\n"
+            "from typing import Any\n\n"
+            "from .store import get_item, list_items, new_store\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class Response:\n"
+            "    status: int\n"
+            "    body: dict[str, Any]\n\n\n"
+            "def route_request(method: str, path: str, body: str | None = None, *, store: dict[str, dict[str, Any]] | None = None) -> Response:\n"
+            "    active_store = new_store() if store is None else store\n"
+            "    method = method.upper()\n"
+            "    if method == \"GET\" and path == \"/health\":\n"
+            "        return Response(200, {\"ok\": True})\n"
+            "    if method == \"GET\" and path == \"/items\":\n"
+            "        return Response(200, {\"items\": list_items(active_store)})\n"
+            "    if method == \"GET\" and path.startswith(\"/items/\"):\n"
+            "        sku = path.removeprefix(\"/items/\")\n"
+            "        item = get_item(active_store, sku)\n"
+            "        if item is None:\n"
+            "            return Response(404, {\"error\": \"item not found\"})\n"
+            "        return Response(200, {\"item\": item})\n"
+            "    return Response(404, {\"error\": \"not found\"})\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_router.py").write_text(
+            "import unittest\n\n"
+            "from catalog import route_request\n"
+            "from catalog.store import new_store\n\n\n"
+            "class RouterTests(unittest.TestCase):\n"
+            "    def test_health(self) -> None:\n"
+            "        response = route_request(\"GET\", \"/health\")\n"
+            "        self.assertEqual(response.status, 200)\n"
+            "        self.assertEqual(response.body, {\"ok\": True})\n\n"
+            "    def test_get_item(self) -> None:\n"
+            "        response = route_request(\"GET\", \"/items/pen\")\n"
+            "        self.assertEqual(response.status, 200)\n"
+            "        self.assertEqual(response.body[\"item\"][\"name\"], \"Gel Pen\")\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n",
+            encoding="utf-8",
+        )
+        (root / "README.md").write_text("# Catalog Router\n\n- `GET /items/{sku}`\n", encoding="utf-8")
+        command = f"{sys.executable} -m unittest discover -s tests -v"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        successful_tool_results: list[dict[str, object]] = []
+        satisfied_tool_names: set[str] = set()
+        tool_calls: list[dict[str, object]] = []
+        request_text = (
+            "Add a PATCH /items/{sku}/tags route to this catalog router. The request body should be JSON "
+            "with a tags array of strings. It should replace the item's tags in the supplied store and return "
+            "the updated item. Unknown items should return 404, and invalid JSON or non-string tags should return 400. "
+            "Update README with the new route. Add tests for success, missing item, and invalid tags. Run the tests "
+            "and prove the behavior with a shell command."
+        )
+        obligations = agent._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+
+        result = agent._try_catalog_patch_tags_package_repair(
+            request_text=request_text,
+            round_number=2,
+            request_obligations=obligations,
+            forbidden_tool_names=set(),
+            successful_tool_results=successful_tool_results,  # type: ignore[arg-type]
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.completed)
+        router_after = (root / "catalog" / "router.py").read_text(encoding="utf-8")
+        tests_after = (root / "tests" / "test_router.py").read_text(encoding="utf-8")
+        readme_after = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn('method == "PATCH"', router_after)
+        self.assertIn("replace_item_tags", router_after)
+        self.assertIn("test_patch_tags_replaces_tags_in_supplied_store", tests_after)
+        self.assertIn("PATCH /items/{sku}/tags", readme_after)
+        proof = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from catalog import route_request; from catalog.store import new_store; "
+                    "s=new_store(); r=route_request('PATCH','/items/pen/tags','{\"tags\":[\"office\",\"favorite\"]}',store=s); "
+                    "print(r); print(s['pen']['tags'])"
+                ),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proof.returncode, 0, proof.stderr)
+        self.assertIn("favorite", proof.stdout)
+
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
         tools = ToolExecutor(root, approval_mode="auto")
