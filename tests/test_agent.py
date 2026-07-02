@@ -3567,6 +3567,60 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Use explicit named imports and update `__all__`", feedback)
 
+    def test_package_init_implementation_write_is_rejected_before_execution(self) -> None:
+        root = self._workspace_scratch()
+        (root / "analytics").mkdir()
+        (root / "analytics" / "__init__.py").write_text(
+            "from .events import RequestEvent, summarize_status\n\n"
+            "__all__ = [\"RequestEvent\", \"summarize_status\"]\n",
+            encoding="utf-8",
+        )
+        (root / "analytics" / "events.py").write_text(
+            "class RequestEvent:\n"
+            "    pass\n\n\n"
+            "def summarize_status(events):\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        polluted_init = (
+            "from .events import RequestEvent\n\n\n"
+            "def percentile_latency(events, percentile=95):\n"
+            "    return None\n\n\n"
+            "class AnalyticsTests:\n"
+            "    def test_percentile_latency(self):\n"
+            "        assert percentile_latency([]) is None\n"
+        )
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "write_file",
+                        "arguments": {"path": "analytics/__init__.py", "content": polluted_init},
+                    }
+                ),
+                *[json.dumps({"type": "final", "message": "done"}) for _ in range(4)],
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        result = agent.handle_user(
+            "Add percentile_latency to this analytics package, export it, update README, add tests, and run tests."
+        )
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual(
+            (root / "analytics" / "__init__.py").read_text(encoding="utf-8"),
+            "from .events import RequestEvent, summarize_status\n\n__all__ = [\"RequestEvent\", \"summarize_status\"]\n",
+        )
+        guards = [event for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertTrue(any(event.get("guard") == "package-init-implementation-write" for event in guards))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not write feature implementations or test classes into package export file", feedback)
+        self.assertIn("Put implementation code in `analytics/events.py` first", feedback)
+
     def test_repeated_add_function_after_success_routes_to_remaining_obligations(self) -> None:
         root = self._workspace_scratch()
         (root / "analytics").mkdir()
@@ -4536,6 +4590,48 @@ class AgentTests(AgentTestBase):
             ("app.py", "tests/test_app.py"),
         )
         self.assertIn("drops existing top-level symbols", calls[-1]["failed_run_test_result"]["summary"])
+
+    def test_spec_guided_repair_paths_reroute_package_init_to_backing_module(self) -> None:
+        root = self._workspace_scratch()
+        (root / "analytics").mkdir()
+        (root / "tests").mkdir()
+        (root / "analytics" / "__init__.py").write_text(
+            "from .events import RequestEvent, summarize_status, percentile_latency\n\n"
+            "__all__ = [\"RequestEvent\", \"summarize_status\"]\n",
+            encoding="utf-8",
+        )
+        (root / "analytics" / "events.py").write_text(
+            "class RequestEvent:\n"
+            "    pass\n\n\n"
+            "def summarize_status(events):\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_events.py").write_text(
+            "from analytics import RequestEvent, summarize_status\n\n\n"
+            "def test_summarize_status():\n"
+            "    assert summarize_status([]) == {}\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "read_file",
+                "arguments": {"path": "tests/test_events.py"},
+                "result": {"ok": True, "path": "tests/test_events.py", "output": "from analytics import summarize_status"},
+            },
+            {
+                "name": "edit_intent",
+                "arguments": {"path": "analytics/__init__.py", "intent": "add_import", "target": "percentile_latency"},
+                "result": {"ok": True, "path": "analytics/__init__.py", "summary": "Added import to analytics/__init__.py."},
+            },
+        ]
+
+        self.assertEqual(
+            agent._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True),
+            ("analytics/events.py", "tests/test_events.py"),
+        )
 
     def test_final_repair_spec_stop_attempts_spec_guided_repair(self) -> None:
         root = self._workspace_scratch()
@@ -9997,6 +10093,27 @@ class AgentTests(AgentTestBase):
         auto_results = [event for event in agent.events if event["type"] == "tool_result" and event["name"] == "run_test"]
         self.assertTrue(auto_results[0]["auto"])
 
+    def test_final_chance_test_success_does_not_complete_unproven_obligations(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=pass_command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=1)
+
+            result = agent.handle_user("Edit app.py, add tests for it, run tests, and prove it with a shell command.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("final-chance tests passed but requested deliverables remain unproven", result.message)
+        self.assertIn("add or update the requested tests", result.message)
+        self.assertIn("prove the requested behavior with a shell command", result.message)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
     def test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -12995,6 +13112,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_missing_mutation_target_blocks_before_python_payload_syntax_guard",
         "test_add_function_to_package_init_redirects_to_backing_module",
         "test_package_init_wildcard_export_is_rejected_before_write",
+        "test_package_init_implementation_write_is_rejected_before_execution",
         "test_repeated_add_function_after_success_routes_to_remaining_obligations",
         "test_replace_body_full_function_payload_is_rejected_before_tool_execution",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
@@ -13026,8 +13144,10 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_spec_guided_mechanical_repair_rejects_unproven_requested_flag",
         "test_failed_proactive_run_test_invokes_spec_guided_repair",
         "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
+        "test_spec_guided_repair_paths_reroute_package_init_to_backing_module",
         "test_final_repair_spec_stop_attempts_spec_guided_repair",
         "test_known_syntax_error_blocks_lint_validator_until_repair",
+        "test_final_chance_test_success_does_not_complete_unproven_obligations",
         "test_pending_repair_spec_fails_closed_without_repeated_auto_lint",
         "test_unproven_feature_obligations_fail_before_final_verifier",
         "test_syntax_bad_mutation_invokes_spec_guided_repair_with_workspace_fallback",

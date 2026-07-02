@@ -6568,6 +6568,58 @@ class OllamaCodeAgent:
             return "", ""
         return init_paths[0], match.group(1)
 
+    def _package_init_implementation_write_target(self, arguments: dict[str, Any]) -> tuple[str, str]:
+        paths = self._mutation_target_paths(arguments)
+        init_paths = [path for path in paths if path.endswith("__init__.py")]
+        if not init_paths:
+            return "", ""
+        payload = "\n".join(
+            str(arguments.get(key) or "")
+            for key in ("content", "replacement", "new")
+            if str(arguments.get(key) or "")
+        )
+        if not re.search(r"(?m)^(?:def|class)\s+[A-Za-z_]\w*\b", payload):
+            return "", ""
+        try:
+            init_path = self.tools.resolve_path(init_paths[0], allow_missing=False)
+            siblings = [
+                path
+                for path in init_path.parent.glob("*.py")
+                if path.name != "__init__.py" and path.is_file()
+            ]
+        except Exception:
+            return init_paths[0], ""
+        if len(siblings) == 1:
+            try:
+                return init_paths[0], self.tools.relative_label(siblings[0])
+            except Exception:
+                return init_paths[0], ""
+        return init_paths[0], ""
+
+    def _package_init_single_backing_module(self, path: str) -> str:
+        normalized = str(path or "").strip().replace("\\", "/").lstrip("./")
+        if not normalized.endswith("__init__.py"):
+            return ""
+        try:
+            init_path = self.tools.resolve_path(normalized, allow_missing=False)
+            siblings = [
+                sibling
+                for sibling in init_path.parent.glob("*.py")
+                if sibling.name != "__init__.py" and sibling.is_file()
+            ]
+        except Exception:
+            return ""
+        if len(siblings) != 1:
+            return ""
+        try:
+            return self.tools.relative_label(siblings[0]).replace("\\", "/").lstrip("./")
+        except Exception:
+            return ""
+
+    def _reroute_package_init_source_path(self, source_path: str) -> str:
+        backing_module = self._package_init_single_backing_module(source_path)
+        return backing_module or source_path
+
     def _successful_add_function_target_repeated(
         self,
         arguments: dict[str, Any],
@@ -10314,6 +10366,7 @@ class OllamaCodeAgent:
     ) -> tuple[str, str] | None:
         failed_test_path, failed_source_path = self._failed_test_output_paths(successful_tool_results)
         if failed_source_path:
+            failed_source_path = self._reroute_package_init_source_path(failed_source_path)
             try:
                 source_file = self.tools.resolve_path(failed_source_path, allow_missing=False)
                 source_line_count = len(source_file.read_text(encoding="utf-8", errors="replace").splitlines())
@@ -10344,7 +10397,7 @@ class OllamaCodeAgent:
                     test_paths = self._related_tests_for_source(single_source)
         if not source_paths or not test_paths:
             return None
-        source_path = source_paths[-1]
+        source_path = self._reroute_package_init_source_path(source_paths[-1])
         test_path = test_paths[-1]
         try:
             source_file = self.tools.resolve_path(source_path, allow_missing=False)
@@ -14852,6 +14905,32 @@ class OllamaCodeAgent:
                             }
                         )
                         continue
+                    init_path, implementation_path = self._package_init_implementation_write_target(arguments)
+                    if init_path:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="package-init-implementation-write",
+                            init_path=init_path,
+                            implementation_path=implementation_path,
+                            rounds=round_number,
+                        )
+                        destination = (
+                            f" Put implementation code in `{implementation_path}` first."
+                            if implementation_path
+                            else " Put implementation code in the backing source module first."
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Do not write feature implementations or test classes into package export file `{init_path}`. "
+                                    + destination
+                                    + " Put tests in the test file, and leave the package initializer to explicit imports plus `__all__`. Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
                 if name == "edit_intent":
                     repeated_path, repeated_target = self._successful_add_function_target_repeated(arguments, successful_tool_results)
                     if repeated_path and repeated_target:
@@ -16573,6 +16652,31 @@ class OllamaCodeAgent:
                         last_successful_run_test_version = mutation_version
                         latest_run_test_failed = False
                         latest_run_test_failure_summary = ""
+                        if request_obligations:
+                            obligation_statuses = self._request_obligation_proof_status(
+                                obligations=request_obligations,
+                                successful_tool_results=successful_tool_results,
+                                required_tool_names=required_tool_names,
+                            )
+                            unresolved_obligations = [
+                                item for item in obligation_statuses if str(item.get("status") or "").strip() != "proven"
+                            ]
+                            if unresolved_obligations:
+                                labels = [
+                                    str(item.get("label") or item.get("id") or "").strip()
+                                    for item in unresolved_obligations
+                                    if str(item.get("label") or item.get("id") or "").strip()
+                                ]
+                                missing = "; ".join(labels[:4]) if labels else "requested deliverables"
+                                message = "Stopped because final-chance tests passed but requested deliverables remain unproven. " + missing + "."
+                                self._record_event(
+                                    "assistant",
+                                    content=message,
+                                    rounds=round_number,
+                                    obligation_checks=obligation_statuses,
+                                )
+                                self._flush_llm_call_events()
+                                return AgentResult(message=message, rounds=round_number, completed=False)
                         message = "Ran tests after the latest edit: passed."
                         self._record_event("assistant_synthesized", content=message, tool="run_test", rounds=round_number, auto=True)
                         self._record_event("assistant", content=message, rounds=round_number)
