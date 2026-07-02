@@ -5488,6 +5488,24 @@ def double(value: int) -> int:
         self.assertEqual(final_text.count("from .store import"), 1)
         self.assertIn("from .store import add_bookmark, list_bookmarks, archive_bookmark", final_text)
 
+    def test_apply_structured_edit_rejects_executable_add_import_payload(self) -> None:
+        root = self._workspace_scratch()
+        sample = root / "notes_cli.py"
+        sample.write_text("import argparse\n\nparser = argparse.ArgumentParser()\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        result = tools.apply_structured_edit(
+            {
+                "op": "add_import",
+                "path": "notes_cli.py",
+                "statement": "import argparse\nparser.add_argument('--limit', type=int)",
+            }
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("no executable code", result["summary"])
+        self.assertNotIn("--limit", sample.read_text(encoding="utf-8"))
+
     def test_apply_structured_edit_replaces_function_body(self) -> None:
         root = self._workspace_scratch()
         sample = root / "ops.py"

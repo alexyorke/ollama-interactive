@@ -6074,6 +6074,34 @@ class AgentTests(AgentTestBase):
         self.assertTrue(file_allowed)
         self.assertFalse(agent._repair_spec_has_followup_mutation(state))
 
+    def test_failed_narrow_edit_does_not_block_broad_write_file_repair(self) -> None:
+        agent = self._cwd_agent()
+        tool_error_counts = {
+            ("replace_symbol", '{"path":"notes_cli.py","symbol":"parser"}', "unknown"): 1,
+        }
+
+        write_file_error = agent._matching_repeated_tool_error(
+            name="write_file",
+            arguments={"path": "notes_cli.py", "content": "def main():\n    return 0\n"},
+            tool_error_counts=tool_error_counts,
+        )
+        text_fallback_error = agent._matching_repeated_tool_error(
+            name="replace_in_file",
+            arguments={"path": "notes_cli.py", "old": "missing", "new": "value"},
+            tool_error_counts=tool_error_counts,
+        )
+        repeated_text_error = agent._matching_repeated_tool_error(
+            name="replace_in_file",
+            arguments={"path": "notes_cli.py", "old": "other", "new": "value"},
+            tool_error_counts={
+                ("replace_in_file", '{"path":"notes_cli.py","old":"missing"}', "unknown"): 1,
+            },
+        )
+
+        self.assertIsNone(write_file_error)
+        self.assertIsNone(text_fallback_error)
+        self.assertEqual(repeated_text_error, "edit_intent:unknown")
+
     def test_failed_edit_recovery_blocks_validation_when_multiple_repair_specs_exist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -8065,6 +8093,59 @@ class AgentTests(AgentTestBase):
 
         self.assertIn("Use replace_symbol/replace_in_file", feedback)
         self.assertIn("content was abbreviated", feedback)
+
+    def test_agent_failed_cli_proof_points_to_parser_repair(self) -> None:
+        agent = self._cwd_agent()
+
+        feedback = agent._tool_result_feedback_message(
+            "run_shell",
+            {
+                "ok": False,
+                "exit_code": 2,
+                "output": (
+                    "usage: notes_cli.py [-h] [--tag TAG] [--json]\n"
+                    "notes_cli.py: error: unrecognized arguments: --limit 1\n"
+                ),
+            },
+            real_tool_use=False,
+            arguments={"command": f"{sys.executable} notes_cli.py --tag work --limit 1 --json"},
+        )
+
+        self.assertIn("app parser rejected --limit", feedback)
+        self.assertIn("Repair the source command surface first", feedback)
+        self.assertIn("do not use replace_symbol on a local parser variable", feedback)
+        self.assertIn("rerun the same shell proof and tests", feedback)
+
+    def test_agent_failed_pytest_flag_does_not_point_to_app_parser_repair(self) -> None:
+        agent = self._cwd_agent()
+
+        feedback = agent._tool_result_feedback_message(
+            "run_shell",
+            {
+                "ok": False,
+                "exit_code": 4,
+                "output": "usage: pytest [options]\npytest: error: unrecognized arguments: --wat\n",
+            },
+            real_tool_use=False,
+            arguments={"command": "python -m pytest --wat"},
+        )
+
+        self.assertIn("Correct the command flags", feedback)
+        self.assertNotIn("app parser", feedback)
+
+    def test_agent_missing_edit_symbol_feedback_rejects_invented_helper(self) -> None:
+        agent = self._cwd_agent()
+
+        feedback = agent._tool_result_feedback_message(
+            "edit_intent",
+            {"ok": False, "summary": "change Python function body: Symbol not found: _parse_args"},
+            real_tool_use=False,
+            arguments={"path": "notes_cli.py", "intent": "replace_body", "target": "_parse_args"},
+        )
+
+        self.assertIn("Edit target `_parse_args` was not found", feedback)
+        self.assertIn("Do not invent helper symbols", feedback)
+        self.assertIn("existing symbol such as main", feedback)
 
     def test_agent_blocks_repeated_failed_run_test_until_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

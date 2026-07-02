@@ -12889,8 +12889,16 @@ import string
                 module = str(payload.get("module") or "").strip()
                 name = str(payload.get("name") or "").strip()
                 statement = f"from {module} import {name}" if module and name else ""
-            if not statement.startswith(("import ", "from ")):
-                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": "add_import requires an import/from statement."}
+            try:
+                parsed_statement = ast.parse(statement)
+            except SyntaxError:
+                parsed_statement = None
+            if (
+                parsed_statement is None
+                or not parsed_statement.body
+                or any(not isinstance(node, (ast.Import, ast.ImportFrom)) for node in parsed_statement.body)
+            ):
+                return {"ok": False, "tool": "apply_structured_edit", "path": relative_path, "summary": "add_import requires import/from statements and no executable code."}
             original = target.read_text(encoding="utf-8", errors="replace")
             updated = self._insert_import_statement(original, statement)
             diagnostic = self._python_syntax_diagnostic(target, updated)

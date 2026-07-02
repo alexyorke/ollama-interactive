@@ -3475,6 +3475,50 @@ class OllamaCodeAgent:
             parts.append("diff=" + self._truncate_text(diff.strip().replace("\n", " | "), limit=260))
         return self._truncate_text(" ".join(parts), limit=760)
 
+    def _run_shell_failure_follow_up(self, result: dict[str, Any], arguments: dict[str, Any] | None = None) -> str:
+        output = str(result.get("output") or "")
+        summary = str(result.get("summary") or "")
+        text = "\n".join(part for part in (output, summary) if part).strip()
+        if "unrecognized arguments" not in text.lower():
+            return "Tool failed; not required success. Fix or choose another. Next JSON only."
+        command = str((arguments or {}).get("command") or "")
+        command_lower = command.lower()
+        python_cli_command = (
+            ".py" in command_lower
+            and "pytest" not in command_lower
+            and "unittest" not in command_lower
+        ) or re.search(r"(?im)^usage:\s+\S+\.py\b", output) is not None
+        if not python_cli_command:
+            return "Command arguments were rejected. Correct the command flags or target CLI before retrying. Next JSON only."
+        match = re.search(r"(?im)unrecognized arguments?:\s*(?P<args>.+)$", text)
+        rejected_args = ""
+        if match:
+            tokens = [token for token in shlex.split(match.group("args")) if token.startswith("-")]
+            rejected_args = ", ".join(tokens[:4])
+        if rejected_args:
+            return (
+                f"CLI proof failed because the app parser rejected {rejected_args}. "
+                "Repair the source command surface first: re-read the source, add the requested argparse flag inside the parser setup, "
+                "thread args through the behavior path, and do not use replace_symbol on a local parser variable. "
+                "Then rerun the same shell proof and tests before any final. Next JSON only."
+            )
+        return (
+            "CLI proof failed because the app parser rejected requested arguments. Repair the source command surface first: "
+            "re-read the source, update the parser setup and behavior path, and do not use replace_symbol on a local parser variable. "
+            "Then rerun the same shell proof and tests before any final. Next JSON only."
+        )
+
+    def _edit_intent_failure_follow_up(self, result: dict[str, Any], arguments: dict[str, Any] | None = None) -> str:
+        summary = str(result.get("summary") or "")
+        if "symbol not found" not in summary.lower():
+            return "Tool failed; not required success. Fix or choose another. Next JSON only."
+        target = str((arguments or {}).get("target") or "").strip()
+        target_text = f" `{target}`" if target else ""
+        return (
+            f"Edit target{target_text} was not found. Do not invent helper symbols or keep targeting missing symbols. "
+            "Re-read the file and edit an existing symbol such as main, or use write_file only after reading the complete file. Next JSON only."
+        )
+
     def _tool_result_feedback_message(
         self,
         name: str,
@@ -3483,11 +3527,17 @@ class OllamaCodeAgent:
         real_tool_use: bool,
         evidence_id: str | None = None,
         successful_tool_results: list[dict[str, Any]] | None = None,
+        arguments: dict[str, Any] | None = None,
     ) -> str:
         payload = self._compact_tool_result_for_context(name, result, for_verification=False)
         follow_up = "Next JSON only."
         if not real_tool_use:
-            follow_up = "Tool failed; not required success. Fix or choose another. Next JSON only."
+            if name == "run_shell":
+                follow_up = self._run_shell_failure_follow_up(result, arguments)
+            elif name == "edit_intent":
+                follow_up = self._edit_intent_failure_follow_up(result, arguments)
+            else:
+                follow_up = "Tool failed; not required success. Fix or choose another. Next JSON only."
             summary = str(result.get("summary") or "")
             if "omitted-context marker" in summary:
                 follow_up = "Tool failed because content was abbreviated. Use replace_symbol/replace_in_file for partial edits, or read and provide complete file content. Next JSON only."
@@ -7164,9 +7214,12 @@ class OllamaCodeAgent:
                 and tool_error_counts[(prior_name, prior_arg_key, error_class)] >= 1
             ):
                 return error_class
-        if name in LOW_LEVEL_EDIT_TOOL_NAMES and "edit_intent" in self.tools.available_tool_names():
+        narrow_low_level_edits = LOW_LEVEL_EDIT_TOOL_NAMES - {"write_file"}
+        if name in narrow_low_level_edits and "edit_intent" in self.tools.available_tool_names():
             for prior_name, _prior_arg_key, error_class in tool_error_counts:
-                if prior_name in LOW_LEVEL_EDIT_TOOL_NAMES and tool_error_counts[(prior_name, _prior_arg_key, error_class)] >= 1:
+                if prior_name in narrow_low_level_edits and tool_error_counts[(prior_name, _prior_arg_key, error_class)] >= 1:
+                    if name == "replace_in_file" and prior_name in {"replace_symbol", "replace_symbols"} and error_class == "unknown":
+                        continue
                     return f"edit_intent:{error_class}"
         for prior_name, prior_arg_key, error_class in tool_error_counts:
             if prior_name == name and prior_arg_key == arg_key and tool_error_counts[(prior_name, prior_arg_key, error_class)] >= 2:
@@ -8191,6 +8244,7 @@ class OllamaCodeAgent:
                     real_tool_use=real_tool_use,
                     evidence_id=evidence_id,
                     successful_tool_results=successful_tool_results,
+                    arguments=arguments,
                 ),
             }
         )
@@ -13713,6 +13767,7 @@ class OllamaCodeAgent:
                             real_tool_use=real_tool_use,
                             evidence_id=evidence_id,
                             successful_tool_results=successful_tool_results,
+                            arguments=arguments,
                         ),
                     }
                 )
