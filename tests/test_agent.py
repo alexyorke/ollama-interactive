@@ -4193,8 +4193,9 @@ class AgentTests(AgentTestBase):
         ]
         tool_calls: list[dict[str, object]] = []
 
+        request_text = "Add a --sort title option, update README.md and tests, run tests, and prove --sort with --json from the shell."
         result = agent._try_spec_guided_mechanical_repair(
-            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            request_text=request_text,
             round_number=3,
             source_path="notes_cli.py",
             test_path="tests/test_notes_cli.py",
@@ -4218,9 +4219,9 @@ class AgentTests(AgentTestBase):
             for item in obligation_events[-1].get("unresolved_obligations", [])
             if isinstance(item, dict)
         ]
-        self.assertTrue(any('"--limit" flag' in label for label in unresolved_labels))
+        self.assertTrue(any('"--sort" flag' in label for label in unresolved_labels))
         repeat_direct = agent._try_spec_guided_mechanical_repair(
-            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            request_text=request_text,
             round_number=4,
             source_path="notes_cli.py",
             test_path="tests/test_notes_cli.py",
@@ -4244,7 +4245,7 @@ class AgentTests(AgentTestBase):
             and event.get("phase") == "post_context_cli_mechanical_start"
         ]
         request_obligations = agent._derive_request_obligations(
-            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            request_text=request_text,
             required_tool_names=set(),
             required_mutation_paths=set(),
             code_mutation_required=True,
@@ -4252,7 +4253,7 @@ class AgentTests(AgentTestBase):
         )
 
         repeat = agent._try_post_context_cli_feature_repair(
-            request_text="Add a --limit N option, update README.md and tests, run tests, and prove --limit with --json from the shell.",
+            request_text=request_text,
             round_number=4,
             request_obligations=request_obligations,
             forbidden_tool_names=set(),
@@ -8146,6 +8147,21 @@ class AgentTests(AgentTestBase):
         self.assertIn("Edit target `_parse_args` was not found", feedback)
         self.assertIn("Do not invent helper symbols", feedback)
         self.assertIn("existing symbol such as main", feedback)
+
+    def test_candidate_cli_proof_commands_include_requested_limit_flag(self) -> None:
+        agent = self._cwd_agent()
+
+        commands = agent._candidate_cli_proof_commands(
+            "notes_cli.py",
+            (
+                "parser.add_argument('--tag')\n"
+                "parser.add_argument('--json', action='store_true')\n"
+                "parser.add_argument('--limit', type=int)\n"
+            ),
+            "Add a --limit N option that works with --json.",
+        )
+
+        self.assertTrue(any("--tag work --limit 1 --json" in command for command in commands), commands)
 
     def test_agent_blocks_repeated_failed_run_test_until_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

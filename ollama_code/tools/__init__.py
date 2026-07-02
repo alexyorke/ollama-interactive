@@ -8792,7 +8792,13 @@ import string
             "summary": f"argparse task CLI candidate for {rel_source}",
         }
 
-    def synthesize_argparse_dataclass_json_cli_candidate(self, source_path: str, test_path: str | None = None, limit: int = 80) -> dict[str, Any]:
+    def synthesize_argparse_dataclass_json_cli_candidate(
+        self,
+        source_path: str,
+        test_path: str | None = None,
+        limit: int = 80,
+        request_text: str | None = None,
+    ) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)
         rel_source = self.relative_label(source_file)
@@ -8811,7 +8817,7 @@ import string
                 test_text = self.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
             except Exception:
                 test_text = ""
-        combined = source_text + "\n" + test_text
+        combined = source_text + "\n" + test_text + "\n" + str(request_text or "")
         if "subprocess" not in combined and "run_cli(" not in combined and "_run(" not in combined:
             return {"ok": False, "tool": "synthesize_argparse_dataclass_json_cli_candidate", "path": rel_source, "summary": "Requires CLI subprocess-style tests or evidence."}
 
@@ -8889,6 +8895,20 @@ import string
         fields = dataclasses[class_name]
         list_function = "list_notes" if "def list_notes" in source_text else "list_items"
         item_name = class_name[:1].lower() + class_name[1:]
+        wants_limit = "--limit" in combined
+        limit_param = ", limit: int | None = None" if wants_limit else ""
+        limit_arg = ", limit" if wants_limit else ""
+        limit_slice = (
+            "    if limit is not None:\n"
+            "        selected = selected[:limit]\n"
+            "    return selected\n\n\n"
+            if wants_limit
+            else ""
+        )
+        selected_return = "" if wants_limit else "    return selected\n\n\n"
+        list_signature = f"def {list_function}(tag: str | None = None{limit_param}) -> list[str]:\n"
+        json_signature = f"def json_items(tag: str | None = None{limit_param}) -> str:\n"
+        parser_limit = "    parser.add_argument('--limit', type=int, help='Limit the number of selected items after filtering')\n" if wants_limit else ""
         constructor_rows = ",\n".join(
             "    " + class_name + "(" + ", ".join(f"{field}={row[field]!r}" for field, _annotation in fields if field in row) + ")"
             for row in rows
@@ -8905,23 +8925,26 @@ import string
             f"{collection_name} = [\n"
             f"{constructor_rows}\n"
             "]\n\n\n"
-            f"def selected_{collection_name.lower()}(tag: str | None = None) -> list[{class_name}]:\n"
+            f"def selected_{collection_name.lower()}(tag: str | None = None{limit_param}) -> list[{class_name}]:\n"
             "    if tag is None:\n"
-            f"        return list({collection_name})\n"
-            f"    return [{item_name} for {item_name} in {collection_name} if tag in {item_name}.tags]\n\n\n"
-            f"def {list_function}(tag: str | None = None) -> list[str]:\n"
-            f"    return [f'{{{item_name}.title}}: {{{item_name}.body}}' for {item_name} in selected_{collection_name.lower()}(tag)]\n\n\n"
-            "def json_items(tag: str | None = None) -> str:\n"
-            f"    return json.dumps([asdict({item_name}) for {item_name} in selected_{collection_name.lower()}(tag)])\n\n\n"
+            f"        selected = list({collection_name})\n"
+            "    else:\n"
+            f"        selected = [{item_name} for {item_name} in {collection_name} if tag in {item_name}.tags]\n"
+            f"{limit_slice or selected_return}"
+            f"{list_signature}"
+            f"    return [f'{{{item_name}.title}}: {{{item_name}.body}}' for {item_name} in selected_{collection_name.lower()}(tag{limit_arg})]\n\n\n"
+            f"{json_signature}"
+            f"    return json.dumps([asdict({item_name}) for {item_name} in selected_{collection_name.lower()}(tag{limit_arg})])\n\n\n"
             "def main(argv: list[str] | None = None) -> int:\n"
             "    parser = argparse.ArgumentParser()\n"
             "    parser.add_argument('--tag', help='Only show items with this tag')\n"
             "    parser.add_argument('--json', action='store_true', help='Print selected items as JSON')\n"
+            f"{parser_limit}"
             "    args = parser.parse_args(argv)\n"
             "    if args.json:\n"
-            "        print(json_items(args.tag))\n"
+            f"        print(json_items(args.tag{', args.limit' if wants_limit else ''}))\n"
             "        return 0\n"
-            f"    for line in {list_function}(args.tag):\n"
+            f"    for line in {list_function}(args.tag{', args.limit' if wants_limit else ''}):\n"
             "        print(line)\n"
             "    return 0\n\n\n"
             "if __name__ == '__main__':\n"

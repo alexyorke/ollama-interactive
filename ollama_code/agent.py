@@ -10536,11 +10536,12 @@ class OllamaCodeAgent:
         _score, source_path, test_path = sorted(candidates, reverse=True)[0]
         return source_path, test_path
 
-    def _candidate_cli_proof_commands(self, source_path: str, candidate_source: str) -> list[str]:
+    def _candidate_cli_proof_commands(self, source_path: str, candidate_source: str, request_text: str = "") -> list[str]:
         commands: list[str] = []
         has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
         has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
         has_json_flag = "--json" in candidate_source
+        has_limit_flag = "--limit" in candidate_source and "--limit" in request_text
         if has_stats:
             commands.append(self._repair_shell_command([sys.executable, source_path, "stats"]))
         if has_priority_filter:
@@ -10549,6 +10550,10 @@ class OllamaCodeAgent:
             commands.append(self._repair_shell_command([sys.executable, source_path, "--json"]))
             if "--tag" in candidate_source:
                 commands.append(self._repair_shell_command([sys.executable, source_path, "--tag", "work", "--json"]))
+                if has_limit_flag:
+                    commands.append(self._repair_shell_command([sys.executable, source_path, "--tag", "work", "--limit", "1", "--json"]))
+        elif has_limit_flag:
+            commands.append(self._repair_shell_command([sys.executable, source_path, "--limit", "1"]))
         return commands
 
     def _mechanical_obligation_repair_failed_for(self, source_path: str, test_path: str) -> bool:
@@ -10580,7 +10585,8 @@ class OllamaCodeAgent:
         has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
         has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
         has_json_flag = "--json" in candidate_source
-        if not has_stats and not has_priority_filter and not has_json_flag:
+        has_limit_flag = "--limit" in candidate_source and "--limit" in request_text
+        if not has_stats and not has_priority_filter and not has_json_flag and not has_limit_flag:
             return
         try:
             readme_path = self.tools.resolve_path("README.md", allow_missing=False)
@@ -10595,7 +10601,19 @@ class OllamaCodeAgent:
             additions.append("- `stats` prints counts by status and priority.")
         if has_json_flag and "--json" not in lowered:
             additions.append("- `--json` prints the selected items as JSON objects.")
+        if has_limit_flag and "--limit" not in lowered:
+            additions.append("- `--limit N` limits the selected items after filtering and works with `--json`.")
         if not additions:
+            if re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
+                self._execute_controller_tool(
+                    name="read_file",
+                    arguments={"path": "README.md"},
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
             return
         separator = "" if readme_text.endswith("\n") else "\n"
         content = readme_text + separator + "\nAdditional commands:\n" + "\n".join(additions) + "\n"
@@ -10620,29 +10638,47 @@ class OllamaCodeAgent:
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> None:
-        if "--json" not in candidate_source:
+        wants_limit_tests = "--limit" in candidate_source and "--limit" in request_text
+        if "--json" not in candidate_source and not wants_limit_tests:
             return
         try:
             test_file = self.tools.resolve_path(test_path, allow_missing=False)
             test_text = test_file.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return
-        if "--json" in test_text:
-            return
         helper_match = re.search(r"(?m)^def\s+(?P<name>[_A-Za-z]\w*)\(\*args:\s*str\)", test_text)
         if not helper_match:
             return
         helper_name = helper_match.group("name")
-        insertion = (
-            "\n"
-            "    def test_json_output(self) -> None:\n"
-            f"        result = {helper_name}('--json')\n"
-            "        self.assertEqual(result.returncode, 0)\n"
-            "        self.assertIn('\"title\"', result.stdout)\n"
-            "        self.assertIn('\"body\"', result.stdout)\n"
-            "        self.assertIn('\"tags\"', result.stdout)\n"
-            "\n"
-        )
+        additions: list[str] = []
+        if "--json" not in test_text:
+            additions.append(
+                "    def test_json_output(self) -> None:\n"
+                f"        result = {helper_name}('--json')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('\"title\"', result.stdout)\n"
+                "        self.assertIn('\"body\"', result.stdout)\n"
+                "        self.assertIn('\"tags\"', result.stdout)\n"
+                "\n"
+            )
+        if wants_limit_tests and "--limit" not in test_text:
+            additions.append(
+                "    def test_limit_text_output(self) -> None:\n"
+                f"        result = {helper_name}('--tag', 'work', '--limit', '1')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('ship-cli', result.stdout)\n"
+                "        self.assertNotIn('fix-bug', result.stdout)\n"
+                "\n"
+                "    def test_limit_json_output(self) -> None:\n"
+                f"        result = {helper_name}('--tag', 'work', '--limit', '1', '--json')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('\"title\": \"ship-cli\"', result.stdout)\n"
+                "        self.assertNotIn('fix-bug', result.stdout)\n"
+                "\n"
+            )
+        if not additions:
+            return
+        insertion = "\n" + "\n".join(additions)
         marker = "\n\nif __name__ == '__main__':"
         if marker in test_text:
             content = test_text.replace(marker, insertion + marker, 1)
@@ -10675,7 +10711,10 @@ class OllamaCodeAgent:
         for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
                 synthesize = getattr(self.tools, synthesis_name)
-                synthesized = synthesize(source_path, test_path, limit=80)
+                try:
+                    synthesized = synthesize(source_path, test_path, limit=80, request_text=request_text)
+                except TypeError:
+                    synthesized = synthesize(source_path, test_path, limit=80)
             except Exception as exc:
                 synthesized = {"ok": False, "summary": f"{synthesis_name} failed: {exc}"}
             if synthesized.get("ok") is not True or not isinstance(synthesized.get("candidate_source"), str):
@@ -10753,7 +10792,7 @@ class OllamaCodeAgent:
             )
             if final_result.get("ok") is not True:
                 return None
-            proof_commands = self._candidate_cli_proof_commands(source_path, candidate_to_apply)
+            proof_commands = self._candidate_cli_proof_commands(source_path, candidate_to_apply, request_text)
             for command in proof_commands:
                 proof_result = self._execute_controller_tool(
                     name="run_shell",
