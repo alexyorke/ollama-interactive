@@ -8964,9 +8964,12 @@ class OllamaCodeAgent:
         session_memory_request: bool,
         requested_git_diff_mode: str | None,
         successful_tool_results: list[dict[str, Any]] | None = None,
+        request_obligations: list[dict[str, Any]] | None = None,
+        blocked_deterministic_shortcuts: set[str] | None = None,
     ) -> AgentResult | None:
         if session_memory_request:
             return None
+        blocked_deterministic_shortcuts = blocked_deterministic_shortcuts if blocked_deterministic_shortcuts is not None else set()
         prior_successful_tool_results = list(successful_tool_results or [])
         successful_tool_results: list[dict[str, Any]] = []
         tool_calls_this_turn: list[dict[str, Any]] = []
@@ -9025,6 +9028,7 @@ class OllamaCodeAgent:
             and (self._request_requires_mutation(request_text) or self._request_requires_code_mutation(request_text))
             and self._request_requires_test_run(request_text)
             and re.search(r"\b(?:import|package|module|modulenotfound|importerror)\b", lowered)
+            and "old_tests_only_success" not in blocked_deterministic_shortcuts
         ):
             round_number += 1
             test_args = {"command": self.tools.default_test_command}
@@ -9038,6 +9042,25 @@ class OllamaCodeAgent:
                 tool_calls_this_turn=tool_calls_this_turn,
             )
             if test_result.get("ok") is True:
+                if request_obligations:
+                    obligation_statuses = self._request_obligation_proof_status(
+                        obligations=request_obligations,
+                        successful_tool_results=[*prior_successful_tool_results, *successful_tool_results],
+                        required_tool_names=set(),
+                    )
+                    unresolved = [
+                        item for item in obligation_statuses if str(item.get("status") or "").strip() != "proven"
+                    ]
+                    if unresolved:
+                        blocked_deterministic_shortcuts.add("old_tests_only_success")
+                        self._record_event(
+                            "deterministic_turn",
+                            phase="blocked_old_tests_only_success",
+                            ok=False,
+                            obligation_checks=obligation_statuses,
+                            rounds=round_number,
+                        )
+                        return None
                 return self._record_synthesized_final("Tests already pass.", tool="run_test", round_number=round_number)
             import_repair = self._try_relative_import_repair(
                 request_text=request_text,
@@ -13098,6 +13121,7 @@ class OllamaCodeAgent:
             required_tool_names=required_tool_names,
             forbidden_tool_names=forbidden_tool_names,
         )
+        blocked_deterministic_shortcuts: set[str] = set()
         if not self.require_llm_for_turn:
             deterministic_result = self._try_handle_deterministic_turn(
                 request_text=text,
@@ -13111,6 +13135,8 @@ class OllamaCodeAgent:
                 session_memory_request=session_memory_request,
                 requested_git_diff_mode=requested_git_diff_mode,
                 successful_tool_results=None,
+                request_obligations=request_obligations,
+                blocked_deterministic_shortcuts=blocked_deterministic_shortcuts,
             )
             if deterministic_result is not None:
                 return deterministic_result
@@ -13158,6 +13184,8 @@ class OllamaCodeAgent:
         last_failed_run_shell_error_class = ""
         last_failed_path_lookup_summary = ""
         last_failed_path_lookup_error_class = ""
+        last_failed_path_lookup_path = ""
+        last_failed_path_lookup_suggestions: list[str] = []
         last_timeout_command = ""
         last_timeout_summary = ""
         if (
@@ -13328,6 +13356,8 @@ class OllamaCodeAgent:
                     session_memory_request=session_memory_request,
                     requested_git_diff_mode=requested_git_diff_mode,
                     successful_tool_results=successful_tool_results,
+                    request_obligations=request_obligations,
+                    blocked_deterministic_shortcuts=blocked_deterministic_shortcuts,
                 )
                 if deterministic_result is not None:
                     return deterministic_result
@@ -14241,6 +14271,53 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if name in MUTATING_TOOL_NAMES and last_failed_path_lookup_error_class == "path_missing":
+                    target_paths = {
+                        str(path or "").strip().replace("\\", "/").lstrip("./")
+                        for path in self._mutation_target_paths(arguments)
+                    }
+                    missing_path = last_failed_path_lookup_path.strip().replace("\\", "/").lstrip("./")
+                    suggestions = [
+                        str(path or "").strip().replace("\\", "/").lstrip("./")
+                        for path in last_failed_path_lookup_suggestions
+                        if str(path or "").strip()
+                    ]
+                    if missing_path and missing_path in target_paths and suggestions:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="missing-path-mutation-target",
+                            missing_path=missing_path,
+                            suggested_paths=suggestions[:5],
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"The last path lookup proved `{missing_path}` does not exist. "
+                                    f"Do not mutate that missing path. Re-read the suggested path first: {', '.join(suggestions[:3])}. "
+                                    "Then edit the grounded file if it matches the requested feature. Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
+                if name == "write_file":
+                    content_text = str(arguments.get("content") or "")
+                    if re.search(r"(?m)^\s*(?:>{2,3}\s*)?(?:BEGIN|END) EDITED CONTENT\s*(?:<{2,3})?\s*$", content_text):
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="write-file-rewrite-markers",
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": "write_file content must be the exact file contents, without BEGIN/END EDITED CONTENT markers or transcript delimiters. Re-read the target file, then send clean source text only. Next JSON only.",
+                            }
+                        )
+                        continue
                 active_mutation_repair_state = None
                 if name in MUTATING_TOOL_NAMES:
                     active_mutation_repair_state = self._active_failed_edit_recovery_state(
@@ -15292,6 +15369,13 @@ class OllamaCodeAgent:
                     if error_class == "path_missing":
                         last_failed_path_lookup_summary = str(result.get("summary") or result.get("output") or "").strip()
                         last_failed_path_lookup_error_class = error_class
+                        last_failed_path_lookup_path = str(arguments.get("path") or arguments.get("file") or arguments.get("filename") or "").strip()
+                        raw_suggestions = result.get("suggested_paths")
+                        last_failed_path_lookup_suggestions = [
+                            str(path).strip()
+                            for path in raw_suggestions
+                            if str(path).strip()
+                        ] if isinstance(raw_suggestions, list) else []
                     if name == "run_shell" and error_class == "timeout":
                         last_timeout_command = str(arguments.get("command") or "").strip()
                         last_timeout_summary = str(result.get("summary") or result.get("output") or "").strip()

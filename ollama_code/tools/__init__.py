@@ -13019,6 +13019,90 @@ import string
         ]
         return candidates[0] if len(candidates) == 1 else ""
 
+    def _append_python_symbol_source(self, target: Path, relative_path: str, symbol: str, source: str) -> dict[str, Any]:
+        if target.suffix.lower() != ".py":
+            return {
+                "ok": False,
+                "tool": "append_symbol",
+                "path": relative_path,
+                "summary": "append_symbol only supports Python files.",
+                "error_class": "invalid_args",
+            }
+        if not self._looks_like_full_symbol_source(target, source):
+            return {
+                "ok": False,
+                "tool": "append_symbol",
+                "path": relative_path,
+                "summary": "add_function requires full function or class source as replacement.",
+                "error_class": "invalid_args",
+            }
+        normalized_source = self._python_parse_text(source)
+        replacement_name = self._single_python_replacement_symbol_name(normalized_source)
+        requested_name = symbol.rsplit(".", 1)[-1].strip()
+        if requested_name and replacement_name and requested_name != replacement_name:
+            return {
+                "ok": False,
+                "tool": "append_symbol",
+                "path": relative_path,
+                "summary": f"Replacement defines {replacement_name}, not requested symbol {requested_name}.",
+                "error_class": "invalid_args",
+            }
+        try:
+            ast.parse(normalized_source)
+        except SyntaxError as exc:
+            diagnostic = f"SyntaxError at {relative_path}:{exc.lineno or 1}: {exc.msg}"
+            return {
+                "ok": False,
+                "tool": "append_symbol",
+                "path": relative_path,
+                "syntax_ok": False,
+                "diagnostic": diagnostic,
+                "summary": f"Refusing add_function because the replacement source is invalid. {diagnostic}",
+                "error_class": "syntax_error",
+            }
+        symbols, original, _ = self._code_symbols(target)
+        existing = self._symbol_matches(symbols, requested_name or replacement_name)
+        if existing:
+            return {
+                "ok": False,
+                "tool": "append_symbol",
+                "path": relative_path,
+                "symbol": str(existing[0].get("qualname") or requested_name or replacement_name),
+                "summary": f"Symbol already exists: {existing[0].get('qualname') or requested_name or replacement_name}. Use replace_symbol instead.",
+                "error_class": "invalid_args",
+            }
+        source_block = normalized_source if normalized_source.endswith("\n") else normalized_source + "\n"
+        if original.strip():
+            updated = original.rstrip() + "\n\n\n" + source_block
+        else:
+            updated = source_block
+        diagnostic = self._python_syntax_diagnostic(target, updated)
+        if diagnostic is not None:
+            return {
+                "ok": False,
+                "tool": "append_symbol",
+                "path": relative_path,
+                "symbol": requested_name or replacement_name,
+                "syntax_ok": False,
+                "diagnostic": diagnostic,
+                "summary": f"Refusing add_function because the updated file would be invalid. {diagnostic}",
+                "error_class": "syntax_error",
+            }
+        preview = self._diff_preview(relative_path, original, updated)
+        approved, reason = self._approve_mutation(f"Append {requested_name or replacement_name} to {relative_path}?", preview)
+        if not approved:
+            return {"ok": False, "tool": "append_symbol", "path": relative_path, "symbol": requested_name or replacement_name, "summary": reason}
+        self._write_text_and_invalidate_python_cache(target, updated)
+        return {
+            "ok": True,
+            "tool": "append_symbol",
+            "path": relative_path,
+            "symbol": requested_name or replacement_name,
+            "syntax_ok": True,
+            "summary": f"Appended {requested_name or replacement_name} to {relative_path}.",
+            "diff": preview,
+        }
+
     def _looks_like_function_body_edit_intent(self, intent: str) -> bool:
         normalized = re.sub(r"[^a-z0-9_]+", "_", intent.lower())
         words = {word for word in normalized.split("_") if word}
@@ -13064,7 +13148,7 @@ import string
         old = self._normalize_python_symbol_target(target_path, clean_intent, old)
         if not clean_intent:
             return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires an intent."}
-        if not old and clean_intent not in {"add_import", "add_import_if_missing"}:
+        if not old and clean_intent not in {"add_import", "add_import_if_missing", "add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
             return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires target for this intent."}
         if replacement is None and clean_intent != "delete_symbol":
             return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires replacement for this intent."}
@@ -13102,6 +13186,9 @@ import string
             route = "add import if missing"
             routed_tool = "apply_structured_edit"
             operation = {"op": "add_import_if_missing", "path": relative_path, "statement": statement}
+        elif clean_intent in {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
+            route = "append Python symbol source"
+            routed_tool = "append_symbol"
         elif (
             target_path.suffix.lower() == ".py"
             and self._looks_like_symbol_name(old)
@@ -13157,7 +13244,7 @@ import string
                 "path": relative_path,
                 "summary": (
                     f"Unknown edit_intent intent: {intent}. Use one of rename, replace_text, "
-                    "replace_symbol, replace_body, change_signature, or add_import."
+                    "replace_symbol, replace_body, change_signature, add_import, or add_function."
                 ),
                 "error_class": "invalid_args",
             }
@@ -13172,6 +13259,8 @@ import string
             }
         if operation is not None:
             return self._wrap_routed_edit_result(routed_tool, route, self.apply_structured_edit(operation))
+        if routed_tool == "append_symbol":
+            return self._wrap_routed_edit_result(routed_tool, route, self._append_python_symbol_source(target_path, relative_path, old, new))
         if routed_tool == "replace_symbol":
             return self._wrap_routed_edit_result(routed_tool, route, self.replace_symbol(relative_path, old, new))
         replace_all = clean_scope in {"project", "repo", "repository", "all"} or clean_intent in {"rename", "rename_symbol", "refactor_rename"}

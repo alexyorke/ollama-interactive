@@ -2033,6 +2033,58 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("return left + right", final_text)
         self.assertNotIn("def def", final_text)
 
+    def test_edit_intent_add_function_appends_missing_python_symbol(self) -> None:
+        with self._temp_tools() as (root, tools):
+            sample = root / "reports.py"
+            sample.write_text(
+                "from dataclasses import dataclass\n\n\n"
+                "@dataclass(frozen=True)\n"
+                "class ReportRow:\n"
+                "    name: str\n"
+                "    count: int\n"
+                "    active: bool\n",
+                encoding="utf-8",
+            )
+            result = tools.edit_intent(
+                "reports.py",
+                "add_function",
+                "export_ndjson",
+                (
+                    "def export_ndjson(rows: list[ReportRow]) -> str:\n"
+                    "    import json\n"
+                    "    if not rows:\n"
+                    "        return \"\"\n"
+                    "    return \"\\n\".join(json.dumps({\"name\": row.name, \"count\": row.count, \"active\": row.active}) for row in rows) + \"\\n\"\n"
+                ),
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["routed_tool"], "append_symbol")
+        self.assertEqual(result["symbol"], "export_ndjson")
+        self.assertIn("def export_ndjson(rows: list[ReportRow]) -> str:", final_text)
+        self.assertIn("class ReportRow", final_text)
+
+    def test_edit_intent_add_function_rejects_invalid_replacement_source(self) -> None:
+        with self._temp_tools() as (root, tools):
+            sample = root / "reports.py"
+            original = "def export_csv(rows):\n    return \"\"\n"
+            sample.write_text(original, encoding="utf-8")
+            result = tools.edit_intent(
+                "reports.py",
+                "add_function",
+                "export_ndjson",
+                "def export_ndjson(rows):\n    \"unterminated\n    return \"\"\n",
+            )
+
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["routed_tool"], "append_symbol")
+        self.assertEqual(result["error_class"], "syntax_error")
+        self.assertEqual(final_text, original)
+
     def test_edit_intent_surfacing_syntax_errors_as_failed_tool(self) -> None:
         with self._temp_tools() as (root, tools):
             sample = root / "billing.py"

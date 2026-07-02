@@ -1168,6 +1168,113 @@ class AgentTests(AgentTestBase):
 
         self.assertFalse(any(item.get("kind") == "feature_token" for item in obligations))
 
+    def test_passing_old_tests_do_not_satisfy_package_feature_request(self) -> None:
+        root = self._workspace_scratch()
+        (root / "reports").mkdir()
+        (root / "tests").mkdir()
+        (root / "reports" / "__init__.py").write_text(
+            "from .exporter import ReportRow, export_csv\n\n"
+            "__all__ = [\"ReportRow\", \"export_csv\"]\n",
+            encoding="utf-8",
+        )
+        (root / "reports" / "exporter.py").write_text(
+            "from __future__ import annotations\n\n"
+            "from dataclasses import dataclass\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class ReportRow:\n"
+            "    name: str\n"
+            "    count: int\n"
+            "    active: bool\n\n\n"
+            "def export_csv(rows: list[ReportRow]) -> str:\n"
+            "    lines = [\"name,count,active\"]\n"
+            "    for row in rows:\n"
+            "        lines.append(f\"{row.name},{row.count},{str(row.active).lower()}\")\n"
+            "    return \"\\n\".join(lines) + \"\\n\"\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_exporter.py").write_text(
+            "import unittest\n\n"
+            "from reports import ReportRow, export_csv\n\n\n"
+            "class ExporterTests(unittest.TestCase):\n"
+            "    def test_export_csv(self) -> None:\n"
+            "        self.assertEqual(export_csv([ReportRow(\"alpha\", 2, True)]), \"name,count,active\\nalpha,2,true\\n\")\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n",
+            encoding="utf-8",
+        )
+        (root / "README.md").write_text("# Reports\n\nUse `export_csv(rows)` for CSV output.\n", encoding="utf-8")
+        command = f"{sys.executable} -m unittest discover -s tests -v"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        request_text = (
+            "Add an export_ndjson(rows) function to this report exporter. It should serialize each ReportRow "
+            "as one JSON object per line with keys name, count, and active in that order, preserve row order, "
+            "and end the output with a trailing newline when rows are present. It should return an empty string "
+            "for no rows. Export it from the package __init__.py. Update README with the new NDJSON export "
+            "behavior. Add tests for multiple rows, empty rows, and escaping names with quotes or newlines. "
+            "Run the tests and prove the behavior with a shell command."
+        )
+        obligations = agent._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        blocked_shortcuts: set[str] = set()
+
+        result = agent._try_handle_deterministic_turn(
+            request_text=request_text,
+            exact_file_write=None,
+            target_line_read=None,
+            symbol_read=None,
+            exact_shell_command=None,
+            expected_exact_reply_text=None,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+            session_memory_request=False,
+            requested_git_diff_mode=None,
+            successful_tool_results=[],
+            request_obligations=obligations,
+            blocked_deterministic_shortcuts=blocked_shortcuts,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertEqual(blocked_shortcuts, {"old_tests_only_success"})
+        repeated_result = agent._try_handle_deterministic_turn(
+            request_text=request_text,
+            exact_file_write=None,
+            target_line_read=None,
+            symbol_read=None,
+            exact_shell_command=None,
+            expected_exact_reply_text=None,
+            required_tool_names=set(),
+            forbidden_tool_names=set(),
+            session_memory_request=False,
+            requested_git_diff_mode=None,
+            successful_tool_results=[],
+            request_obligations=obligations,
+            blocked_deterministic_shortcuts=blocked_shortcuts,
+        )
+
+        self.assertIsNone(repeated_result)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertTrue(
+            any(
+                event.get("type") == "deterministic_turn"
+                and event.get("phase") == "blocked_old_tests_only_success"
+                for event in agent.events
+            )
+        )
+        self.assertFalse(
+            any(
+                event.get("type") == "assistant_synthesized"
+                and event.get("content") == "Tests already pass."
+                for event in agent.events
+            )
+        )
+
     def test_shell_recursive_grep_inspection_normalizes_to_search(self) -> None:
         client = FakeClient(
             [
@@ -3084,6 +3191,69 @@ class AgentTests(AgentTestBase):
         )
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("only non-test Python source was grounded instead: task_cli.py", feedback)
+
+    def test_missing_path_suggestion_blocks_mutating_wrong_package_path(self) -> None:
+        root = self._workspace_scratch()
+        (root / "reports").mkdir()
+        (root / "reports" / "__init__.py").write_text("from .exporter import ReportRow\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "__init__.py"}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "__init__.py", "content": "from .report_row import ReportRow\n"}}),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "reports/__init__.py"}}),
+                json.dumps({"type": "final", "message": "grounded package init"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        result = agent.handle_user("Add export_ndjson to the package __init__.py for this report exporter.")
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual(tools.execute_counts.get("read_file"), 2)
+        guard_events = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "missing-path-mutation-target"
+        ]
+        self.assertEqual(len(guard_events), 1)
+        self.assertEqual(guard_events[0].get("missing_path"), "__init__.py")
+        self.assertEqual(guard_events[0].get("suggested_paths"), ["reports/__init__.py"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Re-read the suggested path first: reports/__init__.py", feedback)
+
+    def test_write_file_with_edit_markers_is_rejected_before_execution(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "app.py",
+                            "content": ">> BEGIN EDITED CONTENT <<\ndef value() -> int:\n    return 2\n>>> END EDITED CONTENT >>>\n",
+                        },
+                    }
+                ),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        agent.handle_user("Update app.py so value returns 2.")
+
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "def value() -> int:\n    return 1\n")
+        self.assertTrue(
+            any(
+                event.get("type") == "controller_guard" and event.get("guard") == "write-file-rewrite-markers"
+                for event in agent.events
+            )
+        )
 
     def test_keep_tests_green_creates_test_run_obligation(self) -> None:
         tools = ToolExecutor(self._workspace_scratch(), approval_mode="auto")
