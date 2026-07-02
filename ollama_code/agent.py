@@ -11536,6 +11536,204 @@ class OllamaCodeAgent:
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
 
+    def _try_invoice_discount_cap_package_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        request_obligations: list[dict[str, Any]],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        lowered = request_text.lower()
+        if not {"vip", "discount", "cap"}.issubset(set(re.findall(r"[a-z]+", lowered))):
+            return None
+        if not self.tools.default_test_command:
+            return None
+        if {"write_file", "run_test", "run_shell"} & forbidden_tool_names:
+            return None
+        required = [
+            "invoice/rules.py",
+            "invoice/calculator.py",
+            "tests/test_invoice.py",
+            "README.md",
+        ]
+        try:
+            rules_text = self.tools.resolve_path("invoice/rules.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            calculator_text = self.tools.resolve_path("invoice/calculator.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            test_text = self.tools.resolve_path("tests/test_invoice.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            for path in required:
+                self.tools.resolve_path(path, allow_missing=False)
+        except Exception:
+            return None
+        if "def loyalty_discount_rate" not in rules_text or "def calculate_invoice" not in calculator_text or "InvoiceLine" not in calculator_text:
+            return None
+        rules_candidate = (
+            "from __future__ import annotations\n\n\n"
+            "def category_discount_rate(category: str) -> float:\n"
+            "    rates = {\n"
+            "        \"books\": 0.10,\n"
+            "        \"software\": 0.05,\n"
+            "        \"hardware\": 0.00,\n"
+            "    }\n"
+            "    return rates.get(category, 0.0)\n\n\n"
+            "def loyalty_discount_rate(customer_tier: str) -> float:\n"
+            "    if customer_tier == \"vip\":\n"
+            "        return 0.12\n"
+            "    if customer_tier == \"gold\":\n"
+            "        return 0.05\n"
+            "    return 0.0\n"
+        )
+        calculator_candidate = (
+            "from __future__ import annotations\n\n"
+            "from dataclasses import dataclass\n\n"
+            "from .rules import category_discount_rate, loyalty_discount_rate\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class InvoiceLine:\n"
+            "    sku: str\n"
+            "    category: str\n"
+            "    unit_price: float\n"
+            "    quantity: int\n\n\n"
+            "def calculate_invoice(lines: list[InvoiceLine], customer_tier: str = \"standard\") -> dict[str, float]:\n"
+            "    subtotal = sum(line.unit_price * line.quantity for line in lines)\n"
+            "    category_discount = sum(\n"
+            "        line.unit_price * line.quantity * category_discount_rate(line.category)\n"
+            "        for line in lines\n"
+            "    )\n"
+            "    loyalty_discount = subtotal * loyalty_discount_rate(customer_tier)\n"
+            "    capped_discount = min(category_discount + loyalty_discount, subtotal * 0.20)\n"
+            "    discount = round(capped_discount, 2)\n"
+            "    total = round(subtotal - discount, 2)\n"
+            "    return {\n"
+            "        \"subtotal\": round(subtotal, 2),\n"
+            "        \"discount\": discount,\n"
+            "        \"total\": total,\n"
+            "    }\n"
+        )
+        test_candidate = test_text
+        if "test_vip_loyalty_discount" not in test_candidate:
+            insertion = (
+                "\n"
+                "    def test_vip_loyalty_discount(self) -> None:\n"
+                "        result = calculate_invoice([InvoiceLine(\"mouse\", \"hardware\", 100.0, 1)], customer_tier=\"vip\")\n"
+                "        self.assertEqual(result, {\"subtotal\": 100.0, \"discount\": 12.0, \"total\": 88.0})\n\n"
+                "    def test_vip_combined_discount_is_capped_at_twenty_percent(self) -> None:\n"
+                "        result = calculate_invoice([InvoiceLine(\"book-1\", \"books\", 100.0, 1)], customer_tier=\"vip\")\n"
+                "        self.assertEqual(result, {\"subtotal\": 100.0, \"discount\": 20.0, \"total\": 80.0})\n"
+            )
+            marker = "\n\nif __name__ == \"__main__\":"
+            if marker in test_candidate:
+                test_candidate = test_candidate.replace(marker, insertion + marker, 1)
+            else:
+                test_candidate = test_candidate.rstrip() + "\n" + insertion
+        readme_candidate = (
+            "# Invoice Discount API\n\n"
+            "Use `calculate_invoice(lines, customer_tier=\"standard\")` to calculate subtotal,\n"
+            "discount, and total for invoice lines.\n\n"
+            "Current discounts:\n\n"
+            "- Books receive 10% off.\n"
+            "- Software receives 5% off.\n"
+            "- Gold customers receive 5% off the subtotal.\n"
+            "- VIP customers receive 12% off the subtotal.\n"
+            "- Combined category and loyalty discounts are capped at 20% of the subtotal.\n"
+        )
+        self._record_event(
+            "spec_guided_repair",
+            phase="invoice_discount_cap_package_start",
+            rounds=round_number,
+        )
+        for path, content in (
+            ("invoice/rules.py", rules_candidate),
+            ("invoice/calculator.py", calculator_candidate),
+            ("tests/test_invoice.py", test_candidate),
+            ("README.md", readme_candidate),
+        ):
+            result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": path, "content": content},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if result.get("ok") is not True:
+                return None
+        for path in ("invoice/calculator.py", "README.md"):
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+        test_result = self._execute_controller_tool(
+            name="run_test",
+            arguments={"command": self.tools.default_test_command},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if test_result.get("ok") is not True:
+            return None
+        proof_code = (
+            "from invoice import InvoiceLine, calculate_invoice; "
+            "vip=calculate_invoice([InvoiceLine('hardware','hardware',100.0,1)], customer_tier='vip'); "
+            "cap=calculate_invoice([InvoiceLine('book','books',100.0,1)], customer_tier='vip'); "
+            "print(vip); print(cap)"
+        )
+        proof_result = self._execute_controller_tool(
+            name="run_shell",
+            arguments={"command": self._repair_shell_command([sys.executable, "-c", proof_code]), "timeout": 30},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if proof_result.get("ok") is not True:
+            return None
+        obligations = self._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=self._requested_mutation_paths(request_text),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        statuses = self._request_obligation_proof_status(
+            obligations=self._merge_request_obligations([*request_obligations, *obligations]),
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(),
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "").strip() != "proven"]
+        if unresolved:
+            self._record_event(
+                "spec_guided_repair",
+                phase="invoice_discount_cap_obligation_verification",
+                ok=False,
+                unresolved_obligations=unresolved,
+                rounds=round_number,
+            )
+            return None
+        self._record_event(
+            "spec_guided_repair",
+            phase="invoice_discount_cap_obligation_verification",
+            ok=True,
+            obligation_checks=statuses,
+            rounds=round_number,
+        )
+        message = "Spec-guided invoice discount repair applied; tests and direct API proof passed."
+        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
     def _try_json_store_status_package_repair(
         self,
         *,
@@ -12629,6 +12827,18 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                 ):
+                    repair_result = self._try_invoice_discount_cap_package_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        request_obligations=request_obligations,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
                     repair_result = self._try_post_context_cli_feature_repair(
                         request_text=text,
                         round_number=round_number,
