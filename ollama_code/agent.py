@@ -1674,6 +1674,36 @@ class OllamaCodeAgent:
                     "label": "run tests successfully after the latest edit",
                 }
             )
+        test_update_requested = bool(
+            re.search(
+                r"\b(?:add|write|create|update|extend|cover)\b[^.]{0,80}\btests?\b|"
+                r"\btests?\b[^.]{0,80}\b(?:add|write|create|update|extend|cover)\b",
+                lowered,
+            )
+        )
+        if test_update_requested:
+            obligations.append(
+                {
+                    "id": "tests-update",
+                    "kind": "tests_update",
+                    "label": "add or update the requested tests",
+                }
+            )
+        shell_proof_requested = bool(
+            re.search(
+                r"\bprove\b[^.]{0,120}\b(?:shell|command|cli)\b|"
+                r"\b(?:shell|command|cli)\b[^.]{0,120}\bproof\b",
+                lowered,
+            )
+        )
+        if shell_proof_requested:
+            obligations.append(
+                {
+                    "id": "shell-proof",
+                    "kind": "shell_proof",
+                    "label": "prove the requested behavior with a shell command",
+                }
+            )
         doc_targets = sorted(path for path in required_mutation_paths if self._path_looks_like_doc_target(path))
         docs_update_requested = bool(
             re.search(
@@ -1780,7 +1810,9 @@ class OllamaCodeAgent:
         mutated_paths = self._mutated_paths_from_successful_results(successful_tool_results)
         code_mutated = any(not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path) for path in mutated_paths)
         docs_mutated = {path for path in mutated_paths if self._path_looks_like_doc_target(path)}
+        tests_mutated = {path for path in mutated_paths if self._path_looks_like_test_file(path)}
         test_ran = self._latest_successful_tool_result(successful_tool_results, "run_test") is not None
+        shell_proof_ran = self._latest_successful_tool_result(successful_tool_results, "run_shell") is not None
         source_reads: set[str] = set()
         doc_reads: set[str] = set()
         for item in successful_tool_results:
@@ -1826,6 +1858,18 @@ class OllamaCodeAgent:
                     status["evidence"] = "run_test"
                 else:
                     status["guidance"] = "Run tests after the latest edit before finishing."
+            elif kind == "tests_update":
+                if tests_mutated:
+                    status["status"] = "proven"
+                    status["evidence"] = ", ".join(sorted(tests_mutated)[:3])
+                else:
+                    status["guidance"] = "The request asked to add or update tests; mutate a relevant test file before finishing."
+            elif kind == "shell_proof":
+                if shell_proof_ran:
+                    status["status"] = "proven"
+                    status["evidence"] = "run_shell"
+                else:
+                    status["guidance"] = "The request asked for shell-command proof; run a direct shell command that demonstrates the requested behavior before finishing."
             elif kind == "docs_update":
                 requested_paths = [str(path).strip().replace("\\", "/") for path in list(obligation.get("paths") or []) if str(path).strip()]
                 if requested_paths:
@@ -6440,12 +6484,48 @@ class OllamaCodeAgent:
         seen: set[str] = set()
         for key in ("path", "file", "filename"):
             raw = str(arguments.get(key) or "").strip().replace("\\", "/")
-            normalized = "." if raw in {".", "./"} else raw.lstrip("./")
+            normalized = "." if raw in {".", "./"} else (raw[2:] if raw.startswith("./") else raw)
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
             paths.append(normalized)
         return paths
+
+    def _missing_mutation_target_suggestions(self, arguments: dict[str, Any]) -> tuple[str, list[str]]:
+        for path in self._mutation_target_paths(arguments):
+            if not path or path == ".":
+                continue
+            try:
+                self.tools.resolve_path(path, allow_missing=False)
+                continue
+            except Exception:
+                pass
+            name = Path(path).name
+            if not name:
+                continue
+            suggestions: list[str] = []
+            try:
+                iterator = self.tools.workspace_root.rglob(name)
+            except Exception:
+                iterator = iter(())
+            for candidate in iterator:
+                try:
+                    if not candidate.is_file():
+                        continue
+                    rel = self.tools.relative_label(candidate)
+                except Exception:
+                    continue
+                parts = Path(rel).parts
+                if any(part in {".git", ".hg", ".ollama-code", "__pycache__", "node_modules"} for part in parts):
+                    continue
+                if rel == path:
+                    continue
+                suggestions.append(rel)
+                if len(suggestions) >= 5:
+                    break
+            if suggestions:
+                return path, suggestions
+        return "", []
 
     def _python_mutation_payload_syntax_diagnostic(self, name: str, arguments: dict[str, Any]) -> str:
         path = ""
@@ -14390,6 +14470,28 @@ class OllamaCodeAgent:
                             {
                                 "role": "user",
                                 "content": "write_file content must be the exact file contents, without BEGIN/END EDITED CONTENT markers or transcript delimiters. Re-read the target file, then send clean source text only. Next JSON only.",
+                            }
+                        )
+                        continue
+                if name in MUTATING_TOOL_NAMES:
+                    missing_path, suggestions = self._missing_mutation_target_suggestions(arguments)
+                    if missing_path and suggestions:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="missing-mutation-target",
+                            missing_path=missing_path,
+                            suggested_paths=suggestions[:5],
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"The mutation target `{missing_path}` does not exist. "
+                                    f"Do not mutate that missing path. Read the existing candidate first: {', '.join(suggestions[:3])}. "
+                                    "Then edit the grounded file if it matches the requested feature. Next JSON only."
+                                ),
                             }
                         )
                         continue

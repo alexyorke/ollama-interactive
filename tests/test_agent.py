@@ -1181,6 +1181,25 @@ class AgentTests(AgentTestBase):
 
         self.assertEqual(feature_ids, ["function:export_ndjson"])
 
+    def test_requested_test_addition_and_shell_proof_create_obligations(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        obligations = agent._derive_request_obligations(
+            request_text=(
+                "Add an export_ndjson(rows) function. Add tests for multiple rows and escaping names. "
+                "Run the tests and prove the behavior with a shell command."
+            ),
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        obligation_ids = {item["id"] for item in obligations}
+
+        self.assertIn("tests-update", obligation_ids)
+        self.assertIn("shell-proof", obligation_ids)
+
     def test_read_only_command_check_does_not_create_feature_obligation(self) -> None:
         root = self._workspace_scratch()
         agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
@@ -1233,6 +1252,54 @@ class AgentTests(AgentTestBase):
         self.assertIn('function "export_ndjson" is still unproven', unproven[0]["guidance"])
         self.assertEqual(proven[0]["status"], "proven")
         self.assertEqual(proven[0]["evidence"], "reports/exporter.py")
+
+    def test_requested_tests_and_shell_proof_require_matching_tool_evidence(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        obligations = [
+            {"id": "tests-update", "kind": "tests_update", "label": "add or update the requested tests"},
+            {"id": "shell-proof", "kind": "shell_proof", "label": "prove the requested behavior with a shell command"},
+        ]
+
+        old_tests_only = agent._request_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=[
+                {
+                    "name": "run_test",
+                    "arguments": {"command": "python -m unittest discover -s tests -v"},
+                    "result": {"ok": True, "output": "Ran 2 tests in 0.000s\n\nOK"},
+                },
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "reports/__init__.py"},
+                    "result": {"ok": True, "path": "reports/__init__.py", "output": "def export_ndjson(rows):\n    return ''\n"},
+                },
+            ],
+            required_tool_names=set(),
+        )
+        proven = agent._request_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=[
+                {
+                    "name": "write_file",
+                    "arguments": {"path": "tests/test_exporter.py", "content": "def test_export_ndjson():\n    assert True\n"},
+                    "result": {"ok": True, "path": "tests/test_exporter.py"},
+                },
+                {
+                    "name": "run_shell",
+                    "arguments": {"command": "python -c \"from reports import export_ndjson; print(export_ndjson([]))\""},
+                    "result": {"ok": True, "command": "python -c \"from reports import export_ndjson; print(export_ndjson([]))\""},
+                },
+            ],
+            required_tool_names=set(),
+        )
+
+        self.assertEqual([item["status"] for item in old_tests_only], ["unproven", "unproven"])
+        self.assertIn("add or update tests", old_tests_only[0]["guidance"])
+        self.assertIn("shell-command proof", old_tests_only[1]["guidance"])
+        self.assertEqual([item["status"] for item in proven], ["proven", "proven"])
+        self.assertEqual(proven[0]["evidence"], "tests/test_exporter.py")
+        self.assertEqual(proven[1]["evidence"], "run_shell")
 
     def test_passing_old_tests_do_not_satisfy_package_feature_request(self) -> None:
         root = self._workspace_scratch()
@@ -3288,6 +3355,42 @@ class AgentTests(AgentTestBase):
         self.assertEqual(guard_events[0].get("suggested_paths"), ["reports/__init__.py"])
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Re-read the suggested path first: reports/__init__.py", feedback)
+
+    def test_missing_mutation_target_blocks_before_python_payload_syntax_guard(self) -> None:
+        root = self._workspace_scratch()
+        (root / "reports").mkdir()
+        (root / "reports" / "__init__.py").write_text("from .exporter import ReportRow\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "__init__.py",
+                            "intent": "add_function",
+                            "target": "export_ndjson",
+                            "replacement": "def export_ndjson(rows):\n    \"unterminated\n",
+                        },
+                    }
+                ),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "reports/__init__.py"}}),
+                *[json.dumps({"type": "final", "message": "grounded package init"}) for _ in range(6)],
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        result = agent.handle_user("Add export_ndjson to the package __init__.py for this report exporter.")
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        guard_names = [event.get("guard") for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertIn("missing-mutation-target", guard_names)
+        self.assertNotIn("invalid-python-mutation-payload", guard_names)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Read the existing candidate first: reports/__init__.py", feedback)
 
     def test_write_file_with_edit_markers_is_rejected_before_execution(self) -> None:
         root = self._workspace_scratch()
@@ -12597,6 +12700,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_trajectory_ground_guard_allows_explicit_new_file_creation",
         "test_tool_error_guard_blocks_third_duplicate_path_failure",
         "test_path_missing_on_single_source_repo_auto_grounds_real_source",
+        "test_missing_mutation_target_blocks_before_python_payload_syntax_guard",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_repair_pivot_model_timeout_fails_closed",
         "test_final_round_repeated_mutating_failure_fails_closed",
@@ -12640,8 +12744,10 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_readme_inspection_does_not_create_docs_update_obligation",
         "test_command_obligation_ignores_descriptive_command_words",
         "test_function_obligation_tracks_requested_new_function",
+        "test_requested_test_addition_and_shell_proof_create_obligations",
         "test_read_only_command_check_does_not_create_feature_obligation",
         "test_function_obligation_requires_source_proof",
+        "test_requested_tests_and_shell_proof_require_matching_tool_evidence",
         "test_final_verification_requires_read_proof_for_requested_command_token",
         "test_final_verification_requires_behavior_proof_for_cli_command_and_flag",
         "test_request_obligations_persist_across_continue_requests",
