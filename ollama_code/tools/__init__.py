@@ -12159,7 +12159,31 @@ import string
             return parsed if isinstance(parsed, dict) else None
         return None
 
-    def _insert_import_statement(self, original: str, statement: str) -> str:
+    def _merge_from_import_statement(self, original: str, statement: str) -> str | None:
+        match = re.fullmatch(r"from\s+(?P<module>[.\w]+)\s+import\s+(?P<names>.+)", statement.strip())
+        if not match:
+            return None
+        module = match.group("module")
+        requested_names = [name.strip() for name in match.group("names").split(",") if name.strip()]
+        if not requested_names:
+            return None
+        lines = original.splitlines(keepends=True)
+        existing_pattern = re.compile(rf"^(?P<prefix>\s*from\s+{re.escape(module)}\s+import\s+)(?P<names>.+?)(?P<newline>\r?\n?)$")
+        for index, line in enumerate(lines):
+            existing = existing_pattern.match(line)
+            if not existing:
+                continue
+            existing_names = [name.strip() for name in existing.group("names").split(",") if name.strip()]
+            existing_keys = {name.split(" as ", 1)[0].strip() for name in existing_names}
+            missing = [name for name in requested_names if name.split(" as ", 1)[0].strip() not in existing_keys]
+            if not missing:
+                return original
+            newline = existing.group("newline") or ("\n" if line.endswith("\n") else "")
+            lines[index] = existing.group("prefix") + ", ".join([*existing_names, *missing]) + newline
+            return "".join(lines)
+        return None
+
+    def _insert_single_import_statement(self, original: str, statement: str) -> str:
         lines = original.splitlines(keepends=True)
         insert_at = 0
         if lines and lines[0].startswith("#!"):
@@ -12184,9 +12208,21 @@ import string
             pass
         if statement.strip() in {line.strip() for line in lines}:
             return original
+        merged = self._merge_from_import_statement(original, statement)
+        if merged is not None:
+            return merged
         if not statement.endswith("\n"):
             statement += "\n"
         return "".join(lines[:insert_at]) + statement + "".join(lines[insert_at:])
+
+    def _insert_import_statement(self, original: str, statement: str) -> str:
+        updated = original
+        statements = [line.strip() for line in statement.splitlines() if line.strip()]
+        if not statements:
+            return original
+        for single_statement in statements:
+            updated = self._insert_single_import_statement(updated, single_statement)
+        return updated
 
     def _delete_symbol_text(self, target: Path, symbol: str) -> tuple[str, str, dict[str, Any] | None]:
         symbols, original, _ = self._code_symbols(target)
@@ -12613,6 +12649,15 @@ import string
             summary = str(routed.get("summary") or "").strip()
             routed["summary"] = "Routed full function replacement to replace_symbol. " + summary if summary else "Routed full function replacement to replace_symbol."
             return routed
+        if re.search(r"(?m)^(?:async\s+def|def|class)\s+[A-Za-z_]\w*", normalized):
+            return {
+                "ok": False,
+                "tool": "apply_structured_edit",
+                "path": relative_path,
+                "op": "replace_function_body",
+                "error_class": "invalid_args",
+                "summary": "replace_function_body received additional top-level definitions. Use write_file or replace_symbol for coordinated multi-function edits.",
+            }
         shadow_diagnostic = self._shadowed_builtin_call_diagnostic(node, normalized)
         if shadow_diagnostic:
             return {

@@ -1835,6 +1835,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(final_text.count("def add"), 1)
         self.assertIn("return left + right", final_text)
 
+    def test_replace_body_rejects_extra_top_level_definitions(self) -> None:
+        with self._temp_tools() as (root, tools):
+            sample = root / "store.py"
+            original = "def save(path, rows):\n    return None\n\n\ndef load(path):\n    return []\n"
+            sample.write_text(original, encoding="utf-8")
+            result = tools.edit_intent(
+                "store.py",
+                "replace_body",
+                "save",
+                "def save(path, rows):\n"
+                "    path.write_text(str(rows))\n\n"
+                "def archive(rows):\n"
+                "    return rows\n",
+            )
+            final_text = sample.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_class"], "invalid_args")
+        self.assertIn("additional top-level definitions", result["summary"])
+        self.assertEqual(final_text, original)
+
     def test_edit_intent_repairs_common_join_typo_in_body_edit(self) -> None:
         with self._temp_tools() as (root, tools):
             sample = root / "joiner.py"
@@ -5439,6 +5460,33 @@ def double(value: int) -> int:
 
         self.assertTrue(result["ok"])
         self.assertTrue(final_text.startswith("import math\n"))
+
+    def test_apply_structured_edit_merges_multiline_import_request(self) -> None:
+        root = self._workspace_scratch()
+        package = root / "bookmarks"
+        package.mkdir()
+        sample = package / "cli.py"
+        sample.write_text(
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "from pathlib import Path\n\n"
+            "from .store import add_bookmark, list_bookmarks\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        result = tools.apply_structured_edit(
+            {
+                "op": "add_import",
+                "path": "bookmarks/cli.py",
+                "statement": "import argparse\nfrom .store import add_bookmark, list_bookmarks, archive_bookmark",
+            }
+        )
+        final_text = sample.read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(final_text.count("import argparse"), 1)
+        self.assertEqual(final_text.count("from .store import"), 1)
+        self.assertIn("from .store import add_bookmark, list_bookmarks, archive_bookmark", final_text)
 
     def test_apply_structured_edit_replaces_function_body(self) -> None:
         root = self._workspace_scratch()

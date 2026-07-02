@@ -1475,6 +1475,12 @@ class OllamaCodeAgent:
             return False
         return not self._repair_spec_has_followup_mutation(state)
 
+    def _pending_repair_spec_without_followup(self) -> dict[str, Any] | None:
+        for state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
+            if not self._repair_spec_has_followup_mutation(state):
+                return dict(state)
+        return None
+
     def _repair_spec_validation_retry_message(self, state: dict[str, Any]) -> str:
         return (
             self._failed_edit_recovery_retry_message(state, need_reground=not self._failed_edit_recovery_regrounded(state))
@@ -1645,7 +1651,14 @@ class OllamaCodeAgent:
                     "token": tool_name,
                 }
             )
-        if code_mutation_required:
+        feature_delivery_requested = bool(
+            code_mutation_required
+            or re.search(
+                r"\b(?:add|implement|create|change|modify|update|support|introduce)\b.*\b(?:subcommand|command|flag)\b",
+                lowered,
+            )
+        )
+        if feature_delivery_requested:
             obligations.append(
                 {
                     "id": "code-change",
@@ -1678,9 +1691,24 @@ class OllamaCodeAgent:
                     "paths": doc_targets,
                 }
             )
-        for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9_-]{1,40})\b\s+(?:subcommand|command)\b", request_text):
-            token = str(match.group(1)).strip()
-            if token:
+        if feature_delivery_requested:
+            command_token_stopwords = {
+                "a",
+                "an",
+                "the",
+                "new",
+                "existing",
+                "current",
+                "requested",
+                "direct",
+                "targeted",
+                "shell",
+                "cli",
+            }
+            for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9_-]{1,40})\b\s+(?:subcommand|command)\b", request_text):
+                token = str(match.group(1)).strip()
+                if not token or token.lower() in command_token_stopwords:
+                    continue
                 obligations.append(
                     {
                         "id": f"command:{token.lower()}",
@@ -1690,16 +1718,16 @@ class OllamaCodeAgent:
                         "feature_class": "command",
                     }
                 )
-        for token in sorted(set(re.findall(r"(--[A-Za-z0-9][A-Za-z0-9-]*)", request_text))):
-            obligations.append(
-                {
-                    "id": f"flag:{token.lower()}",
-                    "kind": "feature_token",
-                    "label": f'prove the "{token}" flag exists',
-                    "token": token,
-                    "feature_class": "flag",
-                }
-            )
+            for token in sorted(set(re.findall(r"(--[A-Za-z0-9][A-Za-z0-9-]*)", request_text))):
+                obligations.append(
+                    {
+                        "id": f"flag:{token.lower()}",
+                        "kind": "feature_token",
+                        "label": f'prove the "{token}" flag exists',
+                        "token": token,
+                        "feature_class": "flag",
+                    }
+                )
         return self._merge_request_obligations(obligations)
 
     def _request_obligation_proof_status(
@@ -11348,6 +11376,8 @@ class OllamaCodeAgent:
         diagnosed_tool_error_keys: set[tuple[str, str, str]] = set()
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
+        repair_pivot_prompt_pending = False
+        last_repair_pivot_message = ""
         last_successful_mutation: dict[str, Any] | None = None
         last_successful_source_mutation: dict[str, Any] | None = None
         last_failed_run_shell_command = ""
@@ -11493,7 +11523,17 @@ class OllamaCodeAgent:
                 if deterministic_result is not None:
                     return deterministic_result
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
+            old_client_timeout: int | None = None
             try:
+                if repair_pivot_prompt_pending and isinstance(self.client, OllamaClient):
+                    old_client_timeout = self.client.timeout
+                    self.client.timeout = min(self.client.timeout, SPEC_GUIDED_REPAIR_CANDIDATE_TIMEOUT)
+                    self._record_event(
+                        "controller_guard",
+                        guard="bounded-repair-prompt",
+                        timeout_s=self.client.timeout,
+                        rounds=round_number,
+                    )
                 response = self._chat(
                     purpose="primary",
                     model=self.model,
@@ -11513,8 +11553,24 @@ class OllamaCodeAgent:
                     ),
                     primary_can_emit_large_payload=mutation_allowed or mutation_required,
                 )
-            except OllamaError:
+            except OllamaError as exc:
+                if repair_pivot_prompt_pending and "timed out" in str(exc).lower():
+                    failure = "Stopped because the model timed out while responding to the bounded repair prompt after a failed edit."
+                    if last_repair_pivot_message:
+                        failure += " " + self._truncate_text(last_repair_pivot_message, limit=420)
+                    self._record_event(
+                        "assistant",
+                        content=failure,
+                        rounds=round_number,
+                        error_class="timeout",
+                    )
+                    self._flush_llm_call_events()
+                    return AgentResult(message=failure, rounds=round_number, completed=False)
                 raise
+            finally:
+                if old_client_timeout is not None and isinstance(self.client, OllamaClient):
+                    self.client.timeout = old_client_timeout
+            repair_pivot_prompt_pending = False
             recovered_tool_audit_bypass_reason: str | None = None
             payload = extract_json_response(response.content)
             if payload is None:
@@ -12056,6 +12112,47 @@ class OllamaCodeAgent:
                     )
                     self._flush_llm_call_events()
                     return AgentResult(message=failure, rounds=round_number, completed=False)
+                if request_obligations:
+                    obligation_statuses = self._request_obligation_proof_status(
+                        obligations=request_obligations,
+                        successful_tool_results=successful_tool_results,
+                        required_tool_names=required_tool_names,
+                    )
+                    unresolved_obligations = [
+                        item for item in obligation_statuses if str(item.get("status") or "").strip() != "proven"
+                    ]
+                    if unresolved_obligations:
+                        labels = [
+                            str(item.get("label") or item.get("id") or "").strip()
+                            for item in unresolved_obligations
+                            if str(item.get("label") or item.get("id") or "").strip()
+                        ]
+                        guidance = [
+                            str(item.get("guidance") or "").strip()
+                            for item in unresolved_obligations
+                            if str(item.get("guidance") or "").strip()
+                        ]
+                        missing = "; ".join(labels[:4]) if labels else "requested deliverables"
+                        detail = " ".join(guidance[:3])
+                        if round_number >= self.max_tool_rounds:
+                            failure = "Stopped because requested deliverables remain unproven before final verification. " + missing + "."
+                            if detail:
+                                failure += " " + self._truncate_text(detail, limit=420)
+                            self._record_event(
+                                "assistant",
+                                content=failure,
+                                rounds=round_number,
+                                obligation_checks=obligation_statuses,
+                            )
+                            self._flush_llm_call_events()
+                            return AgentResult(message=failure, rounds=round_number, completed=False)
+                        self._append_assistant_payload(payload)
+                        retry_message = "Requested deliverables remain unproven: " + missing + "."
+                        if detail:
+                            retry_message += " " + self._truncate_text(detail, limit=420)
+                        retry_message += " Use current source or command evidence to prove them before final answer. Next JSON only."
+                        self.messages.append({"role": "user", "content": retry_message})
+                        continue
                 if expected_exact_file_line is not None:
                     latest_read_result = self._latest_successful_tool_result(successful_tool_results, "read_file")
                     if latest_read_result is not None:
@@ -12844,14 +12941,25 @@ class OllamaCodeAgent:
                     )
                     forbidden_tool_names.update({"edit_intent", "replace_in_file", "replace_symbol", "replace_symbols", "apply_structured_edit"})
                     required_tool_names.difference_update(forbidden_tool_names)
+                    last_repair_pivot_message = self._repeated_mutating_failure_escape_message(
+                        name=name,
+                        arguments=arguments,
+                        result={"summary": latest_run_test_failure_summary or "Earlier mutating edit already failed on this target."},
+                    )
+                    if round_number >= self.max_tool_rounds:
+                        failure = "Stopped because a repeated failed mutation reached the final tool round. " + last_repair_pivot_message
+                        self._record_event(
+                            "assistant",
+                            content=failure,
+                            rounds=round_number,
+                        )
+                        self._flush_llm_call_events()
+                        return AgentResult(message=failure, rounds=round_number, completed=False)
+                    repair_pivot_prompt_pending = True
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": self._repeated_mutating_failure_escape_message(
-                                name=name,
-                                arguments=arguments,
-                                result={"summary": latest_run_test_failure_summary or "Earlier mutating edit already failed on this target."},
-                            ),
+                            "content": last_repair_pivot_message,
                         }
                     )
                     continue
@@ -13051,7 +13159,8 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
-                repair_pending_before_validation = pending_repair_state is not None or (
+                pending_repair_without_followup = self._pending_repair_spec_without_followup()
+                repair_pending_before_validation = pending_repair_state is not None or pending_repair_without_followup is not None or (
                     self._mutation_record_targets_source(last_successful_source_mutation or last_successful_mutation, successful_tool_results)
                     and self._failed_test_still_needs_repair(
                         latest_run_test_failed=latest_run_test_failed,
@@ -13071,7 +13180,16 @@ class OllamaCodeAgent:
                         feedback = self._failed_test_repair_retry_message(latest_run_test_failure_summary)
                     self.messages.append({"role": "user", "content": feedback + " Next JSON only."})
                     continue
-                if self._should_force_post_edit_validation(
+                if pending_repair_without_followup is not None and name in VALIDATION_TOOL_NAMES:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._repair_spec_validation_retry_message(pending_repair_without_followup) + " Next JSON only.",
+                        }
+                    )
+                    continue
+                if pending_repair_without_followup is None and self._should_force_post_edit_validation(
                     request_text=text,
                     candidate_tool_name=name,
                     repair_pending=repair_pending_before_validation,
@@ -14083,6 +14201,32 @@ class OllamaCodeAgent:
                 if self._sticky_failed_edit_recovery:
                     failure += " Continue from the grounded target with one broader repair after re-reading the current source."
                 self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
+                self._flush_llm_call_events()
+                return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
+        if request_obligations:
+            obligation_statuses = self._request_obligation_proof_status(
+                obligations=request_obligations,
+                successful_tool_results=successful_tool_results,
+                required_tool_names=required_tool_names,
+            )
+            unresolved = [item for item in obligation_statuses if str(item.get("status") or "").strip() != "proven"]
+            if unresolved:
+                unresolved_labels = [
+                    str(item.get("label") or item.get("id") or "").strip()
+                    for item in unresolved
+                    if str(item.get("label") or item.get("id") or "").strip()
+                ]
+                guidance = [
+                    str(item.get("guidance") or "").strip()
+                    for item in unresolved
+                    if str(item.get("guidance") or "").strip()
+                ]
+                failure = "Stopped after reaching the maximum tool rounds with requested deliverables still unproven."
+                if unresolved_labels:
+                    failure += " " + "; ".join(unresolved_labels[:4]) + "."
+                if guidance:
+                    failure += " " + self._truncate_text(" ".join(guidance[:3]), limit=420)
+                self._record_event("assistant", content=failure, rounds=self.max_tool_rounds, obligation_checks=obligation_statuses)
                 self._flush_llm_call_events()
                 return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
         failure = "Stopped after reaching the maximum tool rounds."

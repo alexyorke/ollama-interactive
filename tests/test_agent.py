@@ -25,7 +25,7 @@ from ollama_code.agent import (
     extract_json_response,
 )
 from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
-from ollama_code.ollama_client import ChatResponse, TokenUsage
+from ollama_code.ollama_client import ChatResponse, OllamaError, TokenUsage
 from ollama_code.tools import ToolExecutor
 from tests.agent_test_support import AgentTestBase
 
@@ -943,7 +943,7 @@ class AgentTests(AgentTestBase):
         )
         root = self._workspace_scratch()
         tools = CountingToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
         (root / "README.md").write_text("overview\n", encoding="utf-8")
         (root / "src").mkdir()
         (root / "src" / "core.py").write_text(
@@ -1136,6 +1136,38 @@ class AgentTests(AgentTestBase):
 
         self.assertEqual(update_obligations, [])
 
+    def test_command_obligation_ignores_descriptive_command_words(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        obligations = agent._derive_request_obligations(
+            request_text=(
+                "Implement a new archive subcommand. Update README with the new command and flag. "
+                "Run the tests and prove the new behavior with a shell command. Add list --all."
+            ),
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        feature_ids = sorted(item["id"] for item in obligations if item.get("kind") == "feature_token")
+
+        self.assertEqual(feature_ids, ["command:archive", "flag:--all"])
+
+    def test_read_only_command_check_does_not_create_feature_obligation(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        obligations = agent._derive_request_obligations(
+            request_text="Check whether the helper command works, but do not loop on dependency failures.",
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=False,
+            test_run_required=False,
+        )
+
+        self.assertFalse(any(item.get("kind") == "feature_token" for item in obligations))
+
     def test_shell_recursive_grep_inspection_normalizes_to_search(self) -> None:
         client = FakeClient(
             [
@@ -1145,7 +1177,7 @@ class AgentTests(AgentTestBase):
         )
         root = self._workspace_scratch()
         tools = CountingToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
         (root / "azure_functions_worker").mkdir()
         (root / "azure_functions_worker" / "constants.py").write_text("PYTHON_THREADPOOL_THREAD_COUNT = 1\n", encoding="utf-8")
 
@@ -3824,6 +3856,71 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Do not run validators while Python syntax errors are already known", feedback)
 
+    def test_pending_repair_spec_fails_closed_without_repeated_auto_lint(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("import os\n\n\ndef value() -> str:\n    return os.name\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "app.py",
+                            "content": "import os\nimport os\n\n\ndef value() -> str:\n    return os.name\n",
+                        },
+                    }
+                ),
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"final","message":"still repairing"}',
+                '{"type":"final","message":"still repairing"}',
+                '{"type":"final","message":"still repairing"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        result = agent.handle_user("Update app.py and keep validation green.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("lint_typecheck"), 1)
+        guards = [event for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertTrue(any(event.get("guard") == "post-edit-validation" for event in guards))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not rerun validators until you make the broader repair", feedback)
+
+    def test_unproven_feature_obligations_fail_before_final_verifier(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+        (root / "README.md").write_text("# App\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def main():\n    return 0\n"}}),
+                json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                *[json.dumps({"type": "final", "message": "Implemented archive and --all."}) for _ in range(10)],
+            ]
+        )
+        tools = CountingToolExecutor(
+            root,
+            approval_mode="auto",
+            test_command=subprocess.list2cmdline([sys.executable, "-c", "print('OK')"]),
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        result = agent.handle_user("Add an archive command and --all flag. Update README and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("requested deliverables remain unproven before final verification", result.message)
+        self.assertIn('prove the "archive" command exists', result.message)
+        verifier_calls = [
+            call
+            for call in client.calls
+            if call["messages"] and str(call["messages"][0]["content"]).startswith("You are a grounded final verifier")
+        ]
+        self.assertEqual(verifier_calls, [])
+
     def test_syntax_bad_mutation_invokes_spec_guided_repair_with_workspace_fallback(self) -> None:
         root = self._workspace_scratch()
         (root / "tests").mkdir()
@@ -3843,7 +3940,7 @@ class AgentTests(AgentTestBase):
             ]
         )
         tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
         calls: list[dict[str, object]] = []
 
         def fake_spec_guided_repair(**kwargs: object) -> AgentResult | None:
@@ -4895,8 +4992,7 @@ class AgentTests(AgentTestBase):
             client = FakeClient(
                 [
                     '{"type":"tool","name":"write_file","arguments":{"path":"README.md","content":"Use the stats command.\\n"}}',
-                    '{"type":"final","message":"Added the stats command and updated README."}',
-                    '{"type":"final","message":"Added the stats command and updated README."}',
+                    *['{"type":"final","message":"Added the stats command and updated README."}' for _ in range(10)],
                 ]
             )
             tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
@@ -4905,7 +5001,7 @@ class AgentTests(AgentTestBase):
             result = agent.handle_user("Add a stats command to app.py and update README.md.")
 
         self.assertFalse(result.completed)
-        self.assertIn("grounded final verification", result.message)
+        self.assertIn("requested deliverables", result.message)
         tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
         self.assertIn("write_file", tool_calls)
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
@@ -4967,8 +5063,7 @@ class AgentTests(AgentTestBase):
             client = FakeClient(
                 [
                     '{"type":"tool","name":"write_file","arguments":{"path":"README.md","content":"Use the stats command.\\n"}}',
-                    '{"type":"final","message":"Added the stats command and updated README."}',
-                    '{"type":"final","message":"Added the stats command and updated README."}',
+                    *['{"type":"final","message":"Added the stats command and updated README."}' for _ in range(10)],
                     '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
                     '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
                     '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"def add(left, right):\\n    return left + right\\n","new":"def add(left, right):\\n    return left + right\\n\\ndef stats():\\n    return 1\\n"}}',
@@ -8563,6 +8658,75 @@ class AgentTests(AgentTestBase):
         guards = [event for event in agent.events if event.get("guard") == "repeated-mutating-failure-pivot"]
         self.assertEqual(len(guards), 1)
 
+    def test_repair_pivot_model_timeout_fails_closed(self) -> None:
+        class TimeoutAfterScriptedClient(FakeClient):
+            def chat(
+                self,
+                *,
+                model: str,
+                messages: list[dict[str, str]],
+                response_format: str = "json",
+                on_thinking: object | None = None,
+                think: bool | None = None,
+                options: dict[str, object] | None = None,
+            ) -> ChatResponse:
+                if not self.responses:
+                    raise OllamaError("Ollama timed out after 60 seconds.")
+                return super().chat(
+                    model=model,
+                    messages=messages,
+                    response_format=response_format,
+                    on_thinking=on_thinking,
+                    think=think,
+                    options=options,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            client = TimeoutAfterScriptedClient(
+                [
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_text", "target": "return missing", "replacement": "return left + right"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_text", "target": "return other_missing", "replacement": "return left + right"}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Fix app.py.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("timed out while responding to the bounded repair prompt", result.message)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        guards = [event for event in agent.events if event.get("guard") == "repeated-mutating-failure-pivot"]
+        self.assertEqual(len(guards), 1)
+
+    def test_final_round_repeated_mutating_failure_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_text", "target": "return missing", "replacement": "return left + right"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_text", "target": "return other_missing", "replacement": "return left + right"}}),
+                    json.dumps({"type": "final", "message": "should not be reached"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Fix app.py.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("repeated failed mutation reached the final tool round", result.message)
+        self.assertIn("Stop retrying narrow edit operations on app.py", result.message)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(len(client.responses), 1)
+        guards = [event for event in agent.events if event.get("guard") == "repeated-mutating-failure-pivot"]
+        self.assertEqual(len(guards), 1)
+
     def test_failed_tests_feedback_includes_stubs_and_unittest_examples(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -10984,6 +11148,8 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_tool_error_guard_blocks_third_duplicate_path_failure",
         "test_path_missing_on_single_source_repo_auto_grounds_real_source",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
+        "test_repair_pivot_model_timeout_fails_closed",
+        "test_final_round_repeated_mutating_failure_fails_closed",
         "test_failed_edit_recovery_guard_requires_behavior_surface_read_for_cli_repair",
         "test_spec_guided_repair_uses_context_pack_test_files_as_recent_tests",
         "test_failed_edit_recovery_state_carries_into_later_mutation_turn",
@@ -11011,6 +11177,8 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
         "test_final_repair_spec_stop_attempts_spec_guided_repair",
         "test_known_syntax_error_blocks_lint_validator_until_repair",
+        "test_pending_repair_spec_fails_closed_without_repeated_auto_lint",
+        "test_unproven_feature_obligations_fail_before_final_verifier",
         "test_syntax_bad_mutation_invokes_spec_guided_repair_with_workspace_fallback",
         "test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request",
         "test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests",
@@ -11019,6 +11187,8 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_verification_rejects_docs_only_feature_completion_until_code_proof_exists",
         "test_request_obligation_code_change_requires_mutation_not_source_read",
         "test_readme_inspection_does_not_create_docs_update_obligation",
+        "test_command_obligation_ignores_descriptive_command_words",
+        "test_read_only_command_check_does_not_create_feature_obligation",
         "test_final_verification_requires_read_proof_for_requested_command_token",
         "test_final_verification_requires_behavior_proof_for_cli_command_and_flag",
         "test_request_obligations_persist_across_continue_requests",
