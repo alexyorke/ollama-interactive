@@ -285,6 +285,15 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("quote prefixes", result["summary"])
         self.assertEqual(final_text, "import re\n\ndef f():\n    return re.escape('x')\n")
 
+    def test_write_file_strips_rewrite_markers_for_python(self) -> None:
+        with self._temp_tools() as (root, tools):
+            result = tools.write_file("rewritten.py", ">> BEGIN REWRITE <<<\ndef f():\n    return 1\n>> END REWRITE <<<\n")
+            final_text = (root / "rewritten.py").read_text(encoding="utf-8")
+
+        self.assertTrue(result["ok"])
+        self.assertIn("rewrite markers", result["summary"])
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+
     def test_write_file_repairs_common_join_string_typo_when_parseable(self) -> None:
         with self._temp_tools() as (root, tools):
             result = tools.write_file("joiner.py", "def f(items):\n    return '.join(items)\n")
@@ -4085,6 +4094,24 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls pretty with 0 supplied args; expected 1", result["output"])
+
+    def test_contract_check_ignores_business_todo_status_text(self) -> None:
+        with self._temp_files_tools(
+            {
+                "task_cli.py": (
+                    "TASKS = [\n"
+                    "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high'},\n"
+                    "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low'},\n"
+                    "]\n\n"
+                    "def list_tasks():\n"
+                    "    return ['todo', 'done']\n"
+                ),
+            }
+        ) as (_root, tools):
+            result = tools.contract_check(["task_cli.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("placeholder", result["output"].lower())
 
     def test_contract_check_counts_keyword_arguments_for_arity(self) -> None:
         with self._temp_files_tools(

@@ -9503,9 +9503,15 @@ import string
                     shapes.add(f"tuple[{len(value.elts)}]")
                 elif isinstance(value, ast.List):
                     shapes.add("list")
+                elif isinstance(value, ast.ListComp):
+                    shapes.add("list")
                 elif isinstance(value, ast.Dict):
                     shapes.add("dict")
+                elif isinstance(value, ast.DictComp):
+                    shapes.add("dict")
                 elif isinstance(value, ast.Set):
+                    shapes.add("set")
+                elif isinstance(value, ast.SetComp):
                     shapes.add("set")
                 elif isinstance(value, ast.Constant):
                     shapes.add(type(value.value).__name__)
@@ -9652,9 +9658,15 @@ import string
             return local_shapes.get(value.id)
         if isinstance(value, ast.List):
             return "list"
+        if isinstance(value, ast.ListComp):
+            return "list"
         if isinstance(value, ast.Dict):
             return "dict"
+        if isinstance(value, ast.DictComp):
+            return "dict"
         if isinstance(value, ast.Set):
+            return "set"
+        if isinstance(value, ast.SetComp):
             return "set"
         if isinstance(value, ast.Tuple):
             return "tuple"
@@ -9966,15 +9978,19 @@ import string
 
     def _python_placeholder_text_diagnostics(self, rel: str, text: str, limit: int) -> list[str]:
         diagnostics: list[str] = []
-        patterns = [
-            (r"\bplaceholder implementation\b", "placeholder implementation text remains"),
-            (r"\bin a real scenario\b", "speculative placeholder text remains"),
-            (r"\bNote_(?:Interval_)?\b", "fake generated note placeholder remains"),
-            (r"\bTODO\b|\bstub\b|\byour code\b", "TODO/stub placeholder text remains"),
-        ]
         for index, line in enumerate(text.splitlines(), start=1):
             lowered = line.lower()
-            for pattern, message in patterns:
+            stripped = line.strip()
+            commentish = stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''")
+            patterns = [
+                (r"\bplaceholder implementation\b", "placeholder implementation text remains", True),
+                (r"\bin a real scenario\b", "speculative placeholder text remains", True),
+                (r"\bNote_(?:Interval_)?\b", "fake generated note placeholder remains", True),
+                (r"\bTODO\b|\bstub\b|\byour code\b", "TODO/stub placeholder text remains", commentish),
+            ]
+            for pattern, message, enabled in patterns:
+                if not enabled:
+                    continue
                 if re.search(pattern, line, flags=re.IGNORECASE):
                     diagnostics.append(f"{rel}:{index} {message}: {lowered.strip()[:100]}")
                     break
@@ -12976,6 +12992,9 @@ import string
         fenced_match = re.match(r"^\s*```(?:python|py)?\s*\n(?P<body>.*?)(?:\n)?```\s*$", content, flags=re.DOTALL | re.IGNORECASE)
         if fenced_match:
             candidates.append((fenced_match.group("body"), "Stripped markdown code fence from Python file content before write."))
+        rewrite_marker_stripped = self._strip_python_rewrite_markers(content)
+        if rewrite_marker_stripped != content:
+            candidates.append((rewrite_marker_stripped, "Stripped rewrite markers from Python file content before write."))
         quote_stripped = self._strip_markdown_quote_prefixes(content)
         if quote_stripped != content:
             candidates.append((quote_stripped, "Stripped markdown quote prefixes from Python file content before write."))
@@ -13002,6 +13021,19 @@ import string
 
     def _repair_common_python_join_typo(self, content: str) -> str:
         return re.sub(r"(?m)^(\s*return\s+)['\"]\.join\(", r'\1" ".join(', content)
+
+    def _strip_python_rewrite_markers(self, content: str) -> str:
+        lines = content.splitlines()
+        if len(lines) < 3:
+            return content
+        first = lines[0].strip().lower()
+        last = lines[-1].strip().lower()
+        begin_rewrite = bool(re.fullmatch(r"[>=#/\-\s]*begin (?:rewrite|file|source|replacement)[<\-=#/\s]*", first))
+        end_rewrite = bool(re.fullmatch(r"[>=#/\-\s]*end (?:rewrite|file|source|replacement)[<\-=#/\s]*", last))
+        if begin_rewrite and end_rewrite:
+            trailing_newline = "\n" if content.endswith(("\n", "\r\n")) else ""
+            return "\n".join(lines[1:-1]) + trailing_newline
+        return content
 
     def _strip_markdown_quote_prefixes(self, content: str) -> str:
         lines = content.splitlines(keepends=True)

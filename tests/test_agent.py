@@ -3983,6 +3983,28 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn('prove the "stats" command exists', feedback)
 
+    def test_request_obligation_code_change_requires_mutation_not_source_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            agent = OllamaCodeAgent(
+                client=FakeClient([]),
+                tools=CountingToolExecutor(root, approval_mode="auto"),
+                model="fake-model",
+                debate_enabled=False,
+            )
+
+            statuses = agent._request_obligation_proof_status(
+                obligations=[{"id": "code-change", "kind": "code_change", "label": "implement the requested code change"}],
+                successful_tool_results=[
+                    {"name": "read_file", "arguments": {"path": "app.py"}, "result": {"ok": True, "path": "app.py", "output": "def add(left, right):\n    return left + right\n"}},
+                ],
+                required_tool_names=set(),
+            )
+
+        self.assertEqual(statuses[0]["status"], "unproven")
+        self.assertIn("real code change", statuses[0]["guidance"])
+
     def test_final_verification_requires_read_proof_for_requested_command_token(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4041,6 +4063,1027 @@ class AgentTests(AgentTestBase):
         tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
         self.assertIn("read_file", tool_calls)
         self.assertIn("write_file", tool_calls)
+
+    def helper_failed_edit_recovery_blocks_second_narrow_edit_until_regrounded_and_broad_repair_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "import argparse\nimport json\nfrom collections.abc import Sequence\nfrom pathlib import Path\nfrom typing import Any\n\n"
+                "DEFAULT_DB_PATH = Path('tasks.json')\n\n"
+                "def load_tasks(db_path: Path) -> list[dict[str, Any]]:\n"
+                "    if not db_path.exists():\n"
+                "        return []\n"
+                "    payload = json.loads(db_path.read_text(encoding='utf-8'))\n"
+                "    return [row for row in payload if isinstance(row, dict)]\n\n"
+                "def save_tasks(db_path: Path, tasks: Sequence[dict[str, Any]]) -> None:\n"
+                "    db_path.write_text(json.dumps(list(tasks), indent=2) + '\\n', encoding='utf-8')\n\n"
+                "def next_task_id(tasks: Sequence[dict[str, Any]]) -> int:\n"
+                "    return max((int(task.get('id', 0)) for task in tasks), default=0) + 1\n\n"
+                "def add_task(db_path: Path, title: str, *, priority: str = 'medium') -> dict[str, Any]:\n"
+                "    tasks = load_tasks(db_path)\n"
+                "    task = {'id': next_task_id(tasks), 'title': title.strip(), 'status': 'open', 'priority': priority}\n"
+                "    tasks.append(task)\n"
+                "    save_tasks(db_path, tasks)\n"
+                "    return task\n\n"
+                "def complete_task(db_path: Path, task_id: int) -> dict[str, Any]:\n"
+                "    tasks = load_tasks(db_path)\n"
+                "    for task in tasks:\n"
+                "        if int(task.get('id', 0)) == task_id:\n"
+                "            task['status'] = 'done'\n"
+                "            save_tasks(db_path, tasks)\n"
+                "            return task\n"
+                "    raise KeyError(f'task {task_id} not found')\n\n"
+                "def format_task(task: dict[str, Any]) -> str:\n"
+                "    return f\"[{task['id']}] {task['title']} ({task['status']}, priority={task['priority']})\"\n\n"
+                "def list_tasks(db_path: Path, *, status: str | None = None) -> list[str]:\n"
+                "    tasks = load_tasks(db_path)\n"
+                "    if status is not None:\n"
+                "        tasks = [task for task in tasks if task.get('status') == status]\n"
+                "    return [format_task(task) for task in tasks]\n\n"
+                "def build_parser() -> argparse.ArgumentParser:\n"
+                "    parser = argparse.ArgumentParser(description='Tiny task tracker CLI')\n"
+                "    parser.add_argument('--db', default=str(DEFAULT_DB_PATH))\n"
+                "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                "    add_parser = subparsers.add_parser('add')\n"
+                "    add_parser.add_argument('title')\n"
+                "    add_parser.add_argument('--priority', choices=['low', 'medium', 'high'], default='medium')\n"
+                "    list_parser = subparsers.add_parser('list')\n"
+                "    list_parser.add_argument('--status', choices=['open', 'done'], default=None)\n"
+                "    complete_parser = subparsers.add_parser('complete')\n"
+                "    complete_parser.add_argument('task_id', type=int)\n"
+                "    return parser\n\n"
+                "def main(argv: Sequence[str] | None = None) -> int:\n"
+                "    parser = build_parser()\n"
+                "    args = parser.parse_args(argv)\n"
+                "    db_path = Path(args.db)\n"
+                "    if args.command == 'add':\n"
+                "        task = add_task(db_path, args.title, priority=args.priority)\n"
+                "        print(f'added {format_task(task)}')\n"
+                "        return 0\n"
+                "    if args.command == 'list':\n"
+                "        for line in list_tasks(db_path, status=args.status):\n"
+                "            print(line)\n"
+                "        return 0\n"
+                "    if args.command == 'complete':\n"
+                "        task = complete_task(db_path, args.task_id)\n"
+                "        print(f'completed {format_task(task)}')\n"
+                "        return 0\n"
+                "    raise SystemExit(2)\n\n"
+                "if __name__ == '__main__':\n"
+                "    raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            (root / "tests").mkdir()
+            (root / "tests" / "test_task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "import subprocess\nimport sys\nimport tempfile\nimport unittest\nfrom pathlib import Path\n\n"
+                "ROOT = Path(__file__).resolve().parents[1]\n"
+                "CLI = [sys.executable, str(ROOT / 'task_cli.py')]\n\n"
+                "def run_cli(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:\n"
+                "    return subprocess.run(CLI + list(args), cwd=cwd, text=True, capture_output=True, check=False)\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_add_and_list_task(self) -> None:\n"
+                "        with tempfile.TemporaryDirectory() as tmp:\n"
+                "            cwd = Path(tmp)\n"
+                "            added = run_cli('add', 'Write tests', '--priority', 'high', cwd=cwd)\n"
+                "            listed = run_cli('list', cwd=cwd)\n"
+                "        self.assertEqual(added.returncode, 0, added.stderr)\n"
+                "        self.assertIn('added [1] Write tests (open, priority=high)', added.stdout)\n"
+                "        self.assertEqual(listed.returncode, 0, listed.stderr)\n"
+                "        self.assertIn('[1] Write tests (open, priority=high)', listed.stdout)\n\n"
+                "    def test_complete_marks_task_done(self) -> None:\n"
+                "        with tempfile.TemporaryDirectory() as tmp:\n"
+                "            cwd = Path(tmp)\n"
+                "            run_cli('add', 'Ship release', cwd=cwd)\n"
+                "            completed = run_cli('complete', '1', cwd=cwd)\n"
+                "            listed = run_cli('list', '--status', 'done', cwd=cwd)\n"
+                "        self.assertEqual(completed.returncode, 0, completed.stderr)\n"
+                "        self.assertIn('completed [1] Ship release (done, priority=medium)', completed.stdout)\n"
+                "        self.assertEqual(listed.returncode, 0, listed.stderr)\n"
+                "        self.assertIn('[1] Ship release (done, priority=medium)', listed.stdout)\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "old": "        for line in list_tasks(db_path, status=args.status):\n",
+                                "new": "        for line in list_tasks(db_path, status=args.status, priority=args.priority):\n",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "old": "        print(f'completed {format_task(task)}')\n",
+                                "new": "        print(f'completed {format_task(task)}')\n        print('stats pending')\n",
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"still fixing the CLI"}',
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "old": "import argparse\n",
+                                "new": "import argparse\nfrom collections import Counter\n",
+                            },
+                        }
+                    ),
+                    '{"type":"tool","name":"read_file","arguments":{"path":"task_cli.py"}}',
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "content": (
+                                    "from __future__ import annotations\n\n"
+                                    "import argparse\nimport json\nfrom collections import Counter\nfrom collections.abc import Sequence\nfrom pathlib import Path\nfrom typing import Any\n\n"
+                                    "DEFAULT_DB_PATH = Path('tasks.json')\n\n"
+                                    "def load_tasks(db_path: Path) -> list[dict[str, Any]]:\n"
+                                    "    if not db_path.exists():\n"
+                                    "        return []\n"
+                                    "    payload = json.loads(db_path.read_text(encoding='utf-8'))\n"
+                                    "    return [row for row in payload if isinstance(row, dict)]\n\n"
+                                    "def save_tasks(db_path: Path, tasks: Sequence[dict[str, Any]]) -> None:\n"
+                                    "    db_path.write_text(json.dumps(list(tasks), indent=2) + '\\n', encoding='utf-8')\n\n"
+                                    "def next_task_id(tasks: Sequence[dict[str, Any]]) -> int:\n"
+                                    "    return max((int(task.get('id', 0)) for task in tasks), default=0) + 1\n\n"
+                                    "def add_task(db_path: Path, title: str, *, priority: str = 'medium') -> dict[str, Any]:\n"
+                                    "    tasks = load_tasks(db_path)\n"
+                                    "    task = {'id': next_task_id(tasks), 'title': title.strip(), 'status': 'open', 'priority': priority}\n"
+                                    "    tasks.append(task)\n"
+                                    "    save_tasks(db_path, tasks)\n"
+                                    "    return task\n\n"
+                                    "def complete_task(db_path: Path, task_id: int) -> dict[str, Any]:\n"
+                                    "    tasks = load_tasks(db_path)\n"
+                                    "    for task in tasks:\n"
+                                    "        if int(task.get('id', 0)) == task_id:\n"
+                                    "            task['status'] = 'done'\n"
+                                    "            save_tasks(db_path, tasks)\n"
+                                    "            return task\n"
+                                    "    raise KeyError(f'task {task_id} not found')\n\n"
+                                    "def format_task(task: dict[str, Any]) -> str:\n"
+                                    "    return f\"[{task['id']}] {task['title']} ({task['status']}, priority={task['priority']})\"\n\n"
+                                    "def list_tasks(db_path: Path, *, status: str | None = None, priority: str | None = None) -> list[str]:\n"
+                                    "    tasks = load_tasks(db_path)\n"
+                                    "    if status is not None:\n"
+                                    "        tasks = [task for task in tasks if task.get('status') == status]\n"
+                                    "    if priority is not None:\n"
+                                    "        tasks = [task for task in tasks if task.get('priority') == priority]\n"
+                                    "    return [format_task(task) for task in tasks]\n\n"
+                                    "def stats_lines(db_path: Path) -> list[str]:\n"
+                                    "    tasks = load_tasks(db_path)\n"
+                                    "    status_counts = Counter(str(task.get('status') or 'unknown') for task in tasks)\n"
+                                    "    priority_counts = Counter(str(task.get('priority') or 'unknown') for task in tasks)\n"
+                                    "    lines = [f\"{name}: {status_counts[name]}\" for name in sorted(status_counts)]\n"
+                                    "    lines.extend(f\"{name}: {priority_counts[name]}\" for name in sorted(priority_counts))\n"
+                                    "    return lines\n\n"
+                                    "def build_parser() -> argparse.ArgumentParser:\n"
+                                    "    parser = argparse.ArgumentParser(description='Tiny task tracker CLI')\n"
+                                    "    parser.add_argument('--db', default=str(DEFAULT_DB_PATH))\n"
+                                    "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                                    "    add_parser = subparsers.add_parser('add')\n"
+                                    "    add_parser.add_argument('title')\n"
+                                    "    add_parser.add_argument('--priority', choices=['low', 'medium', 'high'], default='medium')\n"
+                                    "    list_parser = subparsers.add_parser('list')\n"
+                                    "    list_parser.add_argument('--status', choices=['open', 'done'], default=None)\n"
+                                    "    list_parser.add_argument('--priority', choices=['low', 'medium', 'high'], default=None)\n"
+                                    "    subparsers.add_parser('stats')\n"
+                                    "    complete_parser = subparsers.add_parser('complete')\n"
+                                    "    complete_parser.add_argument('task_id', type=int)\n"
+                                    "    return parser\n\n"
+                                    "def main(argv: Sequence[str] | None = None) -> int:\n"
+                                    "    parser = build_parser()\n"
+                                    "    args = parser.parse_args(argv)\n"
+                                    "    db_path = Path(args.db)\n"
+                                    "    if args.command == 'add':\n"
+                                    "        task = add_task(db_path, args.title, priority=args.priority)\n"
+                                    "        print(f'added {format_task(task)}')\n"
+                                    "        return 0\n"
+                                    "    if args.command == 'list':\n"
+                                    "        for line in list_tasks(db_path, status=args.status, priority=args.priority):\n"
+                                    "            print(line)\n"
+                                    "        return 0\n"
+                                    "    if args.command == 'stats':\n"
+                                    "        for line in stats_lines(db_path):\n"
+                                    "            print(line)\n"
+                                    "        return 0\n"
+                                    "    if args.command == 'complete':\n"
+                                    "        task = complete_task(db_path, args.task_id)\n"
+                                    "        print(f'completed {format_task(task)}')\n"
+                                    "        return 0\n"
+                                    "    raise SystemExit(2)\n\n"
+                                    "if __name__ == '__main__':\n"
+                                    "    raise SystemExit(main())\n"
+                                ),
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"still fixing the CLI again"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+            result = agent.handle_user(
+                "Add a stats command that prints counts by status and priority, add --priority filtering to list, and keep tests green."
+            )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertEqual(tools.execute_counts.get("write_file", 0), 0)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("broader repair", feedback)
+        self.assertIn("Re-ground task_cli.py", feedback)
+        self.assertIn("Rerun proof-producing validation", feedback)
+
+    def helper_failed_edit_recovery_persists_across_continue_requests_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text(
+                "def add(left: int, right: int) -> int:\n"
+                "    return left + right\n\n"
+                "def main() -> int:\n"
+                "    return add(1, 2)\n",
+                encoding="utf-8",
+            )
+            (root / "tests").mkdir()
+            (root / "tests" / "test_app.py").write_text(
+                "import unittest\nfrom app import main\n\n\nclass AppTests(unittest.TestCase):\n"
+                "    def test_main(self) -> None:\n"
+                "        self.assertEqual(main(), 3)\n\n\nif __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "app.py",
+                                "old": "def main() -> int:\n    return add(1, 2)\n",
+                                "new": "def main() -> int:\n    return add(1)\n",
+                            },
+                        }
+                    ),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "app.py",
+                                "old": "    return add(1)\n",
+                                "new": "    return add(1)\n    print('repair pending')\n",
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"Implemented it."}',
+                    '{"type":"final","message":"Implemented it after validation."}',
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "app.py",
+                                "old": "return add(1)\n",
+                                "new": "return add(1, 2)\n",
+                            },
+                        }
+                    ),
+                    '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {
+                                "path": "app.py",
+                                "content": "def add(left: int, right: int) -> int:\n    return left + right\n\n\ndef main() -> int:\n    return add(1, 2)\n",
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"continue working"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+            first = agent.handle_user("Implement the requested code change in app.py and keep tests green.")
+            agent.max_tool_rounds = 4
+            second = agent.handle_user("Continue fixing app.py and keep tests green.")
+
+        self.assertFalse(first.completed)
+        self.assertFalse(second.completed)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 2)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Re-ground app.py", feedback)
+        self.assertIn("broader repair", feedback)
+
+    def test_final_verification_requires_behavior_proof_for_cli_command_and_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "import argparse\n\n"
+                "def build_parser() -> argparse.ArgumentParser:\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                "    subparsers.add_parser('list')\n"
+                "    return parser\n\n"
+                "def main(argv: list[str] | None = None) -> int:\n"
+                "    args = build_parser().parse_args(argv)\n"
+                "    if args.command == 'list':\n"
+                "        print('alpha')\n"
+                "        return 0\n"
+                "    raise SystemExit(2)\n\n"
+                "if __name__ == '__main__':\n"
+                "    raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "content": (
+                                    "from __future__ import annotations\n\n"
+                                    "import argparse\n\n"
+                                    "TASKS = [\n"
+                                    "    {'title': 'alpha', 'priority': 'high'},\n"
+                                    "    {'title': 'beta', 'priority': 'low'},\n"
+                                    "]\n\n"
+                                    "def build_parser() -> argparse.ArgumentParser:\n"
+                                    "    parser = argparse.ArgumentParser()\n"
+                                    "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                                    "    list_parser = subparsers.add_parser('list')\n"
+                                    "    list_parser.add_argument('--priority', default=None)\n"
+                                    "    subparsers.add_parser('stats')\n"
+                                    "    return parser\n\n"
+                                    "def main(argv: list[str] | None = None) -> int:\n"
+                                    "    args = build_parser().parse_args(argv)\n"
+                                    "    if args.command == 'list':\n"
+                                    "        tasks = TASKS if args.priority is None else [task for task in TASKS if task['priority'] == args.priority]\n"
+                                    "        for task in tasks:\n"
+                                    "            print(task['title'])\n"
+                                    "        return 0\n"
+                                    "    if args.command == 'stats':\n"
+                                    "        print('high: 1')\n"
+                                    "        print('low: 1')\n"
+                                    "        return 0\n"
+                                    "    raise SystemExit(2)\n\n"
+                                    "if __name__ == '__main__':\n"
+                                    "    raise SystemExit(main())\n"
+                                ),
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"Added the stats command and --priority flag."}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"task_cli.py"}}',
+                    json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": f'{sys.executable} task_cli.py stats'}}),
+                    json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": f'{sys.executable} task_cli.py list --priority high'}}),
+                    '{"type":"final","message":"Added the stats command and --priority flag after proving them."}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Add a stats command and --priority flag to task_cli.py, but do not run tests.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(tools.execute_counts.get("run_shell"), 2)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("implementation proof and behavior proof", feedback)
+        self.assertIn('prove the "--priority" flag exists', feedback)
+
+    def test_failed_edit_recovery_guard_requires_reground_then_broad_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = (
+                "from __future__ import annotations\n\n"
+                "def stats_lines() -> list[str]:\n"
+                "    return ['todo: 1']\n"
+            )
+            (root / "task_cli.py").write_text(source, encoding="utf-8")
+            client = FakeClient(['{"verdict":"accept","reason":"grounded broader repair"}'])
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            successful_tool_results = [
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "task_cli.py"},
+                    "result": {"ok": True, "path": "task_cli.py", "output": source},
+                }
+            ]
+
+            agent._set_failed_edit_recovery_state(
+                name="replace_in_file",
+                arguments={"path": "task_cli.py", "old": "return ['todo: 1']\n", "new": "return stats_lines(priority)\n"},
+                successful_tool_results=successful_tool_results,
+                validation_name="run_test",
+                diagnostic="TypeError: stats_lines() takes 0 positional arguments but 1 was given",
+            )
+            blocked_before_reground = agent._audit_tool_candidate(
+                request_text="Add a stats command and keep tests green.",
+                round_number=1,
+                proposed_tool_name="replace_in_file",
+                proposed_arguments={"path": "task_cli.py", "old": "return ['todo: 1']\n", "new": "return stats_lines(priority)\n"},
+                tool_calls=[],
+                successful_tool_results=successful_tool_results,
+                accepted_assumption_audits=[],
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                mutation_allowed=True,
+                expected_exact_file_line=None,
+                expected_exact_reply_text=None,
+            )
+            agent._record_event(
+                "tool_result",
+                name="read_file",
+                arguments={"path": "task_cli.py"},
+                result={"ok": True, "path": "task_cli.py", "output": source},
+            )
+            blocked_after_reground = agent._audit_tool_candidate(
+                request_text="Add a stats command and keep tests green.",
+                round_number=2,
+                proposed_tool_name="replace_in_file",
+                proposed_arguments={"path": "task_cli.py", "old": "return ['todo: 1']\n", "new": "return stats_lines(priority)\n"},
+                tool_calls=[],
+                successful_tool_results=successful_tool_results,
+                accepted_assumption_audits=[],
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                mutation_allowed=True,
+                expected_exact_file_line=None,
+                expected_exact_reply_text=None,
+            )
+            accepted_broad_repair = agent._audit_tool_candidate(
+                request_text="Add a stats command and keep tests green.",
+                round_number=3,
+                proposed_tool_name="write_file",
+                proposed_arguments={"path": "task_cli.py", "content": source + "\n# repaired\n"},
+                tool_calls=[],
+                successful_tool_results=successful_tool_results,
+                accepted_assumption_audits=[],
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                mutation_allowed=True,
+                expected_exact_file_line=None,
+                expected_exact_reply_text=None,
+            )
+
+        self.assertEqual(blocked_before_reground["verdict"], "retry")
+        self.assertIn("Re-ground task_cli.py", blocked_before_reground["reason"])
+        self.assertEqual(blocked_after_reground["verdict"], "retry")
+        self.assertIn("broader", blocked_after_reground["reason"])
+        self.assertEqual(accepted_broad_repair["verdict"], "accept")
+
+    def test_failed_edit_recovery_guard_requires_behavior_surface_read_for_cli_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            source = (
+                "from __future__ import annotations\n\n"
+                "def main(argv: list[str] | None = None) -> int:\n"
+                "    return 0\n"
+            )
+            test_source = (
+                "import unittest\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_list(self) -> None:\n"
+                "        self.assertTrue(True)\n"
+            )
+            (root / "task_cli.py").write_text(source, encoding="utf-8")
+            (root / "tests" / "test_task_cli.py").write_text(test_source, encoding="utf-8")
+            client = FakeClient(['{"verdict":"accept","reason":"grounded broader repair"}'])
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            successful_tool_results = [
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "task_cli.py"},
+                    "result": {"ok": True, "path": "task_cli.py", "output": source},
+                }
+            ]
+
+            agent._set_failed_edit_recovery_state(
+                name="replace_in_file",
+                arguments={"path": "task_cli.py", "old": "    return 0\n", "new": "    return 1\n"},
+                successful_tool_results=successful_tool_results,
+                validation_name="run_test",
+                diagnostic="test_list failed after the previous edit",
+                request_obligations=[
+                    {"id": "command:stats", "kind": "feature_token", "label": 'prove the "stats" command exists', "token": "stats", "feature_class": "command"},
+                    {"id": "flag:--priority", "kind": "feature_token", "label": 'prove the "--priority" flag exists', "token": "--priority", "feature_class": "flag"},
+                ],
+            )
+            agent._record_event(
+                "tool_result",
+                name="read_file",
+                arguments={"path": "task_cli.py"},
+                result={"ok": True, "path": "task_cli.py", "output": source},
+            )
+            blocked_without_behavior_read = agent._audit_tool_candidate(
+                request_text="Add a stats command and --priority flag to task_cli.py and keep tests green.",
+                round_number=2,
+                proposed_tool_name="write_file",
+                proposed_arguments={"path": "task_cli.py", "content": source + "\n# repaired\n"},
+                tool_calls=[],
+                successful_tool_results=successful_tool_results,
+                accepted_assumption_audits=[],
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                mutation_allowed=True,
+                expected_exact_file_line=None,
+                expected_exact_reply_text=None,
+            )
+            agent._record_event(
+                "tool_result",
+                name="read_file",
+                arguments={"path": "tests/test_task_cli.py"},
+                result={"ok": True, "path": "tests/test_task_cli.py", "output": test_source},
+            )
+            accepted_after_behavior_read = agent._audit_tool_candidate(
+                request_text="Add a stats command and --priority flag to task_cli.py and keep tests green.",
+                round_number=3,
+                proposed_tool_name="write_file",
+                proposed_arguments={"path": "task_cli.py", "content": source + "\n# repaired\n"},
+                tool_calls=[],
+                successful_tool_results=successful_tool_results,
+                accepted_assumption_audits=[],
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                mutation_allowed=True,
+                expected_exact_file_line=None,
+                expected_exact_reply_text=None,
+            )
+
+        self.assertEqual(blocked_without_behavior_read["verdict"], "retry")
+        self.assertIn("behavior surface", blocked_without_behavior_read["reason"])
+        self.assertIn("test_task_cli.py", " ".join(blocked_without_behavior_read["validation_steps"]))
+        self.assertEqual(accepted_after_behavior_read["verdict"], "accept")
+
+    def test_spec_guided_repair_uses_context_pack_test_files_as_recent_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+            successful_tool_results = [
+                {
+                    "name": "context_pack",
+                    "arguments": {"request": "add stats command", "path": ".", "limit": 6},
+                    "result": {
+                        "ok": True,
+                        "tool": "context_pack",
+                        "test_files": ["tests/test_task_cli.py"],
+                        "output": "context_pack:\ntest_files=tests/test_task_cli.py",
+                    },
+                }
+            ]
+
+            paths = agent._recent_test_paths(successful_tool_results)
+
+        self.assertEqual(paths, ["tests/test_task_cli.py"])
+
+    def test_failed_edit_recovery_state_carries_into_later_mutation_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left: int, right: int) -> int:\n    return left + right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "app.py",
+                                "old": "return left + right\n",
+                                "new": "return add(1)\n",
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"Still working on it."}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=True, max_tool_rounds=2)
+            agent._sticky_failed_edit_recovery = [
+                {
+                    "target_id": "path:app.py",
+                    "kind": "path",
+                    "path": "app.py",
+                    "symbol": "",
+                    "tool_name": "replace_in_file",
+                    "tool_granularity": "narrow",
+                    "validation_name": "run_test",
+                    "diagnostic": "TypeError: add() missing 1 required positional argument: 'right'",
+                    "failure_event_index": -1,
+                }
+            ]
+
+            result = agent.handle_user("Actually implement app.py and keep tests green.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(tools.execute_counts.get("replace_in_file", 0), 0)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Re-ground app.py", feedback)
+        self.assertIn("broader repair", feedback)
+
+    def test_failed_edit_recovery_state_persists_across_continue_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def main() -> int:\n    return 0\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "old": "    return 0\n",
+                                "new": "    return 1\n",
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"still working"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+            agent._sticky_request_obligations = [
+                {"id": "code-change", "kind": "code_change", "label": "implement the requested code change"},
+                {"id": "flag:--priority", "kind": "feature_token", "label": 'prove the "--priority" flag exists', "token": "--priority", "feature_class": "flag"},
+            ]
+            agent._sticky_failed_edit_recovery = [
+                {
+                    "target_id": "path:task_cli.py",
+                    "kind": "path",
+                    "path": "task_cli.py",
+                    "symbol": "",
+                    "tool_name": "replace_in_file",
+                    "last_mutating_tool_family": "replace_in_file",
+                    "tool_granularity": "narrow",
+                    "validation_name": "run_test",
+                    "failing_validators": ["run_test"],
+                    "diagnostic": "test_list failed after a speculative CLI edit",
+                    "failure_event_index": -1,
+                    "repair_strategy": "cli_surface_repair",
+                    "required_proof_items": ['prove the "--priority" flag exists'],
+                    "behavior_paths": ["tests/test_task_cli.py"],
+                    "unresolved_obligations": [
+                        {"id": "flag:--priority", "kind": "feature_token", "label": 'prove the "--priority" flag exists'},
+                    ],
+                }
+            ]
+
+            result = agent.handle_user("continue")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(tools.execute_counts.get("replace_in_file", 0), 0)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn('prove the "--priority" flag exists', feedback)
+        self.assertTrue(agent._sticky_failed_edit_recovery)
+
+    def test_failed_edit_recovery_blocks_validation_only_loop_before_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def main() -> int:\n    return 0\n", encoding="utf-8")
+            client = FakeClient(['{"type":"final","message":"still checking"}'])
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            state = {
+                "target_id": "path:task_cli.py",
+                "kind": "path",
+                "path": "task_cli.py",
+                "symbol": "",
+                "tool_name": "replace_in_file",
+                "last_mutating_tool_family": "replace_in_file",
+                "tool_granularity": "narrow",
+                "validation_name": "run_test",
+                "failing_validators": ["run_test"],
+                "diagnostic": "test_list failed after the previous edit",
+                "failure_event_index": -1,
+                "repair_strategy": "cli_surface_repair",
+                "required_proof_items": ['prove the "--priority" flag exists'],
+                "behavior_paths": ["tests/test_task_cli.py"],
+                "unresolved_obligations": [
+                    {"id": "flag:--priority", "kind": "feature_token", "label": 'prove the "--priority" flag exists'},
+                ],
+            }
+
+        self.assertTrue(agent._repair_spec_blocks_validation_loop(state, "run_test"))
+        self.assertIn(
+            "Do not rerun validators until you make the broader repair.",
+            agent._repair_spec_validation_retry_message(state),
+        )
+
+    def test_failed_edit_recovery_blocks_auto_validation_loop_after_failed_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "TASKS = [\n"
+                "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high'},\n"
+                "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low'},\n"
+                "]\n\n"
+                "def list_tasks(priority: str | None = None) -> list[str]:\n"
+                "    return [task['title'] for task in TASKS]\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_task_cli.py").write_text(
+                "import unittest\n"
+                "from task_cli import list_tasks\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_priority_output(self):\n"
+                "        self.assertIn('write-docs:high', list_tasks(priority='high'))\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"task_cli.py"}}',
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_intent",
+                            "arguments": {
+                                "intent": "replace_body",
+                                "path": "task_cli.py",
+                                "target": "list_tasks",
+                                "replacement": (
+                                    "selected = TASKS\n"
+                                    "if priority is not None:\n"
+                                    "    selected = [task for task in TASKS if task['priority'] == priority]\n"
+                                    "return [task['title'] for task in selected]"
+                                ),
+                            },
+                        }
+                    ),
+                    '{"type":"final","message":"Implemented the priority output and tests passed."}',
+                    '{"type":"final","message":"Implemented the priority output and tests passed."}',
+                ]
+            )
+            test_command = f"{sys.executable} -m unittest discover -s tests -p test_task_cli.py"
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=test_command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                disable_spec_guided_repair=True,
+                max_tool_rounds=4,
+            )
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+                result = agent.handle_user("Update task_cli.py so priority list output includes the priority, and keep tests green.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertIn("Do not rerun validators until you make the broader repair", result.message)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not rerun validators until you make the broader repair", feedback)
+
+    def test_failed_edit_recovery_only_counts_allowed_broad_repair_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def list_tasks(priority=None):\n    return []\n", encoding="utf-8")
+            agent = OllamaCodeAgent(
+                client=FakeClient([]),
+                tools=CountingToolExecutor(root, approval_mode="auto"),
+                model="fake-model",
+                debate_enabled=False,
+            )
+            state = {
+                "target_id": "symbol:task_cli.py:list_tasks",
+                "kind": "symbol",
+                "path": "task_cli.py",
+                "symbol": "list_tasks",
+                "failure_event_index": -1,
+                "repair_strategy": "cli_surface_repair",
+            }
+
+            add_import_allowed, add_import_reason = agent._repair_spec_mutation_allowed(
+                state,
+                proposed_tool_name="edit_intent",
+                proposed_arguments={"path": "task_cli.py", "intent": "add_import", "target": "Counter"},
+            )
+            symbol_allowed, _symbol_reason = agent._repair_spec_mutation_allowed(
+                state,
+                proposed_tool_name="replace_symbol",
+                proposed_arguments={"path": "task_cli.py", "symbol": "list_tasks", "content": "def list_tasks(priority=None):\n    return []\n"},
+            )
+            file_allowed, _file_reason = agent._repair_spec_mutation_allowed(
+                state,
+                proposed_tool_name="write_file",
+                proposed_arguments={"path": "task_cli.py", "content": "def list_tasks(priority=None):\n    return []\n"},
+            )
+            agent.events.append(
+                {
+                    "type": "tool_result",
+                    "name": "edit_intent",
+                    "arguments": {"path": "task_cli.py", "intent": "add_import", "target": "Counter"},
+                    "result": {"ok": True, "path": "task_cli.py"},
+                }
+        )
+
+        self.assertFalse(add_import_allowed)
+        self.assertIn("small speculative edit", add_import_reason)
+        self.assertTrue(symbol_allowed)
+        self.assertTrue(file_allowed)
+        self.assertFalse(agent._repair_spec_has_followup_mutation(state))
+
+    def test_failed_edit_recovery_blocks_validation_when_multiple_repair_specs_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def main() -> int:\n    return 0\n", encoding="utf-8")
+            (root / "README.md").write_text("# Task CLI\n", encoding="utf-8")
+            agent = OllamaCodeAgent(
+                client=FakeClient([]),
+                tools=CountingToolExecutor(root, approval_mode="auto"),
+                model="fake-model",
+                debate_enabled=False,
+            )
+            states = [
+                {
+                    "target_id": "path:readme.md",
+                    "kind": "path",
+                    "path": "README.md",
+                    "failure_event_index": -1,
+                    "repair_strategy": "file_repair",
+                    "diagnostic": "docs update incomplete",
+                },
+                {
+                    "target_id": "path:task_cli.py",
+                    "kind": "path",
+                    "path": "task_cli.py",
+                    "failure_event_index": -1,
+                    "repair_strategy": "cli_surface_repair",
+                    "diagnostic": "test_list failed after the previous edit",
+                },
+            ]
+
+        blocked = [state for state in agent._merge_failed_edit_recovery(states) if agent._repair_spec_blocks_validation_loop(state, "lint_typecheck")]
+        self.assertTrue(blocked)
+        self.assertEqual(blocked[0]["path"], "README.md")
+
+    def test_failed_edit_recovery_rejects_final_before_followup_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def main() -> int:\n    return 0\n", encoding="utf-8")
+            client = FakeClient(['{"type":"final","message":"Implemented the CLI feature."}'])
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=1)
+            agent._sticky_request_obligations = [
+                {"id": "code-change", "kind": "code_change", "label": "implement the requested code change"},
+                {"id": "flag:--priority", "kind": "feature_token", "label": 'prove the "--priority" flag exists', "token": "--priority", "feature_class": "flag"},
+            ]
+            agent._sticky_failed_edit_recovery = [
+                {
+                    "target_id": "path:task_cli.py",
+                    "kind": "path",
+                    "path": "task_cli.py",
+                    "symbol": "",
+                    "tool_name": "replace_in_file",
+                    "last_mutating_tool_family": "replace_in_file",
+                    "tool_granularity": "narrow",
+                    "validation_name": "run_test",
+                    "failing_validators": ["run_test"],
+                    "diagnostic": "test_list failed after the previous edit",
+                    "failure_event_index": -1,
+                    "repair_strategy": "cli_surface_repair",
+                    "required_proof_items": ['prove the "--priority" flag exists'],
+                    "behavior_paths": ["tests/test_task_cli.py"],
+                    "unresolved_obligations": [
+                        {"id": "flag:--priority", "kind": "feature_token", "label": 'prove the "--priority" flag exists'},
+                    ],
+                }
+            ]
+
+            result = agent.handle_user("continue")
+
+        self.assertFalse(result.completed)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not rerun validators until you make the broader repair.", feedback)
+
+    def test_failed_test_guard_requires_repair_before_more_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = OllamaCodeAgent(
+                client=FakeClient([]),
+                tools=CountingToolExecutor(Path(tmp), approval_mode="auto"),
+                model="fake-model",
+                debate_enabled=False,
+            )
+
+        self.assertTrue(
+            agent._failed_test_still_needs_repair(
+                latest_run_test_failed=True,
+                failed_test_mutation_version=3,
+                mutation_version=3,
+            )
+        )
+        self.assertFalse(
+            agent._failed_test_still_needs_repair(
+                latest_run_test_failed=True,
+                failed_test_mutation_version=2,
+                mutation_version=3,
+            )
+        )
+        self.assertIn(
+            "Repair the implementation before rerunning validators",
+            agent._failed_test_repair_retry_message("test_list failed"),
+        )
+
+    def test_failed_test_guard_infers_source_target_from_last_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def list_tasks():\n    return []\n", encoding="utf-8")
+            (root / "README.md").write_text("# Task CLI\n", encoding="utf-8")
+            agent = OllamaCodeAgent(
+                client=FakeClient([]),
+                tools=CountingToolExecutor(root, approval_mode="auto"),
+                model="fake-model",
+                debate_enabled=False,
+            )
+
+            source_mutation = {
+                "name": "edit_intent",
+                "arguments": {"intent": "replace_symbol", "path": "task_cli.py", "symbol": "list_tasks"},
+                "result": {"ok": True, "path": "task_cli.py"},
+            }
+            doc_mutation = {
+                "name": "write_file",
+                "arguments": {"path": "README.md", "content": "# Task CLI\n"},
+                "result": {"ok": True, "path": "README.md"},
+            }
+            pathless_source_mutation = {
+                "name": "edit_intent",
+                "arguments": {"intent": "replace_symbol", "symbol": "list_tasks"},
+                "result": {"ok": True},
+            }
+            grounding = [
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "task_cli.py"},
+                    "result": {"ok": True, "path": "task_cli.py", "output": "def list_tasks():\n    return []\n"},
+                }
+            ]
+
+        self.assertTrue(agent._mutation_record_targets_source(source_mutation))
+        self.assertTrue(agent._mutation_record_targets_source(pathless_source_mutation, grounding))
+        self.assertFalse(agent._mutation_record_targets_source(doc_mutation))
+
+    def test_failed_run_test_recovery_prefers_prior_source_mutation_over_later_docs(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def list_tasks():\n    return []\n", encoding="utf-8")
+            (root / "README.md").write_text("# Task CLI\n", encoding="utf-8")
+            agent = OllamaCodeAgent(
+                client=FakeClient([]),
+                tools=CountingToolExecutor(root, approval_mode="auto"),
+                model="fake-model",
+                debate_enabled=False,
+            )
+            source_mutation = {
+                "name": "edit_intent",
+                "arguments": {"intent": "replace_symbol", "path": "task_cli.py", "symbol": "list_tasks"},
+                "result": {"ok": True, "path": "task_cli.py"},
+            }
+            doc_mutation = {
+                "name": "write_file",
+                "arguments": {"path": "README.md", "content": "# Task CLI\n"},
+                "result": {"ok": True, "path": "README.md"},
+            }
+            validation_mutation = source_mutation if agent._mutation_record_targets_source(source_mutation) else doc_mutation
+
+            agent._set_failed_edit_recovery_state(
+                name=str(validation_mutation["name"]),
+                arguments=validation_mutation["arguments"],
+                successful_tool_results=[],
+                validation_name="run_test",
+                diagnostic="test_list failed",
+            )
+
+        self.assertEqual(agent._sticky_failed_edit_recovery[0]["path"], "task_cli.py")
 
     def test_agent_allows_explanatory_implementation_question_without_mutation(self) -> None:
         client = FakeClient(['{"type":"final","message":"explain plan"}'])
@@ -8920,6 +9963,10 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_trajectory_ground_guard_auto_diagnoses_failed_test_before_pathless_edit",
         "test_trajectory_ground_guard_allows_explicit_new_file_creation",
         "test_tool_error_guard_blocks_third_duplicate_path_failure",
+        "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
+        "test_failed_edit_recovery_guard_requires_behavior_surface_read_for_cli_repair",
+        "test_spec_guided_repair_uses_context_pack_test_files_as_recent_tests",
+        "test_failed_edit_recovery_state_carries_into_later_mutation_turn",
     )
 )
 
@@ -8939,8 +9986,19 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_trajectory_final_chance_validation_discovers_repo_test_command_after_empty_targeted_selection",
         "test_trajectory_final_chance_validation_avoids_rediscovery_after_successful_lint",
         "test_post_edit_verification_rejects_docs_only_feature_completion_until_code_proof_exists",
+        "test_request_obligation_code_change_requires_mutation_not_source_read",
         "test_final_verification_requires_read_proof_for_requested_command_token",
+        "test_final_verification_requires_behavior_proof_for_cli_command_and_flag",
         "test_request_obligations_persist_across_continue_requests",
+        "test_failed_edit_recovery_state_persists_across_continue_requests",
+        "test_failed_edit_recovery_blocks_validation_only_loop_before_repair",
+        "test_failed_edit_recovery_blocks_auto_validation_loop_after_failed_test",
+        "test_failed_edit_recovery_only_counts_allowed_broad_repair_mutation",
+        "test_failed_edit_recovery_blocks_validation_when_multiple_repair_specs_exist",
+        "test_failed_edit_recovery_rejects_final_before_followup_repair",
+        "test_failed_test_guard_requires_repair_before_more_validation",
+        "test_failed_test_guard_infers_source_target_from_last_mutation",
+        "test_failed_run_test_recovery_prefers_prior_source_mutation_over_later_docs",
     )
 )
 

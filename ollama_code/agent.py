@@ -153,6 +153,7 @@ class OllamaCodeAgent:
         self._turn_evidence_counter = 0
         self._transcript_dirty = False
         self._sticky_request_obligations: list[dict[str, Any]] = []
+        self._sticky_failed_edit_recovery: list[dict[str, Any]] = []
         self.tools.agent_runner = self._run_sub_agent
         self.messages = self._base_messages()
 
@@ -1129,6 +1130,491 @@ class OllamaCodeAgent:
             merged.append(dict(item))
         return merged
 
+    def _merge_failed_edit_recovery(self, states: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in states:
+            if not isinstance(item, dict):
+                continue
+            target_id = str(item.get("target_id") or "").strip()
+            if not target_id or target_id in seen:
+                continue
+            seen.add(target_id)
+            merged.append(dict(item))
+        return merged
+
+    def _mutation_edit_granularity(self, *, name: str, arguments: dict[str, Any]) -> str:
+        if name == "write_file":
+            return "broad_file"
+        if name in {"replace_symbol", "replace_symbols"}:
+            return "broad_symbol"
+        if name == "replace_in_file":
+            return "narrow"
+        if name == "apply_structured_edit":
+            operation = arguments.get("operation")
+            op_name = ""
+            if isinstance(operation, dict):
+                op_name = str(operation.get("op") or "").strip().lower()
+            if op_name in {"replace_symbol"}:
+                return "broad_symbol"
+            return "narrow"
+        if name == "edit_intent":
+            intent = str(arguments.get("intent") or "").strip().lower()
+            if intent in {"replace_symbol"}:
+                return "broad_symbol"
+            if intent:
+                return "narrow"
+        return "other"
+
+    def _recovery_target_from_mutation(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, str] | None:
+        symbol_target = self._mutation_symbol_grounding_target(name=name, arguments=arguments)
+        if symbol_target is not None:
+            path, symbol = symbol_target
+            return {
+                "target_id": f"symbol:{path.lower()}:{symbol}",
+                "kind": "symbol",
+                "path": path,
+                "symbol": symbol,
+            }
+        for raw_path in self._mutation_target_paths(arguments):
+            normalized = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+            if normalized and normalized.endswith(".py") and not self._path_looks_like_test_file(normalized):
+                return {
+                    "target_id": f"path:{normalized.lower()}",
+                    "kind": "path",
+                    "path": normalized,
+                    "symbol": "",
+                }
+        result_dict = result if isinstance(result, dict) else {}
+        result_path = str(result_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        if result_path and result_path.endswith(".py") and not self._path_looks_like_test_file(result_path):
+            return {
+                "target_id": f"path:{result_path.lower()}",
+                "kind": "path",
+                "path": result_path,
+                "symbol": "",
+            }
+        source_paths = self._recent_source_paths(successful_tool_results or [])
+        if len(source_paths) == 1:
+            return {
+                "target_id": f"path:{source_paths[0].lower()}",
+                "kind": "path",
+                "path": source_paths[0],
+                "symbol": "",
+            }
+        return None
+
+    def _recovery_target_matches(self, state: dict[str, Any], target: dict[str, str]) -> bool:
+        state_id = str(state.get("target_id") or "").strip()
+        target_id = str(target.get("target_id") or "").strip()
+        if state_id and target_id:
+            return state_id == target_id
+        state_path = str(state.get("path") or "").strip().lower()
+        target_path = str(target.get("path") or "").strip().lower()
+        if not state_path or not target_path or state_path != target_path:
+            return False
+        state_symbol = str(state.get("symbol") or "").strip()
+        target_symbol = str(target.get("symbol") or "").strip()
+        return not state_symbol or not target_symbol or state_symbol == target_symbol
+
+    def _active_failed_edit_recovery_state(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        states = self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery)
+        if not states:
+            return None
+        target = self._recovery_target_from_mutation(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results,
+        )
+        if target is not None:
+            for item in reversed(states):
+                if self._recovery_target_matches(item, target):
+                    return dict(item)
+        if name in MUTATING_TOOL_NAMES and len(states) == 1:
+            return dict(states[0])
+        return None
+
+    def _failed_edit_recovery_regrounded(self, state: dict[str, Any]) -> bool:
+        failure_event_index = int(state.get("failure_event_index", -1) or -1)
+        target_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        target_symbol = str(state.get("symbol") or "").strip()
+        if not target_path:
+            return False
+        for index, event in enumerate(self.events):
+            if index <= failure_event_index or event.get("type") != "tool_result":
+                continue
+            name = str(event.get("name") or "").strip()
+            if name not in {"read_file", "read_symbol", "code_outline"}:
+                continue
+            result = event.get("result") if isinstance(event.get("result"), dict) else {}
+            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            event_path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if event_path != target_path:
+                continue
+            if name == "read_symbol" and target_symbol:
+                event_symbol = str(result.get("symbol") or arguments.get("symbol") or "").strip()
+                if event_symbol != target_symbol:
+                    continue
+            return True
+        return False
+
+    def _failed_edit_recovery_allows_write_file(self, state: dict[str, Any]) -> bool:
+        path = str(state.get("path") or "").strip()
+        if not path:
+            return False
+        try:
+            resolved = self.tools.resolve_path(path, allow_missing=False)
+        except Exception:
+            return False
+        if not resolved.exists() or not resolved.is_file():
+            return False
+        try:
+            line_count = len(resolved.read_text(encoding="utf-8").splitlines())
+        except Exception:
+            return False
+        return line_count <= 260
+
+    def _repair_spec_behavior_paths(self, state: dict[str, Any]) -> list[str]:
+        raw_paths = state.get("behavior_paths")
+        if isinstance(raw_paths, list):
+            normalized = [
+                str(item).strip().replace("\\", "/").lstrip("./")
+                for item in raw_paths
+                if str(item).strip()
+            ]
+            if normalized:
+                return normalized
+        fallback: list[str] = []
+        path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        if path:
+            stem = Path(path).stem
+            tests_root = self.tools.workspace_root / "tests"
+            if tests_root.exists():
+                for pattern in (f"test_{stem}.py", f"{stem}_test.py"):
+                    for candidate in tests_root.rglob(pattern):
+                        if candidate.is_file():
+                            fallback.append(self.tools.relative_label(candidate))
+        for obligation in list(state.get("unresolved_obligations") or []):
+            if not isinstance(obligation, dict):
+                continue
+            if str(obligation.get("kind") or "").strip() != "docs_update":
+                continue
+            for raw_path in list(obligation.get("paths") or []):
+                normalized = str(raw_path).strip().replace("\\", "/").lstrip("./")
+                if normalized:
+                    fallback.append(normalized)
+        return sorted(dict.fromkeys(fallback))
+
+    def _repair_spec_required_proof_items(self, state: dict[str, Any]) -> list[str]:
+        items: list[str] = []
+        raw_items = state.get("required_proof_items")
+        if isinstance(raw_items, list):
+            items.extend(str(item).strip() for item in raw_items if str(item).strip())
+        if not items:
+            for obligation in list(state.get("unresolved_obligations") or []):
+                if not isinstance(obligation, dict):
+                    continue
+                label = str(obligation.get("label") or "").strip()
+                if label:
+                    items.append(label)
+        return list(dict.fromkeys(items))
+
+    def _repair_spec_strategy_class(
+        self,
+        *,
+        target: dict[str, str],
+        obligations: list[dict[str, Any]],
+    ) -> str:
+        path = str(target.get("path") or "").strip()
+        if any(
+            isinstance(item, dict)
+            and str(item.get("kind") or "").strip() == "feature_token"
+            and str(item.get("feature_class") or "").strip() in {"command", "flag"}
+            for item in obligations
+        ):
+            return "cli_surface_repair"
+        if str(target.get("symbol") or "").strip():
+            return "symbol_rewrite"
+        if path and self._failed_edit_recovery_allows_write_file({"path": path}):
+            return "file_repair"
+        return "cross_file_feature"
+
+    def _repair_spec_behavior_regrounded(self, state: dict[str, Any]) -> bool:
+        failure_event_index = int(state.get("failure_event_index", -1) or -1)
+        behavior_paths = set(self._repair_spec_behavior_paths(state))
+        if not behavior_paths:
+            return True
+        for index, event in enumerate(self.events):
+            if index <= failure_event_index or event.get("type") != "tool_result":
+                continue
+            name = str(event.get("name") or "").strip()
+            if name not in {"read_file", "read_symbol", "code_outline"}:
+                continue
+            result = event.get("result") if isinstance(event.get("result"), dict) else {}
+            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            event_path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            if event_path and event_path in behavior_paths:
+                return True
+        return False
+
+    def _repair_spec_complete_plan(self, state: dict[str, Any]) -> str:
+        strategy = str(state.get("repair_strategy") or "").strip() or "file_repair"
+        path = str(state.get("path") or "").strip()
+        obligations = self._repair_spec_required_proof_items(state)
+        obligations_text = ", ".join(obligations[:4]) if obligations else "the unresolved feature obligations"
+        if strategy == "cli_surface_repair":
+            return (
+                f"Complete one command-surface repair in {path or 'the grounded CLI file'} so parser, behavior, docs, "
+                f"and proof land together for {obligations_text}."
+            )
+        if strategy == "symbol_rewrite":
+            return f"Complete one full-symbol repair that resolves {obligations_text} in the grounded source."
+        if strategy == "cross_file_feature":
+            return f"Complete one coordinated feature repair across the allowed files for {obligations_text}."
+        return f"Complete one broader file repair in {path or 'the grounded source file'} for {obligations_text}."
+
+    def _repair_spec_mutation_allowed(
+        self,
+        state: dict[str, Any],
+        *,
+        proposed_tool_name: str,
+        proposed_arguments: dict[str, Any],
+    ) -> tuple[bool, str]:
+        strategy = str(state.get("repair_strategy") or "").strip()
+        target_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        symbol = str(state.get("symbol") or "").strip()
+        proposed_paths = [
+            str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+            for raw_path in self._mutation_target_paths(proposed_arguments)
+            if str(raw_path or "").strip()
+        ]
+        if target_path and proposed_paths and any(path != target_path for path in proposed_paths):
+            return False, "Repair this grounded target before mutating unrelated files."
+        repair_granularity = self._mutation_edit_granularity(name=proposed_tool_name, arguments=proposed_arguments)
+        if repair_granularity == "narrow":
+            return False, "Do not make another small speculative edit on the same failed target."
+        if strategy == "cli_surface_repair":
+            if proposed_tool_name == "write_file" and target_path and target_path in proposed_paths:
+                if self._failed_edit_recovery_allows_write_file(state):
+                    return True, ""
+            if symbol and proposed_tool_name in {"replace_symbol", "replace_symbols"}:
+                return True, ""
+            if not self._failed_edit_recovery_allows_write_file(state):
+                return False, "Use a grounded symbol-level repair here because the CLI file is too large for a safe full rewrite."
+            return False, "Use one broader direct repair on the grounded CLI surface before more validation."
+        if repair_granularity == "broad_file" and not self._failed_edit_recovery_allows_write_file(state):
+            return False, "Prefer a full-symbol replacement here; the grounded file is too large for a safe full-file rewrite fallback."
+        return True, ""
+
+    def _repair_spec_has_followup_mutation(self, state: dict[str, Any]) -> bool:
+        failure_event_index = int(state.get("failure_event_index", -1) or -1)
+        target_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        target_symbol = str(state.get("symbol") or "").strip()
+        for index, event in enumerate(self.events):
+            if index <= failure_event_index or event.get("type") != "tool_result":
+                continue
+            name = str(event.get("name") or "").strip()
+            if name not in MUTATING_TOOL_NAMES:
+                continue
+            result = event.get("result") if isinstance(event.get("result"), dict) else {}
+            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+            if result.get("ok") is not True:
+                continue
+            allowed, _reason = self._repair_spec_mutation_allowed(
+                state,
+                proposed_tool_name=name,
+                proposed_arguments=arguments,
+            )
+            if not allowed:
+                continue
+            target = self._recovery_target_from_mutation(
+                name=name,
+                arguments=arguments,
+                successful_tool_results=[],
+                result=result,
+            )
+            if target is None:
+                continue
+            if self._recovery_target_matches(state, target):
+                return True
+            event_path = str(target.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            event_symbol = str(target.get("symbol") or "").strip()
+            if target_path and event_path == target_path and (not target_symbol or not event_symbol or target_symbol == event_symbol):
+                return True
+        return False
+
+    def _repair_spec_blocks_validation_loop(self, state: dict[str, Any], tool_name: str) -> bool:
+        if tool_name not in {"select_tests", "run_test", "lint_typecheck", "contract_check", "run_function_probe"}:
+            return False
+        return not self._repair_spec_has_followup_mutation(state)
+
+    def _repair_spec_validation_retry_message(self, state: dict[str, Any]) -> str:
+        return (
+            self._failed_edit_recovery_retry_message(state, need_reground=not self._failed_edit_recovery_regrounded(state))
+            + " Do not rerun validators until you make the broader repair."
+        )
+
+    def _failed_test_still_needs_repair(self, *, latest_run_test_failed: bool, failed_test_mutation_version: int | None, mutation_version: int) -> bool:
+        return latest_run_test_failed and failed_test_mutation_version == mutation_version
+
+    def _failed_test_repair_retry_message(self, summary: str) -> str:
+        message = "The latest run_test failed after the current edit. Repair the implementation before rerunning validators or finishing."
+        if summary:
+            message += " Evidence: " + self._truncate_text(summary, limit=420)
+        return message
+
+    def _mutation_record_targets_source(
+        self,
+        mutation: dict[str, Any] | None,
+        successful_tool_results: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        if not isinstance(mutation, dict):
+            return False
+        name = str(mutation.get("name") or "").strip()
+        arguments = mutation.get("arguments") if isinstance(mutation.get("arguments"), dict) else {}
+        result = mutation.get("result") if isinstance(mutation.get("result"), dict) else {}
+        target = self._recovery_target_from_mutation(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results or [],
+            result=result,
+        )
+        if target is None:
+            return False
+        path = str(target.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        return bool(path and not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path))
+
+    def _failed_edit_recovery_broad_repair_hint(self, state: dict[str, Any]) -> str:
+        strategy = str(state.get("repair_strategy") or "").strip()
+        if strategy == "cli_surface_repair":
+            path = str(state.get("path") or "").strip()
+            if path and self._failed_edit_recovery_allows_write_file(state):
+                return f"write_file on {path} so the CLI surface is repaired in one pass"
+            return "one grounded whole-surface CLI repair"
+        if str(state.get("symbol") or "").strip():
+            return "a full-symbol replacement"
+        if self._failed_edit_recovery_allows_write_file(state):
+            return "write_file or a full-symbol replacement"
+        return "a full-symbol replacement or another broader direct repair"
+
+    def _set_failed_edit_recovery_state(
+        self,
+        *,
+        name: str,
+        arguments: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+        validation_name: str,
+        diagnostic: str,
+        request_obligations: list[dict[str, Any]] | None = None,
+        required_tool_names: set[str] | None = None,
+    ) -> None:
+        target = self._recovery_target_from_mutation(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results,
+        )
+        if target is None:
+            return
+        obligation_statuses = self._request_obligation_proof_status(
+            obligations=list(request_obligations or []),
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(required_tool_names or set()),
+        )
+        unresolved_obligations = [
+            dict(item)
+            for item in obligation_statuses
+            if str(item.get("status") or "").strip() != "proven"
+        ]
+        strategy = self._repair_spec_strategy_class(target=target, obligations=list(request_obligations or []))
+        allowed_files = [str(target.get("path") or "").strip()]
+        allowed_files.extend(self._repair_spec_behavior_paths({"path": str(target.get("path") or "").strip(), "unresolved_obligations": unresolved_obligations}))
+        forbidden_files = sorted(
+            path
+            for path in self._mutated_paths_from_successful_results(successful_tool_results)
+            if path not in allowed_files and not self._path_looks_like_doc_target(path)
+        )
+        state = {
+            **target,
+            "tool_name": name,
+            "last_mutating_tool_family": name,
+            "tool_granularity": self._mutation_edit_granularity(name=name, arguments=arguments),
+            "validation_name": validation_name,
+            "failing_validators": [validation_name],
+            "diagnostic": self._truncate_text(diagnostic.strip(), limit=520),
+            "diagnostic_excerpt": self._truncate_text(diagnostic.strip(), limit=240),
+            "failure_event_index": len(self.events),
+            "repair_strategy": strategy,
+            "allowed_files": [path for path in allowed_files if path],
+            "forbidden_files": forbidden_files,
+            "unresolved_obligations": unresolved_obligations,
+            "required_proof_items": [
+                str(item.get("label") or "").strip()
+                for item in unresolved_obligations
+                if str(item.get("label") or "").strip()
+            ],
+            "behavior_paths": self._repair_spec_behavior_paths({"path": str(target.get("path") or "").strip(), "unresolved_obligations": unresolved_obligations}),
+        }
+        self._sticky_failed_edit_recovery = self._merge_failed_edit_recovery([state, *self._sticky_failed_edit_recovery])
+        self._record_event("repair_spec", **state)
+        self._record_event("failed_edit_recovery", **state)
+
+    def _clear_failed_edit_recovery(self) -> None:
+        self._sticky_failed_edit_recovery = []
+
+    def _failed_edit_recovery_retry_message(self, state: dict[str, Any], *, need_reground: bool) -> str:
+        path = str(state.get("path") or "").strip()
+        symbol = str(state.get("symbol") or "").strip()
+        diagnostic = str(state.get("diagnostic") or "").strip()
+        validation_name = str(state.get("validation_name") or "").strip() or "validation"
+        behavior_paths = self._repair_spec_behavior_paths(state)
+        need_behavior_reground = not self._repair_spec_behavior_regrounded(state)
+        if symbol:
+            target_label = f"{symbol} in {path}"
+            reground_step = f"Re-ground {target_label} from current source with read_symbol before another mutation."
+        else:
+            target_label = path or "the current source target"
+            reground_tool = "read_file"
+            reground_step = f"Re-ground {target_label} from current source with {reground_tool} before another mutation."
+        behavior_step = ""
+        if behavior_paths:
+            behavior_targets = ", ".join(behavior_paths[:3])
+            behavior_step = f" Re-read the failing behavior surface with read_file on {behavior_targets} before repairing."
+        repair_step = (
+            " Then make one broader repair with "
+            + self._failed_edit_recovery_broad_repair_hint(state)
+            + ", rerun proof-producing validation, and only then finish."
+        )
+        if need_reground:
+            message = f"Validation already failed after a prior edit on {target_label}. {reground_step}"
+        else:
+            message = (
+                f"Validation already failed after a prior edit on {target_label}. "
+                + "Do not make another small speculative edit on the same target."
+            )
+        if need_behavior_reground and behavior_step:
+            message += behavior_step
+        message += " " + self._repair_spec_complete_plan(state) + repair_step
+        if diagnostic:
+            message += f" Last {validation_name}: {diagnostic}"
+        return message
+
     def _derive_request_obligations(
         self,
         *,
@@ -1207,6 +1693,10 @@ class OllamaCodeAgent:
         required_tool_names: set[str],
     ) -> list[dict[str, Any]]:
         statuses: list[dict[str, Any]] = []
+        require_cli_behavior_proof = any(
+            isinstance(item, dict) and str(item.get("kind") or "").strip() == "feature_token" and str(item.get("feature_class") or "").strip() == "flag"
+            for item in obligations
+        )
         successful_tool_names = {str(item.get("name", "")).strip() for item in successful_tool_results}
         mutated_paths = self._mutated_paths_from_successful_results(successful_tool_results)
         code_mutated = any(not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path) for path in mutated_paths)
@@ -1245,9 +1735,9 @@ class OllamaCodeAgent:
                 else:
                     status["guidance"] = f"Use {token} successfully before finishing."
             elif kind == "code_change":
-                if code_mutated or source_reads:
+                if code_mutated:
                     status["status"] = "proven"
-                    evidence_paths = sorted(path for path in mutated_paths if not self._path_looks_like_doc_target(path))[:3] or sorted(source_reads)[:3]
+                    evidence_paths = sorted(path for path in mutated_paths if not self._path_looks_like_doc_target(path))[:3]
                     status["evidence"] = ", ".join(evidence_paths)
                 else:
                     status["guidance"] = "The task still needs a real code change, not only docs or narration."
@@ -1275,16 +1765,14 @@ class OllamaCodeAgent:
                     status["guidance"] = "The request asked for docs updates, but no docs file has been changed yet."
             elif kind == "feature_token":
                 token_lower = token.lower()
+                source_evidence = ""
+                behavior_evidence = ""
                 for item in reversed(successful_tool_results):
                     name = str(item.get("name", "")).strip()
                     result = item.get("result") if isinstance(item.get("result"), dict) else {}
                     arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
                     path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
                     if name not in {"read_file", "read_symbol", "code_outline", "run_shell", "run_test"}:
-                        continue
-                    if name in {"read_file", "read_symbol", "code_outline"} and path and (
-                        self._path_looks_like_doc_target(path) or self._path_looks_like_test_file(path)
-                    ):
                         continue
                     samples = [
                         str(result.get("output") or ""),
@@ -1293,16 +1781,34 @@ class OllamaCodeAgent:
                         str(arguments.get("command") or result.get("command") or ""),
                     ]
                     haystack = "\n".join(sample for sample in samples if sample).lower()
-                    if token_lower and token_lower in haystack:
-                        status["status"] = "proven"
-                        status["evidence"] = path or name
-                        break
+                    if name in {"read_file", "read_symbol", "code_outline"}:
+                        if path and (self._path_looks_like_doc_target(path) or self._path_looks_like_test_file(path)):
+                            continue
+                        if token_lower and token_lower in haystack and not source_evidence:
+                            source_evidence = path or name
+                        continue
+                    if token_lower and token_lower in haystack and not behavior_evidence:
+                        behavior_evidence = name
+                        command_text = str(arguments.get("command") or result.get("command") or "").strip()
+                        if command_text:
+                            behavior_evidence = self._truncate_text(command_text, limit=120)
+                feature_class = str(obligation.get("feature_class") or "feature").strip()
+                needs_behavior_proof = feature_class == "flag" or (feature_class == "command" and require_cli_behavior_proof)
+                if source_evidence and (behavior_evidence or not needs_behavior_proof):
+                    status["status"] = "proven"
+                    status["evidence"] = source_evidence if not behavior_evidence else f"{source_evidence}; {behavior_evidence}"
                 if status["status"] != "proven":
                     feature_class = str(obligation.get("feature_class") or "feature").strip()
-                    status["guidance"] = (
-                        f'The requested {feature_class} "{token}" is still unproven. '
-                        + "Read the relevant source file or run a direct command that demonstrates it before finishing."
-                    )
+                    if needs_behavior_proof:
+                        status["guidance"] = (
+                            f'The requested {feature_class} "{token}" still needs both implementation proof and behavior proof. '
+                            + "Read the relevant source file and run a direct command or targeted test that demonstrates it before finishing."
+                        )
+                    else:
+                        status["guidance"] = (
+                            f'The requested {feature_class} "{token}" is still unproven. '
+                            + "Read the relevant source file or run a direct command that demonstrates it before finishing."
+                        )
             else:
                 continue
             statuses.append(status)
@@ -1679,6 +2185,68 @@ class OllamaCodeAgent:
         expected_exact_file_line: str | None,
         expected_exact_reply_text: str | None,
     ) -> dict[str, Any]:
+        recovery_state = self._active_failed_edit_recovery_state(
+            name=proposed_tool_name,
+            arguments=proposed_arguments,
+            successful_tool_results=successful_tool_results,
+        )
+        if recovery_state is not None and proposed_tool_name in MUTATING_TOOL_NAMES:
+            need_reground = not self._failed_edit_recovery_regrounded(recovery_state)
+            need_behavior_reground = not self._repair_spec_behavior_regrounded(recovery_state)
+            mutation_allowed_now, mutation_block_reason = self._repair_spec_mutation_allowed(
+                recovery_state,
+                proposed_tool_name=proposed_tool_name,
+                proposed_arguments=proposed_arguments,
+            )
+            if need_reground or need_behavior_reground or not mutation_allowed_now:
+                decision = {
+                    "verdict": "retry",
+                    "reason": self._failed_edit_recovery_retry_message(recovery_state, need_reground=need_reground),
+                    "assumptions": [
+                        f'Validation already failed on {str(recovery_state.get("path") or "the current target").strip()} after a prior edit.',
+                    ],
+                    "validation_steps": [],
+                    "required_tools": [],
+                    "forbidden_tools": [],
+                }
+                if need_reground:
+                    if str(recovery_state.get("symbol") or "").strip():
+                        decision["validation_steps"].append(
+                            f'Re-ground {str(recovery_state.get("symbol")).strip()} in {str(recovery_state.get("path")).strip()} with read_symbol.'
+                        )
+                    else:
+                        decision["validation_steps"].append(
+                            f'Re-ground {str(recovery_state.get("path") or "the source file").strip()} with read_file or code_outline.'
+                        )
+                if need_behavior_reground:
+                    behavior_paths = self._repair_spec_behavior_paths(recovery_state)
+                    if behavior_paths:
+                        decision["validation_steps"].append(
+                            "Re-read the failing behavior surface with read_file on " + ", ".join(behavior_paths[:3]) + "."
+                        )
+                if not need_reground:
+                    decision["validation_steps"].append(
+                        mutation_block_reason or "Use one broader direct repair instead of another small edit on the same target."
+                    )
+                plan_text = self._repair_spec_complete_plan(recovery_state)
+                if plan_text:
+                    decision["validation_steps"].append(plan_text)
+                decision["validation_steps"].append("Rerun proof-producing validation before any final answer.")
+                self._record_event(
+                    "assumption_audit",
+                    round=round_number,
+                    tool=proposed_tool_name,
+                    arguments=self._truncate_json_value(proposed_arguments, limit=800),
+                    verdict=decision["verdict"],
+                    reason=decision["reason"],
+                    assumptions=decision["assumptions"],
+                    validation_steps=decision["validation_steps"],
+                    required_tools=decision["required_tools"],
+                    forbidden_tools=decision["forbidden_tools"],
+                    auditor_model=self.model,
+                    auditor="deterministic-failed-edit-recovery-guard",
+                )
+                return decision
         if proposed_tool_name in MUTATING_TOOL_NAMES:
             symbol_target = self._mutation_symbol_grounding_target(name=proposed_tool_name, arguments=proposed_arguments)
             if symbol_target is not None:
@@ -2332,13 +2900,18 @@ class OllamaCodeAgent:
         for item in reversed(successful_tool_results):
             result = item.get("result") if isinstance(item.get("result"), dict) else {}
             arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            rel = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/")
-            if not rel or rel in seen or not rel.endswith(".py") or not self._path_looks_like_test_file(rel):
-                continue
-            seen.add(rel)
-            paths.append(rel)
-            if len(paths) >= 3:
-                break
+            candidates: list[str] = []
+            if item.get("name") == "context_pack" and isinstance(result.get("test_files"), list):
+                candidates.extend(str(path) for path in result.get("test_files") or [])
+            candidates.append(str(result.get("path") or arguments.get("path") or ""))
+            for candidate in candidates:
+                rel = candidate.strip().replace("\\", "/")
+                if not rel or rel in seen or not rel.endswith(".py") or not self._path_looks_like_test_file(rel):
+                    continue
+                seen.add(rel)
+                paths.append(rel)
+                if len(paths) >= 3:
+                    return list(reversed(paths))
         return list(reversed(paths))
 
     def _recent_identifier_search_query(self, successful_tool_results: list[dict[str, Any]]) -> str | None:
@@ -6870,6 +7443,7 @@ class OllamaCodeAgent:
         *,
         request_text: str,
         candidate_tool_name: str,
+        repair_pending: bool = False,
         mutation_verified_this_turn: bool,
         mutation_version: int,
         last_successful_validation_version: int | None,
@@ -6884,6 +7458,8 @@ class OllamaCodeAgent:
         if not mutation_verified_this_turn or last_successful_validation_version == mutation_version:
             return False
         if not self._request_allows_any_validation(request_text):
+            return False
+        if repair_pending:
             return False
         if candidate_tool_name in MUTATING_TOOL_NAMES or candidate_tool_name in VALIDATION_TOOL_NAMES:
             return False
@@ -7219,6 +7795,7 @@ class OllamaCodeAgent:
                 validation_feedback += " Fix the reported issue now instead of gathering more context. Next JSON only."
                 self.messages.append({"role": "user", "content": validation_feedback})
                 return None
+            self._clear_failed_edit_recovery()
             if validation_name == "run_test" and "tests passed" not in message.lower():
                 message = message.rstrip(".") + "; tests passed."
         return self._record_synthesized_final(message, tool=tool, round_number=round_number)
@@ -9962,6 +10539,7 @@ class OllamaCodeAgent:
             request_obligations = self._merge_request_obligations([*self._sticky_request_obligations, *request_obligations])
         elif not (mutation_required or code_mutation_required or test_run_required):
             self._sticky_request_obligations = []
+            self._clear_failed_edit_recovery()
         if request_obligations:
             self._sticky_request_obligations = self._merge_request_obligations(request_obligations)
             self._record_event("request_obligations", obligations=request_obligations)
@@ -10025,6 +10603,8 @@ class OllamaCodeAgent:
         diagnosed_tool_error_keys: set[tuple[str, str, str]] = set()
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
+        last_successful_mutation: dict[str, Any] | None = None
+        last_successful_source_mutation: dict[str, Any] | None = None
         last_failed_run_shell_command = ""
         last_failed_run_shell_summary = ""
         last_failed_run_shell_error_class = ""
@@ -10268,6 +10848,20 @@ class OllamaCodeAgent:
                 continue
             if response_type == "final":
                 assistant_text = str(payload.get("message", "")).strip()
+                pending_final_repair_state = None
+                for repair_state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
+                    if not self._repair_spec_has_followup_mutation(repair_state):
+                        pending_final_repair_state = dict(repair_state)
+                        break
+                if pending_final_repair_state is not None:
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._repair_spec_validation_retry_message(pending_final_repair_state) + " Next JSON only.",
+                        }
+                    )
+                    continue
                 missing_requested_tools = sorted(required_tool_names - satisfied_tool_names)
                 if missing_requested_tools:
                     self._append_assistant_payload(payload)
@@ -10297,6 +10891,23 @@ class OllamaCodeAgent:
                             "content": "The latest run_test failed; do not claim tests passed. "
                             + self._truncate_text(latest_run_test_failure_summary, limit=360)
                             + " Fix the failure or summarize it accurately. Next JSON only.",
+                        }
+                    )
+                    continue
+                if (
+                    self._mutation_record_targets_source(last_successful_source_mutation)
+                    and
+                    self._failed_test_still_needs_repair(
+                        latest_run_test_failed=latest_run_test_failed,
+                        failed_test_mutation_version=failed_test_mutation_version,
+                        mutation_version=mutation_version,
+                    )
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._failed_test_repair_retry_message(latest_run_test_failure_summary) + " Next JSON only.",
                         }
                     )
                     continue
@@ -10578,6 +11189,7 @@ class OllamaCodeAgent:
                     tool_used_this_turn = True
                     if validation_result.get("ok") is True:
                         last_successful_validation_version = mutation_version
+                        self._clear_failed_edit_recovery()
                         if validation_name == "run_test":
                             last_successful_run_test_version = mutation_version
                             latest_run_test_failed = False
@@ -10607,6 +11219,31 @@ class OllamaCodeAgent:
                             raw_failure = summary
                             latest_run_test_failed = True
                             latest_run_test_failure_summary = self._compact_run_test_output(raw_failure, limit=520) if raw_failure else ""
+                        validation_mutation = last_successful_source_mutation if validation_name == "run_test" and last_successful_source_mutation is not None else last_successful_mutation
+                        if validation_mutation is not None:
+                            self._set_failed_edit_recovery_state(
+                                name=str(validation_mutation.get("name") or "").strip(),
+                                arguments=validation_mutation.get("arguments") if isinstance(validation_mutation.get("arguments"), dict) else {},
+                                successful_tool_results=successful_tool_results,
+                                validation_name=validation_name,
+                                diagnostic=summary or "post-edit validation failed",
+                                request_obligations=request_obligations,
+                                required_tool_names=required_tool_names,
+                            )
+                            recovery_state = self._active_failed_edit_recovery_state(
+                                name=str(validation_mutation.get("name") or "").strip(),
+                                arguments=validation_mutation.get("arguments") if isinstance(validation_mutation.get("arguments"), dict) else {},
+                                successful_tool_results=successful_tool_results,
+                            )
+                            if recovery_state is not None:
+                                self._append_assistant_payload(payload)
+                                self.messages.append(
+                                    {
+                                        "role": "user",
+                                        "content": self._failed_edit_recovery_retry_message(recovery_state, need_reground=True) + " Next JSON only.",
+                                    }
+                                )
+                                continue
                         failure = "Stopped because post-edit validation failed."
                         if summary:
                             failure += " " + self._truncate_text(summary, limit=360)
@@ -10748,6 +11385,7 @@ class OllamaCodeAgent:
                                 )
                                 self._record_event("assistant", content=rewritten_message, rounds=round_number)
                                 self._sticky_request_obligations = []
+                                self._clear_failed_edit_recovery()
                                 self._flush_llm_call_events()
                                 return AgentResult(message=rewritten_message, rounds=round_number, completed=True)
                             if rewrite_outcome.rejected_message:
@@ -10768,6 +11406,7 @@ class OllamaCodeAgent:
                 self._append_assistant_payload(payload)
                 self._record_event("assistant", content=assistant_text, rounds=round_number)
                 self._sticky_request_obligations = []
+                self._clear_failed_edit_recovery()
                 self._flush_llm_call_events()
                 return AgentResult(message=assistant_text, rounds=round_number, completed=True)
             if response_type == "tool":
@@ -10922,6 +11561,36 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                active_mutation_repair_state = None
+                if name in MUTATING_TOOL_NAMES:
+                    active_mutation_repair_state = self._active_failed_edit_recovery_state(
+                        name=name,
+                        arguments=arguments,
+                        successful_tool_results=successful_tool_results,
+                    )
+                if active_mutation_repair_state is not None:
+                    need_reground = not self._failed_edit_recovery_regrounded(active_mutation_repair_state)
+                    need_behavior_reground = not self._repair_spec_behavior_regrounded(active_mutation_repair_state)
+                    mutation_allowed_now, mutation_block_reason = self._repair_spec_mutation_allowed(
+                        active_mutation_repair_state,
+                        proposed_tool_name=name,
+                        proposed_arguments=arguments,
+                    )
+                    if need_reground or need_behavior_reground or not mutation_allowed_now:
+                        self._append_assistant_payload(payload)
+                        feedback = self._failed_edit_recovery_retry_message(active_mutation_repair_state, need_reground=need_reground)
+                        if mutation_block_reason:
+                            feedback += " " + mutation_block_reason
+                        feedback += " Next JSON only."
+                        self._record_event(
+                            "controller_guard",
+                            guard="repair-spec-mutation-protocol",
+                            candidate_tool=name,
+                            forced_next_classes=["read", "broad_repair", "validation"],
+                            rounds=round_number,
+                        )
+                        self.messages.append({"role": "user", "content": feedback})
+                        continue
                 if mutation_required and test_run_required and name == "write_file":
                     feedback = self._unimported_python_write_feedback(text, arguments)
                     if feedback:
@@ -11480,9 +12149,63 @@ class OllamaCodeAgent:
                             continue
                     self.messages.append({"role": "user", "content": self._trajectory_ground_guard_message(text)})
                     continue
+                pending_repair_state = None
+                for repair_state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
+                    if self._repair_spec_blocks_validation_loop(repair_state, name):
+                        pending_repair_state = dict(repair_state)
+                        break
+                if (
+                    pending_repair_state is not None
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._repair_spec_validation_retry_message(pending_repair_state) + " Next JSON only.",
+                        }
+                    )
+                    continue
+                if (
+                    name in VALIDATION_TOOL_NAMES
+                    and self._mutation_record_targets_source(last_successful_source_mutation)
+                    and self._failed_test_still_needs_repair(
+                        latest_run_test_failed=latest_run_test_failed,
+                        failed_test_mutation_version=failed_test_mutation_version,
+                        mutation_version=mutation_version,
+                    )
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._failed_test_repair_retry_message(latest_run_test_failure_summary) + " Next JSON only.",
+                        }
+                    )
+                    continue
+                repair_pending_before_validation = pending_repair_state is not None or (
+                    self._mutation_record_targets_source(last_successful_source_mutation or last_successful_mutation, successful_tool_results)
+                    and self._failed_test_still_needs_repair(
+                        latest_run_test_failed=latest_run_test_failed,
+                        failed_test_mutation_version=failed_test_mutation_version,
+                        mutation_version=mutation_version,
+                    )
+                )
+                if (
+                    repair_pending_before_validation
+                    and name not in MUTATING_TOOL_NAMES
+                    and name not in CONTEXT_GATHERING_TOOL_NAMES
+                ):
+                    self._append_assistant_payload(payload)
+                    if pending_repair_state is not None:
+                        feedback = self._repair_spec_validation_retry_message(pending_repair_state)
+                    else:
+                        feedback = self._failed_test_repair_retry_message(latest_run_test_failure_summary)
+                    self.messages.append({"role": "user", "content": feedback + " Next JSON only."})
+                    continue
                 if self._should_force_post_edit_validation(
                     request_text=text,
                     candidate_tool_name=name,
+                    repair_pending=repair_pending_before_validation,
                     mutation_verified_this_turn=mutation_verified_this_turn,
                     mutation_version=mutation_version,
                     last_successful_validation_version=last_successful_validation_version,
@@ -11519,6 +12242,7 @@ class OllamaCodeAgent:
                         return AgentResult(message=failure, rounds=round_number, completed=False)
                     if validation_result.get("ok") is True:
                         last_successful_validation_version = mutation_version
+                        self._clear_failed_edit_recovery()
                         if validation_name == "run_test":
                             last_failed_run_test_key = None
                             last_failed_run_test_diagnosis_key = None
@@ -11548,11 +12272,33 @@ class OllamaCodeAgent:
                         latest_run_test_failure_summary = compact_failure
                         if compact_failure:
                             previous_run_test_failure_summary = compact_failure
+                    validation_mutation = last_successful_source_mutation if validation_name == "run_test" and last_successful_source_mutation is not None else last_successful_mutation
+                    if validation_mutation is not None:
+                        self._set_failed_edit_recovery_state(
+                            name=str(validation_mutation.get("name") or "").strip(),
+                            arguments=validation_mutation.get("arguments") if isinstance(validation_mutation.get("arguments"), dict) else {},
+                            successful_tool_results=successful_tool_results,
+                            validation_name=validation_name,
+                            diagnostic=str(validation_result.get("summary") or validation_result.get("output") or "").strip() or "post-edit validation failed",
+                            request_obligations=request_obligations,
+                            required_tool_names=required_tool_names,
+                        )
                     validation_summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
-                    validation_feedback = "Post-edit validation failed before more tool use."
-                    if validation_summary:
-                        validation_feedback += " " + self._truncate_text(validation_summary, limit=520)
-                    validation_feedback += " Fix the reported issue now instead of gathering more context. Next JSON only."
+                    recovery_state = None
+                    if validation_mutation is not None:
+                        recovery_state = self._active_failed_edit_recovery_state(
+                            name=str(validation_mutation.get("name") or "").strip(),
+                            arguments=validation_mutation.get("arguments") if isinstance(validation_mutation.get("arguments"), dict) else {},
+                            successful_tool_results=successful_tool_results,
+                        )
+                    if recovery_state is not None:
+                        validation_feedback = self._failed_edit_recovery_retry_message(recovery_state, need_reground=True)
+                    else:
+                        validation_feedback = "Post-edit validation failed before more tool use."
+                        if validation_summary:
+                            validation_feedback += " " + self._truncate_text(validation_summary, limit=520)
+                        validation_feedback += " Fix the reported issue now instead of gathering more context."
+                    validation_feedback += " Next JSON only."
                     self.messages.append({"role": "user", "content": validation_feedback})
                     continue
                 if (
@@ -11580,6 +12326,22 @@ class OllamaCodeAgent:
                     if repair_result is not None:
                         spec_guided_repair_attempted = True
                         return repair_result
+                pending_repair_state = None
+                for repair_state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
+                    if self._repair_spec_blocks_validation_loop(repair_state, name):
+                        pending_repair_state = dict(repair_state)
+                        break
+                if (
+                    pending_repair_state is not None
+                ):
+                    self._append_assistant_payload(payload)
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": self._repair_spec_validation_retry_message(pending_repair_state) + " Next JSON only.",
+                        }
+                    )
+                    continue
                 if self._tool_call_needs_assumption_audit(
                     request_text=text,
                     name=name,
@@ -11684,6 +12446,13 @@ class OllamaCodeAgent:
                     if name in MUTATING_TOOL_NAMES:
                         mutation_verified_this_turn = True
                         mutation_version += 1
+                        last_successful_mutation = {
+                            "name": name,
+                            "arguments": deepcopy(arguments),
+                            "result": deepcopy(result),
+                        }
+                        if self._mutation_record_targets_source(last_successful_mutation, successful_tool_results):
+                            last_successful_source_mutation = deepcopy(last_successful_mutation)
                         last_failed_run_test_diagnosis_key = None
                         failed_test_context_reads = 0
                         failed_test_mutation_version = None
@@ -11711,6 +12480,7 @@ class OllamaCodeAgent:
                         last_timeout_summary = ""
                     if name in VALIDATION_TOOL_NAMES and result.get("ok") is True:
                         last_successful_validation_version = mutation_version
+                        self._clear_failed_edit_recovery()
                 if self._counts_as_real_tool_use(name, result):
                     successful_tool_results.append(
                         {
@@ -11763,6 +12533,23 @@ class OllamaCodeAgent:
                     and result.get("ok") is True
                 ):
                     failed_test_context_reads += 1
+                if (
+                    name in VALIDATION_TOOL_NAMES
+                    and result.get("ok") is not True
+                    and (last_successful_mutation is not None or last_successful_source_mutation is not None)
+                    and mutation_verified_this_turn
+                ):
+                    validation_mutation = last_successful_source_mutation if name == "run_test" and last_successful_source_mutation is not None else last_successful_mutation
+                    if validation_mutation is not None:
+                        self._set_failed_edit_recovery_state(
+                            name=str(validation_mutation.get("name") or "").strip(),
+                            arguments=validation_mutation.get("arguments") if isinstance(validation_mutation.get("arguments"), dict) else {},
+                            successful_tool_results=successful_tool_results,
+                            validation_name=name,
+                            diagnostic=str(result.get("summary") or result.get("output") or "").strip() or "validation failed after edit",
+                            request_obligations=request_obligations,
+                            required_tool_names=required_tool_names,
+                        )
                 result_path = str(result.get("path", "")).strip()
                 if name in MUTATING_TOOL_NAMES and result.get("ok") is True and result_path.endswith(".py"):
                     if result.get("syntax_ok") is False:
@@ -11910,7 +12697,14 @@ class OllamaCodeAgent:
                     and self._spec_guided_repair_enabled()
                     and any(
                         token in str(result.get("summary") or result.get("output") or "").lower()
-                        for token in ("target text was not found", "target text not found", "not found.")
+                        for token in (
+                            "target text was not found",
+                            "target text not found",
+                            "not found.",
+                            "function not found",
+                            "drops existing top-level symbols",
+                            "provide the complete file",
+                        )
                     )
                 ):
                     spec_guided_repair_attempted = True
@@ -12137,6 +12931,28 @@ class OllamaCodeAgent:
             self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
             self._flush_llm_call_events()
             return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
+        pending_final_repair_state = None
+        for repair_state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
+            if not self._repair_spec_has_followup_mutation(repair_state):
+                pending_final_repair_state = dict(repair_state)
+                break
+        if pending_final_repair_state is not None:
+            failure = self._repair_spec_validation_retry_message(pending_final_repair_state)
+            self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
+            self._flush_llm_call_events()
+            return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
+        if (
+            self._mutation_record_targets_source(last_successful_source_mutation or last_successful_mutation, successful_tool_results)
+            and self._failed_test_still_needs_repair(
+                latest_run_test_failed=latest_run_test_failed,
+                failed_test_mutation_version=failed_test_mutation_version,
+                mutation_version=mutation_version,
+            )
+        ):
+            failure = self._failed_test_repair_retry_message(latest_run_test_failure_summary)
+            self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
+            self._flush_llm_call_events()
+            return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
         if (
             self._post_edit_validation_enabled()
             and mutation_verified_this_turn
@@ -12156,6 +12972,21 @@ class OllamaCodeAgent:
             )
             if validation_name is not None and validation_result is not None:
                 if validation_result.get("ok") is True:
+                    obligation_statuses = self._request_obligation_proof_status(
+                        obligations=request_obligations,
+                        successful_tool_results=successful_tool_results,
+                        required_tool_names=required_tool_names,
+                    )
+                    unresolved = [item for item in obligation_statuses if str(item.get("status") or "") != "proven"]
+                    if unresolved:
+                        unresolved_labels = [str(item.get("label") or "").strip() for item in unresolved if str(item.get("label") or "").strip()]
+                        failure = "Stopped because requested deliverables remain unproven after validation passed."
+                        if unresolved_labels:
+                            failure += " " + "; ".join(unresolved_labels[:3]) + "."
+                        self._record_event("assistant", content=failure, rounds=self.max_tool_rounds, obligation_checks=obligation_statuses)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
+                    self._clear_failed_edit_recovery()
                     message = "Ran validation after the latest edit: passed."
                     self._record_event("assistant_synthesized", content=message, tool=validation_name, rounds=self.max_tool_rounds, auto=True)
                     self._record_event("assistant", content=message, rounds=self.max_tool_rounds)
@@ -12184,9 +13015,21 @@ class OllamaCodeAgent:
                     if repair_result is not None:
                         return repair_result
                 summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
+                if last_successful_mutation is not None:
+                    self._set_failed_edit_recovery_state(
+                        name=str(last_successful_mutation.get("name") or "").strip(),
+                        arguments=last_successful_mutation.get("arguments") if isinstance(last_successful_mutation.get("arguments"), dict) else {},
+                        successful_tool_results=successful_tool_results,
+                        validation_name=validation_name,
+                        diagnostic=summary or "final-chance post-edit validation failed",
+                        request_obligations=request_obligations,
+                        required_tool_names=required_tool_names,
+                    )
                 failure = "Stopped because final-chance post-edit validation failed."
                 if summary:
                     failure += " " + self._truncate_text(summary, limit=360)
+                if self._sticky_failed_edit_recovery:
+                    failure += " Continue from the grounded target with one broader repair after re-reading the current source."
                 self._record_event("assistant", content=failure, rounds=self.max_tool_rounds)
                 self._flush_llm_call_events()
                 return AgentResult(message=failure, rounds=self.max_tool_rounds, completed=False)
