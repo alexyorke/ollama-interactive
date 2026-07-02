@@ -3770,6 +3770,40 @@ class AgentTests(AgentTestBase):
             )
         )
 
+    def test_write_file_with_quote_prefixed_source_is_rejected_before_execution(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "write_file",
+                        "arguments": {
+                            "path": "app.py",
+                            "content": "> def value() -> int:\n>     return 2\n> \n> def other() -> int:\n>     return 3\n",
+                        },
+                    }
+                ),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        agent.handle_user("Update app.py so value returns 2.")
+
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "def value() -> int:\n    return 1\n")
+        self.assertTrue(
+            any(
+                event.get("type") == "controller_guard" and event.get("guard") == "write-file-quote-prefixed-content"
+                for event in agent.events
+            )
+        )
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Remove every leading `>` quote marker", feedback)
+
     def test_invalid_add_function_payload_is_rejected_before_tool_execution(self) -> None:
         root = self._workspace_scratch()
         (root / "reports").mkdir()
@@ -13115,6 +13149,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_package_init_implementation_write_is_rejected_before_execution",
         "test_repeated_add_function_after_success_routes_to_remaining_obligations",
         "test_replace_body_full_function_payload_is_rejected_before_tool_execution",
+        "test_write_file_with_quote_prefixed_source_is_rejected_before_execution",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_repair_pivot_model_timeout_fails_closed",
         "test_final_round_repeated_mutating_failure_fails_closed",

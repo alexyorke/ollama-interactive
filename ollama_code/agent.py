@@ -14836,6 +14836,22 @@ class OllamaCodeAgent:
                             }
                         )
                         continue
+                    nonblank_lines = [line for line in content_text.splitlines() if line.strip()]
+                    quote_prefixed_lines = [line for line in nonblank_lines if re.match(r"^\s*>\s?", line)]
+                    if len(quote_prefixed_lines) >= 3 and len(quote_prefixed_lines) >= max(3, int(len(nonblank_lines) * 0.6)):
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="write-file-quote-prefixed-content",
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": "write_file content must be clean file text, not Markdown blockquote or transcript text. Remove every leading `>` quote marker, re-read the target if needed, then send exact file contents only. Next JSON only.",
+                            }
+                        )
+                        continue
                 if name in MUTATING_TOOL_NAMES:
                     missing_path, suggestions = self._missing_mutation_target_suggestions(arguments)
                     if missing_path and suggestions:
