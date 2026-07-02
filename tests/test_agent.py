@@ -1088,6 +1088,61 @@ class AgentTests(AgentTestBase):
         self.assertEqual(normalized[0].get("normalized_name"), "search")
         self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle", "path": "README.md"})
 
+    def test_readme_inspection_does_not_create_docs_update_obligation(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        obligations = agent._derive_request_obligations(
+            request_text="Inspect README.md for needle and summarize.",
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=False,
+            test_run_required=False,
+        )
+        update_obligations = [item for item in obligations if item.get("kind") == "docs_update"]
+
+        self.assertEqual(update_obligations, [])
+
+    def test_shell_recursive_grep_inspection_normalizes_to_search(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"grep -r \\"THREADPOOL\\" azure_functions_worker"}}',
+                '{"type":"final","message":"THREADPOOL is in constants.py"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        (root / "azure_functions_worker").mkdir()
+        (root / "azure_functions_worker" / "constants.py").write_text("PYTHON_THREADPOOL_THREAD_COUNT = 1\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect azure_functions_worker for THREADPOOL and summarize.")
+
+        self.assertEqual(result.message, "THREADPOOL is in constants.py")
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "THREADPOOL", "path": "azure_functions_worker"})
+
+    def test_shell_recursive_grep_with_unsupported_flags_does_not_normalize(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "app.py").write_text("needle\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        normalized_name, normalized_arguments, reason = agent._normalize_shell_inspection_call(
+            "run_shell",
+            {"command": "grep -ri needle src"},
+            request_text="Inspect src with recursive ignore-case grep if useful and summarize.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(normalized_name, "run_shell")
+        self.assertEqual(normalized_arguments, {"command": "grep -ri needle src"})
+        self.assertIsNone(reason)
+
     def test_shell_head_inspection_normalizes_to_bounded_read_file(self) -> None:
         client = FakeClient(
             [
@@ -10483,6 +10538,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_trajectory_final_chance_validation_avoids_rediscovery_after_successful_lint",
         "test_post_edit_verification_rejects_docs_only_feature_completion_until_code_proof_exists",
         "test_request_obligation_code_change_requires_mutation_not_source_read",
+        "test_readme_inspection_does_not_create_docs_update_obligation",
         "test_final_verification_requires_read_proof_for_requested_command_token",
         "test_final_verification_requires_behavior_proof_for_cli_command_and_flag",
         "test_request_obligations_persist_across_continue_requests",
@@ -10508,6 +10564,8 @@ EXTRACTED_FAILURE_COMPRESSION_TESTS = _extract_agent_tests(
 
 EXTRACTED_SHELL_COMMAND_PREFLIGHT_TESTS = _extract_agent_tests(
     (
+        "test_shell_recursive_grep_inspection_normalizes_to_search",
+        "test_shell_recursive_grep_with_unsupported_flags_does_not_normalize",
         "test_shell_find_dot_exec_grep_h_normalizes_to_filtered_search",
         "test_shell_find_dot_exec_grep_unsupported_flags_does_not_normalize",
         "test_tool_error_guard_auto_diagnoses_repeated_missing_dependency_failure",

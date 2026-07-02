@@ -1655,7 +1655,14 @@ class OllamaCodeAgent:
                 }
             )
         doc_targets = sorted(path for path in required_mutation_paths if self._path_looks_like_doc_target(path))
-        if doc_targets or re.search(r"\b(?:readme|docs?|documentation)\b", lowered):
+        docs_update_requested = bool(
+            re.search(
+                r"\b(?:update|edit|change|modify|revise|add|write|document|sync|mention|include)\b.*\b(?:readme|docs?|documentation)\b|"
+                r"\b(?:readme|docs?|documentation)\b.*\b(?:update|edit|change|modify|revise|add|write|document|sync|mention|include)\b",
+                lowered,
+            )
+        )
+        if doc_targets or docs_update_requested:
             obligations.append(
                 {
                     "id": "docs-update",
@@ -5238,15 +5245,18 @@ class OllamaCodeAgent:
         return name, arguments, None
 
     def _normalize_grep_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
-        if len(argv) not in {3, 4} or not argv:
+        if len(argv) < 3 or len(argv) > 5 or not argv:
             return None
         if argv[0].lower() not in {"grep", "rg", "ripgrep"}:
             return None
         index = 1
-        if len(argv) == 4:
-            if argv[index] not in {"-n", "--line-number"}:
+        allowed_flags = {"-n", "--line-number", "-r", "-R", "--recursive"}
+        while index < len(argv) and argv[index].startswith("-"):
+            if argv[index] not in allowed_flags:
                 return None
             index += 1
+        if len(argv) - index != 2:
+            return None
         query, path = argv[index], argv[index + 1]
         if query.startswith("-") or path.startswith("-"):
             return None
