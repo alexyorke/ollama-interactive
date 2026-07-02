@@ -164,13 +164,14 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(read["output"], "   2 | line2")
 
     def test_tool_catalog_groups_model_facing_tools(self) -> None:
-        compact = format_compact_tool_help({"read_file", "ast_search", "run_test"}, grouped=True)
+        compact = format_compact_tool_help({"read_file", "ast_search", "run_test", "edit_intent"}, grouped=True)
         groups = format_tool_group_help({"read_file", "ast_search", "run_test"})
 
         self.assertIn("[navigation]", compact)
         self.assertIn("[structural]", compact)
         self.assertIn("[validation]", compact)
         self.assertIn("read_file(path,start=1,end=200)", compact)
+        self.assertIn("add_import|add_function", compact)
         self.assertIn("navigation:", groups)
         self.assertIn("ast_search", groups)
 

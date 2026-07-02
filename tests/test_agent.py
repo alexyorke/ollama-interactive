@@ -248,6 +248,15 @@ class AgentTests(AgentTestBase):
         _client, _tools, agent = self._build_agent(Path.cwd(), client, approval_mode=approval_mode, **kwargs)
         return agent
 
+    def test_system_prompt_advertises_add_function_edit_intent(self) -> None:
+        root = self._workspace_scratch()
+        _client, _tools, agent = self._build_agent(root, debate_enabled=False)
+
+        prompt = agent._system_prompt_for_tools({"edit_intent"})
+
+        self.assertIn("add_import|add_function", prompt)
+        self.assertIn("edit_intent(path,intent=", prompt)
+
     def _workspace_agent(
         self,
         client: FakeClient | None = None,
@@ -4146,6 +4155,47 @@ class AgentTests(AgentTestBase):
         self.assertEqual(len(lint_tool_calls), len(lint_auto_validations))
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Do not run validators while Python syntax errors are already known", feedback)
+        self.assertIn("omit docstrings and prose strings", feedback)
+        self.assertIn("intent add_function", feedback)
+
+    def test_repeated_invalid_write_file_after_syntax_rollback_pivots_to_spec_guided_repair(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value() -> str:\n    return 'ok'\n", encoding="utf-8")
+        bad_content = "def value() -> str:\n    \"unterminated\n    return 'new'\n"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": bad_content}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": bad_content}}),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": bad_content}}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+        repair_calls: list[dict[str, object]] = []
+
+        def fake_repair(**kwargs: object) -> AgentResult | None:
+            repair_calls.append(dict(kwargs))
+            if len(repair_calls) == 1:
+                return None
+            return AgentResult(message="spec-guided repair", rounds=4, completed=False)
+
+        with patch.object(agent, "_try_spec_guided_repair", side_effect=fake_repair) as repair:
+            result = agent.handle_user("Fix app.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.message, "spec-guided repair")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "def value() -> str:\n    return 'ok'\n")
+        self.assertGreaterEqual(repair.call_count, 2)
+        self.assertTrue(repair.call_args.kwargs["allow_workspace_fallback"])
+        guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "invalid-python-mutation-payload"
+        ]
+        self.assertEqual(len(guards), 2)
+        self.assertTrue(all(event.get("tool") == "write_file" for event in guards))
 
     def test_pending_repair_spec_fails_closed_without_repeated_auto_lint(self) -> None:
         root = self._workspace_scratch()

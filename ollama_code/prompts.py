@@ -9,7 +9,7 @@ JSON only:
 Rules:
 - One tool or one final. Relative paths. No fences/thought.
 - Need repo/file/git/shell/edit/agent facts? Use tools; do not guess.
-- Inspect before edit. Preferred edit: edit_intent with intent rename|replace_text|replace_symbol|replace_body|change_signature|add_import. Low-level edits: write_file, replace_symbol/replace_symbols, replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
+- Inspect before edit. Preferred edit: edit_intent with intent rename|replace_text|replace_symbol|replace_body|change_signature|add_import|add_function. Low-level edits: write_file, replace_symbol/replace_symbols, replace_in_file. Tests: run_test, not run_shell. Git: git_status/git_diff/git_commit.
 - write_file content is raw file text only; no markdown fences, no leading ">" quote markers.
 - For fix/implement + tests: read tests/source, edit implementation, run_test; do not only summarize or loop on reads. If source has pass/.../return None stubs, edit those stubs directly; do not keep using read_symbol/code_outline on the same stub file.
 - If user names a source file/function to fix, edit source, not tests, unless tests are explicitly requested.

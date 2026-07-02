@@ -14359,12 +14359,21 @@ class OllamaCodeAgent:
                             }
                         )
                         continue
-                if name == "edit_intent":
+                if name in {"edit_intent", "write_file"}:
                     syntax_diagnostic = self._python_mutation_payload_syntax_diagnostic(name, arguments)
-                    if syntax_diagnostic:
+                    mutation_paths = self._mutation_target_paths(arguments)
+                    syntax_guard_allowed = name == "edit_intent" or any(path in unresolved_syntax_diagnostics for path in mutation_paths)
+                    if syntax_diagnostic and syntax_guard_allowed:
                         target_key = ",".join(self._mutation_target_paths(arguments)) or "."
                         invalid_key = (name, target_key)
                         invalid_python_mutation_payload_counts[invalid_key] = invalid_python_mutation_payload_counts.get(invalid_key, 0) + 1
+                        self._record_event(
+                            "controller_guard",
+                            guard="invalid-python-mutation-payload",
+                            tool=name,
+                            diagnostic=syntax_diagnostic,
+                            rounds=round_number,
+                        )
                         if (
                             invalid_python_mutation_payload_counts[invalid_key] >= 2
                             and not spec_guided_repair_attempted
@@ -14391,13 +14400,6 @@ class OllamaCodeAgent:
                                 spec_guided_repair_attempted = True
                                 return repair_result
                         self._append_assistant_payload(payload)
-                        self._record_event(
-                            "controller_guard",
-                            guard="invalid-python-mutation-payload",
-                            tool=name,
-                            diagnostic=syntax_diagnostic,
-                            rounds=round_number,
-                        )
                         self.messages.append(
                             {
                                 "role": "user",
@@ -15611,7 +15613,9 @@ class OllamaCodeAgent:
                         post_tool_feedback.append(
                             "Post-edit syntax check failed: "
                             + self._truncate_text(syntax_diagnostic or "Python syntax error", limit=620)
-                            + ". Repair the Python source before running validators or finishing. Next JSON only."
+                            + ". "
+                            + self._python_mutation_payload_syntax_feedback(syntax_diagnostic or "Python syntax error")
+                            + " If you are adding one new Python function, prefer edit_intent with intent add_function on the implementation module instead of rewriting the whole file."
                         )
                     else:
                         unresolved_syntax_diagnostics.pop(result_path, None)

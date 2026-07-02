@@ -287,7 +287,7 @@ TOOL_DESCRIPTIONS = [
     },
     {
         "name": "edit_intent",
-        "arguments": {"path": "relative path", "intent": "rename|replace_text|replace_symbol|replace_body|change_signature|add_import", "target": "old text/symbol", "replacement": "new text/source", "scope": "file|project, default file", "apply": "bool, default true"},
+        "arguments": {"path": "relative path", "intent": "rename|replace_text|replace_symbol|replace_body|change_signature|add_import|add_function", "target": "old text/symbol", "replacement": "new text/source", "scope": "file|project, default file", "apply": "bool, default true"},
         "description": "Route an edit intent to the safest low-level edit tool and avoid common symbol/text mixups.",
     },
     {
@@ -545,7 +545,7 @@ def format_compact_tool_help(tool_names: Iterable[str] | None = None, *, grouped
         "write_file": "write_file(path,content)",
         "replace_in_file": "replace_in_file(path,old,new,all=false,whole_word=false)",
         "apply_structured_edit": 'apply_structured_edit(operation={"op":"rename_symbol|replace_function_body|change_signature|...","path":"a.py"})',
-        "edit_intent": "edit_intent(path,intent=rename|replace_text|replace_symbol|replace_body|change_signature|add_import,target?,replacement?,scope='file',apply=true)",
+        "edit_intent": "edit_intent(path,intent=rename|replace_text|replace_symbol|replace_body|change_signature|add_import|add_function,target?,replacement?,scope='file',apply=true)",
         "generate_tests_from_spec": "generate_tests_from_spec(target_symbol,behavior,test_path?,apply=false)",
         "browser_smoke": "browser_smoke(url,actions=[],wait_for?,viewport='desktop',screenshot=false)",
         "security_scan": "security_scan(path='.',scanners='auto',limit=80)",
