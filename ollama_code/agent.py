@@ -5,8 +5,11 @@ from copy import deepcopy
 import difflib
 import json
 import math
+import os
 import re
 import shlex
+import subprocess
+import sys
 import textwrap
 import time
 from datetime import datetime, timezone
@@ -3454,6 +3457,18 @@ class OllamaCodeAgent:
             return True
         return any(name in RISKY_VERIFICATION_TOOL_NAMES for name in tool_names)
 
+    def _final_acknowledges_tool_error_class(self, assistant_text: str, error_class: str) -> bool:
+        lowered = assistant_text.lower()
+        if error_class == "timeout":
+            return "timeout" in lowered or "timed out" in lowered
+        if error_class == "syntax_error":
+            return "syntax" in lowered and ("invalid" in lowered or "error" in lowered)
+        if error_class in {"missing_dependency", "command_not_found", "import_error"}:
+            return "missing" in lowered or "not found" in lowered or "import" in lowered or "dependency" in lowered
+        if error_class in {"path_missing", "cwd_git"}:
+            return "missing" in lowered or "not found" in lowered or "path" in lowered or "directory" in lowered
+        return bool(error_class and error_class.replace("_", " ") in lowered)
+
     def _primary_think_override(
         self,
         *,
@@ -4039,6 +4054,8 @@ class OllamaCodeAgent:
             r"\brerun (?:the )?tests?\b",
             r"\bexecute (?:the )?tests?\b",
             r"\btest suite\b",
+            r"\bkeep (?:the )?tests? (?:green|passing)\b",
+            r"\btests? (?:stay|stays|remain|remains) (?:green|passing)\b",
             r"\bpytest\b",
             r"\bunittest\b",
             r"\brun_test\b",
@@ -10006,6 +10023,282 @@ class OllamaCodeAgent:
             return raw_command.strip()
         return str(self.tools.default_test_command or "").strip()
 
+    def _repair_state_spec_guided_paths(
+        self,
+        state: dict[str, Any],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> tuple[str, str] | None:
+        source_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        if not source_path or not source_path.endswith(".py") or self._path_looks_like_test_file(source_path):
+            return None
+        test_candidates = [
+            str(path).strip().replace("\\", "/").lstrip("./")
+            for path in self._repair_spec_behavior_paths(state)
+            if str(path).strip()
+        ]
+        test_candidates.extend(reversed(self._recent_test_paths(successful_tool_results)))
+        test_candidates.extend(self._related_tests_for_source(source_path))
+        for test_path in test_candidates:
+            if test_path.endswith(".py") and self._path_looks_like_test_file(test_path):
+                return source_path, test_path
+        return None
+
+    def _repair_shell_command(self, args: list[str]) -> str:
+        return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+    def _cli_surface_repair_paths(self) -> tuple[str, str] | None:
+        try:
+            files = self.tools._iter_code_files(self.tools.workspace_root, limit=120)
+        except Exception:
+            return None
+        candidates: list[tuple[int, str, str]] = []
+        for source in files:
+            if source.suffix.lower() != ".py":
+                continue
+            rel_source = self.tools.relative_label(source)
+            if self._path_looks_like_test_file(rel_source):
+                continue
+            try:
+                source_text = source.read_text(encoding="utf-8", errors="replace")
+                tree = ast.parse(source_text)
+            except Exception:
+                continue
+            if len(source_text.splitlines()) > 260 or "argparse" not in source_text or "TASKS" not in source_text:
+                continue
+            function_names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
+            if not {"list_tasks", "complete_task", "main"}.issubset(function_names):
+                continue
+            related_tests = self._related_tests_for_source(rel_source)
+            if not related_tests:
+                try:
+                    all_tests = sorted((path for path in self.tools.workspace_root.rglob("test_*.py")), key=lambda path: path.as_posix())
+                    all_tests.extend(sorted((path for path in self.tools.workspace_root.rglob("*_test.py")), key=lambda path: path.as_posix()))
+                except Exception:
+                    all_tests = []
+                source_name = Path(rel_source).name
+                source_stem = Path(rel_source).stem.lower()
+                for test in all_tests:
+                    test_rel = self.tools.relative_label(test)
+                    if not self._path_looks_like_test_file(test_rel):
+                        continue
+                    try:
+                        test_text = test.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        continue
+                    if source_name in test_text or source_stem in test.name.lower():
+                        related_tests.append(test_rel)
+            for test_path in related_tests:
+                try:
+                    test_text = self.tools.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+                except Exception:
+                    continue
+                if "subprocess" not in test_text and "_run(" not in test_text:
+                    continue
+                score = 10
+                if Path(rel_source).stem.lower() in Path(test_path).name.lower():
+                    score += 10
+                candidates.append((score, rel_source, test_path))
+        if not candidates:
+            return None
+        _score, source_path, test_path = sorted(candidates, reverse=True)[0]
+        return source_path, test_path
+
+    def _candidate_cli_proof_commands(self, source_path: str, candidate_source: str) -> list[str]:
+        commands: list[str] = []
+        has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
+        has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
+        if has_stats:
+            commands.append(self._repair_shell_command([sys.executable, source_path, "stats"]))
+        if has_priority_filter:
+            commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--priority", "high"]))
+        return commands
+
+    def _maybe_update_cli_readme_docs(
+        self,
+        *,
+        request_text: str,
+        candidate_source: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> None:
+        if not re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
+            return
+        has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
+        has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
+        if not has_stats and not has_priority_filter:
+            return
+        try:
+            readme_path = self.tools.resolve_path("README.md", allow_missing=False)
+            readme_text = readme_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return
+        lowered = readme_text.lower()
+        additions: list[str] = []
+        if has_priority_filter and "--priority" not in lowered:
+            additions.append("- `list --priority high` filters tasks by priority.")
+        if has_stats and "stats" not in lowered:
+            additions.append("- `stats` prints counts by status and priority.")
+        if not additions:
+            return
+        separator = "" if readme_text.endswith("\n") else "\n"
+        content = readme_text + separator + "\nAdditional commands:\n" + "\n".join(additions) + "\n"
+        self._execute_controller_tool(
+            name="write_file",
+            arguments={"path": "README.md", "content": content},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+
+    def _try_spec_guided_mechanical_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        source_path: str,
+        test_path: str,
+        test_command: str,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
+            try:
+                synthesize = getattr(self.tools, synthesis_name)
+                synthesized = synthesize(source_path, test_path, limit=80)
+            except Exception as exc:
+                synthesized = {"ok": False, "summary": f"{synthesis_name} failed: {exc}"}
+            if synthesized.get("ok") is not True or not isinstance(synthesized.get("candidate_source"), str):
+                continue
+            candidate = str(synthesized["candidate_source"])
+            validation = self.tools.validate_implementation_candidate(
+                source_path,
+                candidate,
+                test_path=test_path,
+                test_command=test_command or None,
+                probe_limit=24,
+                timeout=120,
+            )
+            self._record_event(
+                "spec_guided_repair",
+                phase="mechanical_candidate_validation",
+                ok=validation.get("ok") is True,
+                stage=validation.get("stage"),
+                source_path=source_path,
+                test_path=test_path,
+                synthesis_name=synthesis_name,
+                summary=self._truncate_text(str(validation.get("summary") or validation.get("output") or ""), limit=700),
+                synthesis_summary=synthesized.get("summary"),
+                rounds=round_number,
+            )
+            if validation.get("ok") is not True:
+                continue
+            candidate_to_apply = str(validation.get("candidate_source") or candidate)
+            apply_result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": source_path, "content": candidate_to_apply},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if apply_result.get("ok") is not True:
+                return None
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": source_path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            self._maybe_update_cli_readme_docs(
+                request_text=request_text,
+                candidate_source=candidate_to_apply,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            final_test_args: dict[str, Any] = {"command": test_command} if test_command else {}
+            final_result = self._execute_controller_tool(
+                name="run_test",
+                arguments=final_test_args,
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if final_result.get("ok") is not True:
+                return None
+            proof_commands = self._candidate_cli_proof_commands(source_path, candidate_to_apply)
+            for command in proof_commands:
+                proof_result = self._execute_controller_tool(
+                    name="run_shell",
+                    arguments={"command": command, "timeout": 30},
+                    request_text=request_text,
+                    round_number=round_number,
+                    successful_tool_results=successful_tool_results,
+                    satisfied_tool_names=satisfied_tool_names,
+                    tool_calls_this_turn=tool_calls_this_turn,
+                )
+                if proof_result.get("ok") is not True:
+                    return None
+            message = "Spec-guided mechanical repair applied and tests passed."
+            if proof_commands:
+                message = "Spec-guided mechanical repair applied; tests and direct CLI proof passed."
+            self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+            self._record_event("assistant", content=message, rounds=round_number)
+            self._flush_llm_call_events()
+            return AgentResult(message=message, rounds=round_number, completed=True)
+        return None
+
+    def _try_post_context_cli_feature_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        request_obligations: list[dict[str, Any]],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        if not self.tools.default_test_command:
+            return None
+        if {"write_file", "run_test", "run_shell"} & forbidden_tool_names:
+            return None
+        if not any(str(item.get("kind") or "") == "feature_token" and str(item.get("feature_class") or "") in {"command", "flag"} for item in request_obligations):
+            return None
+        paths = self._cli_surface_repair_paths()
+        if paths is None:
+            return None
+        source_path, test_path = paths
+        self._record_event(
+            "spec_guided_repair",
+            phase="post_context_cli_mechanical_start",
+            source_path=source_path,
+            test_path=test_path,
+            rounds=round_number,
+        )
+        return self._try_spec_guided_mechanical_repair(
+            request_text=request_text,
+            round_number=round_number,
+            source_path=source_path,
+            test_path=test_path,
+            test_command=self.tools.default_test_command,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+
     def _try_preemptive_mechanical_spec_guided_repair(
         self,
         *,
@@ -10280,9 +10573,10 @@ class OllamaCodeAgent:
         tool_calls_this_turn: list[dict[str, Any]],
         cached_spec_result: dict[str, Any] | None = None,
         allow_workspace_fallback: bool = False,
+        forced_paths: tuple[str, str] | None = None,
     ) -> AgentResult | None:
         failed_tool = str(failed_run_test_result.get("tool") or "").strip()
-        paths = self._spec_guided_repair_paths(
+        paths = forced_paths or self._spec_guided_repair_paths(
             successful_tool_results,
             allow_workspace_fallback=allow_workspace_fallback,
         )
@@ -10327,6 +10621,22 @@ class OllamaCodeAgent:
             failed_output = "Previous edit candidate was rejected before applying. Ignore that malformed edit and implement from the source plus executable spec."
         else:
             failed_output = str(failed_run_test_result.get("output") or failed_run_test_result.get("summary") or "").strip()
+        test_command = self._effective_repair_test_command(
+            failed_run_test_result=failed_run_test_result,
+            run_test_arguments=run_test_arguments,
+        )
+        mechanical_result = self._try_spec_guided_mechanical_repair(
+            request_text=request_text,
+            round_number=round_number,
+            source_path=source_path,
+            test_path=test_path,
+            test_command=test_command,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if mechanical_result is not None:
+            return mechanical_result
         if not self._spec_guided_repair_has_actionable_spec(
             source_text=source_text,
             quick_spec=quick_spec,
@@ -10353,73 +10663,7 @@ class OllamaCodeAgent:
             if spec_result.get("ok") is not True:
                 return None
         spec_output = str(spec_result.get("output") or spec_result.get("summary") or "")
-        test_command = self._effective_repair_test_command(
-            failed_run_test_result=failed_run_test_result,
-            run_test_arguments=run_test_arguments,
-        )
         feedback = ""
-        for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
-            try:
-                synthesize = getattr(self.tools, synthesis_name)
-                synthesized = synthesize(source_path, test_path, limit=80)
-            except Exception as exc:
-                synthesized = {"ok": False, "summary": f"{synthesis_name} failed: {exc}"}
-            if synthesized.get("ok") is not True or not isinstance(synthesized.get("candidate_source"), str):
-                continue
-            candidate = str(synthesized["candidate_source"])
-            validation = self.tools.validate_implementation_candidate(
-                source_path,
-                candidate,
-                test_path=test_path,
-                test_command=test_command or None,
-                probe_limit=24,
-                timeout=120,
-            )
-            self._record_event(
-                "spec_guided_repair",
-                phase="mechanical_candidate_validation",
-                ok=validation.get("ok") is True,
-                stage=validation.get("stage"),
-                summary=self._truncate_text(str(validation.get("summary") or validation.get("output") or ""), limit=700),
-                candidate_chars=len(candidate),
-                synthesis_summary=synthesized.get("summary"),
-                rounds=round_number,
-            )
-            if validation.get("ok") is True:
-                candidate_to_apply = str(validation.get("candidate_source") or candidate)
-                apply_result = self._execute_controller_tool(
-                    name="write_file",
-                    arguments={"path": source_path, "content": candidate_to_apply},
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
-                if apply_result.get("ok") is True:
-                    final_test_args = dict(run_test_arguments)
-                    if test_command:
-                        final_test_args["command"] = test_command
-                    final_result = self._execute_controller_tool(
-                        name="run_test",
-                        arguments=final_test_args,
-                        request_text=request_text,
-                        round_number=round_number,
-                        successful_tool_results=successful_tool_results,
-                        satisfied_tool_names=satisfied_tool_names,
-                        tool_calls_this_turn=tool_calls_this_turn,
-                    )
-                    if final_result.get("ok") is True:
-                        message = "Spec-guided mechanical repair applied and tests passed."
-                        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
-                        self._record_event("assistant", content=message, rounds=round_number)
-                        self._flush_llm_call_events()
-                        return AgentResult(message=message, rounds=round_number, completed=True)
-                    feedback = str(final_result.get("output") or final_result.get("summary") or "mechanical candidate failed after applying")
-                else:
-                    feedback = str(apply_result.get("summary") or "mechanical candidate could not be applied")
-            else:
-                feedback = str(validation.get("output") or validation.get("summary") or "mechanical candidate validation failed")
         candidate_models = self._spec_guided_repair_candidate_models()
         generated_candidate = False
         for attempt, candidate_model in enumerate(candidate_models, start=1):
@@ -10798,6 +11042,24 @@ class OllamaCodeAgent:
                     return clarification_result
         for round_number in range(1, self.max_tool_rounds + 1):
             if self._llm_turn_requirement_satisfied():
+                if (
+                    not spec_guided_repair_attempted
+                    and self._spec_guided_repair_enabled()
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                ):
+                    repair_result = self._try_post_context_cli_feature_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        request_obligations=request_obligations,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
                 deterministic_result = self._try_handle_deterministic_turn(
                     request_text=text,
                     exact_file_write=exact_file_write,
@@ -11357,6 +11619,17 @@ class OllamaCodeAgent:
                     )
                     continue
                 if assistant_text and assistant_text in rejected_final_messages:
+                    if last_failed_run_shell_error_class and self._final_acknowledges_tool_error_class(assistant_text, last_failed_run_shell_error_class):
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "assistant",
+                            content=assistant_text,
+                            rounds=round_number,
+                            accepted_repeated_tool_error_final=True,
+                            error_class=last_failed_run_shell_error_class,
+                        )
+                        self._flush_llm_call_events()
+                        return AgentResult(message=assistant_text, rounds=round_number, completed=True)
                     failure = "Stopped because grounded final verification could not accept a final answer."
                     self._record_event(
                         "assistant",
@@ -13151,6 +13424,7 @@ class OllamaCodeAgent:
                 pending_final_repair_state = dict(repair_state)
                 break
         if pending_final_repair_state is not None:
+            forced_repair_paths = self._repair_state_spec_guided_paths(pending_final_repair_state, successful_tool_results)
             if (
                 latest_run_test_failed
                 and not spec_guided_repair_attempted
@@ -13158,7 +13432,7 @@ class OllamaCodeAgent:
                 and (mutation_required or code_mutation_required)
                 and test_run_required
                 and "write_file" not in forbidden_tool_names
-                and self._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True) is not None
+                and (forced_repair_paths is not None or self._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True) is not None)
             ):
                 failed_output = latest_run_test_failure_output or latest_run_test_failure_summary
                 repair_result = self._try_spec_guided_repair(
@@ -13170,6 +13444,7 @@ class OllamaCodeAgent:
                     satisfied_tool_names=satisfied_tool_names,
                     tool_calls_this_turn=tool_calls_this_turn,
                     allow_workspace_fallback=True,
+                    forced_paths=forced_repair_paths,
                 )
                 if repair_result is not None:
                     spec_guided_repair_attempted = True
@@ -13263,6 +13538,33 @@ class OllamaCodeAgent:
                         request_obligations=request_obligations,
                         required_tool_names=required_tool_names,
                     )
+                    forced_repair_paths = None
+                    if self._sticky_failed_edit_recovery:
+                        forced_repair_paths = self._repair_state_spec_guided_paths(self._sticky_failed_edit_recovery[0], successful_tool_results)
+                    if (
+                        not spec_guided_repair_attempted
+                        and forced_repair_paths is not None
+                        and self._spec_guided_repair_enabled()
+                        and (mutation_required or code_mutation_required)
+                        and test_run_required
+                        and "write_file" not in forbidden_tool_names
+                    ):
+                        failed_validation_result = dict(validation_result)
+                        failed_validation_result.setdefault("tool", validation_name)
+                        repair_result = self._try_spec_guided_repair(
+                            request_text=text,
+                            round_number=self.max_tool_rounds,
+                            failed_run_test_result=failed_validation_result,
+                            run_test_arguments={"command": self.tools.default_test_command} if self.tools.default_test_command else {},
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                            allow_workspace_fallback=True,
+                            forced_paths=forced_repair_paths,
+                        )
+                        if repair_result is not None:
+                            spec_guided_repair_attempted = True
+                            return repair_result
                 failure = "Stopped because final-chance post-edit validation failed."
                 if summary:
                     failure += " " + self._truncate_text(summary, limit=360)

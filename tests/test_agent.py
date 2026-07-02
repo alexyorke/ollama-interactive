@@ -2566,6 +2566,13 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("only non-test Python source was grounded instead: task_cli.py", feedback)
 
+    def test_keep_tests_green_creates_test_run_obligation(self) -> None:
+        tools = ToolExecutor(self._workspace_scratch(), approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+
+        self.assertTrue(agent._request_requires_test_run("Add a stats command and keep tests green."))
+        self.assertTrue(agent._request_requires_test_run("Update the CLI and keep the tests passing."))
+
     def test_tool_error_guard_auto_diagnoses_repeated_missing_dependency_failure(self) -> None:
         root = self._workspace_scratch()
         command = subprocess.list2cmdline([sys.executable, "-c", "import definitely_missing_package_12345"])
@@ -3330,6 +3337,97 @@ class AgentTests(AgentTestBase):
         self.assertEqual(len(calls), 1)
         self.assertTrue(calls[0].get("allow_workspace_fallback"))
         self.assertIn("Post-edit syntax check failed", calls[0]["failed_run_test_result"]["summary"])
+
+    def test_spec_guided_cli_repair_proves_docs_and_behavior(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        source = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n\n"
+            "TASKS = [\n"
+            "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high'},\n"
+            "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low'},\n"
+            "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium'},\n"
+            "]\n\n"
+            "def list_tasks(priority: str | None = None) -> list[str]:\n"
+            "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+            "    return [f\"{task['title']}:{task['status']}:{task['priority']}\" for task in tasks]\n\n"
+            "def complete_task(title: str) -> str:\n"
+            "    for task in TASKS:\n"
+            "        if task['title'] == title:\n"
+            "            task['status'] = 'done'\n"
+            "            return f\"completed:{title}\"\n"
+            "    raise SystemExit(f\"unknown task: {title}\")\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    parser = argparse.ArgumentParser()\n"
+            "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+            "    subparsers.add_parser('list')\n"
+            "    complete_parser = subparsers.add_parser('complete')\n"
+            "    complete_parser.add_argument('title')\n"
+            "    args = parser.parse_args(argv)\n"
+            "    if args.command == 'list':\n"
+            "        print('\\n'.join(list_tasks()))\n"
+            "        return 0\n"
+            "    if args.command == 'complete':\n"
+            "        print(complete_task(args.title))\n"
+            "        return 0\n"
+            "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(main())\n"
+        )
+        test_source = (
+            "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+            "ROOT = Path(__file__).resolve().parents[1]\n\n"
+            "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+            "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+            "class TaskCliTests(unittest.TestCase):\n"
+            "    def test_list(self) -> None:\n"
+            "        result = _run('list')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('write-docs:todo:high', result.stdout)\n\n"
+            "    def test_complete(self) -> None:\n"
+            "        result = _run('complete', 'write-docs')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('completed:write-docs', result.stdout)\n"
+        )
+        (root / "task_cli.py").write_text(source, encoding="utf-8")
+        (root / "README.md").write_text("# Task CLI\n\nCommands:\n- `list`\n- `complete <title>`\n", encoding="utf-8")
+        (root / "tests" / "test_task_cli.py").write_text(test_source, encoding="utf-8")
+        command = f"{sys.executable} -m unittest discover -s tests -p test_task_cli.py"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+        successful_tool_results = [
+            {"name": "read_file", "arguments": {"path": "task_cli.py"}, "result": {"ok": True, "path": "task_cli.py", "output": source}},
+            {"name": "read_file", "arguments": {"path": "tests/test_task_cli.py"}, "result": {"ok": True, "path": "tests/test_task_cli.py", "output": test_source}},
+        ]
+        tool_calls: list[dict[str, object]] = []
+
+        result = agent._try_spec_guided_repair(
+            request_text="Add a stats command that prints counts by status and priority, add --priority filtering to list, update README.md, and keep tests green.",
+            round_number=4,
+            failed_run_test_result={"ok": False, "tool": "run_test", "summary": "test_list failed", "output": "test_list failed"},
+            run_test_arguments={"command": command},
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=set(),
+            tool_calls_this_turn=tool_calls,
+            allow_workspace_fallback=True,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.completed)
+        self.assertIn("direct CLI proof passed", result.message)
+        self.assertIn("add_parser('stats')", (root / "task_cli.py").read_text(encoding="utf-8"))
+        self.assertIn("--priority", (root / "task_cli.py").read_text(encoding="utf-8"))
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("stats", readme)
+        self.assertIn("--priority", readme)
+        run_shell_commands = [
+            str(call.get("arguments", {}).get("command", ""))
+            for call in tool_calls
+            if call.get("name") == "run_shell" and isinstance(call.get("arguments"), dict)
+        ]
+        self.assertTrue(any(" stats" in command for command in run_shell_commands))
+        self.assertTrue(any("--priority" in command for command in run_shell_commands))
 
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
