@@ -2142,6 +2142,33 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("should_retry(503, 0) -> True", result["output"])
         self.assertIn("should_retry(404, 0) -> False", result["output"])
 
+    def test_test_spec_extract_captures_subprocess_cli_assertions(self) -> None:
+        with self._temp_tools() as (root, tools):
+            (root / "task_cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+            (root / "test_task_cli.py").write_text(
+                "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                "ROOT = Path(__file__).resolve().parents[0]\n\n"
+                "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_list(self):\n"
+                "        result = _run('list', '--priority', 'high')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('write-docs:todo:high', result.stdout)\n"
+                "        self.assertNotIn('ship-cli', result.stdout)\n",
+                encoding="utf-8",
+            )
+
+            extracted = tools.test_spec_extract("test_task_cli.py", source_path="task_cli.py", limit=10)
+            spec = tools.implementation_spec("task_cli.py", "test_task_cli.py", limit=10)
+
+        self.assertTrue(extracted["ok"], extracted)
+        self.assertIn("_run('list', '--priority', 'high') returncode == 0", extracted["output"])
+        self.assertIn("_run('list', '--priority', 'high') stdout contains 'write-docs:todo:high'", extracted["output"])
+        self.assertIn("_run('list', '--priority', 'high') stdout does not contain 'ship-cli'", extracted["output"])
+        self.assertIn("cli:", spec["output"])
+        self.assertGreaterEqual(len(spec["examples"]), 3)
+
     def test_test_spec_extract_keeps_constructor_attribute_and_receiver_context(self) -> None:
         with self._temp_tools() as (root, tools):
             (root / "phone_number.py").write_text("class PhoneNumber:\n    def __init__(self, number):\n        pass\n", encoding="utf-8")

@@ -2894,6 +2894,46 @@ class OllamaCodeAgent:
                     return list(reversed(paths))
         return list(reversed(paths))
 
+    def _single_non_test_python_source_path(self) -> str | None:
+        roots_to_skip = {
+            ".git",
+            ".hg",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".venv",
+            "__pycache__",
+            "build",
+            "dist",
+            "node_modules",
+            "scratch",
+            "tests",
+            "venv",
+        }
+        candidates: list[str] = []
+        try:
+            iterator = self.tools.workspace_root.rglob("*.py")
+        except Exception:
+            return None
+        for path in iterator:
+            try:
+                rel = self.tools.relative_label(path)
+            except Exception:
+                continue
+            parts = Path(rel).parts
+            lowered_parts = {part.lower() for part in parts}
+            if lowered_parts & roots_to_skip:
+                continue
+            if any(part.startswith(".") for part in parts):
+                continue
+            if self._path_looks_like_test_file(rel):
+                continue
+            candidates.append(rel)
+            if len(candidates) > 1:
+                return None
+        return candidates[0] if len(candidates) == 1 else None
+
     def _recent_test_paths(self, successful_tool_results: list[dict[str, Any]]) -> list[str]:
         paths: list[str] = []
         seen: set[str] = set()
@@ -9546,7 +9586,12 @@ class OllamaCodeAgent:
         response["ok"] = True
         return response
 
-    def _spec_guided_repair_paths(self, successful_tool_results: list[dict[str, Any]]) -> tuple[str, str] | None:
+    def _spec_guided_repair_paths(
+        self,
+        successful_tool_results: list[dict[str, Any]],
+        *,
+        allow_workspace_fallback: bool = False,
+    ) -> tuple[str, str] | None:
         failed_test_path, failed_source_path = self._failed_test_output_paths(successful_tool_results)
         if failed_source_path:
             try:
@@ -9556,13 +9601,27 @@ class OllamaCodeAgent:
                 failed_source_path = None
             else:
                 if source_line_count <= 260:
-                    test_path = failed_test_path or (self._recent_test_paths(successful_tool_results)[-1] if self._recent_test_paths(successful_tool_results) else None)
+                    recent_test_paths = self._recent_test_paths(successful_tool_results)
+                    related_test_paths = self._related_tests_for_source(failed_source_path) if allow_workspace_fallback else []
+                    test_path = (
+                        failed_test_path
+                        or (recent_test_paths[-1] if recent_test_paths else None)
+                        or (related_test_paths[0] if related_test_paths else None)
+                    )
                     if test_path is None:
                         return None
                     return failed_source_path, test_path
 
         source_paths = self._recent_source_paths(successful_tool_results)
         test_paths = self._recent_test_paths(successful_tool_results)
+        if allow_workspace_fallback and source_paths and not test_paths:
+            test_paths = self._related_tests_for_source(source_paths[-1])
+        if allow_workspace_fallback and not source_paths:
+            single_source = self._single_non_test_python_source_path()
+            if single_source:
+                source_paths = [single_source]
+                if not test_paths:
+                    test_paths = self._related_tests_for_source(single_source)
         if not source_paths or not test_paths:
             return None
         source_path = source_paths[-1]
@@ -9649,6 +9708,7 @@ class OllamaCodeAgent:
     def _spec_guided_repair_messages(
         self,
         *,
+        request_text: str,
         source_path: str,
         test_path: str,
         source_text: str,
@@ -9660,6 +9720,8 @@ class OllamaCodeAgent:
             "Repair this Python implementation file using the tests as the executable spec.\n"
             "Return only the complete replacement source for the implementation file. No JSON, no markdown, no explanation.\n"
             "Preserve public class/function/method names and signatures exactly.\n\n"
+            "Also satisfy the original user request; tests may only cover the existing behavior that must not regress.\n"
+            f"Original request: {self._truncate_text(request_text, limit=900)}\n\n"
             "Use unittest method names, transform hints, and assertion order as requirement labels; they often describe edge-case rules.\n\n"
             f"Source path: {source_path}\n"
             f"Test path: {test_path}\n\n"
@@ -10217,8 +10279,13 @@ class OllamaCodeAgent:
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
         cached_spec_result: dict[str, Any] | None = None,
+        allow_workspace_fallback: bool = False,
     ) -> AgentResult | None:
-        paths = self._spec_guided_repair_paths(successful_tool_results)
+        failed_tool = str(failed_run_test_result.get("tool") or "").strip()
+        paths = self._spec_guided_repair_paths(
+            successful_tool_results,
+            allow_workspace_fallback=allow_workspace_fallback,
+        )
         if paths is None:
             return None
         source_path, test_path = paths
@@ -10234,10 +10301,26 @@ class OllamaCodeAgent:
             except Exception:
                 return None
             if quick_spec.get("ok") is not True:
-                return None
+                try:
+                    extracted = self.tools.test_spec_extract(test_path, source_path=source_path, limit=60)
+                except Exception:
+                    return None
+                if extracted.get("ok") is not True:
+                    return None
+                quick_spec = {
+                    "ok": True,
+                    "tool": "implementation_spec",
+                    "source_path": source_path,
+                    "test_path": test_path,
+                    "definitions": [],
+                    "stubs": [],
+                    "examples": list(extracted.get("examples") or []),
+                    "output": str(extracted.get("output") or extracted.get("summary") or ""),
+                    "summary": str(extracted.get("summary") or extracted.get("output") or ""),
+                    "fallback": "test_spec_extract",
+                }
         else:
             quick_spec = spec_result
-        failed_tool = str(failed_run_test_result.get("tool") or "").strip()
         if failed_tool == "preemptive_spec_repair":
             failed_output = str(failed_run_test_result.get("output") or failed_run_test_result.get("summary") or "").strip()
         elif failed_tool and failed_tool != "run_test":
@@ -10358,6 +10441,7 @@ class OllamaCodeAgent:
                     purpose="candidate_repair",
                     model=candidate_model,
                     messages=self._spec_guided_repair_messages(
+                        request_text=request_text,
                         source_path=source_path,
                         test_path=test_path,
                         source_text=source_text,
@@ -11697,7 +11781,7 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
-                if name == "run_test" and unresolved_syntax_diagnostics:
+                if name in (set(VALIDATION_TOOL_NAMES) | {"lint_typecheck", "contract_check", "run_function_probe"}) and unresolved_syntax_diagnostics:
                     self._append_assistant_payload(payload)
                     diagnostics = "; ".join(
                         f"{path}: {diagnostic}" for path, diagnostic in sorted(unresolved_syntax_diagnostics.items())
@@ -11705,7 +11789,7 @@ class OllamaCodeAgent:
                     self.messages.append(
                         {
                             "role": "user",
-                            "content": "Do not run tests while Python syntax errors are already known: "
+                            "content": "Do not run validators while Python syntax errors are already known: "
                             + self._truncate_text(diagnostics, limit=320)
                             + ". Fix the file first. Next JSON only.",
                         }
@@ -12283,6 +12367,29 @@ class OllamaCodeAgent:
                             request_obligations=request_obligations,
                             required_tool_names=required_tool_names,
                         )
+                    if (
+                        validation_name == "run_test"
+                        and not spec_guided_repair_attempted
+                        and self._spec_guided_repair_enabled()
+                        and (mutation_required or code_mutation_required)
+                        and test_run_required
+                        and "write_file" not in forbidden_tool_names
+                        and self._spec_guided_repair_paths(successful_tool_results) is not None
+                    ):
+                        failed_validation_result = dict(validation_result)
+                        failed_validation_result.setdefault("tool", validation_name)
+                        repair_result = self._try_spec_guided_repair(
+                            request_text=text,
+                            round_number=round_number,
+                            failed_run_test_result=failed_validation_result,
+                            run_test_arguments=validation_arguments or {},
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                        if repair_result is not None:
+                            spec_guided_repair_attempted = True
+                            return repair_result
                     validation_summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
                     recovery_state = None
                     if validation_mutation is not None:
@@ -12553,9 +12660,15 @@ class OllamaCodeAgent:
                 result_path = str(result.get("path", "")).strip()
                 if name in MUTATING_TOOL_NAMES and result.get("ok") is True and result_path.endswith(".py"):
                     if result.get("syntax_ok") is False:
-                        unresolved_syntax_diagnostics[result_path] = str(result.get("diagnostic") or result.get("summary") or "").strip()
+                        syntax_diagnostic = str(result.get("diagnostic") or result.get("summary") or "").strip()
+                        unresolved_syntax_diagnostics[result_path] = syntax_diagnostic
                         unresolved_static_diagnostics.pop(result_path, None)
                         unresolved_probe_diagnostics.pop(result_path, None)
+                        post_tool_feedback.append(
+                            "Post-edit syntax check failed: "
+                            + self._truncate_text(syntax_diagnostic or "Python syntax error", limit=620)
+                            + ". Repair the Python source before running validators or finishing. Next JSON only."
+                        )
                     else:
                         unresolved_syntax_diagnostics.pop(result_path, None)
                         try:
@@ -12615,6 +12728,42 @@ class OllamaCodeAgent:
                 for feedback in post_tool_feedback:
                     self.messages.append({"role": "user", "content": feedback})
                 if (
+                    result.get("ok") is not True
+                    and name in {"read_file", "read_symbol", "code_outline"}
+                    and self._tool_error_class(result) == "path_missing"
+                    and (mutation_required or code_mutation_required)
+                ):
+                    fallback_path = self._single_non_test_python_source_path()
+                    requested_path = str(arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                    if fallback_path and fallback_path != requested_path:
+                        fallback_tool = "code_outline" if name in {"code_outline", "read_symbol"} and self.tools.is_tool_enabled("code_outline") else "read_file"
+                        self._record_event(
+                            "controller_guard",
+                            guard="single-source-path-fallback",
+                            candidate_tool=name,
+                            missing_path=requested_path,
+                            fallback_path=fallback_path,
+                            fallback_tool=fallback_tool,
+                            rounds=round_number,
+                        )
+                        fallback_result = self._execute_controller_tool(
+                            name=fallback_tool,
+                            arguments={"path": fallback_path},
+                            request_text=text,
+                            round_number=round_number,
+                            successful_tool_results=successful_tool_results,
+                            satisfied_tool_names=satisfied_tool_names,
+                            tool_calls_this_turn=tool_calls_this_turn,
+                        )
+                        if fallback_result.get("ok") is True:
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": f"The requested path {requested_path or '(empty)'} was missing, so the only non-test Python source was grounded instead: {fallback_path}. Continue from that evidence. Next JSON only.",
+                                }
+                            )
+                            continue
+                if (
                     name in MUTATING_TOOL_NAMES
                     and result.get("ok") is True
                     and post_tool_feedback
@@ -12624,7 +12773,6 @@ class OllamaCodeAgent:
                     and "write_file" not in forbidden_tool_names
                     and self._spec_guided_repair_enabled()
                 ):
-                    spec_guided_repair_attempted = True
                     feedback_text = "\n".join(post_tool_feedback)
                     repair_result = self._try_spec_guided_repair(
                         request_text=text,
@@ -12636,6 +12784,7 @@ class OllamaCodeAgent:
                         tool_calls_this_turn=tool_calls_this_turn,
                     )
                     if repair_result is not None:
+                        spec_guided_repair_attempted = True
                         return repair_result
                 if (
                     latest_run_test_failed
@@ -12656,6 +12805,33 @@ class OllamaCodeAgent:
                     )
                     self.messages.append({"role": "user", "content": self._failed_test_no_edit_guard_message(successful_tool_results)})
                 if (
+                    name == "diagnose_test_failure"
+                    and result.get("ok") is True
+                    and latest_run_test_failed
+                    and not spec_guided_repair_attempted
+                    and (mutation_required or code_mutation_required)
+                    and test_run_required
+                    and "write_file" not in forbidden_tool_names
+                    and self._spec_guided_repair_enabled()
+                    and self._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True) is not None
+                ):
+                    failure_text = latest_run_test_failure_output or latest_run_test_failure_summary
+                    diagnosis_text = str(result.get("output") or result.get("summary") or "").strip()
+                    combined_failure = (failure_text + "\n\nDiagnosis:\n" + diagnosis_text).strip()
+                    repair_result = self._try_spec_guided_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        failed_run_test_result={"ok": False, "tool": "run_test", "summary": combined_failure, "output": combined_failure},
+                        run_test_arguments={},
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
+                if (
                     name == "run_test"
                     and result.get("ok") is not True
                     and not spec_guided_repair_attempted
@@ -12675,7 +12851,6 @@ class OllamaCodeAgent:
                     )
                     if import_repair is not None:
                         return import_repair
-                    spec_guided_repair_attempted = True
                     repair_result = self._try_spec_guided_repair(
                         request_text=text,
                         round_number=round_number,
@@ -12686,6 +12861,7 @@ class OllamaCodeAgent:
                         tool_calls_this_turn=tool_calls_this_turn,
                     )
                     if repair_result is not None:
+                        spec_guided_repair_attempted = True
                         return repair_result
                 if (
                     name in MUTATING_TOOL_NAMES
@@ -12707,7 +12883,6 @@ class OllamaCodeAgent:
                         )
                     )
                 ):
-                    spec_guided_repair_attempted = True
                     repair_result = self._try_spec_guided_repair(
                         request_text=text,
                         round_number=round_number,
@@ -12716,8 +12891,10 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if repair_result is not None:
+                        spec_guided_repair_attempted = True
                         return repair_result
                 if (
                     name in MUTATING_TOOL_NAMES
@@ -12740,7 +12917,6 @@ class OllamaCodeAgent:
                         )
                     )
                 ):
-                    spec_guided_repair_attempted = True
                     repair_result = self._try_spec_guided_repair(
                         request_text=text,
                         round_number=round_number,
@@ -12749,8 +12925,10 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if repair_result is not None:
+                        spec_guided_repair_attempted = True
                         return repair_result
                 if (
                     name in MUTATING_TOOL_NAMES
@@ -12998,9 +13176,8 @@ class OllamaCodeAgent:
                     and (mutation_required or code_mutation_required)
                     and test_run_required
                     and "write_file" not in forbidden_tool_names
-                    and self._spec_guided_repair_paths(successful_tool_results) is not None
+                    and self._spec_guided_repair_paths(successful_tool_results, allow_workspace_fallback=True) is not None
                 ):
-                    spec_guided_repair_attempted = True
                     failed_validation_result = dict(validation_result)
                     failed_validation_result.setdefault("tool", validation_name)
                     repair_result = self._try_spec_guided_repair(
@@ -13013,6 +13190,7 @@ class OllamaCodeAgent:
                         tool_calls_this_turn=tool_calls_this_turn,
                     )
                     if repair_result is not None:
+                        spec_guided_repair_attempted = True
                         return repair_result
                 summary = str(validation_result.get("summary") or validation_result.get("output") or "").strip()
                 if last_successful_mutation is not None:

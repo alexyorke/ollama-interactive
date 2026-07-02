@@ -4901,6 +4901,89 @@ class ToolExecutor:
         if item not in examples:
             examples.append(item)
 
+    def _test_spec_cli_result_access(
+        self,
+        node: ast.AST,
+        local_exprs: dict[str, str],
+    ) -> tuple[str, str] | None:
+        attrs: list[str] = []
+        current = node
+        while isinstance(current, ast.Attribute):
+            attrs.append(current.attr)
+            current = current.value
+        if not isinstance(current, ast.Name) or not attrs:
+            return None
+        command_expr = local_exprs.get(current.id, "")
+        if not command_expr:
+            return None
+        command_lower = command_expr.lower()
+        if not (
+            "subprocess.run(" in command_lower
+            or re.search(r"\b(?:_run|run_cli|cli|invoke|run_command)\s*\(", command_expr)
+        ):
+            return None
+        attr_path = ".".join(reversed(attrs))
+        if attr_path not in {"returncode", "stdout", "stderr"}:
+            return None
+        return command_expr, attr_path
+
+    def _test_spec_add_cli_example(
+        self,
+        examples: list[dict[str, Any]],
+        *,
+        command_expr: str,
+        assertion: str,
+        line: int,
+        test_name: str | None,
+    ) -> None:
+        item = {"symbol": "cli", "example": f"{command_expr} {assertion}", "line": line}
+        if test_name:
+            item["test_name"] = test_name
+        if item not in examples:
+            examples.append(item)
+
+    def _test_spec_add_cli_assertion_examples(
+        self,
+        examples: list[dict[str, Any]],
+        *,
+        method_name: str,
+        args: list[ast.AST],
+        local_exprs: dict[str, str],
+        line: int,
+        test_name: str | None,
+    ) -> bool:
+        if method_name in {"assertEqual", "assertEquals"} and len(args) >= 2:
+            for actual_node, expected_node in ((args[0], args[1]), (args[1], args[0])):
+                access = self._test_spec_cli_result_access(actual_node, local_exprs)
+                if access is None:
+                    continue
+                command_expr, attr_path = access
+                expected = self._node_expr(expected_node, local_exprs)
+                self._test_spec_add_cli_example(
+                    examples,
+                    command_expr=command_expr,
+                    assertion=f"{attr_path} == {expected}",
+                    line=line,
+                    test_name=test_name,
+                )
+                return True
+        if method_name in {"assertIn", "assertNotIn"} and len(args) >= 2:
+            member = self._node_expr(args[0], local_exprs)
+            access = self._test_spec_cli_result_access(args[1], local_exprs)
+            if access is None:
+                return False
+            command_expr, attr_path = access
+            relation = "contains" if method_name == "assertIn" else "does not contain"
+            self._test_spec_add_cli_example(
+                examples,
+                command_expr=command_expr,
+                assertion=f"{attr_path} {relation} {member}",
+                line=line,
+                test_name=test_name,
+            )
+            return True
+        return False
+
     def _test_spec_call_may_mutate_state(self, call: ast.Call) -> bool:
         name = self._test_spec_call_name(call)
         return name in {
@@ -5030,6 +5113,15 @@ class ToolExecutor:
                 if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
                     node = stmt.value
                     method_name = self._method_name(node)
+                    if self._test_spec_add_cli_assertion_examples(
+                        examples,
+                        method_name=method_name,
+                        args=list(node.args),
+                        local_exprs=local_exprs,
+                        line=int(getattr(node, "lineno", 1)),
+                        test_name=function.name,
+                    ):
+                        continue
                     if self._method_name(node) in equality_methods and len(node.args) >= 2:
                         actual: ast.Call | None = None
                         expected_node: ast.AST | None = None

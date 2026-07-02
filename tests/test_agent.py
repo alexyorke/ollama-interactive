@@ -2541,6 +2541,31 @@ class AgentTests(AgentTestBase):
         self.assertEqual(len(controller_guards), 1)
         self.assertTrue(any("Use the diagnosis above to repair the path/cwd" in message["content"] for message in agent.messages if message["role"] == "user"))
 
+    def test_path_missing_on_single_source_repo_auto_grounds_real_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "task_cli.py").write_text("def main() -> int:\n    return 0\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"code_outline","arguments":{"path":"tasks.py"}}',
+                    '{"type":"final","message":"No implementation found."}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+                agent.handle_user("Add a stats command to this CLI repo and keep tests green.")
+
+        tool_calls = [event for event in agent.events if event.get("type") == "tool_call"]
+        outline_paths = [event.get("arguments", {}).get("path") for event in tool_calls if event.get("name") == "code_outline"]
+        self.assertEqual(outline_paths[:2], ["tasks.py", "task_cli.py"])
+        self.assertTrue(
+            any(event.get("type") == "controller_guard" and event.get("guard") == "single-source-path-fallback" for event in agent.events)
+        )
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("only non-test Python source was grounded instead: task_cli.py", feedback)
+
     def test_tool_error_guard_auto_diagnoses_repeated_missing_dependency_failure(self) -> None:
         root = self._workspace_scratch()
         command = subprocess.list2cmdline([sys.executable, "-c", "import definitely_missing_package_12345"])
@@ -3105,6 +3130,124 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Post-edit validation failed before more tool use.", feedback)
         self.assertIn("markdown heading missing", feedback)
+
+    def test_failed_proactive_run_test_invokes_spec_guided_repair(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "app.py").write_text("def value() -> int:\n    return 0\n", encoding="utf-8")
+        (root / "tests" / "test_app.py").write_text(
+            "import unittest\nfrom app import value\n\n"
+            "class AppTests(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        self.assertEqual(value(), 1)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_app.py"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":"app.py","old":"return 0","new":"return 2"}}',
+                '{"type":"final","message":"Updated app.py and tests passed."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+        calls: list[dict[str, object]] = []
+
+        def fake_spec_guided_repair(**kwargs: object) -> AgentResult | None:
+            calls.append(dict(kwargs))
+            failed = kwargs.get("failed_run_test_result")
+            if isinstance(failed, dict) and failed.get("tool") == "preemptive_spec_repair":
+                return None
+            return AgentResult(message="spec repair called", rounds=int(kwargs["round_number"]), completed=False)
+
+        agent._try_spec_guided_repair = fake_spec_guided_repair  # type: ignore[method-assign]
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.message, "spec repair called")
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls[-1]["run_test_arguments"], {})
+        self.assertFalse(calls[-1]["failed_run_test_result"]["ok"])
+        self.assertIn("Post-edit example probes failed", calls[-1]["failed_run_test_result"]["summary"])
+
+    def test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "app.py").write_text(
+            "def value() -> int:\n"
+            "    return 0\n\n"
+            "def main() -> int:\n"
+            "    return value()\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_app.py").write_text(
+            "import unittest\nfrom app import value\n\n"
+            "class AppTests(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        if value() != 1:\n"
+            "            raise AssertionError(f'{value()} != 1')\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"write_file","arguments":{"path":"app.py","content":"def value() -> int:\\n    return 1\\n"}}',
+                '{"type":"final","message":"Updated app.py and tests passed."}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+        calls: list[dict[str, object]] = []
+
+        def fake_spec_guided_repair(**kwargs: object) -> AgentResult | None:
+            calls.append(dict(kwargs))
+            failed = kwargs.get("failed_run_test_result")
+            if isinstance(failed, dict) and failed.get("tool") == "preemptive_spec_repair":
+                return None
+            return AgentResult(message="spec repair after failed overwrite", rounds=int(kwargs["round_number"]), completed=False)
+
+        agent._try_spec_guided_repair = fake_spec_guided_repair  # type: ignore[method-assign]
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.message, "spec repair after failed overwrite")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            agent._spec_guided_repair_paths(calls[-1]["successful_tool_results"], allow_workspace_fallback=True),
+            ("app.py", "tests/test_app.py"),
+        )
+        self.assertIn("drops existing top-level symbols", calls[-1]["failed_run_test_result"]["summary"])
+
+    def test_known_syntax_error_blocks_lint_validator_until_repair(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value() -> str:\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"write_file","arguments":{"path":"app.py","content":"def value() -> str:\\n    return \\"unterminated\\n"}}',
+                '{"type":"tool","name":"lint_typecheck","arguments":{"paths":"app.py"}}',
+                '{"type":"final","message":"done"}',
+                '{"type":"final","message":"done"}',
+                '{"type":"final","message":"done"}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            agent.handle_user("Fix app.py and run validation.")
+
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        lint_tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "lint_typecheck"]
+        lint_auto_validations = [event for event in agent.events if event.get("type") == "auto_validation" and event.get("name") == "lint_typecheck"]
+        self.assertEqual(len(lint_tool_calls), len(lint_auto_validations))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not run validators while Python syntax errors are already known", feedback)
 
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
@@ -9963,6 +10106,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_trajectory_ground_guard_auto_diagnoses_failed_test_before_pathless_edit",
         "test_trajectory_ground_guard_allows_explicit_new_file_creation",
         "test_tool_error_guard_blocks_third_duplicate_path_failure",
+        "test_path_missing_on_single_source_repo_auto_grounds_real_source",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_failed_edit_recovery_guard_requires_behavior_surface_read_for_cli_repair",
         "test_spec_guided_repair_uses_context_pack_test_files_as_recent_tests",
@@ -9981,6 +10125,9 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_post_edit_validation_respects_explicit_skip_validation_request",
         "test_synthesized_final_runs_post_edit_validation_for_no_test_request",
         "test_post_edit_validation_feedback_includes_validator_diagnostic",
+        "test_failed_proactive_run_test_invokes_spec_guided_repair",
+        "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
+        "test_known_syntax_error_blocks_lint_validator_until_repair",
         "test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request",
         "test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests",
         "test_trajectory_final_chance_validation_discovers_repo_test_command_after_empty_targeted_selection",
