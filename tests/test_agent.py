@@ -2002,6 +2002,32 @@ class AgentTests(AgentTestBase):
 
         self.assertEqual(probe, ("context_pack", {"request": "Fix add in src/alpha.py and src/beta.py.", "path": ".", "limit": 6}))
 
+    def test_trajectory_ground_guard_lists_ambiguous_pathless_candidates_after_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "alpha.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+        (root / "src" / "beta.py").write_text("def add(left, right):\n    return 0\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search_symbols","arguments":{"query":"add","path":"."}}',
+                '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","target":"add","replacement":"return left + right"}}',
+            ],
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=2)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix add so it returns the sum.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("return left - right", (root / "src" / "alpha.py").read_text(encoding="utf-8"))
+        self.assertIn("return 0", (root / "src" / "beta.py").read_text(encoding="utf-8"))
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Pathless mutation for add is ambiguous across src/alpha.py, src/beta.py.", feedback)
+        self.assertIn("retry with an explicit target path", feedback)
+
     def test_pathless_mutation_grounding_probe_prefers_test_affined_symbol_match_among_multiple_explicit_sources(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -10557,6 +10583,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_pathless_mutation_grounding_probe_prefers_unique_symbol_match_among_multiple_explicit_sources",
         "test_trajectory_grounding_probe_keeps_ambiguous_multiple_explicit_sources_unresolved_without_context_pack",
         "test_trajectory_grounding_probe_uses_context_pack_for_ambiguous_multiple_explicit_sources",
+        "test_trajectory_ground_guard_lists_ambiguous_pathless_candidates_after_search",
         "test_pathless_mutation_grounding_probe_prefers_test_affined_symbol_match_among_multiple_explicit_sources",
         "test_contextual_explicit_source_path_prefers_recent_test_bridge_within_named_sources",
         "test_pathless_mutation_grounding_probe_prefers_recent_named_source_when_explicit_symbol_matches_tie",

@@ -6822,6 +6822,50 @@ class OllamaCodeAgent:
             return True
         return False
 
+    def _pathless_mutation_ambiguity_message(
+        self,
+        *,
+        request_text: str,
+        name: str,
+        arguments: dict[str, Any],
+        required_mutation_paths: set[str],
+        successful_tool_results: list[dict[str, Any]],
+    ) -> str | None:
+        if self._mutation_has_explicit_path_target(arguments):
+            return None
+        symbol_name = self._mutation_requested_symbol_name(name=name, arguments=arguments)
+        candidate_paths = self._explicit_source_repair_candidates(required_mutation_paths)
+        if not candidate_paths and symbol_name:
+            for item in reversed(successful_tool_results):
+                if item.get("name") != "search_symbols":
+                    continue
+                result = item.get("result") if isinstance(item.get("result"), dict) else {}
+                if result.get("ok") is not True:
+                    continue
+                arguments_dict = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+                if str(arguments_dict.get("query") or "").strip().lower() != symbol_name.lower():
+                    continue
+                candidate_paths = list(
+                    dict.fromkeys(
+                        path
+                        for path, qualname in self._parse_search_symbols_matches(str(result.get("output") or ""))
+                        if not self._path_looks_like_test_file(path)
+                        and qualname.rsplit(".", 1)[-1].lower() == symbol_name.lower()
+                    )
+                )
+                break
+        if len(candidate_paths) < 2:
+            return None
+        candidate_list = ", ".join(candidate_paths[:4])
+        target_label = symbol_name or "the requested edit"
+        if len(candidate_paths) > 4:
+            candidate_list += f", and {len(candidate_paths) - 4} more"
+        return (
+            f"Pathless mutation for {target_label} is ambiguous across {candidate_list}. "
+            "Do not edit from weak grounding. Read the intended file or symbol, or retry with an explicit target path, before mutating. "
+            "Next JSON only."
+        )
+
     def _trajectory_grounding_probe(
         self,
         *,
@@ -12640,7 +12684,14 @@ class OllamaCodeAgent:
                                 }
                             )
                             continue
-                    self.messages.append({"role": "user", "content": self._trajectory_ground_guard_message(text)})
+                    ambiguity_message = self._pathless_mutation_ambiguity_message(
+                        request_text=text,
+                        name=name,
+                        arguments=arguments,
+                        required_mutation_paths=required_mutation_paths,
+                        successful_tool_results=successful_tool_results,
+                    )
+                    self.messages.append({"role": "user", "content": ambiguity_message or self._trajectory_ground_guard_message(text)})
                     continue
                 pending_repair_state = None
                 for repair_state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
