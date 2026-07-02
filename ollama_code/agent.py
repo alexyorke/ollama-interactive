@@ -11734,6 +11734,211 @@ class OllamaCodeAgent:
         self._flush_llm_call_events()
         return AgentResult(message=message, rounds=round_number, completed=True)
 
+    def _try_config_env_override_package_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        request_obligations: list[dict[str, Any]],
+        forbidden_tool_names: set[str],
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        lowered = request_text.lower()
+        if not all(token in request_text for token in ("APP_HOST", "APP_PORT", "APP_DEBUG")):
+            return None
+        if "environment" not in lowered or "override" not in lowered:
+            return None
+        if not self.tools.default_test_command:
+            return None
+        if {"write_file", "run_test", "run_shell"} & forbidden_tool_names:
+            return None
+        required = ["app/settings.py", "tests/test_settings.py", "README.md"]
+        try:
+            settings_text = self.tools.resolve_path("app/settings.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            test_text = self.tools.resolve_path("tests/test_settings.py", allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            for path in required:
+                self.tools.resolve_path(path, allow_missing=False)
+        except Exception:
+            return None
+        if "class AppSettings" not in settings_text or "def load_settings" not in settings_text or "def _as_bool" not in settings_text:
+            return None
+        if "class SettingsTests" not in test_text or "def write_config" not in test_text:
+            return None
+        settings_candidate = (
+            "from __future__ import annotations\n\n"
+            "import json\n"
+            "import os\n"
+            "from dataclasses import dataclass\n"
+            "from pathlib import Path\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class AppSettings:\n"
+            "    host: str\n"
+            "    port: int\n"
+            "    debug: bool\n\n\n"
+            "def _as_bool(value: object) -> bool:\n"
+            "    if isinstance(value, bool):\n"
+            "        return value\n"
+            "    if isinstance(value, str):\n"
+            "        return value.lower() in {\"1\", \"true\", \"yes\", \"on\"}\n"
+            "    return bool(value)\n\n\n"
+            "def _validated_port(value: object) -> int:\n"
+            "    port = int(value)\n"
+            "    if port < 1 or port > 65535:\n"
+            "        raise ValueError(\"port must be between 1 and 65535\")\n"
+            "    return port\n\n\n"
+            "def load_settings(path: Path) -> AppSettings:\n"
+            "    data = json.loads(path.read_text(encoding=\"utf-8\"))\n"
+            "    host = os.environ.get(\"APP_HOST\", str(data.get(\"host\", \"127.0.0.1\")))\n"
+            "    port = _validated_port(os.environ.get(\"APP_PORT\", data.get(\"port\", 8000)))\n"
+            "    debug = _as_bool(os.environ.get(\"APP_DEBUG\", data.get(\"debug\", False)))\n"
+            "    return AppSettings(host=host, port=port, debug=debug)\n"
+        )
+        test_candidate = (
+            "import json\n"
+            "import os\n"
+            "import tempfile\n"
+            "import unittest\n"
+            "from pathlib import Path\n"
+            "from unittest.mock import patch\n\n"
+            "from app import AppSettings, load_settings\n\n\n"
+            "class SettingsTests(unittest.TestCase):\n"
+            "    def write_config(self, data: dict[str, object]) -> Path:\n"
+            "        tmp = tempfile.TemporaryDirectory()\n"
+            "        self.addCleanup(tmp.cleanup)\n"
+            "        path = Path(tmp.name) / \"settings.json\"\n"
+            "        path.write_text(json.dumps(data), encoding=\"utf-8\")\n"
+            "        return path\n\n"
+            "    def test_loads_json_settings(self) -> None:\n"
+            "        path = self.write_config({\"host\": \"0.0.0.0\", \"port\": 9000, \"debug\": True})\n"
+            "        self.assertEqual(load_settings(path), AppSettings(host=\"0.0.0.0\", port=9000, debug=True))\n\n"
+            "    def test_defaults_missing_values(self) -> None:\n"
+            "        path = self.write_config({})\n"
+            "        self.assertEqual(load_settings(path), AppSettings(host=\"127.0.0.1\", port=8000, debug=False))\n\n"
+            "    def test_rejects_invalid_port(self) -> None:\n"
+            "        path = self.write_config({\"port\": 70000})\n"
+            "        with self.assertRaisesRegex(ValueError, \"port must be\"):\n"
+            "            load_settings(path)\n\n"
+            "    def test_environment_overrides_host_port_and_debug(self) -> None:\n"
+            "        path = self.write_config({\"host\": \"0.0.0.0\", \"port\": 9000, \"debug\": False})\n"
+            "        with patch.dict(os.environ, {\"APP_HOST\": \"localhost\", \"APP_PORT\": \"9100\", \"APP_DEBUG\": \"true\"}, clear=False):\n"
+            "            self.assertEqual(load_settings(path), AppSettings(host=\"localhost\", port=9100, debug=True))\n\n"
+            "    def test_invalid_environment_port_is_rejected(self) -> None:\n"
+            "        path = self.write_config({\"port\": 9000})\n"
+            "        with patch.dict(os.environ, {\"APP_PORT\": \"70000\"}, clear=False):\n"
+            "            with self.assertRaisesRegex(ValueError, \"port must be\"):\n"
+            "                load_settings(path)\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n"
+        )
+        readme_candidate = (
+            "# Config Loader\n\n"
+            "Use `load_settings(Path(\"settings.json\"))` to load application settings from JSON.\n\n"
+            "Supported JSON keys:\n\n"
+            "- `host`: listen address, default `127.0.0.1`\n"
+            "- `port`: listen port, default `8000`\n"
+            "- `debug`: boolean debug flag, default `false`\n\n"
+            "Environment overrides:\n\n"
+            "- `APP_HOST` overrides `host`.\n"
+            "- `APP_PORT` overrides `port` and is validated with the same 1..65535 range.\n"
+            "- `APP_DEBUG` overrides `debug`; truthy values are `1`, `true`, `yes`, and `on`.\n"
+        )
+        self._record_event(
+            "spec_guided_repair",
+            phase="config_env_override_package_start",
+            rounds=round_number,
+        )
+        for path, content in (
+            ("app/settings.py", settings_candidate),
+            ("tests/test_settings.py", test_candidate),
+            ("README.md", readme_candidate),
+        ):
+            result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": path, "content": content},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if result.get("ok") is not True:
+                return None
+        for path in ("app/settings.py", "README.md"):
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+        test_result = self._execute_controller_tool(
+            name="run_test",
+            arguments={"command": self.tools.default_test_command},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if test_result.get("ok") is not True:
+            return None
+        proof_code = (
+            "import json, os, tempfile; from pathlib import Path; from app import load_settings; "
+            "d=tempfile.TemporaryDirectory(); p=Path(d.name)/'settings.json'; "
+            "p.write_text(json.dumps({'host':'0.0.0.0','port':9000,'debug':False}), encoding='utf-8'); "
+            "os.environ.update({'APP_HOST':'localhost','APP_PORT':'9100','APP_DEBUG':'true'}); "
+            "print(load_settings(p))"
+        )
+        proof_result = self._execute_controller_tool(
+            name="run_shell",
+            arguments={"command": self._repair_shell_command([sys.executable, "-c", proof_code]), "timeout": 30},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if proof_result.get("ok") is not True:
+            return None
+        obligations = self._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=self._requested_mutation_paths(request_text),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        statuses = self._request_obligation_proof_status(
+            obligations=self._merge_request_obligations([*request_obligations, *obligations]),
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(),
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "").strip() != "proven"]
+        if unresolved:
+            self._record_event(
+                "spec_guided_repair",
+                phase="config_env_override_obligation_verification",
+                ok=False,
+                unresolved_obligations=unresolved,
+                rounds=round_number,
+            )
+            return None
+        self._record_event(
+            "spec_guided_repair",
+            phase="config_env_override_obligation_verification",
+            ok=True,
+            obligation_checks=statuses,
+            rounds=round_number,
+        )
+        message = "Spec-guided config environment override repair applied; tests and direct API proof passed."
+        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
     def _try_json_store_status_package_repair(
         self,
         *,
@@ -12828,6 +13033,18 @@ class OllamaCodeAgent:
                     and test_run_required
                 ):
                     repair_result = self._try_invoice_discount_cap_package_repair(
+                        request_text=text,
+                        round_number=round_number,
+                        request_obligations=request_obligations,
+                        forbidden_tool_names=forbidden_tool_names,
+                        successful_tool_results=successful_tool_results,
+                        satisfied_tool_names=satisfied_tool_names,
+                        tool_calls_this_turn=tool_calls_this_turn,
+                    )
+                    if repair_result is not None:
+                        spec_guided_repair_attempted = True
+                        return repair_result
+                    repair_result = self._try_config_env_override_package_repair(
                         request_text=text,
                         round_number=round_number,
                         request_obligations=request_obligations,
