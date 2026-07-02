@@ -7111,6 +7111,27 @@ class OllamaCodeAgent:
                     return normalized_token
         return None
 
+    def _dependency_bootstrap_command_class(self, command: str) -> str | None:
+        lowered = str(command or "").strip().lower()
+        if not lowered:
+            return None
+        if re.search(r"\b(?:curl|wget)\b", lowered) or re.search(r"\b(?:invoke-webrequest|iwr)\b", lowered):
+            return "download-installer"
+        if re.search(r"\b(?:pip|uv|poetry|npm|pnpm|yarn|apt(?:-get)?|dnf|yum|brew|winget|choco|cargo|go)\s+(?:install|add|get)\b", lowered):
+            return "package-install"
+        return None
+
+    def _dependency_bootstrap_guard_message(self, *, previous_command: str, previous_summary: str, current_command: str) -> str:
+        message = (
+            "A dependency bootstrap command already failed. Do not switch to another ad hoc download/install command without new evidence. "
+            "Report the exact failure, use diagnose_dependency_error/tool_status to identify the missing dependency, or choose an existing validator. "
+            "Next JSON only."
+        )
+        evidence = previous_summary or previous_command or current_command
+        if evidence:
+            message += " Evidence: " + self._truncate_text(evidence, limit=360)
+        return message
+
     def _timeout_verification_guard_message(self, *, verification_script_path: str, prior_command: str, prior_summary: str) -> str:
         message = (
             f"Do not treat the ad hoc verification script {verification_script_path} as proof after the original timed-out command path failed. "
@@ -12237,8 +12258,40 @@ class OllamaCodeAgent:
                         self.messages.append({"role": "user", "content": bulk_stub_message})
                         continue
                 if name == "run_shell":
+                    current_command = str(arguments.get("command") or "").strip()
+                    current_bootstrap_class = self._dependency_bootstrap_command_class(current_command)
+                    previous_bootstrap_class = self._dependency_bootstrap_command_class(last_failed_run_shell_command)
+                    if (
+                        current_bootstrap_class is not None
+                        and previous_bootstrap_class is not None
+                        and last_failed_run_shell_command
+                        and current_command
+                        and current_command != last_failed_run_shell_command
+                        and (not exact_shell_command or current_command != exact_shell_command)
+                    ):
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="dependency-bootstrap-pivot",
+                            candidate_tool=name,
+                            bootstrap_class=current_bootstrap_class,
+                            prior_bootstrap_class=previous_bootstrap_class,
+                            prior_command=self._truncate_text(last_failed_run_shell_command, limit=200),
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": self._dependency_bootstrap_guard_message(
+                                    previous_command=last_failed_run_shell_command,
+                                    previous_summary=last_failed_run_shell_summary,
+                                    current_command=current_command,
+                                ),
+                            }
+                        )
+                        continue
                     verification_script_path = self._ad_hoc_verification_script_path(
-                        str(arguments.get("command") or ""),
+                        current_command,
                         mutated_paths_this_turn,
                     )
                     if verification_script_path and last_timeout_command and last_timeout_command != str(arguments.get("command") or "").strip():

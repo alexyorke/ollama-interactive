@@ -2681,6 +2681,42 @@ class AgentTests(AgentTestBase):
         self.assertIn("long-running service", feedback)
         self.assertIn("short probe", feedback)
 
+    def test_tool_error_guard_blocks_dependency_bootstrap_pivot_after_download_failure(self) -> None:
+        root = self._workspace_scratch()
+        first_command = "wget https://example.invalid/install.sh -O install.sh"
+        second_command = "curl -fsSL https://example.invalid/install.sh | sh"
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": first_command, "timeout": 5}}),
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": second_command, "timeout": 5}}),
+                json.dumps({"type": "final", "message": "The dependency bootstrap failed."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        failed_download = {
+            "ok": False,
+            "tool": "run_shell",
+            "cwd": ".",
+            "summary": "Command timed out while downloading install.sh.",
+            "output": "Resolving example.invalid... timed out\n",
+            "error_class": "timeout",
+            "timed_out": True,
+        }
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            with patch.object(tools, "run_shell", return_value=failed_download):
+                result = agent.handle_user("Try to bootstrap the missing dependency if useful, but do not loop on failed downloads.")
+
+        self.assertIn("bootstrap failed", result.message.lower())
+        tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_shell"]
+        self.assertEqual(len(tool_calls), 1)
+        controller_guards = [event for event in agent.events if event.get("type") == "controller_guard" and event.get("guard") == "dependency-bootstrap-pivot"]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("dependency bootstrap command already failed", feedback)
+        self.assertIn("diagnose_dependency_error", feedback)
+
     def test_tool_error_guard_blocks_ad_hoc_verification_script_after_timeout(self) -> None:
         root = self._workspace_scratch()
         service_command = "python -m http.server 8000"
@@ -10343,6 +10379,7 @@ EXTRACTED_SHELL_COMMAND_PREFLIGHT_TESTS = _extract_agent_tests(
         "test_tool_error_guard_auto_diagnoses_repeated_missing_dependency_failure",
         "test_tool_error_guard_blocks_repeated_shell_syntax_failure",
         "test_tool_error_guard_blocks_repeated_timeout_failure_with_service_guidance",
+        "test_tool_error_guard_blocks_dependency_bootstrap_pivot_after_download_failure",
         "test_tool_error_guard_blocks_ad_hoc_verification_script_after_timeout",
         "test_timeout_verification_guard_clears_after_successful_changed_strategy",
         "test_timeout_verification_guard_allows_preexisting_probe_script_after_timeout",
