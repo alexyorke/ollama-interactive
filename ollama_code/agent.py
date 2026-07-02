@@ -6128,7 +6128,7 @@ class OllamaCodeAgent:
     ) -> bool:
         if name in CONTEXT_GATHERING_TOOL_NAMES and self._context_tool_streak(tool_calls) >= 3:
             return True
-        if not cache_hit and self._same_tool_call_count(tool_calls, name, arguments) >= 2:
+        if self._same_tool_call_count(tool_calls, name, arguments) >= 2:
             return True
         return False
 

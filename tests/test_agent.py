@@ -7097,6 +7097,32 @@ class AgentTests(AgentTestBase):
         self.assertFalse(tool_results[0].get("cached", False))
         self.assertTrue(tool_results[1].get("cached", False))
 
+    def test_agent_blocks_third_identical_cached_symbol_search(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"search_symbols","arguments":{"query":"wrapped","path":"src"}}',
+                    '{"type":"tool","name":"search_symbols","arguments":{"query":"wrapped","path":"src"}}',
+                    '{"type":"tool","name":"search_symbols","arguments":{"query":"wrapped","path":"src"}}',
+                    '{"type":"final","message":"wrapped is in src/core.py"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+            result = agent.handle_user("Find the wrapped implementation in src and summarize the match.")
+
+        self.assertEqual(result.message, "wrapped is in src/core.py")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        search_tool_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "search_symbols"]
+        self.assertEqual(len(search_tool_calls), 2)
+        tool_results = [event for event in agent.events if event.get("type") == "tool_result" and event.get("name") == "search_symbols"]
+        self.assertEqual(len(tool_results), 2)
+        self.assertTrue(tool_results[1].get("cached", False))
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "loop-cap" for event in agent.events))
+
     def test_agent_compacts_large_tool_results_in_follow_up_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -10435,6 +10461,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
 
 EXTRACTED_FAILURE_COMPRESSION_TESTS = _extract_agent_tests(
     (
+        "test_agent_blocks_third_identical_cached_symbol_search",
         "test_trajectory_failure_compression_auto_diagnoses_repeated_run_test",
         "test_trajectory_failure_compression_diagnoses_first_failed_test_before_more_context",
     )
