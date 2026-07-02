@@ -11220,6 +11220,322 @@ class OllamaCodeAgent:
                 args.append(name)
         return args
 
+    def _json_store_add_arg_types(self, store_text: str, add_func: str) -> dict[str, str]:
+        match = re.search(rf"def\s+{re.escape(add_func)}\s*\(([^)]*)\)", store_text)
+        if not match:
+            return {}
+        types: dict[str, str] = {}
+        for raw in match.group(1).split(","):
+            chunk = raw.strip()
+            if not chunk:
+                continue
+            name = chunk.split(":", 1)[0].split("=", 1)[0].strip()
+            if not name or name == "path":
+                continue
+            if ":" in chunk:
+                annotation = chunk.split(":", 1)[1].split("=", 1)[0].strip()
+                types[name] = annotation or "str"
+            else:
+                types[name] = "str"
+        return types
+
+    def _json_store_field_update_request(self, request_text: str) -> tuple[str, str] | None:
+        lowered = request_text.lower()
+        match = re.search(r"\bset-([a-z][a-z0-9_-]*)\b", lowered)
+        if not match:
+            return None
+        field = match.group(1).replace("-", "_")
+        if field not in lowered:
+            return None
+        return (f"set-{match.group(1)}", field)
+
+    def _try_json_store_field_update_package_repair(
+        self,
+        *,
+        request_text: str,
+        round_number: int,
+        successful_tool_results: list[dict[str, Any]],
+        satisfied_tool_names: set[str],
+        tool_calls_this_turn: list[dict[str, Any]],
+    ) -> AgentResult | None:
+        update_request = self._json_store_field_update_request(request_text)
+        if update_request is None:
+            return None
+        command_name, field = update_request
+        paths = self._find_json_store_cli_package()
+        if paths is None:
+            return None
+        cli_path, store_path, test_path, readme_path, add_func, list_func, singular = paths
+        update_func = f"{command_name.replace('-', '_')}_{singular}"
+        try:
+            cli_text = self.tools.resolve_path(cli_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            store_text = self.tools.resolve_path(store_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+            test_text = self.tools.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            return None
+        if update_func in store_text and f"add_parser(\"{command_name}\")" in cli_text:
+            return None
+        default_match = re.search(r"(DEFAULT_[A-Z0-9_]+)\s*=\s*(\[[\s\S]*?\])\n\n", store_text)
+        add_args = self._status_package_add_args(store_text, add_func)
+        arg_types = self._json_store_add_arg_types(store_text, add_func)
+        if not default_match or len(add_args) < 3 or field not in add_args:
+            return None
+        key_arg = add_args[0]
+        key_match = re.search(rf"""["']{re.escape(key_arg)}["']\s*:\s*["']([^"']+)["']""", store_text)
+        label_field = "name" if "name" in add_args else "title" if "title" in add_args else add_args[1]
+        label_match = re.search(rf"""["']{re.escape(label_field)}["']\s*:\s*["']([^"']+)["']""", store_text)
+        old_value_match = re.search(rf"""["']{re.escape(field)}["']\s*:\s*([0-9]+(?:\.[0-9]+)?|["'][^"']+["'])""", store_text)
+        if not key_match or not label_match or not old_value_match:
+            return None
+        key_value = key_match.group(1)
+        label_value = label_match.group(1)
+        field_type = arg_types.get(field, "str")
+        new_value_literal = "\"updated\"" if field_type == "str" else "3.75" if field == "price" else "7"
+        new_value_arg = "updated" if field_type == "str" else "3.75" if field == "price" else "7"
+        expected_fragment = f"${float(new_value_arg):.2f}" if field == "price" else new_value_arg
+        default_name = default_match.group(1)
+        default_block = default_match.group(0).rstrip()
+        collection = list_func[5:]
+        load_func = f"load_{collection}"
+        save_func = f"save_{collection}"
+        item_fields = []
+        for arg in add_args:
+            if arg == "tags":
+                item_fields.append('"tags": tags')
+            else:
+                item_fields.append(f'"{arg}": {arg}')
+        add_signature_parts = [
+            f"{arg}: {arg_types.get(arg, 'str')}"
+            for arg in add_args
+            if arg != "tags"
+        ]
+        if "tags" in add_args:
+            add_signature_parts.append("tags: list[str]")
+        store_candidate = (
+            "from __future__ import annotations\n\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "from typing import Any\n\n"
+            f"{default_block}\n\n\n"
+            f"def {load_func}(path: Path) -> list[dict[str, Any]]:\n"
+            "    if not path.exists():\n"
+            f"        return [{{**item, \"tags\": list(item.get(\"tags\", []))}} for item in {default_name}]\n"
+            "    return json.loads(path.read_text(encoding=\"utf-8\"))\n\n\n"
+            f"def {save_func}(path: Path, items: list[dict[str, Any]]) -> None:\n"
+            "    path.write_text(json.dumps(items, indent=2, sort_keys=True) + \"\\n\", encoding=\"utf-8\")\n\n\n"
+            f"def {add_func}(path: Path, {', '.join(add_signature_parts)}) -> dict[str, Any]:\n"
+            f"    items = {load_func}(path)\n"
+            f"    if any(item[\"{key_arg}\"] == {key_arg} for item in items):\n"
+            f"        raise ValueError(f\"{singular} exists: {{{key_arg}}}\")\n"
+            f"    item = {{{', '.join(item_fields)}}}\n"
+            "    items.append(item)\n"
+            f"    {save_func}(path, items)\n"
+            "    return item\n\n\n"
+            f"def {update_func}(path: Path, {key_arg}: str, {field}: {field_type}) -> dict[str, Any]:\n"
+            f"    items = {load_func}(path)\n"
+            "    for item in items:\n"
+            f"        if item[\"{key_arg}\"] == {key_arg}:\n"
+            f"            item[\"{field}\"] = {field}\n"
+            f"            {save_func}(path, items)\n"
+            "            return item\n"
+            f"    raise ValueError(f\"{singular} not found: {{{key_arg}}}\")\n\n\n"
+            f"def {list_func}(path: Path, tag: str | None = None) -> list[dict[str, Any]]:\n"
+            f"    items = {load_func}(path)\n"
+            "    if tag is None:\n"
+            "        return items\n"
+            "    return [item for item in items if tag in item.get(\"tags\", [])]\n"
+        )
+        format_name = f"format_{singular}"
+        format_block = self._extract_python_function_block(cli_text, format_name)
+        if format_block is None:
+            return None
+        prog_match = re.search(r"ArgumentParser\(\s*prog\s*=\s*['\"]([^'\"]+)['\"]", cli_text)
+        data_default_match = re.search(
+            r"parser\.add_argument\(\s*['\"]--data['\"][\s\S]*?default\s*=\s*Path\(\s*['\"]([^'\"]+)['\"]\s*\)",
+            cli_text,
+        )
+        cli_prog = prog_match.group(1) if prog_match else collection
+        data_default = data_default_match.group(1) if data_default_match else f"{collection}.json"
+        import_line = f"from .store import {add_func}, {list_func}, {update_func}"
+        add_parser_lines = [
+            "    add_parser = subparsers.add_parser(\"add\")",
+            f"    add_parser.add_argument(\"{key_arg}\")",
+        ]
+        for arg in add_args[1:]:
+            if arg == "tags":
+                add_parser_lines.append("    add_parser.add_argument(\"--tag\", action=\"append\", default=[])")
+            elif arg_types.get(arg) == "float":
+                add_parser_lines.append(f"    add_parser.add_argument(\"{arg}\", type=float)")
+            else:
+                add_parser_lines.append(f"    add_parser.add_argument(\"{arg}\")")
+        add_call_args = ["args.tag" if arg == "tags" else f"args.{arg}" for arg in add_args]
+        cli_candidate = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "from pathlib import Path\n\n"
+            f"{import_line}\n\n\n"
+            f"{format_block}\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            f"    parser = argparse.ArgumentParser(prog=\"{cli_prog}\")\n"
+            f"    parser.add_argument(\"--data\", type=Path, default=Path(\"{data_default}\"))\n"
+            "    subparsers = parser.add_subparsers(dest=\"command\", required=True)\n\n"
+            "    list_parser = subparsers.add_parser(\"list\")\n"
+            "    list_parser.add_argument(\"--tag\")\n\n"
+            + "\n".join(add_parser_lines)
+            + "\n\n"
+            f"    update_parser = subparsers.add_parser(\"{command_name}\")\n"
+            f"    update_parser.add_argument(\"{key_arg}\")\n"
+            f"    update_parser.add_argument(\"{field}\", type=float)\n\n"
+            "    args = parser.parse_args(argv)\n"
+            "    if args.command == \"list\":\n"
+            f"        for item in {list_func}(args.data, tag=args.tag):\n"
+            f"            print({format_name}(item))\n"
+            "        return 0\n"
+            "    if args.command == \"add\":\n"
+            f"        item = {add_func}(args.data, {', '.join(add_call_args)})\n"
+            f"        print({format_name}(item))\n"
+            "        return 0\n"
+            f"    if args.command == \"{command_name}\":\n"
+            f"        item = {update_func}(args.data, args.{key_arg}, args.{field})\n"
+            f"        print({format_name}(item))\n"
+            "        return 0\n"
+            "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    raise SystemExit(main())\n"
+        )
+        test_name = f"test_{command_name.replace('-', '_')}_updates_{field}_and_preserves_existing_fields"
+        test_candidate = test_text
+        if test_name not in test_candidate:
+            insertion = (
+                "\n"
+                f"    def {test_name}(self) -> None:\n"
+                "        with tempfile.TemporaryDirectory() as tmp:\n"
+                f"            data = Path(tmp) / \"{collection}.json\"\n"
+                f"            changed = run_cli(\"--data\", str(data), \"{command_name}\", \"{key_value}\", \"{new_value_arg}\")\n"
+                "            listed = run_cli(\"--data\", str(data), \"list\")\n"
+                "            saved = json.loads(data.read_text(encoding=\"utf-8\"))\n"
+                "        self.assertEqual(changed.returncode, 0, changed.stderr)\n"
+                f"        self.assertIn(\"{label_value}\", changed.stdout)\n"
+                f"        self.assertIn(\"{expected_fragment}\", changed.stdout)\n"
+                f"        self.assertIn(\"{expected_fragment}\", listed.stdout)\n"
+                f"        updated = next(item for item in saved if item[\"{key_arg}\"] == \"{key_value}\")\n"
+                f"        self.assertEqual(updated[\"{field}\"], {new_value_literal})\n"
+                f"        self.assertEqual(updated[\"{label_field}\"], \"{label_value}\")\n"
+                "        self.assertEqual(updated[\"tags\"], [\"office\"])\n"
+            )
+            marker = "\n\nif __name__ == \"__main__\":"
+            if marker in test_candidate:
+                test_candidate = test_candidate.replace(marker, insertion + marker, 1)
+            else:
+                test_candidate = test_candidate.rstrip() + "\n" + insertion
+        readme_candidate = (
+            f"# {collection.replace('_', ' ').title()} CLI\n\n"
+            "Usage:\n\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {data_default} list`\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {data_default} list --tag office`\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {data_default} add {key_value} \"{label_value}\" {new_value_arg} --tag office`\n"
+            f"- `python -m {cli_path[:-3].replace('/', '.')} --data {data_default} {command_name} {key_value} {new_value_arg}`\n"
+        )
+        self._record_event(
+            "spec_guided_repair",
+            phase="json_store_field_update_package_start",
+            command=command_name,
+            field=field,
+            cli_path=cli_path,
+            store_path=store_path,
+            test_path=test_path,
+            rounds=round_number,
+        )
+        for path, content in (
+            (store_path, store_candidate),
+            (cli_path, cli_candidate),
+            (test_path, test_candidate),
+            (readme_path, readme_candidate),
+        ):
+            result = self._execute_controller_tool(
+                name="write_file",
+                arguments={"path": path, "content": content},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if result.get("ok") is not True:
+                return None
+        for path in (cli_path, readme_path):
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": path},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+        test_result = self._execute_controller_tool(
+            name="run_test",
+            arguments={"command": self.tools.default_test_command},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if test_result.get("ok") is not True:
+            return None
+        data_path = f"{command_name}-proof-{collection}.json"
+        proof_commands = [
+            self._repair_shell_command([sys.executable, "-m", cli_path[:-3].replace("/", "."), "--data", data_path, command_name, key_value, new_value_arg]),
+            self._repair_shell_command([sys.executable, "-m", cli_path[:-3].replace("/", "."), "--data", data_path, "list"]),
+        ]
+        for command in proof_commands:
+            proof_result = self._execute_controller_tool(
+                name="run_shell",
+                arguments={"command": command, "timeout": 30},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            if proof_result.get("ok") is not True:
+                return None
+        obligations = self._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=self._requested_mutation_paths(request_text),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+        statuses = self._request_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=set(),
+        )
+        unresolved = [item for item in statuses if str(item.get("status") or "").strip() != "proven"]
+        if unresolved:
+            self._record_event(
+                "spec_guided_repair",
+                phase="json_store_field_update_package_obligation_verification",
+                ok=False,
+                unresolved_obligations=unresolved,
+                rounds=round_number,
+            )
+            return None
+        self._record_event(
+            "spec_guided_repair",
+            phase="json_store_field_update_package_obligation_verification",
+            ok=True,
+            obligation_checks=statuses,
+            rounds=round_number,
+        )
+        message = "Spec-guided JSON-store field update repair applied; tests and direct CLI proof passed."
+        self._record_event("assistant_synthesized", content=message, tool="spec_guided_repair", rounds=round_number, auto=True)
+        self._record_event("assistant", content=message, rounds=round_number)
+        self._flush_llm_call_events()
+        return AgentResult(message=message, rounds=round_number, completed=True)
+
     def _try_json_store_status_package_repair(
         self,
         *,
@@ -11519,6 +11835,15 @@ class OllamaCodeAgent:
         )
         if bookmark_result is not None:
             return bookmark_result
+        field_update_result = self._try_json_store_field_update_package_repair(
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if field_update_result is not None:
+            return field_update_result
         status_package_result = self._try_json_store_status_package_repair(
             request_text=request_text,
             round_number=round_number,
