@@ -168,6 +168,39 @@ class EmptySelectTestsLintFallbackToolExecutor(EmptySelectTestsToolExecutor):
         return ToolExecutor.execute(self, name, arguments)
 
 
+class WorkflowValidatorToolExecutor(CountingToolExecutor):
+    def __init__(self, *args: object, workflow_command: str, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.workflow_command = workflow_command
+
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
+        if name == "discover_validators":
+            return {
+                "ok": True,
+                "tool": "discover_validators",
+                "validators": [
+                    {
+                        "kind": "test",
+                        "lang": "python",
+                        "command": str(self.default_test_command or ""),
+                        "available": True,
+                        "reason": "configured tests",
+                    },
+                    {
+                        "kind": "lint",
+                        "lang": "github-actions",
+                        "command": self.workflow_command,
+                        "available": True,
+                        "reason": "GitHub Actions workflow files found.",
+                    },
+                ],
+                "summary": "Discovered workflow validator.",
+                "output": f"lint github-actions: {self.workflow_command} available=True reason=GitHub Actions workflow files found.",
+            }
+        return ToolExecutor.execute(self, name, arguments)
+
+
 class AgentTests(AgentTestBase):
     def _primary_tools_for_request(
         self,
@@ -2555,6 +2588,53 @@ class AgentTests(AgentTestBase):
         self.assertEqual(tools.execute_counts.get("run_test"), 1)
         auto_validation_names = [event.get("name") for event in agent.events if event.get("type") == "auto_validation"]
         self.assertEqual(auto_validation_names[:2], ["discover_validators", "run_test"])
+
+    def test_post_edit_validation_prefers_workflow_validator_after_workflow_edit(self) -> None:
+        root = self._workspace_scratch()
+        workflow_dir = root / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        workflow_path = workflow_dir / "ci.yml"
+        workflow_path.write_text(
+            "name: CI\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  test:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: python -m unittest\n",
+            encoding="utf-8",
+        )
+        workflow_command = subprocess.list2cmdline([sys.executable, "-c", "print('actionlint ok')"])
+        default_test_command = subprocess.list2cmdline([sys.executable, "-c", "print('tests ok')"])
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":".github/workflows/ci.yml"}}',
+                '{"type":"tool","name":"replace_in_file","arguments":{"path":".github/workflows/ci.yml","old":"python -m unittest","new":"python -m unittest discover -s tests"}}',
+                '{"type":"final","message":"Updated workflow validation."}',
+                '{"type":"final","message":"Updated workflow validation."}',
+            ]
+        )
+        tools = WorkflowValidatorToolExecutor(
+            root,
+            approval_mode="auto",
+            test_command=default_test_command,
+            workflow_command=workflow_command,
+        )
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Update .github/workflows/ci.yml to use unittest discovery.")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(result.message, "Updated workflow validation.")
+        self.assertIn("python -m unittest discover -s tests", workflow_path.read_text(encoding="utf-8"))
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_names[:4], ["read_file", "replace_in_file", "discover_validators", "run_test"])
+        run_tests = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "run_test"]
+        self.assertEqual(run_tests[0].get("arguments", {}).get("command"), workflow_command)
+        self.assertNotEqual(run_tests[0].get("arguments", {}).get("command"), default_test_command)
+        auto_validation = [event for event in agent.events if event.get("type") == "auto_validation"]
+        self.assertEqual(auto_validation[1].get("reason"), "github-actions validator command selected after validator discovery")
 
     def test_placeholder_completion_reprompts_after_stub_like_code_edit_without_failed_tests(self) -> None:
         root = self._workspace_scratch()
@@ -10660,6 +10740,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_trajectory_validation_selects_targeted_tests_after_edit",
         "test_post_edit_validation_runs_before_extra_context_read",
         "test_post_edit_validation_runs_after_non_code_edit_before_final",
+        "test_post_edit_validation_prefers_workflow_validator_after_workflow_edit",
         "test_post_edit_validation_runs_discovered_lint_after_non_code_edit_without_tests",
         "test_post_edit_validation_runs_non_test_validator_when_request_skips_tests",
         "test_post_edit_validation_runs_code_sanity_when_request_skips_tests",

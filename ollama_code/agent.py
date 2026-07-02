@@ -7462,6 +7462,29 @@ class OllamaCodeAgent:
             return "run_test", {"command": self.tools.default_test_command}, "configured test command"
         return None
 
+    def _preferred_non_code_validator_langs(self, mutated_paths: set[str]) -> list[str]:
+        preferred: list[str] = []
+
+        def add(lang: str) -> None:
+            if lang not in preferred:
+                preferred.append(lang)
+
+        for raw_path in sorted(mutated_paths):
+            normalized = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+            lowered = normalized.lower()
+            suffix = Path(lowered).suffix
+            name = Path(lowered).name
+            if lowered.startswith((".github/workflows/", "github/workflows/")) and suffix in {".yml", ".yaml"}:
+                add("github-actions")
+                add("yaml")
+            elif suffix in {".yml", ".yaml"}:
+                add("yaml")
+            elif suffix in {".sh", ".bash"}:
+                add("shell")
+            elif name == "dockerfile" or name.endswith(".dockerfile"):
+                add("dockerfile")
+        return preferred
+
     def _discover_validators_followup(
         self,
         validation_result: dict[str, Any],
@@ -7470,13 +7493,30 @@ class OllamaCodeAgent:
         allow_tests: bool,
         allow_non_test_validators: bool,
         run_non_test_validators_as_commands: bool = False,
+        preferred_validator_langs: list[str] | None = None,
     ) -> tuple[str, dict[str, Any], str] | None:
-        configured = str(self.tools.default_test_command or "").strip()
-        if allow_tests and configured and "run_test" not in forbidden_tool_names:
-            return "run_test", {"command": configured}, "test command selected after validator discovery"
         validators = validation_result.get("validators")
         if not isinstance(validators, list):
             return None
+        preferred_langs = [str(lang or "").strip().lower() for lang in list(preferred_validator_langs or []) if str(lang or "").strip()]
+        if allow_non_test_validators and run_non_test_validators_as_commands and preferred_langs and "run_test" not in forbidden_tool_names:
+            preferred_kinds = {"lint", "schema", "syntax", "check", "config", "format-check"}
+            for lang in preferred_langs:
+                for item in validators:
+                    if not isinstance(item, dict):
+                        continue
+                    if item.get("available") is not True:
+                        continue
+                    if str(item.get("lang") or "").strip().lower() != lang:
+                        continue
+                    if str(item.get("kind") or "").strip().lower() not in preferred_kinds:
+                        continue
+                    command = str(item.get("command") or "").strip()
+                    if command:
+                        return "run_test", {"command": command}, f"{lang} validator command selected after validator discovery"
+        configured = str(self.tools.default_test_command or "").strip()
+        if allow_tests and configured and "run_test" not in forbidden_tool_names:
+            return "run_test", {"command": configured}, "test command selected after validator discovery"
         priority_order: list[tuple[str, str, str]] = []
         if allow_tests:
             priority_order.append(("test", "run_test", "test command selected after validator discovery"))
@@ -7585,6 +7625,7 @@ class OllamaCodeAgent:
                 allow_tests=allow_tests,
                 allow_non_test_validators=bool(mutated_paths),
                 run_non_test_validators_as_commands=not bool(code_validation_paths),
+                preferred_validator_langs=self._preferred_non_code_validator_langs(mutated_paths),
             )
             if discovered_followup is not None:
                 followup_name, followup_arguments, followup_reason = discovered_followup
@@ -7652,6 +7693,7 @@ class OllamaCodeAgent:
                         allow_tests=allow_tests,
                         allow_non_test_validators=True,
                         run_non_test_validators_as_commands=False,
+                        preferred_validator_langs=self._preferred_non_code_validator_langs(mutated_paths),
                     )
                     if discovered_followup is not None:
                         followup_name, followup_arguments, followup_reason = discovered_followup
