@@ -3472,6 +3472,58 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Read the existing candidate first: reports/__init__.py", feedback)
 
+    def test_add_function_to_package_init_redirects_to_backing_module(self) -> None:
+        root = self._workspace_scratch()
+        (root / "logtools").mkdir()
+        (root / "logtools" / "__init__.py").write_text(
+            "from .summary import LogEvent, summarize_by_level\n\n"
+            "__all__ = [\"LogEvent\", \"summarize_by_level\"]\n",
+            encoding="utf-8",
+        )
+        (root / "logtools" / "summary.py").write_text(
+            "class LogEvent:\n"
+            "    pass\n\n\n"
+            "def summarize_by_level(events):\n"
+            "    return {}\n",
+            encoding="utf-8",
+        )
+        invalid_replacement = (
+            "def slowest_services(events, limit=3):\n"
+            "    \"Return slowest services.\n"
+            "    return []\n"
+        )
+        client = FakeClient(
+            [
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "logtools/__init__.py",
+                            "intent": "add_function",
+                            "target": "slowest_services",
+                            "replacement": invalid_replacement,
+                        },
+                    }
+                ),
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "logtools/summary.py"}}),
+                *[json.dumps({"type": "final", "message": "grounded implementation module"}) for _ in range(6)],
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        result = agent.handle_user("Add slowest_services to the package __init__.py and export it.")
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        guards = [event for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertTrue(any(event.get("guard") == "package-init-implementation-target" for event in guards))
+        self.assertFalse(any(event.get("guard") == "invalid-python-mutation-payload" for event in guards))
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Read and edit the backing implementation module `logtools/summary.py` first", feedback)
+
     def test_write_file_with_edit_markers_is_rejected_before_execution(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
@@ -12781,6 +12833,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_tool_error_guard_blocks_third_duplicate_path_failure",
         "test_path_missing_on_single_source_repo_auto_grounds_real_source",
         "test_missing_mutation_target_blocks_before_python_payload_syntax_guard",
+        "test_add_function_to_package_init_redirects_to_backing_module",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_repair_pivot_model_timeout_fails_closed",
         "test_final_round_repeated_mutating_failure_fails_closed",

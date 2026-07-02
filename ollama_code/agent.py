@@ -6527,6 +6527,32 @@ class OllamaCodeAgent:
                 return path, suggestions
         return "", []
 
+    def _package_init_add_function_sibling(self, arguments: dict[str, Any]) -> tuple[str, str]:
+        intent = str(arguments.get("intent") or "").strip().lower().replace("-", "_")
+        if intent not in {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
+            return "", ""
+        paths = self._mutation_target_paths(arguments)
+        if len(paths) != 1 or not paths[0].endswith("__init__.py"):
+            return "", ""
+        try:
+            init_path = self.tools.resolve_path(paths[0], allow_missing=False)
+        except Exception:
+            return "", ""
+        try:
+            siblings = [
+                path
+                for path in init_path.parent.glob("*.py")
+                if path.name != "__init__.py" and path.is_file()
+            ]
+        except Exception:
+            return "", ""
+        if len(siblings) != 1:
+            return "", ""
+        try:
+            return paths[0], self.tools.relative_label(siblings[0])
+        except Exception:
+            return "", ""
+
     def _python_mutation_payload_syntax_diagnostic(self, name: str, arguments: dict[str, Any]) -> str:
         path = ""
         for raw_path in self._mutation_target_paths(arguments):
@@ -14718,6 +14744,31 @@ class OllamaCodeAgent:
                                     f"The mutation target `{missing_path}` does not exist. "
                                     f"Do not mutate that missing path. Read the existing candidate first: {', '.join(suggestions[:3])}. "
                                     "Then edit the grounded file if it matches the requested feature. Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
+                if name == "edit_intent":
+                    init_path, implementation_path = self._package_init_add_function_sibling(arguments)
+                    if init_path and implementation_path:
+                        self._append_assistant_payload(payload)
+                        target = str(arguments.get("target") or "").strip()
+                        target_text = f" `{target}`" if target else ""
+                        self._record_event(
+                            "controller_guard",
+                            guard="package-init-implementation-target",
+                            init_path=init_path,
+                            implementation_path=implementation_path,
+                            target=target,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Do not implement{target_text} inside package re-export file `{init_path}`. "
+                                    f"Read and edit the backing implementation module `{implementation_path}` first. "
+                                    f"After the implementation exists, update `{init_path}` only to export it. Next JSON only."
                                 ),
                             }
                         )

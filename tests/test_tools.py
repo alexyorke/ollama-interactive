@@ -4430,6 +4430,28 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls pretty with 0 supplied args; expected 1", result["output"])
 
+    def test_contract_check_allows_dataclass_generated_constructor(self) -> None:
+        with self._temp_files_tools(
+            {
+                "logtools.py": (
+                    "from dataclasses import dataclass, field\n\n\n"
+                    "@dataclass(frozen=True)\n"
+                    "class LogEvent:\n"
+                    "    service: str\n"
+                    "    level: str\n"
+                    "    message: str\n"
+                    "    duration_ms: int = 0\n"
+                    "    cached: bool = field(default=False, init=False)\n\n\n"
+                    "def sample_event():\n"
+                    "    return LogEvent('api', 'info', 'started', 12)\n"
+                ),
+            }
+        ) as (_root, tools):
+            result = tools.contract_check(["logtools.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("calls LogEvent with 4 supplied args; expected 0", result["output"])
+
     def test_contract_check_ignores_business_todo_status_text(self) -> None:
         with self._temp_files_tools(
             {

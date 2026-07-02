@@ -9544,6 +9544,7 @@ import string
                 def visit_ClassDef(self, node: ast.ClassDef) -> Any:
                     qualname = ".".join([*self.stack, node.name])
                     init_node = next((child for child in node.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "__init__"), None)
+                    dataclass_args = self.outer._dataclass_contract_args(node)
                     is_exception_class = any(
                         (isinstance(base, ast.Name) and base.id in {"Exception", "BaseException"})
                         or (isinstance(base, ast.Attribute) and base.attr in {"Exception", "BaseException"})
@@ -9554,6 +9555,10 @@ import string
                         if args and str(args[0].get("name")) in {"self", "cls"}:
                             args = args[1:]
                         arity = self.outer._callable_arity_without_receiver(init_node.args)
+                    elif dataclass_args is not None:
+                        args = dataclass_args
+                        required = sum(1 for arg in args if bool(arg.get("required")))
+                        arity = {"min": required, "max": len(args), "has_vararg": False, "has_kwarg": False}
                     elif is_exception_class:
                         args = []
                         arity = {"min": 0, "max": None, "has_vararg": True, "has_kwarg": True}
@@ -9683,6 +9688,58 @@ import string
             if isinstance(arity.get("max"), int):
                 arity["max"] = max(0, int(arity["max"]) - 1)
         return arity
+
+    def _decorator_leaf(self, decorator: ast.AST) -> str:
+        target = decorator.func if isinstance(decorator, ast.Call) else decorator
+        if isinstance(target, ast.Name):
+            return target.id
+        if isinstance(target, ast.Attribute):
+            return target.attr
+        return ""
+
+    def _decorator_keyword_bool(self, decorator: ast.AST, name: str, default: bool) -> bool:
+        if not isinstance(decorator, ast.Call):
+            return default
+        for keyword in decorator.keywords:
+            if keyword.arg == name and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
+                return bool(keyword.value.value)
+        return default
+
+    def _dataclass_contract_args(self, node: ast.ClassDef) -> list[dict[str, Any]] | None:
+        dataclass_decorator = next((decorator for decorator in node.decorator_list if self._decorator_leaf(decorator) == "dataclass"), None)
+        if dataclass_decorator is None:
+            return None
+        if not self._decorator_keyword_bool(dataclass_decorator, "init", True):
+            return []
+
+        rows: list[dict[str, Any]] = []
+        for child in node.body:
+            if not isinstance(child, ast.AnnAssign) or not isinstance(child.target, ast.Name):
+                continue
+            name = child.target.id
+            annotation = self._annotation_text(child.annotation)
+            annotation_leaf = annotation.split(".")[-1]
+            if annotation_leaf.startswith("ClassVar") or annotation_leaf == "KW_ONLY":
+                continue
+            init, has_default = self._dataclass_field_init_and_default(child.value)
+            if not init:
+                continue
+            rows.append({"name": name, "annotation": annotation, "required": not has_default})
+        return rows
+
+    def _dataclass_field_init_and_default(self, value: ast.AST | None) -> tuple[bool, bool]:
+        if value is None:
+            return True, False
+        if not isinstance(value, ast.Call) or self._call_name(value.func) != "field":
+            return True, True
+        init = True
+        has_default = False
+        for keyword in value.keywords:
+            if keyword.arg == "init" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False:
+                init = False
+            elif keyword.arg in {"default", "default_factory"}:
+                has_default = True
+        return init, has_default
 
     def _call_name(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name):
