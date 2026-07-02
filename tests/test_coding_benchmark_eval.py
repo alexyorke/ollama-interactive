@@ -708,7 +708,15 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
     def test_summarize_reports_agent_and_controller_classes_separately(self) -> None:
         results = [
-            {"status": "pass", "benchmark_kind": "coding_accuracy", "benchmark_class": "agent", "usage": {"llm_calls": 2, "total_tokens": 10}},
+            {
+                "case": "feature",
+                "status": "pass",
+                "benchmark_kind": "coding_accuracy",
+                "benchmark_class": "agent",
+                "usage": {"llm_calls": 2, "total_tokens": 10},
+                "failed_tools": [{"name": "run_test"}],
+                "verification_retries": 1,
+            },
             {"status": "pass", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 0, "total_tokens": 0}},
             {"status": "fail", "benchmark_kind": "tool_contract", "benchmark_class": "controller", "usage": {"llm_calls": 1, "total_tokens": 3}},
         ]
@@ -719,6 +727,11 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual(summary["by_benchmark_class"]["agent"]["total_tokens"], 10)
         self.assertEqual(summary["by_benchmark_class"]["controller"]["runs"], 2)
         self.assertEqual(summary["by_benchmark_class"]["controller"]["total_llm_calls"], 1)
+        self.assertEqual(summary["process"]["runs_with_failed_tools"], 1)
+        self.assertEqual(summary["process"]["total_failed_tool_results"], 1)
+        self.assertEqual(summary["process"]["runs_with_retry_churn"], 1)
+        self.assertEqual(summary["process"]["total_verification_retries"], 1)
+        self.assertEqual(summary["process"]["passed_with_process_warnings"][0]["case"], "feature")
 
     def test_issue_validator_passes_hidden_solution(self) -> None:
         with self._temp_root() as workspace:

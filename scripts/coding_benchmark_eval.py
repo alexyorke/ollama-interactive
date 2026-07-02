@@ -1754,6 +1754,56 @@ def _summary_bucket(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def process_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+    warning_rows: list[dict[str, Any]] = []
+    total_failed_tools = 0
+    total_assumption_audit_retries = 0
+    total_reconciliation_retries = 0
+    total_verification_retries = 0
+    total_verification_rewrites = 0
+    runs_with_failed_tools = 0
+    runs_with_retry_churn = 0
+    for item in results:
+        failed_count = len(item.get("failed_tools") if isinstance(item.get("failed_tools"), list) else [])
+        assumption_retries = int(item.get("assumption_audit_retries") or 0)
+        reconciliation_retries = int(item.get("reconciliation_retries") or 0)
+        verification_retries = int(item.get("verification_retries") or 0)
+        verification_rewrites = int(item.get("verification_rewrites") or 0)
+        retry_churn = assumption_retries + reconciliation_retries + verification_retries + verification_rewrites
+        total_failed_tools += failed_count
+        total_assumption_audit_retries += assumption_retries
+        total_reconciliation_retries += reconciliation_retries
+        total_verification_retries += verification_retries
+        total_verification_rewrites += verification_rewrites
+        if failed_count:
+            runs_with_failed_tools += 1
+        if retry_churn:
+            runs_with_retry_churn += 1
+        if item.get("status") == "pass" and (failed_count or retry_churn):
+            usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+            warning_rows.append(
+                {
+                    "case": item.get("case"),
+                    "benchmark_class": benchmark_class_for_outcome(item),
+                    "failed_tools": failed_count,
+                    "retry_churn": retry_churn,
+                    "llm_calls": int(usage.get("llm_calls", 0)),
+                    "total_tokens": int(usage.get("total_tokens", 0)),
+                }
+            )
+    warning_rows.sort(key=lambda row: (int(row["failed_tools"]) + int(row["retry_churn"]), int(row["llm_calls"]), int(row["total_tokens"])), reverse=True)
+    return {
+        "runs_with_failed_tools": runs_with_failed_tools,
+        "total_failed_tool_results": total_failed_tools,
+        "runs_with_retry_churn": runs_with_retry_churn,
+        "total_assumption_audit_retries": total_assumption_audit_retries,
+        "total_reconciliation_retries": total_reconciliation_retries,
+        "total_verification_retries": total_verification_retries,
+        "total_verification_rewrites": total_verification_rewrites,
+        "passed_with_process_warnings": warning_rows[:10],
+    }
+
+
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total_tokens = [int(item["usage"]["total_tokens"]) for item in results if isinstance(item.get("usage"), dict)]
     by_kind_rows: dict[str, list[dict[str, Any]]] = {}
@@ -1771,6 +1821,7 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
         "total_llm_calls": sum(int(item["usage"]["llm_calls"]) for item in results if isinstance(item.get("usage"), dict)),
         "total_tokens": sum(total_tokens),
         "median_total_tokens": median(total_tokens),
+        "process": process_summary(results),
         "by_benchmark_kind": {name: _summary_bucket(rows) for name, rows in sorted(by_kind_rows.items())},
         "by_benchmark_class": {name: _summary_bucket(rows) for name, rows in sorted(by_class_rows.items())},
     }

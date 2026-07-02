@@ -26,7 +26,7 @@ External benchmark inspiration:
 ## Suites
 
 - `local-small`: 8 fast tasks for regular local checks.
-- `local-full`: current 34-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, validator-recovery, path/shell/git regressions, token traps, and the `feature_delivery_cli_proof` case that fails unless a requested command/flag, docs update, and proof path all line up.
+- `local-full`: current 36-task superset that includes `local-small` plus larger symbol navigation, multi-turn editing, refactors, validator-recovery, workflow-config validation, path/shell/git regressions, token traps, and the `feature_delivery_cli_proof` case that fails unless a requested command/flag, docs update, and proof path all line up.
 - `external-smoke`: preflight checks for optional external harnesses; not CI-blocking and not leaderboard-comparable.
 - `scripts/public_benchmark_eval.py`: public Aider Polyglot Python smoke. It clones [Aider-AI/polyglot-benchmark](https://github.com/Aider-AI/polyglot-benchmark) under ignored `scratch/external/`, runs selected Exercism Python tasks, and records status/tokens/tool calls.
 
@@ -46,6 +46,7 @@ Each result records:
 - prompt profile: chars by role and largest prompt messages
 - feature profile: `baseline`, `schema`, `context-pack`, `evidence-handles`, `num-predict-caps`, `structured-edits`, `trajectory-guards`, `contract-guards`, or `all`
 - benchmark class summary: agent vs controller runs, passes, LLM calls, and token totals are reported separately
+- `summary.process`: a top-level process-discipline rollup for green-but-sloppy runs, including failed tool counts, retry churn, verification rewrites, and the highest-warning passing cases
 
 ## Commands
 
