@@ -2309,6 +2309,56 @@ class AgentTests(AgentTestBase):
             "Context pack ranked likely implementation matches. Read the most relevant implementation symbol now before editing. Next JSON only.",
         )
 
+    def test_trajectory_ground_probe_retry_message_lists_ranked_context_pack_symbols(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        message = agent._trajectory_ground_probe_retry_message(
+            request_text="Fix add.",
+            probe_name="context_pack",
+            probe_arguments={"request": "Fix add.", "path": ".", "limit": 6},
+            probe_result={
+                "ok": True,
+                "tool": "context_pack",
+                "path": ".",
+                "suggested_next_tool": "read_symbol",
+                "ranked_paths": ["src/alpha.py", "src/beta.py"],
+                "ranked_symbols": [
+                    {"path": "src/alpha.py", "qualname": "add"},
+                    {"path": "src/beta.py", "qualname": "add"},
+                ],
+            },
+            required_mutation_paths=set(),
+            mutated_paths_this_turn=set(),
+            test_run_required=False,
+        )
+
+        self.assertIn("Context pack ranked multiple implementation symbols: src/alpha.py:add, src/beta.py:add.", message)
+        self.assertIn("do not mutate from ranking alone", message)
+
+    def test_trajectory_ground_probe_retry_message_lists_ranked_context_pack_files(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+
+        message = agent._trajectory_ground_probe_retry_message(
+            request_text="Fix the parser.",
+            probe_name="context_pack",
+            probe_arguments={"request": "Fix the parser.", "path": ".", "limit": 6},
+            probe_result={
+                "ok": True,
+                "tool": "context_pack",
+                "path": ".",
+                "suggested_next_tool": "read_file",
+                "ranked_paths": ["src/cli.py", "src/parser.py"],
+            },
+            required_mutation_paths=set(),
+            mutated_paths_this_turn=set(),
+            test_run_required=False,
+        )
+
+        self.assertIn("Context pack ranked multiple implementation files: src/cli.py, src/parser.py.", message)
+        self.assertIn("Read the intended ranked file before editing", message)
+
     def test_trajectory_ground_guard_maps_failed_test_to_implementation_before_pathless_edit(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
@@ -10591,6 +10641,8 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_explicit_source_path_for_symbol_keeps_ambiguity_when_test_affinity_ties",
         "test_trajectory_ground_probe_retry_message_lists_ambiguous_repo_candidates",
         "test_trajectory_ground_probe_retry_message_guides_read_after_context_pack",
+        "test_trajectory_ground_probe_retry_message_lists_ranked_context_pack_symbols",
+        "test_trajectory_ground_probe_retry_message_lists_ranked_context_pack_files",
         "test_trajectory_ground_guard_maps_failed_test_to_implementation_before_pathless_edit",
         "test_trajectory_ground_guard_auto_diagnoses_failed_test_before_pathless_edit",
         "test_trajectory_ground_guard_allows_explicit_new_file_creation",

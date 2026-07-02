@@ -3051,6 +3051,35 @@ class OllamaCodeAgent:
             return []
         return self._recent_search_code_paths(successful_tool_results, query=query)
 
+    def _context_pack_ranked_candidates(self, result: dict[str, Any]) -> tuple[list[str], list[tuple[str, str]]]:
+        ranked_paths = list(
+            dict.fromkeys(
+                str(path or "").strip().replace("\\", "/").lstrip("./")
+                for path in result.get("ranked_paths", [])
+                if isinstance(path, str)
+            )
+        )
+        ranked_paths = [
+            path
+            for path in ranked_paths
+            if path.endswith(".py") and not self._path_looks_like_test_file(path)
+        ]
+        ranked_symbols: list[tuple[str, str]] = []
+        seen_ranked_symbols: set[tuple[str, str]] = set()
+        for raw_symbol in result.get("ranked_symbols", []) if isinstance(result.get("ranked_symbols"), list) else []:
+            if not isinstance(raw_symbol, dict):
+                continue
+            path = str(raw_symbol.get("path") or "").strip().replace("\\", "/").lstrip("./")
+            qualname = str(raw_symbol.get("qualname") or "").strip()
+            if not path or not qualname or self._path_looks_like_test_file(path):
+                continue
+            key = (path, qualname)
+            if key in seen_ranked_symbols:
+                continue
+            seen_ranked_symbols.add(key)
+            ranked_symbols.append(key)
+        return ranked_paths, ranked_symbols
+
     def _successful_context_pack_read_target(
         self,
         *,
@@ -3065,32 +3094,7 @@ class OllamaCodeAgent:
             if result.get("ok") is not True:
                 continue
             suggested_next_tool = str(result.get("suggested_next_tool") or "").strip().lower()
-            ranked_paths = list(
-                dict.fromkeys(
-                    str(path or "").strip().replace("\\", "/").lstrip("./")
-                    for path in result.get("ranked_paths", [])
-                    if isinstance(path, str)
-                )
-            )
-            ranked_paths = [
-                path
-                for path in ranked_paths
-                if path.endswith(".py") and not self._path_looks_like_test_file(path)
-            ]
-            ranked_symbols: list[tuple[str, str]] = []
-            seen_ranked_symbols: set[tuple[str, str]] = set()
-            for raw_symbol in result.get("ranked_symbols", []) if isinstance(result.get("ranked_symbols"), list) else []:
-                if not isinstance(raw_symbol, dict):
-                    continue
-                path = str(raw_symbol.get("path") or "").strip().replace("\\", "/").lstrip("./")
-                qualname = str(raw_symbol.get("qualname") or "").strip()
-                if not path or not qualname or self._path_looks_like_test_file(path):
-                    continue
-                key = (path, qualname)
-                if key in seen_ranked_symbols:
-                    continue
-                seen_ranked_symbols.add(key)
-                ranked_symbols.append(key)
+            ranked_paths, ranked_symbols = self._context_pack_ranked_candidates(result)
             if normalized_preferred:
                 preferred_matches = [
                     (path, qualname)
@@ -6956,6 +6960,24 @@ class OllamaCodeAgent:
     ) -> str:
         if probe_name == "context_pack":
             suggested_next_tool = str(probe_result.get("suggested_next_tool") or "").strip().lower()
+            ranked_paths, ranked_symbols = self._context_pack_ranked_candidates(probe_result)
+            if suggested_next_tool == "read_symbol" and len(ranked_symbols) >= 2:
+                candidate_list = ", ".join(f"{path}:{qualname}" for path, qualname in ranked_symbols[:4])
+                if len(ranked_symbols) > 4:
+                    candidate_list += f", and {len(ranked_symbols) - 4} more"
+                return (
+                    f"Context pack ranked multiple implementation symbols: {candidate_list}. "
+                    "Read the intended symbol from the ranked list before editing; do not mutate from ranking alone. Next JSON only."
+                )
+            if suggested_next_tool in {"read_file", "code_outline"} and len(ranked_paths) >= 2:
+                candidate_list = ", ".join(ranked_paths[:4])
+                if len(ranked_paths) > 4:
+                    candidate_list += f", and {len(ranked_paths) - 4} more"
+                action = "outline" if suggested_next_tool == "code_outline" else "read"
+                return (
+                    f"Context pack ranked multiple implementation files: {candidate_list}. "
+                    f"{action.capitalize()} the intended ranked file before editing; do not mutate from ranking alone. Next JSON only."
+                )
             if suggested_next_tool == "read_symbol":
                 return "Context pack ranked likely implementation matches. Read the most relevant implementation symbol now before editing. Next JSON only."
             if suggested_next_tool == "read_file":
