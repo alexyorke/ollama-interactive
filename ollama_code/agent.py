@@ -5139,6 +5139,25 @@ class OllamaCodeAgent:
         ]
         return any(re.search(pattern, lowered) for pattern in test_patterns)
 
+    def _bare_python_test_file_command(self, command: str) -> str | None:
+        try:
+            argv = shlex.split(command, posix=True)
+        except ValueError:
+            return None
+        if len(argv) != 1:
+            return None
+        raw_path = str(argv[0] or "").strip()
+        if not raw_path.endswith(".py"):
+            return None
+        try:
+            target = self.tools.resolve_path(raw_path, allow_missing=False)
+        except Exception:
+            return None
+        rel = self.tools.relative_label(target).replace("\\", "/")
+        if "/tests/" not in f"/{rel}" and not target.name.startswith("test_") and not target.name.endswith("_test.py"):
+            return None
+        return rel
+
     def _structured_repair_should_preflight_test_command(self) -> bool:
         command = str(self.tools.default_test_command or "").strip()
         if not command:
@@ -5172,6 +5191,20 @@ class OllamaCodeAgent:
             if "timeout" in arguments:
                 normalized["timeout"] = arguments["timeout"]
             return "run_test", normalized, "Normalized run_shell to run_test because the request explicitly requires run_test."
+        bare_test_path = self._bare_python_test_file_command(command)
+        if bare_test_path is not None:
+            quoted_test_path = f'"{bare_test_path}"' if re.search(r"\s", bare_test_path) else bare_test_path
+            normalized = {"command": self.tools.default_test_command or f"python -m pytest {quoted_test_path}"}
+            if "cwd" in arguments:
+                normalized["cwd"] = arguments["cwd"]
+            if "timeout" in arguments:
+                normalized["timeout"] = arguments["timeout"]
+            reason = (
+                "Normalized bare Python test-file shell command to the configured run_test command."
+                if self.tools.default_test_command
+                else "Normalized bare Python test-file shell command to run_test with pytest."
+            )
+            return "run_test", normalized, reason
         if not self._shell_command_looks_like_test_run(command):
             return name, arguments, None
         if exact_shell_command and command == exact_shell_command:

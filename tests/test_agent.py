@@ -6359,6 +6359,66 @@ class AgentTests(AgentTestBase):
         self.assertEqual(normalizations[0]["normalized_name"], "run_test")
         self.assertIn("original command", normalizations[0]["reason"])
 
+    def test_agent_normalizes_bare_python_test_file_shell_command_to_run_test(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "tests" / "test_sample.py").write_text(
+            "def test_ok():\n    assert True\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'bare_test OK\')"')
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+
+        name, arguments, reason = agent._normalize_shell_test_call(
+            "run_shell",
+            {"command": "tests/test_sample.py"},
+            request_text="Validate the project and summarize failures.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(name, "run_test")
+        self.assertEqual(arguments["command"], 'python -c "print(\'bare_test OK\')"')
+        self.assertIn("bare Python test-file", reason)
+
+    def test_agent_normalizes_bare_python_test_file_shell_command_to_pytest_without_config(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "tests" / "test_sample.py").write_text(
+            "def test_ok():\n    assert True\n",
+            encoding="utf-8",
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+
+        name, arguments, reason = agent._normalize_shell_test_call(
+            "run_shell",
+            {"command": "tests/test_sample.py"},
+            request_text="Validate the project and summarize failures.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(name, "run_test")
+        self.assertEqual(arguments["command"], "python -m pytest tests/test_sample.py")
+        self.assertIn("pytest", reason)
+
+    def test_agent_preserves_exact_user_requested_bare_python_test_file_shell_command(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "tests" / "test_sample.py").write_text("print('shell only')\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'bare_test OK\')"')
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+
+        name, arguments, reason = agent._normalize_shell_test_call(
+            "run_shell",
+            {"command": "tests/test_sample.py"},
+            request_text="Use run_shell to execute exactly: tests/test_sample.py.",
+            exact_shell_command="tests/test_sample.py",
+        )
+
+        self.assertEqual(name, "run_shell")
+        self.assertEqual(arguments, {"command": "tests/test_sample.py"})
+        self.assertIsNone(reason)
+
     def test_agent_preserves_exact_user_requested_shell_test_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -10564,6 +10624,9 @@ EXTRACTED_FAILURE_COMPRESSION_TESTS = _extract_agent_tests(
 
 EXTRACTED_SHELL_COMMAND_PREFLIGHT_TESTS = _extract_agent_tests(
     (
+        "test_agent_normalizes_bare_python_test_file_shell_command_to_run_test",
+        "test_agent_normalizes_bare_python_test_file_shell_command_to_pytest_without_config",
+        "test_agent_preserves_exact_user_requested_bare_python_test_file_shell_command",
         "test_shell_recursive_grep_inspection_normalizes_to_search",
         "test_shell_recursive_grep_with_unsupported_flags_does_not_normalize",
         "test_shell_find_dot_exec_grep_h_normalizes_to_filtered_search",
