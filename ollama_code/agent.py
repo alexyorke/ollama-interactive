@@ -10082,6 +10082,7 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if final_result.get("ok") is True:
                         message = "Spec-guided mechanical repair applied and tests passed."
@@ -10408,6 +10409,7 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if final_result.get("ok") is True:
                         message = "Spec-guided mechanical repair applied and tests passed."
@@ -11908,6 +11910,7 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if diagnosis_result.get("ok") is True:
                         last_failed_run_test_diagnosis_key = last_failed_run_test_key
@@ -12429,6 +12432,7 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if repair_result is not None:
                         spec_guided_repair_attempted = True
@@ -12782,6 +12786,7 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if repair_result is not None:
                         spec_guided_repair_attempted = True
@@ -13188,6 +13193,7 @@ class OllamaCodeAgent:
                         successful_tool_results=successful_tool_results,
                         satisfied_tool_names=satisfied_tool_names,
                         tool_calls_this_turn=tool_calls_this_turn,
+                        allow_workspace_fallback=True,
                     )
                     if repair_result is not None:
                         spec_guided_repair_attempted = True

@@ -3249,6 +3249,43 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Do not run validators while Python syntax errors are already known", feedback)
 
+    def test_syntax_bad_mutation_invokes_spec_guided_repair_with_workspace_fallback(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "app.py").write_text("def value() -> str:\n    return 'ok'\n", encoding="utf-8")
+        (root / "tests" / "test_app.py").write_text(
+            "import unittest\nfrom app import value\n\n"
+            "class AppTests(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        self.assertEqual(value(), 'fixed')\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
+                '{"type":"tool","name":"write_file","arguments":{"path":"app.py","content":"def value() -> str:\\n    return \\"unterminated\\n"}}',
+                '{"type":"final","message":"done"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+        calls: list[dict[str, object]] = []
+
+        def fake_spec_guided_repair(**kwargs: object) -> AgentResult | None:
+            calls.append(dict(kwargs))
+            return AgentResult(message="syntax spec repair called", rounds=int(kwargs["round_number"]), completed=False)
+
+        agent._try_spec_guided_repair = fake_spec_guided_repair  # type: ignore[method-assign]
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Fix app.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.message, "syntax spec repair called")
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0].get("allow_workspace_fallback"))
+        self.assertIn("Post-edit syntax check failed", calls[0]["failed_run_test_result"]["summary"])
+
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
         tools = ToolExecutor(root, approval_mode="auto")
@@ -10128,6 +10165,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_failed_proactive_run_test_invokes_spec_guided_repair",
         "test_failed_partial_overwrite_uses_related_test_for_spec_guided_repair",
         "test_known_syntax_error_blocks_lint_validator_until_repair",
+        "test_syntax_bad_mutation_invokes_spec_guided_repair_with_workspace_fallback",
         "test_trajectory_final_chance_validation_selects_tests_without_explicit_test_request",
         "test_trajectory_final_chance_validation_falls_back_to_default_test_command_when_no_targeted_tests",
         "test_trajectory_final_chance_validation_discovers_repo_test_command_after_empty_targeted_selection",
