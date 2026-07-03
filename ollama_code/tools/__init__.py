@@ -46,6 +46,12 @@ from ollama_code.tool_dependencies import (
     resolve_tool_executable,
 )
 from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_group_help, format_tool_help
+from ollama_code.tools.validation import (
+    collapse_validation_targets,
+    lint_typecheck_cache_key,
+    python_typechecker_targets,
+    python_validation_targets,
+)
 
 try:
     import tomllib  # type: ignore[attr-defined]
@@ -1437,26 +1443,7 @@ class ToolExecutor:
         return self._iter_repo_files(base, limit=limit, suffixes=CODE_FILE_SUFFIXES)
 
     def _collapse_validation_targets(self, labels: Iterable[str], *, limit: int = 100) -> list[str]:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        for raw_label in labels:
-            label = str(raw_label or "").strip().replace("\\", "/")
-            if not label:
-                continue
-            if label == ".":
-                return ["."]
-            if label in seen:
-                continue
-            seen.add(label)
-            cleaned.append(label)
-        selected: list[str] = []
-        for label in sorted(cleaned, key=lambda item: (item.count("/"), len(item), item)):
-            if any(label == existing or label.startswith(existing + "/") for existing in selected):
-                continue
-            selected.append(label)
-            if len(selected) >= limit:
-                break
-        return selected
+        return collapse_validation_targets(labels, limit=limit)
 
     def _python_validation_targets(
         self,
@@ -1465,15 +1452,12 @@ class ToolExecutor:
         requested_scopes: Iterable[str],
         limit: int = 100,
     ) -> list[str]:
-        file_targets = self._collapse_validation_targets(discovered_files, limit=limit)
-        if not file_targets:
-            return []
-        scope_targets = self._collapse_validation_targets(requested_scopes, limit=limit)
-        if "." in scope_targets:
-            return ["."]
-        if len(file_targets) <= MAX_EXPLICIT_VALIDATOR_FILES:
-            return file_targets
-        return scope_targets or file_targets
+        return python_validation_targets(
+            discovered_files=discovered_files,
+            requested_scopes=requested_scopes,
+            limit=limit,
+            max_explicit_files=MAX_EXPLICIT_VALIDATOR_FILES,
+        )
 
     def _python_typechecker_targets(
         self,
@@ -1482,15 +1466,11 @@ class ToolExecutor:
         requested_scopes: Iterable[str],
         limit: int = 100,
     ) -> list[str]:
-        file_targets = self._collapse_validation_targets(discovered_files, limit=limit)
-        if not file_targets:
-            return []
-        scope_targets = self._collapse_validation_targets(requested_scopes, limit=limit)
-        if "." in scope_targets:
-            return ["."]
-        if len(scope_targets) == 1 and not scope_targets[0].endswith(".py"):
-            return scope_targets
-        return file_targets
+        return python_typechecker_targets(
+            discovered_files=discovered_files,
+            requested_scopes=requested_scopes,
+            limit=limit,
+        )
 
     def _python_typechecker_configured(self) -> bool:
         if (self.workspace_root / "pyrightconfig.json").exists() or (self.workspace_root / "basedpyrightconfig.json").exists():
@@ -1509,45 +1489,16 @@ class ToolExecutor:
         typechecker_command: list[str] | None,
         bash_path: str | None,
     ) -> str:
-        file_stats: list[dict[str, Any]] = []
-        for label in sorted({str(item).replace("\\", "/") for item in checked if str(item).strip()}):
-            try:
-                stat = (self.workspace_root / label).stat()
-            except OSError:
-                file_stats.append({"path": label, "missing": True})
-                continue
-            file_stats.append({"path": label, "mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)})
-        config_stats: list[dict[str, Any]] = []
-        for label in (
-            "pyproject.toml",
-            "setup.cfg",
-            "tox.ini",
-            "ruff.toml",
-            ".ruff.toml",
-            "pyrightconfig.json",
-            "basedpyrightconfig.json",
-        ):
-            path = self.workspace_root / label
-            if not path.exists():
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            config_stats.append({"path": label, "mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)})
-        payload = {
-            "version": 1,
-            "checked": file_stats,
-            "configs": config_stats,
-            "validator_targets": list(validator_targets),
-            "typechecker_targets": list(typechecker_targets),
-            "shell_targets": list(shell_targets),
-            "ruff_path": ruff_path or "",
-            "typechecker_command": list(typechecker_command or []),
-            "bash_path": bash_path or "",
-        }
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+        return lint_typecheck_cache_key(
+            workspace_root=self.workspace_root,
+            checked=checked,
+            validator_targets=validator_targets,
+            typechecker_targets=typechecker_targets,
+            shell_targets=shell_targets,
+            ruff_path=ruff_path,
+            typechecker_command=typechecker_command,
+            bash_path=bash_path,
+        )
 
     def _python_signature(self, lines: list[str], start: int) -> str:
         collected: list[str] = []
