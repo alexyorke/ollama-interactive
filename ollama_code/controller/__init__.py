@@ -11,6 +11,19 @@ from .feature_delivery import (
     typed_cli_flag_protocol_enabled,
 )
 from .navigation_validation import NavigationValidationController, NavigationValidationTurn
+from .request_policy import (
+    request_allows_any_validation,
+    request_allows_mutation,
+    request_explicitly_allows_test_mutation,
+    request_forbids_test_mutation,
+    request_forbids_tests,
+    request_forbids_validation,
+    request_looks_like_issue_report,
+    request_requires_code_mutation,
+    request_requires_mutation,
+    request_requires_test_run,
+    validation_preferences,
+)
 from .repair_protocol import (
     FailedAttempt,
     GroundedTarget,
@@ -45,6 +58,17 @@ __all__ = [
     "RepairProtocolState",
     "RequestedDeliverable",
     "ValidationPlan",
+    "request_allows_any_validation",
+    "request_allows_mutation",
+    "request_explicitly_allows_test_mutation",
+    "request_forbids_test_mutation",
+    "request_forbids_tests",
+    "request_forbids_validation",
+    "request_looks_like_issue_report",
+    "request_requires_code_mutation",
+    "request_requires_mutation",
+    "request_requires_test_run",
+    "validation_preferences",
     "cli_feature_capabilities",
     "cli_proof_command_argvs",
     "cli_readme_additions",

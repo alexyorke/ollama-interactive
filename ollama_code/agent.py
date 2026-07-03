@@ -92,9 +92,20 @@ from ollama_code.controller import (
     cli_test_additions,
     derive_request_obligations as derive_feature_request_obligations,
     merge_request_obligations,
+    request_allows_any_validation as controller_request_allows_any_validation,
+    request_allows_mutation as controller_request_allows_mutation,
+    request_explicitly_allows_test_mutation as controller_request_explicitly_allows_test_mutation,
+    request_forbids_test_mutation as controller_request_forbids_test_mutation,
+    request_forbids_tests as controller_request_forbids_tests,
+    request_forbids_validation as controller_request_forbids_validation,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
+    request_looks_like_issue_report as controller_request_looks_like_issue_report,
     request_obligation_proof_status as feature_obligation_proof_status,
+    request_requires_code_mutation as controller_request_requires_code_mutation,
+    request_requires_mutation as controller_request_requires_mutation,
+    request_requires_test_run as controller_request_requires_test_run,
     typed_cli_flag_protocol_enabled,
+    validation_preferences as controller_validation_preferences,
 )
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
 from ollama_code.prompts import (
@@ -3924,154 +3935,25 @@ class OllamaCodeAgent:
         return any(re.search(pattern, lowered) for pattern in patterns)
 
     def _request_allows_mutation(self, text: str) -> bool:
-        lowered = text.lower()
-        mutation_phrases = [
-            "create ",
-            "write ",
-            "replace ",
-            "edit ",
-            "update ",
-            "rewrite ",
-            "append ",
-            "modify ",
-            "change ",
-            "delete ",
-            "remove ",
-            "rename ",
-            "fix ",
-            "implement ",
-            "patch ",
-            "refactor ",
-            "make ",
-            "add ",
-            "commit ",
-        ]
-        return any(phrase in lowered for phrase in mutation_phrases) or self._request_looks_like_issue_report(text)
+        return controller_request_allows_mutation(text)
 
     def _request_looks_like_issue_report(self, text: str) -> bool:
-        lowered = text.lower()
-        has_code_context = bool(
-            re.search(
-                r"`[^`]+`|(?:^|\s)[A-Za-z_][\w./-]*\.(?:py|js|ts|tsx|jsx|java|go|rs|c|cc|cpp)\b|array\(\[|traceback|from [A-Za-z0-9_. ]+ import ",
-                text,
-            )
-        )
-        if not has_code_context:
-            return False
-        issue_patterns = [
-            r"\b(?:bug|issue|regression)\b",
-            r"\bdoes not\b[^.?!\n]{0,120}\b(?:correctly|properly|compute|return|handle|pass|work)\b",
-            r"\breturns?\b[^.?!\n]{0,80}\bwrong\b",
-            r"\b(?:incorrect|incorrectly|unexpected(?:ly)?)\b",
-            r"\bfails?\b[^.?!\n]{0,120}\b(?:when|with|for|to|under|on)\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in issue_patterns)
+        return controller_request_looks_like_issue_report(text)
 
     def _request_requires_mutation(self, text: str) -> bool:
-        lowered = text.lower()
-        read_only_patterns = [
-            r"\bdo not edit\b(?!\s+(?:tests?|test files?)\b)",
-            r"\bdon't edit\b(?!\s+(?:tests?|test files?)\b)",
-            r"\bdo not modify\b",
-            r"\bdon't modify\b",
-            r"\bdo not change\b(?!\s+(?:tests?|test files?)\b)",
-            r"\bdon't change\b(?!\s+(?:tests?|test files?)\b)",
-            r"\bwithout editing\b(?!\s+(?:tests?|test files?)\b)",
-            r"\bwithout modifying\b",
-            r"\bwithout changing\b(?!\s+(?:tests?|test files?)\b)",
-            r"\bno changes\b",
-            r"\bread-only\b",
-            r"\binspect only\b",
-            r"\bsummarize only\b",
-        ]
-        if any(re.search(pattern, lowered) for pattern in read_only_patterns):
-            return False
-        if re.search(r"\b(?:how|what|why)\s+(?:would|should|can)\b", lowered):
-            return False
-        if self._request_looks_like_issue_report(text):
-            return True
-        mutation_patterns = [
-            r"\bimplement\b",
-            r"\bfix\b",
-            r"\bpatch\b",
-            r"\brefactor\s+(?:[\w./-]+\.[A-Za-z0-9]+|[A-Za-z_][\w./-]*\s+to|code\s+to|module\s+to|tests?\s+to)",
-            r"\bedit\b",
-            r"\bupdate\b",
-            r"\brewrite\b",
-            r"\bmodify\b",
-            r"\bchange\b",
-            r"\bcreate\b",
-            r"\bwrite\b",
-            r"\badd\b",
-            r"\bremove\b",
-            r"\bdelete\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in mutation_patterns)
+        return controller_request_requires_mutation(text)
 
     def _request_requires_test_run(self, text: str) -> bool:
-        lowered = text.lower()
-        if self._request_forbids_tests(lowered):
-            return False
-        patterns = [
-            r"\brun (?:the )?tests?\b",
-            r"\brerun (?:the )?tests?\b",
-            r"\bexecute (?:the )?tests?\b",
-            r"\btest suite\b",
-            r"\bkeep (?:the )?tests? (?:green|passing)\b",
-            r"\btests? (?:stay|stays|remain|remains) (?:green|passing)\b",
-            r"\bpytest\b",
-            r"\bunittest\b",
-            r"\brun_test\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in patterns)
+        return controller_request_requires_test_run(text)
 
     def _request_requires_code_mutation(self, text: str) -> bool:
-        lowered = text.lower()
-        if not self._request_requires_mutation(text):
-            return False
-        return bool(
-            re.search(r"\b(?:fix|implement|patch|repair|refactor|change|update)\b", lowered)
-            and (
-                re.search(r"\b(?:implementation|source|code|bug|failing|failure|hidden tests?)\b", lowered)
-                or re.search(r"\b(?:fix|patch|repair)\b.{0,120}\btests?\b", lowered)
-            )
-        )
+        return controller_request_requires_code_mutation(text)
 
     def _request_explicitly_allows_test_mutation(self, text: str) -> bool:
-        lowered = text.lower()
-        if any(
-            phrase in lowered
-            for phrase in [
-                "update tests",
-                "edit tests",
-                "modify tests",
-                "change tests",
-                "rewrite tests",
-                "add tests",
-                "test file",
-                "test files",
-                "tests, and docs",
-                "tests and docs",
-            ]
-        ):
-            return True
-        return bool(re.search(r"\btests?/[^\s,;:]+", lowered))
+        return controller_request_explicitly_allows_test_mutation(text)
 
     def _request_forbids_test_mutation(self, text: str) -> bool:
-        lowered = text.lower()
-        if any(phrase in lowered for phrase in ["update tests", "edit tests", "modify tests", "change tests", "tests, and docs", "tests and docs"]):
-            return False
-        return any(
-            phrase in lowered
-            for phrase in [
-                "edit only implementation",
-                "only implementation files",
-                "do not edit tests",
-                "don't edit tests",
-                "without editing tests",
-                "leave tests unchanged",
-            ]
-        ) or bool(re.search(r"\b(?:fix|change|edit|update|implement|make)\b.{0,120}\bsrc/[^\s,;:]+", lowered))
+        return controller_request_forbids_test_mutation(text)
 
     def _python_test_import_targets(self) -> set[str]:
         root = self.tools.workspace_root.resolve(strict=False)
@@ -7695,33 +7577,16 @@ class OllamaCodeAgent:
         )
 
     def _request_forbids_tests(self, text: str) -> bool:
-        lowered = text.lower()
-        explicit_skip_patterns = [
-            r"\b(?:do not|don't|dont|skip)\s+(?:run|rerun|execute)(?:\s+the)?\s+(?:(?:[\w-]+)\s+){0,4}(?:tests?|test suite)\b",
-            r"\b(?:do not|don't|dont|skip)\s+(?:use\s+)?(?:pytest|unittest)\b",
-            r"\bwithout\s+(?:running\s+)?(?:tests?|test suite)\b",
-            r"\bwithout\s+(?:using\s+)?(?:pytest|unittest)\b",
-            r"\bno tests?(?:\s+(?:needed|required|necessary))?\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in explicit_skip_patterns)
+        return controller_request_forbids_tests(text)
 
     def _request_forbids_validation(self, text: str) -> bool:
-        lowered = text.lower()
-        return bool(
-            re.search(
-                r"\b(?:do not|don't|dont|skip|without|no)\b[^.?!;\n]{0,80}\b(?:validation|validate|validator|validators|lint|linter|typecheck|type\s+check|sanity\s+check)\b",
-                lowered,
-            )
-        )
+        return controller_request_forbids_validation(text)
 
     def _validation_preferences(self, text: str) -> tuple[bool, bool]:
-        forbid_validation = self._request_forbids_validation(text)
-        forbid_tests = forbid_validation or self._request_forbids_tests(text)
-        return not forbid_tests, not forbid_validation
+        return controller_validation_preferences(text)
 
     def _request_allows_any_validation(self, text: str) -> bool:
-        allow_tests, allow_non_test_validation = self._validation_preferences(text)
-        return allow_tests or allow_non_test_validation
+        return controller_request_allows_any_validation(text)
 
     def _post_edit_validation_enabled(self) -> bool:
         return True
