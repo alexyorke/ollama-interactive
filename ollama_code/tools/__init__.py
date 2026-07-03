@@ -114,6 +114,7 @@ from ollama_code.tools.validation import (
     collapse_validation_targets,
     ini_has_section,
     lint_typecheck_cache_key,
+    lint_typecheck_file_analysis,
     python_typechecker_configured,
     python_typechecker_targets,
     python_validation_targets,
@@ -10814,37 +10815,20 @@ import string
     def _lint_typecheck_file_analysis(self, file_path: Path, *, timeout: int) -> dict[str, Any]:
         rel = self.relative_label(file_path)
         suffix = file_path.suffix.lower()
-        stat = file_path.stat()
-        signature = {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
-        node_available = bool(self._which("node")) if suffix in {".js", ".jsx"} else None
-        cached = self._lint_typecheck_file_cache.get(rel)
-        if (
-            isinstance(cached, dict)
-            and cached.get("signature") == signature
-            and cached.get("suffix") == suffix
-            and cached.get("node_available") == node_available
-        ):
-            analysis = cached.get("analysis")
-            if isinstance(analysis, dict):
-                return dict(analysis)
-        analysis: dict[str, Any] = {"suffix": suffix, "diagnostic": None}
-        if suffix == ".py":
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            analysis["diagnostic"] = self._python_syntax_diagnostic(file_path, text)
-        elif suffix in {".js", ".jsx"} and node_available:
-            completed = self._run_process(["node", "--check", str(file_path)], cwd=self.workspace_root, timeout=timeout, shell=False)
-            if completed.returncode != 0:
-                analysis["diagnostic"] = self._truncate_text(self._collect_process_output(completed), limit=500)
-        elif self._tree_sitter_language_for_path(file_path) is not None:
-            text = file_path.read_text(encoding="utf-8", errors="replace")
-            analysis["diagnostic"] = self._tree_sitter_syntax_diagnostic(file_path, text)
-        self._lint_typecheck_file_cache[rel] = {
-            "signature": signature,
-            "suffix": suffix,
-            "node_available": node_available,
-            "analysis": dict(analysis),
-        }
-        return analysis
+        return lint_typecheck_file_analysis(
+            file_path=file_path,
+            rel=rel,
+            workspace_root=self.workspace_root,
+            cache=self._lint_typecheck_file_cache,
+            timeout=timeout,
+            node_available=bool(self._which("node")) if suffix in {".js", ".jsx"} else None,
+            run_process=self._run_process,
+            collect_process_output=self._collect_process_output,
+            truncate_text=lambda text: self._truncate_text(text, limit=500),
+            python_syntax_diagnostic=self._python_syntax_diagnostic,
+            tree_sitter_language_for_path=self._tree_sitter_language_for_path,
+            tree_sitter_syntax_diagnostic=self._tree_sitter_syntax_diagnostic,
+        )
 
     def _ini_has_section(self, path: Path, prefixes: tuple[str, ...]) -> bool:
         return ini_has_section(path, prefixes)

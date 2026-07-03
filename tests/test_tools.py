@@ -18,6 +18,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
+from ollama_code.tools.validation import lint_typecheck_file_analysis
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -5445,6 +5446,70 @@ def double(value: int) -> int:
 
         self.assertFalse(result["ok"])
         self.assertIn("bad.py:1", result["output"])
+
+    def test_lint_typecheck_file_analysis_caches_by_file_signature(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "app.py"
+            target.write_text("VALUE = 1\n", encoding="utf-8")
+            cache: dict[str, dict[str, object]] = {}
+            calls: list[str] = []
+
+            def syntax_diagnostic(path: Path, text: str) -> str | None:
+                calls.append(text)
+                return None if "VALUE = 1" in text else "changed"
+
+            def fail_process(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                self.fail("python file analysis should not run subprocess validators")
+
+            first = lint_typecheck_file_analysis(
+                file_path=target,
+                rel="app.py",
+                workspace_root=root,
+                cache=cache,
+                timeout=1,
+                node_available=None,
+                run_process=fail_process,
+                collect_process_output=lambda _completed: "",
+                truncate_text=lambda text: text,
+                python_syntax_diagnostic=syntax_diagnostic,
+                tree_sitter_language_for_path=lambda _path: None,
+                tree_sitter_syntax_diagnostic=lambda _path, _text: None,
+            )
+            second = lint_typecheck_file_analysis(
+                file_path=target,
+                rel="app.py",
+                workspace_root=root,
+                cache=cache,
+                timeout=1,
+                node_available=None,
+                run_process=fail_process,
+                collect_process_output=lambda _completed: "",
+                truncate_text=lambda text: text,
+                python_syntax_diagnostic=syntax_diagnostic,
+                tree_sitter_language_for_path=lambda _path: None,
+                tree_sitter_syntax_diagnostic=lambda _path, _text: None,
+            )
+            target.write_text("VALUE = 22\n", encoding="utf-8")
+            third = lint_typecheck_file_analysis(
+                file_path=target,
+                rel="app.py",
+                workspace_root=root,
+                cache=cache,
+                timeout=1,
+                node_available=None,
+                run_process=fail_process,
+                collect_process_output=lambda _completed: "",
+                truncate_text=lambda text: text,
+                python_syntax_diagnostic=syntax_diagnostic,
+                tree_sitter_language_for_path=lambda _path: None,
+                tree_sitter_syntax_diagnostic=lambda _path, _text: None,
+            )
+
+        self.assertIsNone(first["diagnostic"])
+        self.assertIsNone(second["diagnostic"])
+        self.assertEqual(third["diagnostic"], "changed")
+        self.assertEqual(len(calls), 2)
 
     def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
         with self._temp_files_tools({"script.sh": "if true; then\n  echo ok\n"}) as (_root, tools):

@@ -5,7 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 def toml_tool_section(payload: dict[str, Any], name: str) -> bool:
@@ -279,3 +279,51 @@ def lint_typecheck_cache_key(
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def lint_typecheck_file_analysis(
+    *,
+    file_path: Path,
+    rel: str,
+    workspace_root: Path,
+    cache: dict[str, dict[str, Any]],
+    timeout: int,
+    node_available: bool | None,
+    run_process: Callable[..., Any],
+    collect_process_output: Callable[[Any], str],
+    truncate_text: Callable[[str], str],
+    python_syntax_diagnostic: Callable[[Path, str], str | None],
+    tree_sitter_language_for_path: Callable[[Path], Any],
+    tree_sitter_syntax_diagnostic: Callable[[Path, str], str | None],
+) -> dict[str, Any]:
+    suffix = file_path.suffix.lower()
+    stat = file_path.stat()
+    signature = {"mtime_ns": int(stat.st_mtime_ns), "size": int(stat.st_size)}
+    cached = cache.get(rel)
+    if (
+        isinstance(cached, dict)
+        and cached.get("signature") == signature
+        and cached.get("suffix") == suffix
+        and cached.get("node_available") == node_available
+    ):
+        analysis = cached.get("analysis")
+        if isinstance(analysis, dict):
+            return dict(analysis)
+    analysis: dict[str, Any] = {"suffix": suffix, "diagnostic": None}
+    if suffix == ".py":
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        analysis["diagnostic"] = python_syntax_diagnostic(file_path, text)
+    elif suffix in {".js", ".jsx"} and node_available:
+        completed = run_process(["node", "--check", str(file_path)], cwd=workspace_root, timeout=timeout, shell=False)
+        if completed.returncode != 0:
+            analysis["diagnostic"] = truncate_text(collect_process_output(completed))
+    elif tree_sitter_language_for_path(file_path) is not None:
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        analysis["diagnostic"] = tree_sitter_syntax_diagnostic(file_path, text)
+    cache[rel] = {
+        "signature": signature,
+        "suffix": suffix,
+        "node_available": node_available,
+        "analysis": dict(analysis),
+    }
+    return analysis
