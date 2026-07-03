@@ -18,13 +18,16 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
   `ollama_code/tools/contracts.py`, `ollama_code/tools/synthesis.py`, `ollama_code/tools/validation.py`, and
   `ollama_code/tools/command_validation.py`.
 
+## Completed ToolExecutor Tranche
+
+- `lint_typecheck` file-level analysis, scan-state collection, target planning, subprocess runner, timeout shaping, cache-hit shaping, and final result shaping now live in `ollama_code/tools/validation.py` with direct tests.
+- `ToolExecutor.lint_typecheck` is now mostly adapter code for path resolution, local tool discovery, cache storage, and callback injection.
+
 ## Next ToolExecutor Tranche
 
 - Do not keep extracting tiny wrappers just to reduce line count.
-- Next meaningful split is the remaining `lint_typecheck` subprocess/cache orchestration.
-- File-level lint analysis, scan-state collection, and target planning already live in `ollama_code/tools/validation.py` with direct tests.
-- Treat the remaining subprocess runner as a separate measured tranche because it couples cache hits, timeout behavior, ruff, basedpyright/pyright, bash, command rendering, and result assembly.
-- Preserve the current compatibility wrappers until the extracted validator implementation has direct focused tests.
+- Next meaningful split is the remaining synthesis/candidate family around implementation-candidate validation and generated-code repair, or validator discovery if a measured setup gap appears.
+- Preserve compatibility wrappers until extracted implementations have direct focused tests.
 
 ## Readiness Gates
 
