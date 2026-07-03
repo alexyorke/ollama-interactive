@@ -71,6 +71,115 @@ class AgentShellCommandPreflightTests(AgentTestBase):
         self.assertEqual(arguments, {"command": "tests/test_sample.py"})
         self.assertIsNone(reason)
 
+    def test_shell_cat_inspection_normalizes_to_read_file(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"cat README.md"}}',
+                '{"type":"final","message":"hello from docs"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        (root / "README.md").write_text("hello from docs\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect README.md and summarize it.")
+
+        self.assertEqual(result.message, "hello from docs")
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("original_name"), "run_shell")
+        self.assertEqual(normalized[0].get("normalized_name"), "read_file")
+
+    def test_shell_ls_inspection_normalizes_to_list_files(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"ls ."}}',
+                '{"type":"final","message":"README.md exists"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the project files and summarize them.")
+
+        self.assertEqual(result.message, "README.md exists")
+        self.assertEqual(tools.execute_counts.get("list_files"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("original_name"), "run_shell")
+        self.assertEqual(normalized[0].get("normalized_name"), "list_files")
+
+    def test_shell_grep_inspection_normalizes_to_search(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"grep \\"needle phrase\\" README.md"}}',
+                '{"type":"final","message":"needle phrase is in README.md"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        (root / "README.md").write_text("alpha\nneedle phrase\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect README.md for the needle phrase and summarize.")
+
+        self.assertEqual(result.message, "needle phrase is in README.md")
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("original_name"), "run_shell")
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle phrase", "path": "README.md"})
+
+    def test_shell_grep_with_flags_does_not_normalize_to_search(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"rg -i needle README.md"}}',
+                '{"type":"final","message":"searched with grep"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        (root / "README.md").write_text("needle\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the project with a shell-style lookup if useful and summarize.")
+
+        self.assertEqual(result.message, "searched with grep")
+        self.assertEqual(tools.execute_counts.get("run_shell"), 1)
+        self.assertIsNone(tools.execute_counts.get("search"))
+        self.assertFalse(any(event.get("type") == "tool_normalized" for event in agent.events))
+
+    def test_shell_grep_line_number_inspection_normalizes_to_search(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"grep -n needle README.md"}}',
+                '{"type":"final","message":"needle found"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+        (root / "README.md").write_text("alpha\nneedle\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect README.md for needle and summarize.")
+
+        self.assertEqual(result.message, "needle found")
+        self.assertEqual(tools.execute_counts.get("search"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_shell"))
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(normalized[0].get("normalized_name"), "search")
+        self.assertEqual(normalized[0].get("normalized_arguments"), {"query": "needle", "path": "README.md"})
+
     def test_shell_recursive_grep_inspection_normalizes_to_search(self) -> None:
         client = FakeClient(
             [
@@ -581,4 +690,3 @@ class AgentShellCommandPreflightTests(AgentTestBase):
         self.assertEqual(len(validation_events), 1)
         self.assertFalse(validation_events[0].get("valid"))
         self.assertEqual(validation_events[0].get("family"), "git")
-
