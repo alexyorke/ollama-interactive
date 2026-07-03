@@ -388,6 +388,26 @@ def python_import_statement_is_safe(statement: str) -> bool:
     return bool(parsed_statement.body) and all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in parsed_statement.body)
 
 
+def render_symbol_matches(matches: list[dict[str, Any]], *, limit: int = 20) -> str:
+    return "\n".join(
+        f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}"
+        for item in matches[:limit]
+    )
+
+
+def delete_symbol_text_from_found(original: str, found: dict[str, Any]) -> str:
+    lines = original.splitlines(keepends=True)
+    start = int(found["start"])
+    end = int(found["end"])
+    while end < len(lines) and not lines[end].strip():
+        end += 1
+    return "".join(lines[: start - 1]) + "".join(lines[end:])
+
+
+def append_moved_symbol_text(destination_original: str, moved_text: str) -> str:
+    return destination_original.rstrip() + "\n\n" + moved_text.lstrip()
+
+
 def python_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     args = node.args
     names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}

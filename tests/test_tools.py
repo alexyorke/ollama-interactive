@@ -34,8 +34,10 @@ from ollama_code.tools.synthesis import (
     candidate_validation_run_in_temp_workspace,
     candidate_validation_success_result,
     candidate_workspace_ignored_names,
+    append_moved_symbol_text,
     canonical_foldr_replacement_if_safe,
     canonical_signature_order_replacement_if_safe,
+    delete_symbol_text_from_found,
     edit_intent_route_plan,
     foldr_argument_order_diagnostic,
     function_probe_result,
@@ -51,6 +53,7 @@ from ollama_code.tools.synthesis import (
     python_parameter_names,
     python_parameter_sequence,
     repair_common_python_join_typo,
+    render_symbol_matches,
     single_python_replacement_symbol_name,
     shadowed_builtin_call_diagnostic,
     strip_markdown_quote_prefixes,
@@ -474,6 +477,26 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(python_import_statement_is_safe("import os\nfrom pathlib import Path"))
         self.assertFalse(python_import_statement_is_safe("import os\nprint('run')"))
         self.assertFalse(python_import_statement_is_safe("not valid python"))
+
+    def test_symbol_shaping_helpers_render_and_delete_found_symbol(self) -> None:
+        matches = [
+            {"start": 1, "end": 2, "kind": "function", "qualname": "first"},
+            {"start": 5, "end": 6, "kind": "function", "qualname": "second"},
+        ]
+        original = "def keep():\n    return 1\n\n\ndef drop():\n    return 2\n\nVALUE = keep()\n"
+        updated = delete_symbol_text_from_found(original, matches[1])
+
+        self.assertEqual(render_symbol_matches(matches), "1-2 function first\n5-6 function second")
+        self.assertEqual(updated, "def keep():\n    return 1\n\n\nVALUE = keep()\n")
+
+    def test_symbol_shaping_helpers_append_moved_symbol_text(self) -> None:
+        destination = "import os\n\nVALUE = 1\n"
+        moved = "    def moved():\n        return VALUE\n"
+
+        self.assertEqual(
+            append_moved_symbol_text(destination, moved),
+            "import os\n\nVALUE = 1\n\ndef moved():\n        return VALUE\n",
+        )
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):
@@ -6517,6 +6540,27 @@ def double(value: int) -> int:
         self.assertTrue(result["ok"])
         self.assertEqual(result["count"], 0)
         self.assertIn("already renamed", result["summary"])
+
+    def test_apply_structured_edit_moves_symbol_between_python_files(self) -> None:
+        root = self._workspace_scratch()
+        source = root / "source.py"
+        destination = root / "destination.py"
+        source.write_text("def keep():\n    return 1\n\n\ndef moved():\n    return keep()\n", encoding="utf-8")
+        destination.write_text("VALUE = 1\n", encoding="utf-8")
+        tools = ToolExecutor(root, approval_mode="auto")
+
+        result = tools.apply_structured_edit(
+            {
+                "op": "move_symbol",
+                "path": "source.py",
+                "to_path": "destination.py",
+                "symbol": "moved",
+            }
+        )
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("def moved", source.read_text(encoding="utf-8"))
+        self.assertIn("def moved():\n    return keep()", destination.read_text(encoding="utf-8"))
 
     def test_generate_tests_from_spec_previews_patch_without_writing(self) -> None:
         with self._temp_tools() as (root, tools):

@@ -92,6 +92,8 @@ from ollama_code.tools.synthesis import (
     function_probe_script,
     first_behavior_call,
     human_test_name,
+    append_moved_symbol_text,
+    delete_symbol_text_from_found,
     insert_import_statement,
     insert_single_import_statement,
     merge_from_import_statement,
@@ -104,6 +106,7 @@ from ollama_code.tools.synthesis import (
     python_parameter_sequence,
     python_parse_text,
     repair_common_python_join_typo,
+    render_symbol_matches,
     select_test_spec_examples,
     shadowed_builtin_call_diagnostic,
     looks_like_full_symbol_source,
@@ -11607,15 +11610,10 @@ import string
         if not matches:
             return original, f"Symbol not found: {symbol}", None
         if len(matches) > 1:
-            rendered = "\n".join(f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}" for item in matches[:20])
+            rendered = render_symbol_matches(matches)
             return original, f"Ambiguous symbol: {symbol}\n{rendered}", None
         found = matches[0]
-        lines = original.splitlines(keepends=True)
-        start = int(found["start"])
-        end = int(found["end"])
-        while end < len(lines) and not lines[end].strip():
-            end += 1
-        updated = "".join(lines[: start - 1]) + "".join(lines[end:])
+        updated = delete_symbol_text_from_found(original, found)
         return updated, "", found
 
     def _matched_symbol(self, target: Path, symbol: str) -> tuple[dict[str, Any] | None, str]:
@@ -11624,7 +11622,7 @@ import string
         if not matches:
             return None, f"Symbol not found: {symbol}"
         if len(matches) > 1:
-            rendered = "\n".join(f"{item['start']}-{item['end']} {item['kind']} {item['qualname']}" for item in matches[:20])
+            rendered = render_symbol_matches(matches)
             return None, f"Ambiguous symbol: {symbol}\n{rendered}"
         return matches[0], ""
 
@@ -12050,7 +12048,7 @@ import string
             if error:
                 return {"ok": False, "tool": "apply_structured_edit", "path": source_rel, "summary": error}
             dest_original = destination.read_text(encoding="utf-8", errors="replace") if destination.exists() else ""
-            dest_updated = dest_original.rstrip() + "\n\n" + moved_text.lstrip()
+            dest_updated = append_moved_symbol_text(dest_original, moved_text)
             source_diag = self._python_syntax_diagnostic(source, source_updated)
             dest_diag = self._python_syntax_diagnostic(destination, dest_updated)
             if source_diag or dest_diag:
