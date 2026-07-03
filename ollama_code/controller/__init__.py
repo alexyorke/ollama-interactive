@@ -21,11 +21,13 @@ from .final_policy import (
 )
 from .navigation_validation import NavigationValidationController, NavigationValidationTurn
 from .request_policy import (
+    forbidden_tool_names_from_request,
     path_looks_like_doc_target,
     path_looks_like_test_file,
     request_allows_any_validation,
     request_allows_mutation,
     request_explicitly_allows_test_mutation,
+    request_explicitly_requests_tool,
     request_forbids_test_mutation,
     request_forbids_tests,
     request_forbids_validation,
@@ -35,6 +37,9 @@ from .request_policy import (
     request_requires_code_mutation,
     request_requires_mutation,
     request_requires_test_run,
+    request_requires_tools,
+    requested_tool_names_from_request,
+    tool_names_in_fragment,
     validation_preferences,
 )
 from .repair_protocol import (
@@ -80,9 +85,11 @@ __all__ = [
     "final_claims_test_success",
     "final_claims_timeout_success",
     "final_requires_verification",
+    "forbidden_tool_names_from_request",
     "request_allows_any_validation",
     "request_allows_mutation",
     "request_explicitly_allows_test_mutation",
+    "request_explicitly_requests_tool",
     "request_forbids_test_mutation",
     "request_forbids_tests",
     "request_forbids_validation",
@@ -92,6 +99,9 @@ __all__ = [
     "request_requires_code_mutation",
     "request_requires_mutation",
     "request_requires_test_run",
+    "request_requires_tools",
+    "requested_tool_names_from_request",
+    "tool_names_in_fragment",
     "validation_preferences",
     "cli_feature_capabilities",
     "cli_proof_command_argvs",

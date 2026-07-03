@@ -1,11 +1,13 @@
 import unittest
 
 from ollama_code.controller.request_policy import (
+    forbidden_tool_names_from_request,
     path_looks_like_doc_target,
     path_looks_like_test_file,
     request_allows_any_validation,
     request_allows_mutation,
     request_explicitly_allows_test_mutation,
+    request_explicitly_requests_tool,
     request_forbids_test_mutation,
     request_forbids_tests,
     request_forbids_validation,
@@ -15,6 +17,9 @@ from ollama_code.controller.request_policy import (
     request_requires_code_mutation,
     request_requires_mutation,
     request_requires_test_run,
+    request_requires_tools,
+    requested_tool_names_from_request,
+    tool_names_in_fragment,
     validation_preferences,
 )
 
@@ -72,6 +77,53 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         self.assertEqual(validation_preferences("Make the docs change without lint or validation."), (False, False))
         self.assertEqual(validation_preferences("Make the change without running tests."), (False, True))
         self.assertFalse(request_allows_any_validation("Make the docs change without lint or validation."))
+
+    def test_tool_name_policy_parses_static_and_dynamic_tools(self) -> None:
+        known = {"read_file", "run_shell", "run_test"}
+        is_supported = lambda name: name in known or name.startswith("mcp.demo.")
+
+        self.assertEqual(
+            tool_names_in_fragment(
+                "Use read_file and mcp.demo.echo.",
+                known_tool_names=known,
+                is_supported_tool_name=is_supported,
+            ),
+            {"read_file", "mcp.demo.echo"},
+        )
+
+    def test_tool_request_policy_respects_forbidden_constraints(self) -> None:
+        known = {"read_file", "run_shell", "run_test"}
+        is_supported = lambda name: name in known or name.startswith("mcp.demo.")
+        text = "Use mcp.demo.echo and run_test, but do not use run_shell or mcp.demo.delete."
+
+        forbidden = forbidden_tool_names_from_request(
+            text,
+            known_tool_names=known,
+            is_supported_tool_name=is_supported,
+        )
+        requested = requested_tool_names_from_request(
+            text,
+            known_tool_names=known,
+            is_supported_tool_name=is_supported,
+            forbidden_tool_names=forbidden,
+        )
+
+        self.assertEqual(forbidden, {"mcp.demo.delete", "run_shell"})
+        self.assertEqual(requested, {"mcp.demo.echo", "run_test"})
+        self.assertTrue(
+            request_explicitly_requests_tool(
+                text,
+                "run_shell",
+                known_tool_names=known,
+                is_supported_tool_name=is_supported,
+            )
+        )
+
+    def test_requires_tools_policy_matches_repo_and_file_oriented_requests(self) -> None:
+        self.assertTrue(request_requires_tools("Help me merge my missing branch back."))
+        self.assertTrue(request_requires_tools("Read src/app.py and explain the bug."))
+        self.assertTrue(request_requires_tools("Run pytest and keep tests green."))
+        self.assertFalse(request_requires_tools("What is a decorator in Python?"))
 
 
 if __name__ == "__main__":

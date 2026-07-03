@@ -98,12 +98,14 @@ from ollama_code.controller import (
     final_claims_test_success as controller_final_claims_test_success,
     final_claims_timeout_success as controller_final_claims_timeout_success,
     final_requires_verification as controller_final_requires_verification,
+    forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
     merge_request_obligations,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
     request_allows_any_validation as controller_request_allows_any_validation,
     request_allows_mutation as controller_request_allows_mutation,
     request_explicitly_allows_test_mutation as controller_request_explicitly_allows_test_mutation,
+    request_explicitly_requests_tool as controller_request_explicitly_requests_tool,
     request_forbids_test_mutation as controller_request_forbids_test_mutation,
     request_forbids_tests as controller_request_forbids_tests,
     request_forbids_validation as controller_request_forbids_validation,
@@ -115,7 +117,10 @@ from ollama_code.controller import (
     request_requires_code_mutation as controller_request_requires_code_mutation,
     request_requires_mutation as controller_request_requires_mutation,
     request_requires_test_run as controller_request_requires_test_run,
+    request_requires_tools as controller_request_requires_tools,
+    requested_tool_names_from_request as controller_requested_tool_names_from_request,
     typed_cli_flag_protocol_enabled,
+    tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
 )
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
@@ -1117,45 +1122,30 @@ class OllamaCodeAgent:
         return normalized.get("type") == "final"
 
     def _tool_names_in_fragment(self, text: str) -> set[str]:
-        matches: set[str] = set()
-        for name in KNOWN_TOOL_NAMES:
-            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name.lower())}(?![A-Za-z0-9_])", text):
-                matches.add(name)
-        for match in re.findall(r"(?<![A-Za-z0-9_])(mcp\.[a-z0-9_-]+\.[a-z0-9_.-]+)(?![A-Za-z0-9_])", text):
-            clean = match.rstrip(".,;:")
-            if self._is_supported_tool_name(clean):
-                matches.add(clean)
-        return matches
+        return controller_tool_names_in_fragment(
+            text,
+            known_tool_names=set(KNOWN_TOOL_NAMES),
+            is_supported_tool_name=self._is_supported_tool_name,
+        )
 
     def _forbidden_tool_names(self, text: str) -> set[str]:
-        lowered = text.lower()
-        masked = re.sub(
-            r"mcp\.[a-z0-9_-]+\.[a-z0-9_.-]+",
-            lambda match: match.group(0).replace(".", "__mcpdot__"),
-            lowered,
+        return controller_forbidden_tool_names_from_request(
+            text,
+            known_tool_names=set(KNOWN_TOOL_NAMES),
+            is_supported_tool_name=self._is_supported_tool_name,
         )
-        fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", masked)
-        fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", masked))
-        fragments.extend(re.findall(r"\bnot\s+(?:with|using|via)?\s*[^.?!\n]{0,80}", masked))
-        forbidden: set[str] = set()
-        for fragment in fragments:
-            forbidden.update(self._tool_names_in_fragment(fragment.replace("__mcpdot__", ".")))
-        return forbidden
 
     def _intrinsic_forbidden_tool_names(self) -> set[str]:
         available = self.tools.available_tool_names()
         return {name for name in KNOWN_TOOL_NAMES if name not in available}
 
     def _requested_tool_names(self, text: str, *, forbidden_tool_names: set[str] | None = None) -> set[str]:
-        lowered = text.lower()
-        fragments = re.findall(r"\b(?:use|call|run|invoke|start)\b[^.?!\n]{0,160}", lowered)
-        requested: set[str] = set()
-        for fragment in fragments:
-            requested.update(self._tool_names_in_fragment(fragment))
-        requested.update(self._tool_names_in_fragment(lowered))
-        if forbidden_tool_names:
-            requested.difference_update(forbidden_tool_names)
-        return requested
+        return controller_requested_tool_names_from_request(
+            text,
+            known_tool_names=set(KNOWN_TOOL_NAMES),
+            is_supported_tool_name=self._is_supported_tool_name,
+            forbidden_tool_names=forbidden_tool_names,
+        )
 
     def _request_is_continue_prompt(self, text: str) -> bool:
         return controller_request_is_continue_prompt(text)
@@ -3460,58 +3450,7 @@ class OllamaCodeAgent:
         return None
 
     def _request_requires_tools(self, text: str) -> bool:
-        lowered = text.lower()
-        tool_phrases = [
-            "read file",
-            "read the file",
-            "search",
-            "grep",
-            "list files",
-            "list the files",
-            "workspace",
-            "filesystem",
-            "directory",
-            "folder",
-            "repo",
-            "repository",
-            "project",
-            "create ",
-            "write ",
-            "replace ",
-            "edit ",
-            "update ",
-            "run ",
-            "execute ",
-            "shell",
-            "command",
-            "test",
-            "tests",
-            "pytest",
-            "unittest",
-            "git",
-            "checkout",
-            "checked out",
-            "merge",
-            "rebase",
-            "stash",
-            "working tree",
-            "staged",
-            "unstaged",
-            "commit ",
-            "branch",
-            "diff",
-            "sub-agent",
-            "subagent",
-            "helper agent",
-            "run_agent",
-            "run_test",
-            "code_outline",
-            "read_symbol",
-            "search_symbols",
-        ]
-        if any(phrase in lowered for phrase in tool_phrases):
-            return True
-        return bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text))
+        return controller_request_requires_tools(text)
 
     def _request_prefers_structured_file_tools(self, text: str) -> bool:
         lowered = text.lower()
@@ -5213,8 +5152,12 @@ class OllamaCodeAgent:
         return target_tool, {"query": clean_query, "path": path, "limit": 100}
 
     def _request_explicitly_requests_tool(self, text: str, name: str) -> bool:
-        requested = self._requested_tool_names(text, forbidden_tool_names=set())
-        return name in requested
+        return controller_request_explicitly_requests_tool(
+            text,
+            name,
+            known_tool_names=set(KNOWN_TOOL_NAMES),
+            is_supported_tool_name=self._is_supported_tool_name,
+        )
 
     def _request_is_broad_or_ambiguous(self, text: str) -> bool:
         lowered = text.lower()

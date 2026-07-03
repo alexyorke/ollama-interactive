@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
+
+
+ToolNamePredicate = Callable[[str], bool]
 
 
 def path_looks_like_doc_target(path: str) -> bool:
@@ -33,6 +37,154 @@ def request_is_continue_prompt(text: str) -> bool:
         "fix it",
         "finish it",
     }
+
+
+def tool_names_in_fragment(
+    text: str,
+    *,
+    known_tool_names: set[str],
+    is_supported_tool_name: ToolNamePredicate | None = None,
+) -> set[str]:
+    fragment = str(text or "")
+    lowered = fragment.lower()
+    supported = is_supported_tool_name or (lambda name: name in known_tool_names)
+    matches: set[str] = set()
+    for name in known_tool_names:
+        if re.search(rf"(?<![A-Za-z0-9_]){re.escape(name.lower())}(?![A-Za-z0-9_])", lowered):
+            matches.add(name)
+    for match in re.findall(r"(?<![A-Za-z0-9_])(mcp\.[a-z0-9_-]+\.[a-z0-9_.-]+)(?![A-Za-z0-9_])", lowered):
+        clean = match.rstrip(".,;:")
+        if supported(clean):
+            matches.add(clean)
+    return matches
+
+
+def forbidden_tool_names_from_request(
+    text: str,
+    *,
+    known_tool_names: set[str],
+    is_supported_tool_name: ToolNamePredicate | None = None,
+) -> set[str]:
+    lowered = str(text or "").lower()
+    masked = re.sub(
+        r"mcp\.[a-z0-9_-]+\.[a-z0-9_.-]+",
+        lambda match: match.group(0).replace(".", "__mcpdot__"),
+        lowered,
+    )
+    fragments = re.findall(r"\b(?:do not|don't|dont|never|avoid)\b[^.?!\n]{0,160}", masked)
+    fragments.extend(re.findall(r"\bwithout(?: using)?\b[^.?!\n]{0,160}", masked))
+    fragments.extend(re.findall(r"\bnot\s+(?:with|using|via)?\s*[^.?!\n]{0,80}", masked))
+    forbidden: set[str] = set()
+    for fragment in fragments:
+        forbidden.update(
+            tool_names_in_fragment(
+                fragment.replace("__mcpdot__", "."),
+                known_tool_names=known_tool_names,
+                is_supported_tool_name=is_supported_tool_name,
+            )
+        )
+    return forbidden
+
+
+def requested_tool_names_from_request(
+    text: str,
+    *,
+    known_tool_names: set[str],
+    is_supported_tool_name: ToolNamePredicate | None = None,
+    forbidden_tool_names: set[str] | None = None,
+) -> set[str]:
+    lowered = str(text or "").lower()
+    fragments = re.findall(r"\b(?:use|call|run|invoke|start)\b[^.?!\n]{0,160}", lowered)
+    requested: set[str] = set()
+    for fragment in fragments:
+        requested.update(
+            tool_names_in_fragment(
+                fragment,
+                known_tool_names=known_tool_names,
+                is_supported_tool_name=is_supported_tool_name,
+            )
+        )
+    requested.update(
+        tool_names_in_fragment(
+            lowered,
+            known_tool_names=known_tool_names,
+            is_supported_tool_name=is_supported_tool_name,
+        )
+    )
+    if forbidden_tool_names:
+        requested.difference_update(forbidden_tool_names)
+    return requested
+
+
+def request_explicitly_requests_tool(
+    text: str,
+    name: str,
+    *,
+    known_tool_names: set[str],
+    is_supported_tool_name: ToolNamePredicate | None = None,
+) -> bool:
+    requested = requested_tool_names_from_request(
+        text,
+        known_tool_names=known_tool_names,
+        is_supported_tool_name=is_supported_tool_name,
+        forbidden_tool_names=set(),
+    )
+    return name in requested
+
+
+def request_requires_tools(text: str) -> bool:
+    lowered = str(text or "").lower()
+    tool_phrases = [
+        "read file",
+        "read the file",
+        "search",
+        "grep",
+        "list files",
+        "list the files",
+        "workspace",
+        "filesystem",
+        "directory",
+        "folder",
+        "repo",
+        "repository",
+        "project",
+        "create ",
+        "write ",
+        "replace ",
+        "edit ",
+        "update ",
+        "run ",
+        "execute ",
+        "shell",
+        "command",
+        "test",
+        "tests",
+        "pytest",
+        "unittest",
+        "git",
+        "checkout",
+        "checked out",
+        "merge",
+        "rebase",
+        "stash",
+        "working tree",
+        "staged",
+        "unstaged",
+        "commit ",
+        "branch",
+        "diff",
+        "sub-agent",
+        "subagent",
+        "helper agent",
+        "run_agent",
+        "run_test",
+        "code_outline",
+        "read_symbol",
+        "search_symbols",
+    ]
+    if any(phrase in lowered for phrase in tool_phrases):
+        return True
+    return bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", str(text or "")))
 
 
 def request_looks_like_issue_report(text: str) -> bool:
