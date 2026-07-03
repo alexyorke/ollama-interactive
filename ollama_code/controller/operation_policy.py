@@ -80,6 +80,65 @@ def workflow_config_update_operations(*, request_text: str, source: str) -> list
     return workflow_config_update_operations_from_source(path=spec["path"], new_command=spec["new_command"], source=source)
 
 
+def clean_return_expression(expression: str) -> str:
+    expression = re.sub(r"\s+", " ", expression).strip()
+    expression = expression.strip("`\"' ")
+    expression = re.sub(r"\s+(?:then\s+)?(?:run|rerun|and|do not|don't)\b.*$", "", expression, flags=re.IGNORECASE).strip()
+    return expression.rstrip(".,;:`\"' ").strip()
+
+
+def symbol_return_update_spec(request_text: str) -> dict[str, str] | None:
+    patterns = [
+        r"\b(?P<path>[\w./-]+\.(?:js|jsx|ts|tsx|py))\b(?:(?!\n\n).){0,240}?\b(?:change|changing|update|updating)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
+        r"\b(?P<path>[\w./-]+\.(?:js|jsx|ts|tsx|py))\b(?:(?!\n\n).){0,240}?\b(?:so|make)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
+    ]
+    match = next((item for pattern in patterns if (item := re.search(pattern, request_text, flags=re.IGNORECASE | re.DOTALL))), None)
+    if not match:
+        return None
+    path = str(match.group("path") or "").strip().rstrip(".,;:")
+    symbol = match.group("symbol").strip()
+    new_expr = clean_return_expression(match.group("new"))
+    old_expr = clean_return_expression(match.group("old"))
+    if not path or not symbol or not new_expr or not old_expr:
+        return None
+    return {"path": path, "symbol": symbol, "new_expr": new_expr, "old_expr": old_expr}
+
+
+def symbol_return_update_operations_from_source(
+    *,
+    path: str,
+    symbol: str,
+    new_expr: str,
+    old_expr: str,
+    source: str,
+    requested_tool_names: set[str],
+    required_tool_names: set[str],
+) -> list[ToolOperation] | None:
+    if not path or not symbol or not new_expr or not old_expr:
+        return None
+    old_line: str | None = None
+    new_line: str | None = None
+    old_candidates = {f"return {old_expr}", f"return {old_expr};"}
+    for line in source.splitlines():
+        stripped = line.strip()
+        if stripped not in old_candidates:
+            continue
+        indent = line[: len(line) - len(line.lstrip())]
+        semicolon = ";" if stripped.endswith(";") else ""
+        old_line = line
+        new_line = f"{indent}return {new_expr}{semicolon}"
+        break
+    if old_line is None or new_line is None or old_line == new_line:
+        return None
+    operations: list[ToolOperation] = []
+    if "search_symbols" in requested_tool_names or "search_symbols" in required_tool_names:
+        operations.append(("search_symbols", {"query": symbol, "path": path}))
+    if "read_symbol" in requested_tool_names or "read_symbol" in required_tool_names:
+        operations.append(("read_symbol", {"path": path, "symbol": symbol, "include_context": 0}))
+    operations.append(("replace_in_file", {"path": path, "old": old_line, "new": new_line}))
+    return operations
+
+
 def project_function_rename_operations(request_text: str) -> list[ToolOperation] | None:
     lowered = request_text.lower()
     if not re.search(r"\b(?:rename|renam|refactor|change|update)\b", lowered):

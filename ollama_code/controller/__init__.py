@@ -30,8 +30,11 @@ from .final_policy import (
 )
 from .navigation_validation import NavigationValidationController, NavigationValidationTurn
 from .operation_policy import (
+    clean_return_expression,
     project_function_rename_already_satisfied,
     project_function_rename_operations,
+    symbol_return_update_operations_from_source,
+    symbol_return_update_spec,
     workflow_config_update_operations,
     workflow_config_update_operations_from_source,
     workflow_config_update_spec,
@@ -145,11 +148,14 @@ __all__ = [
     "RepairProtocolState",
     "RequestedDeliverable",
     "ValidationPlan",
+    "clean_return_expression",
     "path_looks_like_doc_target",
     "path_looks_like_test_file",
     "path_looks_like_code_file",
     "project_function_rename_already_satisfied",
     "project_function_rename_operations",
+    "symbol_return_update_operations_from_source",
+    "symbol_return_update_spec",
     "workflow_config_update_operations",
     "workflow_config_update_operations_from_source",
     "workflow_config_update_spec",

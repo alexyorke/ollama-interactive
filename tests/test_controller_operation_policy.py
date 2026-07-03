@@ -1,8 +1,11 @@
 import unittest
 
 from ollama_code.controller.operation_policy import (
+    clean_return_expression,
     project_function_rename_already_satisfied,
     project_function_rename_operations,
+    symbol_return_update_operations_from_source,
+    symbol_return_update_spec,
     workflow_config_update_operations,
     workflow_config_update_operations_from_source,
     workflow_config_update_spec,
@@ -10,6 +13,81 @@ from ollama_code.controller.operation_policy import (
 
 
 class ControllerOperationPolicyTests(unittest.TestCase):
+    def test_clean_return_expression_removes_prompt_tail_and_punctuation(self) -> None:
+        self.assertEqual(clean_return_expression(" `new_value`; then run tests"), "new_value")
+        self.assertEqual(clean_return_expression('"result" and do not touch docs'), "result")
+        self.assertEqual(clean_return_expression("foo + bar."), "foo + bar")
+
+    def test_symbol_return_update_spec_parses_request(self) -> None:
+        self.assertEqual(
+            symbol_return_update_spec("In src/app.py change parse() so it returns `new_value` instead of `old_value`; then run tests."),
+            {"path": "src/app.py", "symbol": "parse", "new_expr": "new_value", "old_expr": "old_value"},
+        )
+        self.assertEqual(
+            symbol_return_update_spec("Update src/app.ts so compute() returns 2 instead of 1."),
+            {"path": "src/app.ts", "symbol": "compute", "new_expr": "2", "old_expr": "1"},
+        )
+        self.assertIsNone(symbol_return_update_spec("Update src/app.py without return details."))
+
+    def test_symbol_return_update_operations_replaces_matching_return(self) -> None:
+        source = "def parse():\n    return old_value\n"
+        self.assertEqual(
+            symbol_return_update_operations_from_source(
+                path="src/app.py",
+                symbol="parse",
+                new_expr="new_value",
+                old_expr="old_value",
+                source=source,
+                requested_tool_names=set(),
+                required_tool_names=set(),
+            ),
+            [("replace_in_file", {"path": "src/app.py", "old": "    return old_value", "new": "    return new_value"})],
+        )
+
+    def test_symbol_return_update_operations_adds_requested_grounding_tools(self) -> None:
+        source = "export function compute() {\n  return 1;\n}\n"
+        self.assertEqual(
+            symbol_return_update_operations_from_source(
+                path="src/app.ts",
+                symbol="compute",
+                new_expr="2",
+                old_expr="1",
+                source=source,
+                requested_tool_names={"search_symbols"},
+                required_tool_names={"read_symbol"},
+            ),
+            [
+                ("search_symbols", {"query": "compute", "path": "src/app.ts"}),
+                ("read_symbol", {"path": "src/app.ts", "symbol": "compute", "include_context": 0}),
+                ("replace_in_file", {"path": "src/app.ts", "old": "  return 1;", "new": "  return 2;"}),
+            ],
+        )
+
+    def test_symbol_return_update_operations_rejects_missing_or_noop_replacement(self) -> None:
+        source = "def parse():\n    return old_value\n"
+        self.assertIsNone(
+            symbol_return_update_operations_from_source(
+                path="src/app.py",
+                symbol="parse",
+                new_expr="new_value",
+                old_expr="missing",
+                source=source,
+                requested_tool_names=set(),
+                required_tool_names=set(),
+            )
+        )
+        self.assertIsNone(
+            symbol_return_update_operations_from_source(
+                path="src/app.py",
+                symbol="parse",
+                new_expr="old_value",
+                old_expr="old_value",
+                source=source,
+                requested_tool_names=set(),
+                required_tool_names=set(),
+            )
+        )
+
     def test_workflow_config_update_spec_parses_path_and_command(self) -> None:
         self.assertEqual(
             workflow_config_update_spec(

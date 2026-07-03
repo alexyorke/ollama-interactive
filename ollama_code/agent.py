@@ -90,6 +90,7 @@ from ollama_code.controller import (
     cli_proof_command_argvs,
     cli_readme_additions,
     cli_test_additions,
+    clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
     final_acknowledges_missing_path as controller_final_acknowledges_missing_path,
     final_claims_file_mutation as controller_final_claims_file_mutation,
@@ -179,6 +180,8 @@ from ollama_code.controller import (
     shell_looks_like_file_mutation as controller_shell_looks_like_file_mutation,
     shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
+    symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
+    symbol_return_update_spec as controller_symbol_return_update_spec,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
@@ -7869,62 +7872,37 @@ class OllamaCodeAgent:
         request_text: str,
         required_tool_names: set[str],
     ) -> list[tuple[str, dict[str, Any]]] | None:
-        if not path or not symbol or not new_expr or not old_expr:
-            return None
         try:
             target = self.tools.resolve_path(path, allow_missing=False)
             source = target.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return None
-        old_line: str | None = None
-        new_line: str | None = None
-        old_candidates = {f"return {old_expr}", f"return {old_expr};"}
-        for line in source.splitlines():
-            stripped = line.strip()
-            if stripped not in old_candidates:
-                continue
-            indent = line[: len(line) - len(line.lstrip())]
-            semicolon = ";" if stripped.endswith(";") else ""
-            old_line = line
-            new_line = f"{indent}return {new_expr}{semicolon}"
-            break
-        if old_line is None or new_line is None or old_line == new_line:
-            return None
         requested_tools = self._requested_tool_names(request_text, forbidden_tool_names=set())
-        operations: list[tuple[str, dict[str, Any]]] = []
-        if "search_symbols" in requested_tools or "search_symbols" in required_tool_names:
-            operations.append(("search_symbols", {"query": symbol, "path": path}))
-        if "read_symbol" in requested_tools or "read_symbol" in required_tool_names:
-            operations.append(("read_symbol", {"path": path, "symbol": symbol, "include_context": 0}))
-        operations.append(("replace_in_file", {"path": path, "old": old_line, "new": new_line}))
-        return operations
-
-    def _symbol_return_update_operations(self, request_text: str, required_tool_names: set[str]) -> list[tuple[str, dict[str, Any]]] | None:
-        match = re.search(
-            r"\b(?P<path>[\w./-]+\.(?:js|jsx|ts|tsx|py))\b(?:(?!\n\n).){0,240}?\b(?:change|changing|update|updating)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
-            request_text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not match:
-            return None
-        path = self._clean_match_group(match, "path", strip_suffix=".,;:")
-        symbol = match.group("symbol").strip()
-        new_expr = self._clean_return_expression(match.group("new"))
-        old_expr = self._clean_return_expression(match.group("old"))
-        return self._symbol_return_update_operations_for_target(
+        return controller_symbol_return_update_operations_from_source(
             path=path,
             symbol=symbol,
             new_expr=new_expr,
             old_expr=old_expr,
+            source=source,
+            requested_tool_names=requested_tools,
+            required_tool_names=required_tool_names,
+        )
+
+    def _symbol_return_update_operations(self, request_text: str, required_tool_names: set[str]) -> list[tuple[str, dict[str, Any]]] | None:
+        spec = controller_symbol_return_update_spec(request_text)
+        if not spec:
+            return None
+        return self._symbol_return_update_operations_for_target(
+            path=spec["path"],
+            symbol=spec["symbol"],
+            new_expr=spec["new_expr"],
+            old_expr=spec["old_expr"],
             request_text=request_text,
             required_tool_names=required_tool_names,
         )
 
     def _clean_return_expression(self, expression: str) -> str:
-        expression = re.sub(r"\s+", " ", expression).strip()
-        expression = expression.strip("`\"' ")
-        expression = re.sub(r"\s+(?:then\s+)?(?:run|rerun|and|do not|don't)\b.*$", "", expression, flags=re.IGNORECASE).strip()
-        return expression.rstrip(".,;:").strip()
+        return controller_clean_return_expression(expression)
 
     def _optional_parameter_update_operations(self, request_text: str) -> list[tuple[str, dict[str, Any]]] | None:
         match = re.search(
