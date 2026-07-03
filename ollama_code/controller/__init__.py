@@ -10,6 +10,7 @@ from .feature_delivery import (
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
+from .edit_policy import path_looks_like_code_file, shell_looks_like_file_mutation, snippet_symbol_argument_looks_like_text
 from .final_policy import (
     final_acknowledges_missing_path,
     final_claims_file_mutation,
@@ -118,6 +119,9 @@ __all__ = [
     "ValidationPlan",
     "path_looks_like_doc_target",
     "path_looks_like_test_file",
+    "path_looks_like_code_file",
+    "shell_looks_like_file_mutation",
+    "snippet_symbol_argument_looks_like_text",
     "final_acknowledges_missing_path",
     "final_claims_file_mutation",
     "final_claims_path_exists",

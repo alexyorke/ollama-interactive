@@ -102,6 +102,7 @@ from ollama_code.controller import (
     merge_request_obligations,
     normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
+    path_looks_like_code_file as controller_path_looks_like_code_file,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
     request_allows_any_validation as controller_request_allows_any_validation,
@@ -158,7 +159,9 @@ from ollama_code.controller import (
     requested_search_symbols_spec as controller_requested_search_symbols_spec,
     requested_symbol_read as controller_requested_symbol_read,
     requested_target_line_read as controller_requested_target_line_read,
+    shell_looks_like_file_mutation as controller_shell_looks_like_file_mutation,
     shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
+    snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
@@ -3720,17 +3723,10 @@ class OllamaCodeAgent:
         return name, arguments, None
 
     def _snippet_symbol_argument_looks_like_text(self, value: str) -> bool:
-        snippet = value.strip()
-        if not snippet:
-            return False
-        if "\n" in snippet:
-            return True
-        if re.match(r"^[A-Za-z_][\w.]*\s*(?:\(|$)", snippet):
-            return False
-        return bool(re.search(r"\b(?:return|raise|yield|if|else|for|while|with|try|except)\b|[=+\-*/%<>\[\]{}]", snippet))
+        return controller_snippet_symbol_argument_looks_like_text(value)
 
     def _path_looks_like_code_file(self, path: str) -> bool:
-        return Path(path.replace("\\", "/")).suffix.lower() in CODE_EDIT_SUFFIXES
+        return controller_path_looks_like_code_file(path)
 
     def _decode_accidental_escaped_newlines(self, value: str) -> str:
         if "\n" in value or "\\n" not in value:
@@ -3969,19 +3965,7 @@ class OllamaCodeAgent:
         return controller_request_allows_commit(text)
 
     def _shell_looks_like_file_mutation(self, command: str) -> bool:
-        lowered = command.lower()
-        mutation_patterns = [
-            r">>?",
-            r"\btouch\b",
-            r"\bmkdir\b",
-            r"\bcp\b",
-            r"\bmv\b",
-            r"\brm\b",
-            r"\bsed\s+-i\b",
-            r"\btee\b",
-            r"\bcat\s+>+\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in mutation_patterns)
+        return controller_shell_looks_like_file_mutation(command)
 
     def _normalize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(payload)

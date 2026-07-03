@@ -29,6 +29,7 @@ SMOKE_MODULES = (
     "tests.test_trajectory_error_profile",
     "tests.test_trajectory_evidence_report",
     "tests.test_web_discovered_agent_dataset_analysis",
+    "tests.test_controller_edit_policy",
     "tests.test_controller_final_policy",
     "tests.test_controller_request_policy",
     "tests.test_repair_protocol",

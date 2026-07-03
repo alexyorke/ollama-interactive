@@ -24,6 +24,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Mechanical request parsers for read/list/search/test/git/outline/symbol/line targets now live in `ollama_code.controller.request_policy`.
 - Exact-literal request parsers for single-line writes, exact replies, loose file creation, and exact shell commands now live in `ollama_code.controller.request_policy`.
 - Shell/git request policy for git diff mode, test-command detection, grep normalization, and find-exec-grep normalization now lives in `ollama_code.controller.request_policy`.
+- Edit/shell classification policy for code-file paths, snippet-shaped symbol edits, and shell file-mutation detection now lives in `ollama_code.controller.edit_policy`.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.
