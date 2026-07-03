@@ -55,6 +55,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Repair strategy payload normalization now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only planner output.
 - Spec-guided repair candidate-model selection now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only installed-model discovery.
 - Spec-guided candidate Python source extraction now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only raw model text.
+- Related-test matching and selection policy now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only workspace scans and parsed imports.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.

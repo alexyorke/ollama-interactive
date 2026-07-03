@@ -135,6 +135,8 @@ from ollama_code.controller import (
     project_function_rename_operations as controller_project_function_rename_operations,
     preemptive_repair_source_score as feature_preemptive_repair_source_score,
     preemptive_repair_test_score as feature_preemptive_repair_test_score,
+    related_test_matches_source as feature_related_test_matches_source,
+    related_test_source_facts as feature_related_test_source_facts,
     request_allows_any_validation as controller_request_allows_any_validation,
     request_allows_commit as controller_request_allows_commit,
     request_allows_mutation as controller_request_allows_mutation,
@@ -198,6 +200,7 @@ from ollama_code.controller import (
     select_focused_python_repair_test as feature_select_focused_python_repair_test,
     select_preemptive_repair_source as feature_select_preemptive_repair_source,
     select_preemptive_repair_test as feature_select_preemptive_repair_test,
+    select_related_tests_for_source as feature_select_related_tests_for_source,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
     spec_guided_repair_candidate_models as feature_spec_guided_repair_candidate_models,
     spec_guided_repair_enabled as feature_spec_guided_repair_enabled,
@@ -9139,15 +9142,7 @@ class OllamaCodeAgent:
     def _related_tests_for_source(self, source_path: str) -> list[str]:
         if not source_path:
             return []
-        source = source_path.replace("\\", "/")
-        source_candidates = {source, source.rsplit("/", 1)[-1].rsplit(".", 1)[0]}
-        stem = Path(source).stem
-        parts = Path(source).with_suffix("").as_posix().split("/")
-        if len(parts) > 1:
-            source_candidates.add(".".join(parts[-2:]))
-            source_candidates.add(".".join(parts))
-        source_candidates.discard(".py")
-        source_candidates.discard("")
+        source_facts = feature_related_test_source_facts(source_path)
         try:
             test_paths = sorted((path for path in self.tools.workspace_root.rglob("test_*.py")), key=lambda p: p.name.lower())
             test_paths.extend(sorted((path for path in self.tools.workspace_root.rglob("*_test.py")), key=lambda p: p.name.lower()))
@@ -9172,25 +9167,13 @@ class OllamaCodeAgent:
                 elif isinstance(node, ast.ImportFrom):
                     if node.module:
                         imports.add(node.module)
-            stem_name = Path(source).stem
-            candidates = {stem, stem_name, source.rsplit("/", 1)[-1], ".".join(parts[-2:]), ".".join(parts)}
-            if source_candidates.intersection(imports) or any(candidate in imports for candidate in candidates):
+            if feature_related_test_matches_source(
+                source_facts=source_facts,
+                imports=imports,
+                test_name=test_path.name,
+            ):
                 related.append(self.tools.relative_label(test_path))
-                continue
-            if not imports and stem_name.lower() in test_path.name.lower():
-                related.append(self.tools.relative_label(test_path))
-        if not related:
-            return []
-        if len(related) == 1:
-            return related
-        test_file_name = f"test_{stem}.py"
-        for item in related:
-            if Path(item).name == test_file_name:
-                return [item]
-        for item in related:
-            if stem.lower() in Path(item).name.lower():
-                return [item]
-        return related[:1]
+        return feature_select_related_tests_for_source(related=related, source_facts=source_facts)
 
     def _package_relative_import_rewrite(self, source_path: str) -> str | None:
         if not source_path:

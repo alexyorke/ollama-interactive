@@ -21,6 +21,8 @@ from ollama_code.controller.feature_delivery import (
     normalized_test_or_source_stem,
     preemptive_repair_source_score,
     preemptive_repair_test_score,
+    related_test_matches_source,
+    related_test_source_facts,
     request_is_cli_flag_bundle,
     request_likely_import_repair,
     request_looks_like_python_test_driven_repair,
@@ -30,6 +32,7 @@ from ollama_code.controller.feature_delivery import (
     select_focused_python_repair_test,
     select_preemptive_repair_source,
     select_preemptive_repair_test,
+    select_related_tests_for_source,
     spec_guided_repair_candidate_models,
     spec_guided_repair_has_actionable_spec,
     spec_guided_repair_enabled,
@@ -340,6 +343,22 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
             "@dataclass\nclass Task:\n    name: str\n",
         )
         self.assertEqual(extract_candidate_python_source("just prose"), "")
+
+    def test_related_test_policy_matches_imports_names_and_selects_best(self) -> None:
+        facts = related_test_source_facts("src/pkg/calculator.py")
+
+        self.assertIn("pkg.calculator", facts["source_candidates"])
+        self.assertTrue(related_test_matches_source(source_facts=facts, imports={"pkg.calculator"}, test_name="test_other.py"))
+        self.assertTrue(related_test_matches_source(source_facts=facts, imports=set(), test_name="test_calculator.py"))
+        self.assertFalse(related_test_matches_source(source_facts=facts, imports={"other"}, test_name="test_other.py"))
+        self.assertEqual(
+            select_related_tests_for_source(
+                related=["tests/test_math.py", "tests/test_calculator.py"],
+                source_facts=facts,
+            ),
+            ["tests/test_calculator.py"],
+        )
+        self.assertEqual(select_related_tests_for_source(related=[], source_facts=facts), [])
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:
         events = [

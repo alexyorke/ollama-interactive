@@ -267,6 +267,60 @@ def extract_candidate_python_source(text: str) -> str:
     return candidate + "\n"
 
 
+def related_test_source_facts(source_path: str) -> dict[str, Any]:
+    if not source_path:
+        return {"source": "", "stem": "", "parts": [], "source_candidates": set(), "test_file_name": ""}
+    source = source_path.replace("\\", "/")
+    stem = source.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    without_suffix = source.rsplit(".", 1)[0]
+    parts = without_suffix.split("/")
+    source_candidates = {source, stem}
+    if len(parts) > 1:
+        source_candidates.add(".".join(parts[-2:]))
+        source_candidates.add(".".join(parts))
+    source_candidates.discard(".py")
+    source_candidates.discard("")
+    return {
+        "source": source,
+        "stem": stem,
+        "parts": parts,
+        "source_candidates": source_candidates,
+        "test_file_name": f"test_{stem}.py",
+    }
+
+
+def related_test_matches_source(
+    *,
+    source_facts: dict[str, Any],
+    imports: set[str],
+    test_name: str,
+) -> bool:
+    stem = str(source_facts.get("stem") or "")
+    parts = [str(item) for item in list(source_facts.get("parts") or [])]
+    source = str(source_facts.get("source") or "")
+    source_candidates = set(source_facts.get("source_candidates") or set())
+    candidates = {stem, source.rsplit("/", 1)[-1], ".".join(parts[-2:]), ".".join(parts)}
+    if source_candidates.intersection(imports) or any(candidate in imports for candidate in candidates):
+        return True
+    return not imports and stem.lower() in test_name.lower()
+
+
+def select_related_tests_for_source(*, related: list[str], source_facts: dict[str, Any]) -> list[str]:
+    if not related:
+        return []
+    if len(related) == 1:
+        return related
+    test_file_name = str(source_facts.get("test_file_name") or "")
+    stem = str(source_facts.get("stem") or "")
+    for item in related:
+        if item.replace("\\", "/").rsplit("/", 1)[-1] == test_file_name:
+            return [item]
+    for item in related:
+        if stem.lower() in item.replace("\\", "/").rsplit("/", 1)[-1].lower():
+            return [item]
+    return related[:1]
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,
