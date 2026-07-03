@@ -108,6 +108,7 @@ from ollama_code.controller import (
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
     normalize_payload as controller_normalize_payload,
     normalize_run_test_call as controller_normalize_run_test_call,
+    normalize_shell_inspection_call as controller_normalize_shell_inspection_call,
     normalize_shell_test_call as controller_normalize_shell_test_call,
     normalize_snippet_symbol_edit_call as controller_normalize_snippet_symbol_edit_call,
     normalize_target_line_read_call as controller_normalize_target_line_read_call,
@@ -4397,53 +4398,18 @@ class OllamaCodeAgent:
         request_text: str,
         exact_shell_command: str | None,
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "run_shell":
-            return name, arguments, None
-        if self.approval_mode() == "read-only":
-            return name, arguments, None
-        command = str(arguments.get("command", "")).strip()
-        if not command or exact_shell_command:
-            return name, arguments, None
         request_forbidden = self._forbidden_tool_names(request_text)
-        if self._request_explicitly_requests_tool(request_text, "run_shell") and "run_shell" not in request_forbidden:
-            return name, arguments, None
-        if str(arguments.get("cwd") or ".").strip() not in {"", "."}:
-            return name, arguments, None
-        normalized_find_exec = self._normalize_find_exec_grep_shell_command(command)
-        if normalized_find_exec is not None:
-            return "search", normalized_find_exec, "Normalized find-plus-grep inspection to search for cacheable structured context."
-        if re.search(r"[|&;<>`$()\r\n]", command):
-            return name, arguments, None
-        path_token = r'(?:"([^"]+)"|\'([^\']+)\'|(\S+))'
-        cat_match = re.fullmatch(rf"(?:cat|type)\s+(?:-n\s+)?{path_token}", command, flags=re.IGNORECASE)
-        if cat_match:
-            path = next(group for group in cat_match.groups() if group)
-            if path.startswith("-"):
-                return name, arguments, None
-            return "read_file", {"path": path}, "Normalized shell file inspection to read_file for cacheable structured context."
-        list_match = re.fullmatch(rf"(?:ls|dir)\s+{path_token}", command, flags=re.IGNORECASE)
-        if list_match:
-            path = next(group for group in list_match.groups() if group)
-            if path.startswith("-"):
-                return name, arguments, None
-            return "list_files", {"path": path}, "Normalized shell directory inspection to list_files for cacheable structured context."
-        try:
-            argv = shlex.split(command, posix=True)
-        except ValueError:
-            return name, arguments, None
-        normalized_search = self._normalize_grep_shell_inspection(argv)
-        if normalized_search is not None:
-            return "search", normalized_search, "Normalized shell text search to search for cacheable structured context."
-        if argv and argv[0].lower() in {"head", "tail"}:
-            normalized_read = self._normalize_head_tail_shell_inspection(argv)
-            if normalized_read is not None:
-                return "read_file", normalized_read, "Normalized shell file preview to read_file for bounded structured context."
-        if argv and argv[0].lower() == "find":
-            normalized_find = self._normalize_find_shell_inspection(argv)
-            if normalized_find is not None:
-                tool_name, tool_arguments = normalized_find
-                return tool_name, tool_arguments, "Normalized simple shell discovery to structured search for cacheable context."
-        return name, arguments, None
+        return controller_normalize_shell_inspection_call(
+            name,
+            arguments,
+            approval_mode=self.approval_mode(),
+            explicit_run_shell=self._request_explicitly_requests_tool(request_text, "run_shell") and "run_shell" not in request_forbidden,
+            exact_shell_command=exact_shell_command,
+            normalize_find_exec_grep_shell_command=self._normalize_find_exec_grep_shell_command,
+            normalize_grep_shell_inspection=self._normalize_grep_shell_inspection,
+            normalize_head_tail_shell_inspection=self._normalize_head_tail_shell_inspection,
+            normalize_find_shell_inspection=self._normalize_find_shell_inspection,
+        )
 
     def _normalize_grep_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
         result = controller_normalize_grep_shell_inspection(argv)

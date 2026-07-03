@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,9 @@ PathLabeler = Callable[[Path], str]
 UnittestCommandNormalizer = Callable[[str], str | None]
 BarePythonTestFileDetector = Callable[[str], str | None]
 ShellTestRunPredicate = Callable[[str], bool]
+ToolArgumentsNormalizer = Callable[[str], dict[str, Any] | None]
+ArgvArgumentsNormalizer = Callable[[list[str]], dict[str, Any] | None]
+ArgvToolNormalizer = Callable[[list[str]], tuple[str, dict[str, Any]] | None]
 
 
 def normalize_target_line_read_call(
@@ -131,6 +135,66 @@ def normalize_shell_test_call(
         else "Normalized shell test command to run_test with the original command."
     )
     return "run_test", normalized, reason
+
+
+def normalize_shell_inspection_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    approval_mode: str,
+    explicit_run_shell: bool,
+    exact_shell_command: str | None,
+    normalize_find_exec_grep_shell_command: ToolArgumentsNormalizer,
+    normalize_grep_shell_inspection: ArgvArgumentsNormalizer,
+    normalize_head_tail_shell_inspection: ArgvArgumentsNormalizer,
+    normalize_find_shell_inspection: ArgvToolNormalizer,
+) -> tuple[str, dict[str, Any], str | None]:
+    if name != "run_shell":
+        return name, arguments, None
+    if approval_mode == "read-only":
+        return name, arguments, None
+    command = str(arguments.get("command", "")).strip()
+    if not command or exact_shell_command:
+        return name, arguments, None
+    if explicit_run_shell:
+        return name, arguments, None
+    if str(arguments.get("cwd") or ".").strip() not in {"", "."}:
+        return name, arguments, None
+    normalized_find_exec = normalize_find_exec_grep_shell_command(command)
+    if normalized_find_exec is not None:
+        return "search", normalized_find_exec, "Normalized find-plus-grep inspection to search for cacheable structured context."
+    if re.search(r"[|&;<>`$()\r\n]", command):
+        return name, arguments, None
+    path_token = r'(?:"([^"]+)"|\'([^\']+)\'|(\S+))'
+    cat_match = re.fullmatch(rf"(?:cat|type)\s+(?:-n\s+)?{path_token}", command, flags=re.IGNORECASE)
+    if cat_match:
+        path = next(group for group in cat_match.groups() if group)
+        if path.startswith("-"):
+            return name, arguments, None
+        return "read_file", {"path": path}, "Normalized shell file inspection to read_file for cacheable structured context."
+    list_match = re.fullmatch(rf"(?:ls|dir)\s+{path_token}", command, flags=re.IGNORECASE)
+    if list_match:
+        path = next(group for group in list_match.groups() if group)
+        if path.startswith("-"):
+            return name, arguments, None
+        return "list_files", {"path": path}, "Normalized shell directory inspection to list_files for cacheable structured context."
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return name, arguments, None
+    normalized_search = normalize_grep_shell_inspection(argv)
+    if normalized_search is not None:
+        return "search", normalized_search, "Normalized shell text search to search for cacheable structured context."
+    if argv and argv[0].lower() in {"head", "tail"}:
+        normalized_read = normalize_head_tail_shell_inspection(argv)
+        if normalized_read is not None:
+            return "read_file", normalized_read, "Normalized shell file preview to read_file for bounded structured context."
+    if argv and argv[0].lower() == "find":
+        normalized_find = normalize_find_shell_inspection(argv)
+        if normalized_find is not None:
+            tool_name, tool_arguments = normalized_find
+            return tool_name, tool_arguments, "Normalized simple shell discovery to structured search for cacheable context."
+    return name, arguments, None
 
 
 def normalize_unittest_file_command(

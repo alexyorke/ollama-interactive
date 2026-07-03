@@ -6,6 +6,7 @@ from ollama_code.agent_protocol import TargetLineReadSpec
 from ollama_code.controller.tool_call_policy import (
     normalize_find_shell_inspection,
     normalize_run_test_call,
+    normalize_shell_inspection_call,
     normalize_shell_test_call,
     normalize_target_line_read_call,
     normalize_unittest_file_command,
@@ -234,6 +235,127 @@ class ControllerToolCallPolicyTests(unittest.TestCase):
                 {"command": "python -m unittest discover -s tests -v"},
                 "Normalized bare Python test-file shell command to the configured run_test command.",
             ),
+        )
+
+    def test_shell_inspection_call_normalizes_file_and_directory_reads(self) -> None:
+        kwargs = {
+            "approval_mode": "default",
+            "explicit_run_shell": False,
+            "exact_shell_command": None,
+            "normalize_find_exec_grep_shell_command": lambda command: None,
+            "normalize_grep_shell_inspection": lambda argv: None,
+            "normalize_head_tail_shell_inspection": lambda argv: None,
+            "normalize_find_shell_inspection": lambda argv: None,
+        }
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "cat README.md"}, **kwargs),
+            ("read_file", {"path": "README.md"}, "Normalized shell file inspection to read_file for cacheable structured context."),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "type -n docs/guide.md"}, **kwargs),
+            ("read_file", {"path": "docs/guide.md"}, "Normalized shell file inspection to read_file for cacheable structured context."),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "ls src"}, **kwargs),
+            ("list_files", {"path": "src"}, "Normalized shell directory inspection to list_files for cacheable structured context."),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "dir \"my docs\""}, **kwargs),
+            ("list_files", {"path": "my docs"}, "Normalized shell directory inspection to list_files for cacheable structured context."),
+        )
+
+    def test_shell_inspection_call_preserves_explicit_or_unsafe_shell(self) -> None:
+        kwargs = {
+            "normalize_find_exec_grep_shell_command": lambda command: None,
+            "normalize_grep_shell_inspection": lambda argv: None,
+            "normalize_head_tail_shell_inspection": lambda argv: None,
+            "normalize_find_shell_inspection": lambda argv: None,
+        }
+        self.assertEqual(
+            normalize_shell_inspection_call(
+                "run_shell",
+                {"command": "cat README.md"},
+                approval_mode="default",
+                explicit_run_shell=True,
+                exact_shell_command=None,
+                **kwargs,
+            ),
+            ("run_shell", {"command": "cat README.md"}, None),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call(
+                "run_shell",
+                {"command": "cat README.md", "cwd": "docs"},
+                approval_mode="default",
+                explicit_run_shell=False,
+                exact_shell_command=None,
+                **kwargs,
+            ),
+            ("run_shell", {"command": "cat README.md", "cwd": "docs"}, None),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call(
+                "run_shell",
+                {"command": "cat README.md | head"},
+                approval_mode="default",
+                explicit_run_shell=False,
+                exact_shell_command=None,
+                **kwargs,
+            ),
+            ("run_shell", {"command": "cat README.md | head"}, None),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call(
+                "run_shell",
+                {"command": "cat README.md"},
+                approval_mode="read-only",
+                explicit_run_shell=False,
+                exact_shell_command=None,
+                **kwargs,
+            ),
+            ("run_shell", {"command": "cat README.md"}, None),
+        )
+
+    def test_shell_inspection_call_uses_parser_callbacks(self) -> None:
+        def normalize_grep(argv: list[str]) -> dict[str, object] | None:
+            if argv[:2] == ["grep", "needle"]:
+                return {"query": "needle", "path": ".", "limit": 20}
+            return None
+
+        def normalize_head_tail(argv: list[str]) -> dict[str, object] | None:
+            if argv[:2] == ["head", "README.md"]:
+                return {"path": "README.md", "start": 1, "end": 10}
+            return None
+
+        def normalize_find(argv: list[str]) -> tuple[str, dict[str, object]] | None:
+            if argv[:2] == ["find", "."]:
+                return "file_search", {"query": ".py", "path": ".", "limit": 100}
+            return None
+
+        base_kwargs = {
+            "approval_mode": "default",
+            "explicit_run_shell": False,
+            "exact_shell_command": None,
+            "normalize_find_exec_grep_shell_command": lambda command: {"query": "todo", "path": "."} if command == "find . -exec grep todo {} +" else None,
+            "normalize_grep_shell_inspection": normalize_grep,
+            "normalize_head_tail_shell_inspection": normalize_head_tail,
+            "normalize_find_shell_inspection": normalize_find,
+        }
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "find . -exec grep todo {} +"}, **base_kwargs),
+            ("search", {"query": "todo", "path": "."}, "Normalized find-plus-grep inspection to search for cacheable structured context."),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "grep needle README.md"}, **base_kwargs),
+            ("search", {"query": "needle", "path": ".", "limit": 20}, "Normalized shell text search to search for cacheable structured context."),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "head README.md"}, **base_kwargs),
+            ("read_file", {"path": "README.md", "start": 1, "end": 10}, "Normalized shell file preview to read_file for bounded structured context."),
+        )
+        self.assertEqual(
+            normalize_shell_inspection_call("run_shell", {"command": "find . -name '*.py'"}, **base_kwargs),
+            ("file_search", {"query": ".py", "path": ".", "limit": 100}, "Normalized simple shell discovery to structured search for cacheable context."),
         )
 
     def test_unittest_file_command_normalizes_test_file_paths_only(self) -> None:

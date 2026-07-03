@@ -116,6 +116,7 @@ from .state import ControllerTurnState
 from .tool_call_policy import (
     normalize_find_shell_inspection,
     normalize_run_test_call,
+    normalize_shell_inspection_call,
     normalize_shell_test_call,
     normalize_target_line_read_call,
     normalize_unittest_file_command,
@@ -142,6 +143,7 @@ __all__ = [
     "normalize_find_shell_inspection",
     "normalize_payload",
     "normalize_run_test_call",
+    "normalize_shell_inspection_call",
     "normalize_shell_test_call",
     "normalize_snippet_symbol_edit_call",
     "normalize_target_line_read_call",
