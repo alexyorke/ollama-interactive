@@ -1,6 +1,8 @@
 import unittest
 
 from ollama_code.controller.request_policy import (
+    path_looks_like_doc_target,
+    path_looks_like_test_file,
     request_allows_any_validation,
     request_allows_mutation,
     request_explicitly_allows_test_mutation,
@@ -17,6 +19,16 @@ from ollama_code.controller.request_policy import (
 
 
 class ControllerRequestPolicyTests(unittest.TestCase):
+    def test_path_classification_identifies_docs_and_tests(self) -> None:
+        self.assertTrue(path_looks_like_doc_target("README.md"))
+        self.assertTrue(path_looks_like_doc_target("./docs/setup.rst"))
+        self.assertTrue(path_looks_like_doc_target("notes.txt"))
+        self.assertFalse(path_looks_like_doc_target("src/readme_parser.py"))
+        self.assertTrue(path_looks_like_test_file("tests/test_cli.py"))
+        self.assertTrue(path_looks_like_test_file("src/foo_test.py"))
+        self.assertTrue(path_looks_like_test_file("src/foo.spec.ts"))
+        self.assertFalse(path_looks_like_test_file("src/foo.py"))
+
     def test_mutation_policy_respects_read_only_and_issue_report_shapes(self) -> None:
         self.assertFalse(request_requires_mutation("Inspect only; do not edit app.py."))
         self.assertFalse(request_requires_mutation("How should we refactor this later?"))

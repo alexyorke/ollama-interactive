@@ -3,6 +3,25 @@ from __future__ import annotations
 import re
 
 
+def path_looks_like_doc_target(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").lstrip("./").lower()
+    if not normalized:
+        return False
+    if normalized == "readme.md" or normalized.endswith("/readme.md"):
+        return True
+    return normalized.startswith("docs/") or normalized.endswith((".md", ".rst", ".txt"))
+
+
+def path_looks_like_test_file(path: str) -> bool:
+    normalized = str(path or "").replace("\\", "/").lower()
+    name = normalized.rsplit("/", 1)[-1]
+    return bool(
+        re.search(r"(^test_|_test\.|\.test\.|\.spec\.)", name)
+        or "/tests/" in normalized
+        or normalized.startswith("tests/")
+    )
+
+
 def request_looks_like_issue_report(text: str) -> bool:
     lowered = text.lower()
     has_code_context = bool(

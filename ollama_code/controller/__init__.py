@@ -21,6 +21,8 @@ from .final_policy import (
 )
 from .navigation_validation import NavigationValidationController, NavigationValidationTurn
 from .request_policy import (
+    path_looks_like_doc_target,
+    path_looks_like_test_file,
     request_allows_any_validation,
     request_allows_mutation,
     request_explicitly_allows_test_mutation,
@@ -68,6 +70,8 @@ __all__ = [
     "RepairProtocolState",
     "RequestedDeliverable",
     "ValidationPlan",
+    "path_looks_like_doc_target",
+    "path_looks_like_test_file",
     "final_acknowledges_missing_path",
     "final_claims_file_mutation",
     "final_claims_path_exists",

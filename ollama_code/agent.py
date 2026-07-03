@@ -99,6 +99,8 @@ from ollama_code.controller import (
     final_claims_timeout_success as controller_final_claims_timeout_success,
     final_requires_verification as controller_final_requires_verification,
     merge_request_obligations,
+    path_looks_like_doc_target as controller_path_looks_like_doc_target,
+    path_looks_like_test_file as controller_path_looks_like_test_file,
     request_allows_any_validation as controller_request_allows_any_validation,
     request_allows_mutation as controller_request_allows_mutation,
     request_explicitly_allows_test_mutation as controller_request_explicitly_allows_test_mutation,
@@ -1167,12 +1169,7 @@ class OllamaCodeAgent:
         }
 
     def _path_looks_like_doc_target(self, path: str) -> bool:
-        normalized = self._strip_relative_prefix(path).lower()
-        if not normalized:
-            return False
-        if normalized == "readme.md" or normalized.endswith("/readme.md"):
-            return True
-        return normalized.startswith("docs/") or normalized.endswith((".md", ".rst", ".txt"))
+        return controller_path_looks_like_doc_target(self._strip_relative_prefix(path))
 
     def _merge_request_obligations(self, obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return merge_request_obligations(obligations)
@@ -4046,13 +4043,7 @@ class OllamaCodeAgent:
         )
 
     def _path_looks_like_test_file(self, path: str) -> bool:
-        normalized = path.replace("\\", "/").lower()
-        name = normalized.rsplit("/", 1)[-1]
-        return bool(
-            re.search(r"(^test_|_test\.|\.test\.|\.spec\.)", name)
-            or "/tests/" in normalized
-            or normalized.startswith("tests/")
-        )
+        return controller_path_looks_like_test_file(path)
 
     def _request_allows_commit(self, text: str) -> bool:
         lowered = text.lower()
