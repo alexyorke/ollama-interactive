@@ -29,6 +29,7 @@ from ollama_code.controller.feature_delivery import (
     select_focused_python_repair_test,
     select_preemptive_repair_source,
     select_preemptive_repair_test,
+    spec_guided_repair_candidate_models,
     spec_guided_repair_has_actionable_spec,
     spec_guided_repair_enabled,
     typed_cli_flag_protocol_enabled,
@@ -297,6 +298,35 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 "reason": "None",
                 "notes": [],
             },
+        )
+
+    def test_spec_guided_repair_candidate_models_include_verifier_when_available(self) -> None:
+        self.assertEqual(
+            spec_guided_repair_candidate_models(
+                primary_model="granite",
+                verifier_model="qwen",
+                available_models={"granite", "qwen"},
+                max_attempts=3,
+            ),
+            ["granite", "qwen", "granite"],
+        )
+        self.assertEqual(
+            spec_guided_repair_candidate_models(
+                primary_model="granite",
+                verifier_model="qwen",
+                available_models={"granite"},
+                max_attempts=3,
+            ),
+            ["granite", "granite", "granite"],
+        )
+        self.assertEqual(
+            spec_guided_repair_candidate_models(
+                primary_model="granite",
+                verifier_model="granite",
+                available_models=set(),
+                max_attempts=2,
+            ),
+            ["granite", "granite"],
         )
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:

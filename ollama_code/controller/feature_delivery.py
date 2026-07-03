@@ -226,6 +226,27 @@ def normalize_repair_strategy_payload(payload: dict[str, Any] | None) -> dict[st
     }
 
 
+def spec_guided_repair_candidate_models(
+    *,
+    primary_model: str,
+    verifier_model: str | None,
+    available_models: set[str],
+    max_attempts: int,
+) -> list[str]:
+    models = [primary_model]
+    for candidate in (verifier_model,):
+        if not candidate or candidate in models:
+            continue
+        if available_models and candidate not in available_models:
+            continue
+        models.append(candidate)
+        if len(models) >= max_attempts:
+            break
+    while len(models) < max_attempts:
+        models.append(primary_model)
+    return models
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,

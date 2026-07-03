@@ -198,6 +198,7 @@ from ollama_code.controller import (
     select_preemptive_repair_source as feature_select_preemptive_repair_source,
     select_preemptive_repair_test as feature_select_preemptive_repair_test,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
+    spec_guided_repair_candidate_models as feature_spec_guided_repair_candidate_models,
     spec_guided_repair_enabled as feature_spec_guided_repair_enabled,
     successful_tool_call_already_satisfied as controller_successful_tool_call_already_satisfied,
     symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
@@ -9112,7 +9113,6 @@ class OllamaCodeAgent:
         ]
 
     def _spec_guided_repair_candidate_models(self) -> list[str]:
-        models = [self.model]
         available: set[str] = set()
         list_models = getattr(self.client, "list_models", None)
         if callable(list_models):
@@ -9120,17 +9120,12 @@ class OllamaCodeAgent:
                 available = {str(model) for model in list_models()}
             except Exception:
                 available = set()
-        for candidate in (self.verifier_model,):
-            if not candidate or candidate in models:
-                continue
-            if available and candidate not in available:
-                continue
-            models.append(candidate)
-            if len(models) >= SPEC_GUIDED_REPAIR_MAX_ATTEMPTS:
-                break
-        while len(models) < SPEC_GUIDED_REPAIR_MAX_ATTEMPTS:
-            models.append(self.model)
-        return models
+        return feature_spec_guided_repair_candidate_models(
+            primary_model=self.model,
+            verifier_model=self.verifier_model,
+            available_models=available,
+            max_attempts=SPEC_GUIDED_REPAIR_MAX_ATTEMPTS,
+        )
 
     def _explicit_source_repair_candidates(
         self,
