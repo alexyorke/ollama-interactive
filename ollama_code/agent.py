@@ -86,9 +86,8 @@ from ollama_code.agent_protocol import (
 from ollama_code.controller import (
     NavigationValidationController,
     NavigationValidationTurn,
-    cli_feature_capabilities,
     cli_proof_commands as feature_cli_proof_commands,
-    cli_readme_additions,
+    cli_readme_update_plan as feature_cli_readme_update_plan,
     cli_test_additions,
     clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
@@ -9478,34 +9477,35 @@ class OllamaCodeAgent:
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> None:
-        if not re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
-            return
-        capabilities = cli_feature_capabilities(candidate_source, request_text)
-        if not capabilities.any():
-            return
         try:
             readme_path = self.tools.resolve_path("README.md", allow_missing=False)
             readme_text = readme_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return
-        additions = cli_readme_additions(candidate_source, request_text, readme_text)
-        if not additions:
-            if re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
-                self._execute_controller_tool(
-                    name="read_file",
-                    arguments={"path": "README.md"},
-                    request_text=request_text,
-                    round_number=round_number,
-                    successful_tool_results=successful_tool_results,
-                    satisfied_tool_names=satisfied_tool_names,
-                    tool_calls_this_turn=tool_calls_this_turn,
-                )
+        plan = feature_cli_readme_update_plan(
+            request_text=request_text,
+            candidate_source=candidate_source,
+            existing_readme=readme_text,
+        )
+        action = str(plan.get("action") or "").strip()
+        if action == "skip":
             return
-        separator = "" if readme_text.endswith("\n") else "\n"
-        content = readme_text + separator + "\nAdditional commands:\n" + "\n".join(additions) + "\n"
+        if action == "read":
+            self._execute_controller_tool(
+                name="read_file",
+                arguments={"path": "README.md"},
+                request_text=request_text,
+                round_number=round_number,
+                successful_tool_results=successful_tool_results,
+                satisfied_tool_names=satisfied_tool_names,
+                tool_calls_this_turn=tool_calls_this_turn,
+            )
+            return
+        if action != "write" or not isinstance(plan.get("content"), str):
+            return
         self._execute_controller_tool(
             name="write_file",
-            arguments={"path": "README.md", "content": content},
+            arguments={"path": "README.md", "content": plan["content"]},
             request_text=request_text,
             round_number=round_number,
             successful_tool_results=successful_tool_results,

@@ -6,6 +6,7 @@ from ollama_code.controller.feature_delivery import (
     cli_proof_commands,
     cli_proof_command_argvs,
     cli_readme_additions,
+    cli_readme_update_plan,
     cli_test_additions,
     derive_request_obligations,
     mechanical_obligation_repair_failed_for,
@@ -253,6 +254,43 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         additions = cli_readme_additions(source, "Update README for --due-before.", "Use --priority already.\n")
 
         self.assertEqual(additions, ["- `list --due-before YYYY-MM-DD` filters tasks by due date and can be combined with `--priority`."])
+
+    def test_cli_readme_update_plan_skips_when_docs_not_requested(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--due-before')\n"
+
+        self.assertEqual(
+            cli_readme_update_plan(
+                request_text="Add --due-before to the CLI.",
+                candidate_source=source,
+                existing_readme="",
+            ),
+            {"action": "skip"},
+        )
+
+    def test_cli_readme_update_plan_reads_when_already_documented(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--due-before')\n"
+
+        self.assertEqual(
+            cli_readme_update_plan(
+                request_text="Add --due-before and update README.",
+                candidate_source=source,
+                existing_readme="Use --due-before already.\n",
+            ),
+            {"action": "read"},
+        )
+
+    def test_cli_readme_update_plan_writes_missing_docs(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--due-before')\n"
+
+        plan = cli_readme_update_plan(
+            request_text="Add --due-before and update README.",
+            candidate_source=source,
+            existing_readme="Usage\n",
+        )
+
+        self.assertEqual(plan["action"], "write")
+        self.assertIn("Additional commands", plan["content"])
+        self.assertIn("list --due-before YYYY-MM-DD", plan["content"])
 
     def test_cli_test_additions_create_due_before_regressions(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"

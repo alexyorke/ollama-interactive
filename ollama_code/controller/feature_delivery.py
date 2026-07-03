@@ -647,6 +647,25 @@ def cli_readme_additions(candidate_source: str, request_text: str, existing_read
     return additions
 
 
+def cli_readme_update_plan(
+    *,
+    request_text: str,
+    candidate_source: str,
+    existing_readme: str,
+) -> dict[str, str]:
+    if not re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
+        return {"action": "skip"}
+    capabilities = cli_feature_capabilities(candidate_source, request_text)
+    if not capabilities.any():
+        return {"action": "skip"}
+    additions = cli_readme_additions(candidate_source, request_text, existing_readme)
+    if not additions:
+        return {"action": "read"}
+    separator = "" if existing_readme.endswith("\n") else "\n"
+    content = existing_readme + separator + "\nAdditional commands:\n" + "\n".join(additions) + "\n"
+    return {"action": "write", "content": content}
+
+
 def cli_test_additions(candidate_source: str, request_text: str, existing_test_text: str, helper_name: str) -> list[str]:
     wants_limit_tests = "--limit" in candidate_source and "--limit" in request_text
     wants_due_tests = "--due-before" in candidate_source and "--due-before" in request_text
