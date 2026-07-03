@@ -10,6 +10,7 @@ from ollama_code.controller.repair_protocol import (
     failed_test_still_needs_repair,
     merge_failed_edit_recovery,
     mutation_edit_granularity,
+    mutation_record_targets_source,
     recovery_target_from_mutation,
     recovery_target_matches,
     repair_decision_for_tool,
@@ -382,6 +383,48 @@ class RepairProtocolTests(unittest.TestCase):
         self.assertEqual(state["behavior_paths"], ["tests/test_task_cli.py"])
         self.assertLessEqual(len(state["diagnostic"]), 520)
         self.assertLessEqual(len(state["diagnostic_excerpt"]), 240)
+
+    def test_mutation_record_targets_source_uses_explicit_paths_first(self) -> None:
+        is_doc = lambda path: path.lower().endswith(".md") or path.lower().startswith("docs/")
+        is_test = lambda path: path.startswith("tests/") or path.endswith("_test.py")
+
+        self.assertTrue(
+            mutation_record_targets_source(
+                explicit_paths=["README.md", ".\\src\\task_cli.py"],
+                fallback_target=None,
+                path_looks_like_doc_target=is_doc,
+                path_looks_like_test_file=is_test,
+            )
+        )
+        self.assertFalse(
+            mutation_record_targets_source(
+                explicit_paths=["README.md", "tests/test_task_cli.py"],
+                fallback_target={"path": "src/task_cli.py"},
+                path_looks_like_doc_target=is_doc,
+                path_looks_like_test_file=is_test,
+            )
+        )
+
+    def test_mutation_record_targets_source_falls_back_to_recovery_target(self) -> None:
+        is_doc = lambda path: path.lower().endswith(".md")
+        is_test = lambda path: path.startswith("tests/")
+
+        self.assertTrue(
+            mutation_record_targets_source(
+                explicit_paths=[],
+                fallback_target={"path": ".\\src\\task_cli.py"},
+                path_looks_like_doc_target=is_doc,
+                path_looks_like_test_file=is_test,
+            )
+        )
+        self.assertFalse(
+            mutation_record_targets_source(
+                explicit_paths=[],
+                fallback_target={"path": "tests/test_task_cli.py"},
+                path_looks_like_doc_target=is_doc,
+                path_looks_like_test_file=is_test,
+            )
+        )
 
     def test_failed_test_repair_policy_tracks_current_mutation_version(self) -> None:
         self.assertTrue(

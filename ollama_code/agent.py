@@ -249,6 +249,7 @@ from ollama_code.controller.repair_protocol import (
     failed_test_still_needs_repair as controller_failed_test_still_needs_repair,
     merge_failed_edit_recovery as controller_merge_failed_edit_recovery,
     mutation_edit_granularity as controller_mutation_edit_granularity,
+    mutation_record_targets_source as controller_mutation_record_targets_source,
     recovery_target_from_mutation as controller_recovery_target_from_mutation,
     recovery_target_matches as controller_recovery_target_matches,
     repair_decision_for_tool,
@@ -1484,22 +1485,20 @@ class OllamaCodeAgent:
         result_path = str(result.get("path") or "").strip().replace("\\", "/").lstrip("./")
         if result_path:
             explicit_paths.append(result_path)
-        explicit_paths = list(dict.fromkeys(explicit_paths))
-        if explicit_paths:
-            return any(
-                path and not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path)
-                for path in explicit_paths
+        fallback_target = None
+        if not explicit_paths:
+            fallback_target = self._recovery_target_from_mutation(
+                name=name,
+                arguments=arguments,
+                successful_tool_results=successful_tool_results or [],
+                result=result,
             )
-        target = self._recovery_target_from_mutation(
-            name=name,
-            arguments=arguments,
-            successful_tool_results=successful_tool_results or [],
-            result=result,
+        return controller_mutation_record_targets_source(
+            explicit_paths=explicit_paths,
+            fallback_target=fallback_target,
+            path_looks_like_doc_target=self._path_looks_like_doc_target,
+            path_looks_like_test_file=self._path_looks_like_test_file,
         )
-        if target is None:
-            return False
-        path = str(target.get("path") or "").strip().replace("\\", "/").lstrip("./")
-        return bool(path and not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path))
 
     def _failed_edit_recovery_broad_repair_hint(self, state: dict[str, Any]) -> str:
         return repair_spec_broad_repair_hint(

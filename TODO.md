@@ -64,6 +64,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Failed-edit recovery target merge, mutation granularity, target derivation, and target matching now live in `ollama_code.controller.repair_protocol`; `agent.py` supplies only runtime target/path evidence.
 - Failed-edit target and behavior regrounding proof now lives in `ollama_code.controller.repair_protocol`; `agent.py` supplies only event history and behavior path candidates.
 - Failed-edit recovery-state shaping now lives in `ollama_code.controller.repair_protocol`; `agent.py` supplies only target, validation, obligation, and file-scope evidence.
+- Mutation source-target classification for repair tracking now lives in `ollama_code.controller.repair_protocol`; `agent.py` supplies only explicit paths, fallback target, and path classifiers.
 - Repair-spec behavior-surface path policy now lives in `ollama_code.controller.repair_protocol`; `agent.py` only supplies workspace-discovered test candidates.
 - Repair-spec validation-loop blocking, retry guidance, and failed-test repair retry policy now live in `ollama_code.controller.repair_protocol`.
 - Focused controller tests cover feature-delivery policy directly instead of relying only on the omnibus `tests/test_agent.py`.

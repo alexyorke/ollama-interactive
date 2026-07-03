@@ -504,6 +504,24 @@ def build_failed_edit_recovery_state(
     }
 
 
+def mutation_record_targets_source(
+    *,
+    explicit_paths: list[str],
+    fallback_target: dict[str, str] | None,
+    path_looks_like_doc_target: Any,
+    path_looks_like_test_file: Any,
+) -> bool:
+    normalized_paths = list(dict.fromkeys(_normalize_path(path) for path in explicit_paths if str(path or "").strip()))
+    if normalized_paths:
+        return any(
+            path and not path_looks_like_doc_target(path) and not path_looks_like_test_file(path)
+            for path in normalized_paths
+        )
+    target = fallback_target if isinstance(fallback_target, dict) else {}
+    path = _normalize_path(str(target.get("path") or ""))
+    return bool(path and not path_looks_like_doc_target(path) and not path_looks_like_test_file(path))
+
+
 def repair_spec_required_proof_items(state: dict[str, Any]) -> list[str]:
     items: list[str] = []
     raw_items = state.get("required_proof_items")
