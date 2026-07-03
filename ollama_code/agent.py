@@ -105,6 +105,7 @@ from ollama_code.controller import (
     normalize_file_tool_alias_call as controller_normalize_file_tool_alias_call,
     normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
+    normalize_payload as controller_normalize_payload,
     normalize_snippet_symbol_edit_call as controller_normalize_snippet_symbol_edit_call,
     path_looks_like_code_file as controller_path_looks_like_code_file,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
@@ -3758,42 +3759,7 @@ class OllamaCodeAgent:
         return controller_shell_looks_like_file_mutation(command)
 
     def _normalize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        normalized = dict(payload)
-        response_type = normalized.get("type")
-        tool_name = normalized.get("name")
-        if isinstance(response_type, str):
-            normalized["type"] = response_type.strip()
-        if isinstance(tool_name, str):
-            normalized["name"] = tool_name.strip()
-        response_type = normalized.get("type")
-        tool_name = normalized.get("name")
-        arguments = normalized.get("arguments")
-        if isinstance(tool_name, str) and tool_name == "final" and response_type in {"tool", None, "", "function", "tool_call"}:
-            message = normalized.get("message")
-            if not isinstance(message, str):
-                if isinstance(arguments, dict):
-                    arg_message = arguments.get("message")
-                    if isinstance(arg_message, str):
-                        message = arg_message
-                    else:
-                        arg_content = arguments.get("content")
-                        if isinstance(arg_content, str):
-                            message = arg_content
-            normalized = {"type": "final", "message": str(message or "").strip()}
-            return normalized
-        if isinstance(response_type, str) and self._is_supported_tool_name(response_type):
-            normalized["type"] = "tool"
-            if not isinstance(tool_name, str) or not tool_name:
-                normalized["name"] = response_type
-            if not isinstance(arguments, dict):
-                normalized["arguments"] = {}
-            return normalized
-        if isinstance(tool_name, str) and self._is_supported_tool_name(tool_name) and response_type in {None, "", "function", "tool_call"}:
-            normalized["type"] = "tool"
-            if not isinstance(arguments, dict):
-                normalized["arguments"] = {}
-            return normalized
-        return normalized
+        return controller_normalize_payload(payload, is_supported_tool_name=self._is_supported_tool_name)
 
     def _is_supported_tool_name(self, name: str) -> bool:
         clean = str(name or "").strip()

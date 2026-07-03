@@ -113,6 +113,7 @@ from .repair_protocol import (
     repair_spec_strategy_class,
 )
 from .state import ControllerTurnState
+from .tool_payload_policy import normalize_payload
 
 __all__ = [
     "CliFeatureCapabilities",
@@ -131,6 +132,7 @@ __all__ = [
     "normalize_exact_literal_tool_call",
     "normalize_edit_payload_aliases",
     "normalize_file_tool_alias_call",
+    "normalize_payload",
     "normalize_snippet_symbol_edit_call",
     "shell_looks_like_file_mutation",
     "snippet_symbol_argument_looks_like_text",

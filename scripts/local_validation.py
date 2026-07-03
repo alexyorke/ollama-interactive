@@ -32,6 +32,7 @@ SMOKE_MODULES = (
     "tests.test_controller_edit_policy",
     "tests.test_controller_final_policy",
     "tests.test_controller_request_policy",
+    "tests.test_controller_tool_payload_policy",
     "tests.test_repair_protocol",
 )
 
