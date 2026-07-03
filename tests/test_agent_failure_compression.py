@@ -35,6 +35,28 @@ class AgentFailureCompressionTests(AgentTestBase):
         self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "loop-cap" for event in agent.events))
         self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["search_symbols", "read_symbol", "code_outline"])
 
+    def test_context_planner_blocks_third_broad_context_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"tool","name":"search","arguments":{"query":"hello"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt","start":1,"end":1}}',
+                    '{"type":"final","message":"hello world"}',
+                ]
+            )
+            (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+                result = agent.handle_user("Inspect this repo and find the relevant hello text.")
+
+        self.assertEqual(result.message, "hello world")
+        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "context-planner" for event in agent.events))
+        self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["read_file", "search"])
+
     def test_agent_blocks_third_identical_cached_symbol_search(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -577,26 +577,7 @@ class AgentTests(AgentTestBase):
         self.assertIn("return 'new'", (root / "app.py").read_text(encoding="utf-8"))
         self.assertFalse(any(event.get("type") == "clarification_plan" for event in agent.events))
 
-    # Focused loop-cap coverage lives in test_agent_failure_compression.py.
-
-    def test_context_planner_blocks_third_broad_context_tool(self) -> None:
-        client = FakeClient(
-            [
-                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
-                '{"type":"tool","name":"search","arguments":{"query":"hello"}}',
-                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt","start":1,"end":1}}',
-                '{"type":"final","message":"hello world"}',
-            ]
-        )
-        root, _client, _tools, agent = self._workspace_agent(client, debate_enabled=False, max_tool_rounds=5)
-        (root / "note.txt").write_text("hello world\n", encoding="utf-8")
-
-        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
-            result = agent.handle_user("Inspect this repo and find the relevant hello text.")
-
-        self.assertEqual(result.message, "hello world")
-        self.assertTrue(any(event.get("type") == "controller_guard" and event.get("guard") == "context-planner" for event in agent.events))
-        self.assertEqual([event.get("name") for event in agent.events if event.get("type") == "tool_call"], ["read_file", "search"])
+    # Focused loop-cap and broad-context planner coverage lives in test_agent_failure_compression.py.
 
     def test_context_planner_auto_maps_recent_test_to_implementation_target(self) -> None:
         client = FakeClient(
@@ -8482,7 +8463,6 @@ class AgentTests(AgentTestBase):
         tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_names[:3], ["search_symbols", "read_symbol", "replace_in_file"])
         self.assertEqual(tool_names[3:], ["lint_typecheck", "select_tests", "discover_validators"])
-
 
 
 
