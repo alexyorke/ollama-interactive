@@ -3523,6 +3523,31 @@ class OllamaCodeAgent:
                 values.append(value)
         return bool(values) and all(self._text_is_stub_like_python_repair(value) for value in values)
 
+    def _mutation_payload_contains_omitted_context_marker(self, name: str, arguments: dict[str, Any]) -> bool:
+        values: list[str] = []
+        if name in {"write_file", "replace_symbol"}:
+            value = arguments.get("content")
+            if isinstance(value, str):
+                values.append(value)
+        elif name == "replace_symbols":
+            replacements = arguments.get("replacements")
+            if isinstance(replacements, list):
+                values.extend(
+                    str(item.get("content"))
+                    for item in replacements
+                    if isinstance(item, dict) and isinstance(item.get("content"), str)
+                )
+        elif name == "replace_in_file":
+            for key in ("old", "new"):
+                value = arguments.get(key)
+                if isinstance(value, str):
+                    values.append(value)
+        elif name == "edit_intent":
+            value = arguments.get("replacement")
+            if isinstance(value, str):
+                values.append(value)
+        return any(re.search(r"\[omitted \d+ chars from prior [A-Za-z_]+; do not copy\]", value) for value in values)
+
     def _validation_failure_is_stub_placeholder(self, summary: str) -> bool:
         lowered = summary.lower()
         return "still has stub body" in lowered or "pass-style placeholder" in lowered or "stub/comment/pass-style placeholder" in lowered
@@ -5675,6 +5700,51 @@ class OllamaCodeAgent:
                 if result_path == path:
                     return True
             return False
+        if name in {"replace_symbol", "replace_symbols"}:
+            path = str(arguments.get("path", "")).strip().replace("\\", "/").lstrip("./")
+            if not path:
+                return False
+            symbols: list[str] = []
+            if name == "replace_symbol":
+                symbol = str(arguments.get("symbol") or "").strip()
+                if symbol:
+                    symbols.append(symbol)
+            else:
+                replacements = arguments.get("replacements")
+                if isinstance(replacements, list):
+                    symbols.extend(
+                        str(item.get("symbol") or "").strip()
+                        for item in replacements
+                        if isinstance(item, dict) and str(item.get("symbol") or "").strip()
+                    )
+            if not symbols:
+                return False
+            grounded_symbols: set[str] = set()
+            path_grounded = False
+            for item in reversed(successful_tool_results):
+                if item.get("name") not in {"read_file", "read_symbol", "code_outline"}:
+                    continue
+                result = item.get("result") if isinstance(item.get("result"), dict) else {}
+                if result.get("ok") is not True:
+                    continue
+                result_path = str(result.get("path") or item.get("arguments", {}).get("path") or "").strip().replace("\\", "/").lstrip("./")
+                if result_path != path:
+                    continue
+                path_grounded = True
+                if item.get("name") == "read_symbol":
+                    grounded = str(result.get("symbol") or item.get("arguments", {}).get("symbol") or "").strip()
+                    if grounded:
+                        grounded_symbols.add(grounded)
+                        grounded_symbols.add(grounded.rsplit(".", 1)[-1])
+                else:
+                    output = str(result.get("output") or "")
+                    for symbol in symbols:
+                        if re.search(rf"(?m)^\s*(?:def|class)\s+{re.escape(symbol.rsplit('.', 1)[-1])}\b", output) or symbol in output:
+                            grounded_symbols.add(symbol)
+                            grounded_symbols.add(symbol.rsplit(".", 1)[-1])
+            if not path_grounded:
+                return False
+            return all(symbol in grounded_symbols or symbol.rsplit(".", 1)[-1] in grounded_symbols for symbol in symbols)
         if name != "replace_in_file":
             return False
         path = str(arguments.get("path", "")).strip().replace("\\", "/")
@@ -5714,6 +5784,12 @@ class OllamaCodeAgent:
         ):
             return False
         if name == "write_file" and name not in forbidden_tool_names:
+            return False
+        if name in {"replace_symbol", "replace_symbols"} and name not in forbidden_tool_names and self._tool_call_grounded_by_successful_evidence(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results,
+        ):
             return False
         if failed_tool_this_turn:
             if name in CONTEXT_GATHERING_TOOL_NAMES:
@@ -13774,6 +13850,8 @@ class OllamaCodeAgent:
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
         invalid_python_mutation_payload_counts: dict[tuple[str, str], int] = {}
+        omitted_mutation_payload_counts: dict[tuple[str, str], int] = {}
+        omitted_write_failure_paths: set[str] = set()
         failed_mutation_obligations_pending = False
         context_only_exhausted_for_mutation = False
         repair_pivot_prompt_pending = False
@@ -14917,7 +14995,55 @@ class OllamaCodeAgent:
                         )
                         continue
                 if name == "write_file":
+                    write_path = str(arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
+                    if write_path in omitted_write_failure_paths:
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="write-file-after-omitted-content",
+                            path=write_path,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"Do not retry write_file on `{write_path}` after an abbreviated omitted-content payload failed. "
+                                    "Use replace_symbol or replace_symbols for complete Python symbols, or replace_in_file for a grounded small text edit. Next JSON only."
+                                ),
+                            }
+                        )
+                        continue
                     content_text = str(arguments.get("content") or "")
+                    if re.search(r"\[omitted \d+ chars from prior [A-Za-z_]+; do not copy\]", content_text):
+                        omitted_key = ("write_file", write_path or ".")
+                        omitted_mutation_payload_counts[omitted_key] = omitted_mutation_payload_counts.get(omitted_key, 0) + 1
+                        if write_path and not self._path_looks_like_doc_target(write_path):
+                            omitted_write_failure_paths.add(write_path)
+                            failed_mutation_obligations_pending = True
+                        self._append_assistant_payload(payload)
+                        self._record_event(
+                            "controller_guard",
+                            guard="write-file-omitted-content",
+                            path=write_path,
+                            rounds=round_number,
+                        )
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "write_file content is abbreviated with an omitted-content marker. "
+                                    "Do not use placeholders or transcript compression as file content. Use replace_symbol or replace_symbols "
+                                    "for complete Python symbols, or replace_in_file for a grounded small text edit. Next JSON only."
+                                ),
+                            }
+                        )
+                        if omitted_mutation_payload_counts[omitted_key] >= 3:
+                            failure = f"Stopped because repeated omitted-context mutation payloads were proposed for {write_path or 'the target file'}."
+                            self._record_event("assistant", content=failure, rounds=round_number)
+                            self._flush_llm_call_events()
+                            return AgentResult(message=failure, rounds=round_number, completed=False)
+                        continue
                     if re.search(r"(?m)^\s*(?:>{2,3}\s*)?(?:BEGIN|END) EDITED CONTENT\s*(?:<{2,3})?\s*$", content_text):
                         self._append_assistant_payload(payload)
                         self._record_event(
@@ -15137,6 +15263,48 @@ class OllamaCodeAgent:
                             }
                         )
                         continue
+                if name in MUTATING_TOOL_NAMES and name != "write_file" and self._mutation_payload_contains_omitted_context_marker(name, arguments):
+                    mutation_paths = self._mutation_target_paths(arguments)
+                    omitted_key = (name, ",".join(mutation_paths) or ".")
+                    omitted_mutation_payload_counts[omitted_key] = omitted_mutation_payload_counts.get(omitted_key, 0) + 1
+                    for raw_path in mutation_paths:
+                        rel_path = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+                        if rel_path and not self._path_looks_like_doc_target(rel_path):
+                            failed_mutation_obligations_pending = True
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="mutation-omitted-content",
+                        tool=name,
+                        paths=mutation_paths,
+                        rounds=round_number,
+                    )
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"{name} content is abbreviated with an omitted-content marker. "
+                                "Send complete replacement text for the target symbol or grounded text span; do not use transcript placeholders. Next JSON only."
+                            ),
+                        }
+                    )
+                    if omitted_mutation_payload_counts[omitted_key] >= 3:
+                        failure = (
+                            "Stopped because repeated omitted-context mutation payloads were proposed for "
+                            + (", ".join(mutation_paths) if mutation_paths else name)
+                            + "."
+                        )
+                        self._record_event(
+                            "controller_guard",
+                            guard="omitted-mutation-loop-compressed",
+                            tool=name,
+                            paths=mutation_paths,
+                            rounds=round_number,
+                        )
+                        self._record_event("assistant", content=failure, rounds=round_number)
+                        self._flush_llm_call_events()
+                        return AgentResult(message=failure, rounds=round_number, completed=False)
+                    continue
                 if name in {"edit_intent", "write_file"}:
                     syntax_diagnostic = self._python_mutation_payload_syntax_diagnostic(name, arguments)
                     mutation_paths = self._mutation_target_paths(arguments)
@@ -16283,6 +16451,12 @@ class OllamaCodeAgent:
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
+                    result_summary = str(result.get("summary") or result.get("output") or "").strip()
+                    if name == "write_file" and "omitted-context marker" in result_summary:
+                        for raw_path in self._mutation_target_paths(arguments):
+                            rel_path = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
+                            if rel_path and not self._path_looks_like_doc_target(rel_path):
+                                omitted_write_failure_paths.add(rel_path)
                     accepted_assumption_audits = [
                         audit
                         for audit in accepted_assumption_audits
