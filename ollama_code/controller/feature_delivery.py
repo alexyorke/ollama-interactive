@@ -321,6 +321,57 @@ def select_related_tests_for_source(*, related: list[str], source_facts: dict[st
     return related[:1]
 
 
+def package_relative_import_rewrite_source(
+    *,
+    source_text: str,
+    local_module_exists: Callable[[str], bool],
+) -> str | None:
+    changed_lines: list[str] = []
+    changed = False
+    for line in source_text.splitlines():
+        if line.lstrip().startswith("from ") and " import " in line:
+            match = re.match(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\s+(.+?)\s*$", line)
+            if match:
+                module = match.group(1).strip()
+                rest = match.group(2).strip()
+                if local_module_exists(module):
+                    changed_lines.append(f"from .{module} import {rest}")
+                    changed = True
+                    continue
+        if re.match(r"^\s*import\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:as\s+[\w_]+)?\s*$", line):
+            names = re.match(r"^\s*import\s+(.+?)\s*$", line)
+            if names:
+                import_items = [item.strip() for item in names.group(1).split(",")]
+                rewritten_items = []
+                did_rewrite = False
+                for item in import_items:
+                    if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", item):
+                        rewritten_items.append(item)
+                        continue
+                    alias_match = re.match(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*)?$", item)
+                    if alias_match is None:
+                        rewritten_items.append(item)
+                        continue
+                    name = alias_match.group("name")
+                    alias = alias_match.group("alias")
+                    if local_module_exists(name):
+                        rewritten_items.append(f".{name}" if not alias else f".{name} as {alias}")
+                        did_rewrite = True
+                    else:
+                        rewritten_items.append(item)
+                if did_rewrite:
+                    changed_lines.append("import " + ", ".join(rewritten_items))
+                    changed = True
+                    continue
+        changed_lines.append(line)
+    if not changed:
+        return None
+    candidate = "\n".join(changed_lines)
+    if not candidate.endswith("\n"):
+        candidate += "\n"
+    return candidate
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,

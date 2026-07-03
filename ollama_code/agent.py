@@ -126,6 +126,7 @@ from ollama_code.controller import (
     normalize_snippet_symbol_edit_call as controller_normalize_snippet_symbol_edit_call,
     normalize_target_line_read_call as controller_normalize_target_line_read_call,
     normalize_unittest_file_command as controller_normalize_unittest_file_command,
+    package_relative_import_rewrite_source as feature_package_relative_import_rewrite_source,
     path_looks_like_code_file as controller_path_looks_like_code_file,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
@@ -9188,51 +9189,10 @@ class OllamaCodeAgent:
             text = source_file.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
-        changed_lines: list[str] = []
-        changed = False
-        for line in text.splitlines():
-            if line.lstrip().startswith("from ") and " import " in line:
-                match = re.match(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_]*)\s+import\s+(.+?)\s*$", line)
-                if match:
-                    module = match.group(1).strip()
-                    rest = match.group(2).strip()
-                    candidate_module = source_file.parent / f"{module}.py"
-                    if candidate_module.is_file():
-                        changed_lines.append(f"from .{module} import {rest}")
-                        changed = True
-                        continue
-            if re.match(r"^\s*import\s+[A-Za-z_][A-Za-z0-9_]*\s*(?:as\s+[\w_]+)?\s*$", line):
-                names = re.match(r"^\s*import\s+(.+?)\s*$", line)
-                if names:
-                    import_items = [item.strip() for item in names.group(1).split(",")]
-                    rewritten_items = []
-                    did_rewrite = False
-                    for item in import_items:
-                        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", item):
-                            rewritten_items.append(item)
-                            continue
-                        alias_match = re.match(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*)?$", item)
-                        if alias_match is None:
-                            rewritten_items.append(item)
-                            continue
-                        name = alias_match.group("name")
-                        alias = alias_match.group("alias")
-                        if source_file.parent.joinpath(f"{name}.py").is_file():
-                            rewritten_items.append(f".{name}" if not alias else f".{name} as {alias}")
-                            did_rewrite = True
-                        else:
-                            rewritten_items.append(item)
-                    if did_rewrite:
-                        changed_lines.append("import " + ", ".join(rewritten_items))
-                        changed = True
-                        continue
-            changed_lines.append(line)
-        if not changed:
-            return None
-        candidate = "\n".join(changed_lines)
-        if not candidate.endswith("\n"):
-            candidate += "\n"
-        return candidate
+        return feature_package_relative_import_rewrite_source(
+            source_text=text,
+            local_module_exists=lambda name: source_file.parent.joinpath(f"{name}.py").is_file(),
+        )
 
     def _preemptive_spec_guided_repair_paths(self) -> tuple[str, str] | None:
         try:

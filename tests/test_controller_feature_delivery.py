@@ -19,6 +19,7 @@ from ollama_code.controller.feature_delivery import (
     mechanical_obligation_repair_failed_for,
     normalize_repair_strategy_payload,
     normalized_test_or_source_stem,
+    package_relative_import_rewrite_source,
     preemptive_repair_source_score,
     preemptive_repair_test_score,
     related_test_matches_source,
@@ -163,6 +164,25 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 failed_output="",
                 split_test_example=lambda example: ("value", "parse('x')", "'X'"),
                 test_spec_call_name=call_name,
+            )
+        )
+
+    def test_package_relative_import_rewrite_source_rewrites_local_modules(self) -> None:
+        rewritten = package_relative_import_rewrite_source(
+            source_text="from helpers import build\nimport tasks\nvalue = 1\n",
+            local_module_exists=lambda name: name in {"helpers", "tasks"},
+        )
+
+        self.assertEqual(
+            rewritten,
+            "from .helpers import build\nimport .tasks\nvalue = 1\n",
+        )
+
+    def test_package_relative_import_rewrite_source_returns_none_without_local_modules(self) -> None:
+        self.assertIsNone(
+            package_relative_import_rewrite_source(
+                source_text="import os\nfrom sys import path\n",
+                local_module_exists=lambda name: False,
             )
         )
 
