@@ -33,6 +33,8 @@ from ollama_code.tools.synthesis import (
     candidate_validation_run_in_temp_workspace,
     candidate_validation_success_result,
     candidate_workspace_ignored_names,
+    function_probe_result,
+    function_probe_script,
 )
 
 
@@ -5313,6 +5315,32 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("actual='!e' expected='e!'", result["output"])
         self.assertIn("list_ops.py", result["output"])
         self.assertIn("symbol=foldr", result["output"])
+
+    def test_function_probe_helpers_build_script_and_shape_result(self) -> None:
+        script = function_probe_script("ops", ["fn(2, 5)"], function="add")
+        success = function_probe_result(
+            module="ops",
+            function="add",
+            exit_code=0,
+            rows=[{"expression": "fn(2, 5)", "ok": True, "repr": "7", "type": "int"}],
+            raw_output="raw",
+        )
+        failure = function_probe_result(
+            module="ops",
+            function=None,
+            exit_code=0,
+            rows=[{"expression": "missing()", "ok": False, "error": "NameError: missing"}],
+            raw_output="raw",
+        )
+
+        self.assertIn("module_name=\"ops\"", script)
+        self.assertIn("function_name=\"add\"", script)
+        self.assertIn("expressions=[\"fn(2, 5)\"]", script)
+        self.assertTrue(success["ok"])
+        self.assertEqual(success["function"], "add")
+        self.assertIn("fn(2, 5): 7 (int)", success["output"])
+        self.assertFalse(failure["ok"])
+        self.assertIn("missing(): ERROR NameError: missing", failure["output"])
 
     def test_run_function_probe_reports_actual_values(self) -> None:
         with self._temp_files_tools({"ops.py": "def add(a, b):\n    return a + b\n"}) as (_root, tools):

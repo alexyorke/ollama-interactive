@@ -84,6 +84,8 @@ from ollama_code.tools.synthesis import (
     candidate_workspace_ignored_names,
     candidate_public_signature_map,
     candidate_signature_diagnostics,
+    function_probe_result,
+    function_probe_script,
     first_behavior_call,
     human_test_name,
     method_name,
@@ -9071,28 +9073,7 @@ import string
         approved, reason = self._approve_shell(f"python function probe for {module}", ".")
         if not approved:
             return {"ok": False, "tool": "run_function_probe", "summary": reason}
-        script = (
-            "import importlib,json,os,sys,traceback\n"
-            "workspace=os.getcwd(); sys.path.insert(0, workspace); sys.path.insert(0, os.path.join(workspace, 'src'))\n"
-            f"module_name={json.dumps(module)}\n"
-            f"function_name={json.dumps(function or '')}\n"
-            f"expressions={json.dumps(probe_expressions)}\n"
-            "rows=[]\n"
-            "try:\n"
-            "    mod=importlib.import_module(module_name)\n"
-            "    ns={'module': mod}\n"
-            "    if function_name:\n"
-            "        ns['fn']=getattr(mod, function_name)\n"
-            "    for expr in expressions:\n"
-            "        try:\n"
-            "            value=eval(expr, ns)\n"
-            "            rows.append({'expression': expr, 'ok': True, 'repr': repr(value), 'type': type(value).__name__})\n"
-            "        except Exception as exc:\n"
-            "            rows.append({'expression': expr, 'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)})\n"
-            "except Exception as exc:\n"
-            "    rows.append({'expression': '<import>', 'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)})\n"
-            "print(json.dumps(rows, ensure_ascii=False))\n"
-        )
+        script = function_probe_script(module, probe_expressions, function=function)
         completed = self._run_process([sys.executable, "-c", script], cwd=self.workspace_root, timeout=max(1, int(timeout)))
         raw_output = self._collect_process_output(completed)
         rows: list[Any]
@@ -9100,23 +9081,13 @@ import string
             rows = json.loads(completed.stdout.strip())
         except json.JSONDecodeError:
             rows = []
-        rendered = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if row.get("ok"):
-                rendered.append(f"{row.get('expression')}: {row.get('repr')} ({row.get('type')})")
-            else:
-                rendered.append(f"{row.get('expression')}: ERROR {row.get('error')}")
-        return {
-            "ok": completed.returncode == 0 and all(isinstance(row, dict) and row.get("ok") for row in rows),
-            "tool": "run_function_probe",
-            "module": module,
-            "function": function or "",
-            "exit_code": completed.returncode,
-            "results": rows,
-            "output": "\n".join(rendered) if rendered else raw_output,
-        }
+        return function_probe_result(
+            module=module,
+            function=function,
+            exit_code=completed.returncode,
+            rows=rows,
+            raw_output=raw_output,
+        )
 
     def _annotation_text(self, node: ast.AST | None) -> str:
         return annotation_text(node)

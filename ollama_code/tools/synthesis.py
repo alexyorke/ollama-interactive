@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from pathlib import Path
 import re
 from typing import Any, Callable
@@ -257,6 +258,62 @@ def candidate_validation_run_in_temp_workspace(
         signature_warnings=signature_warnings,
         timing_fields=timing_fields(),
     )
+
+
+def function_probe_script(module: str, expressions: list[str], function: str | None = None) -> str:
+    return (
+        "import importlib,json,os,sys,traceback\n"
+        "workspace=os.getcwd(); sys.path.insert(0, workspace); sys.path.insert(0, os.path.join(workspace, 'src'))\n"
+        f"module_name={json.dumps(module)}\n"
+        f"function_name={json.dumps(function or '')}\n"
+        f"expressions={json.dumps(expressions)}\n"
+        "rows=[]\n"
+        "try:\n"
+        "    mod=importlib.import_module(module_name)\n"
+        "    ns={'module': mod}\n"
+        "    if function_name:\n"
+        "        ns['fn']=getattr(mod, function_name)\n"
+        "    for expr in expressions:\n"
+        "        try:\n"
+        "            value=eval(expr, ns)\n"
+        "            rows.append({'expression': expr, 'ok': True, 'repr': repr(value), 'type': type(value).__name__})\n"
+        "        except Exception as exc:\n"
+        "            rows.append({'expression': expr, 'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)})\n"
+        "except Exception as exc:\n"
+        "    rows.append({'expression': '<import>', 'ok': False, 'error': type(exc).__name__ + ': ' + str(exc)})\n"
+        "print(json.dumps(rows, ensure_ascii=False))\n"
+    )
+
+
+def function_probe_rendered_output(rows: list[Any], raw_output: str) -> str:
+    rendered: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if row.get("ok"):
+            rendered.append(f"{row.get('expression')}: {row.get('repr')} ({row.get('type')})")
+        else:
+            rendered.append(f"{row.get('expression')}: ERROR {row.get('error')}")
+    return "\n".join(rendered) if rendered else raw_output
+
+
+def function_probe_result(
+    *,
+    module: str,
+    function: str | None,
+    exit_code: int,
+    rows: list[Any],
+    raw_output: str,
+) -> dict[str, Any]:
+    return {
+        "ok": exit_code == 0 and all(isinstance(row, dict) and row.get("ok") for row in rows),
+        "tool": "run_function_probe",
+        "module": module,
+        "function": function or "",
+        "exit_code": exit_code,
+        "results": rows,
+        "output": function_probe_rendered_output(rows, raw_output),
+    }
 
 
 def node_expr(node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
