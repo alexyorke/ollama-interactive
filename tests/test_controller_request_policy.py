@@ -9,6 +9,7 @@ from ollama_code.controller.request_policy import (
     request_forbids_test_mutation,
     request_forbids_tests,
     request_forbids_validation,
+    request_is_continue_prompt,
     request_looks_like_issue_report,
     request_needs_exact_grounding,
     request_requires_code_mutation,
@@ -28,6 +29,13 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         self.assertTrue(path_looks_like_test_file("src/foo_test.py"))
         self.assertTrue(path_looks_like_test_file("src/foo.spec.ts"))
         self.assertFalse(path_looks_like_test_file("src/foo.py"))
+
+    def test_continue_prompt_policy_matches_only_resume_phrases(self) -> None:
+        self.assertTrue(request_is_continue_prompt(" Continue "))
+        self.assertTrue(request_is_continue_prompt("keep   going"))
+        self.assertTrue(request_is_continue_prompt("fix it"))
+        self.assertFalse(request_is_continue_prompt("continue by editing README.md"))
+        self.assertFalse(request_is_continue_prompt("fix item 3 in TODO.md"))
 
     def test_mutation_policy_respects_read_only_and_issue_report_shapes(self) -> None:
         self.assertFalse(request_requires_mutation("Inspect only; do not edit app.py."))

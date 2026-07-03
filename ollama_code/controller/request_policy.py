@@ -22,6 +22,19 @@ def path_looks_like_test_file(path: str) -> bool:
     )
 
 
+def request_is_continue_prompt(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    return normalized in {
+        "continue",
+        "keep going",
+        "go on",
+        "resume",
+        "try again",
+        "fix it",
+        "finish it",
+    }
+
+
 def request_looks_like_issue_report(text: str) -> bool:
     lowered = text.lower()
     has_code_context = bool(

@@ -107,6 +107,7 @@ from ollama_code.controller import (
     request_forbids_test_mutation as controller_request_forbids_test_mutation,
     request_forbids_tests as controller_request_forbids_tests,
     request_forbids_validation as controller_request_forbids_validation,
+    request_is_continue_prompt as controller_request_is_continue_prompt,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
     request_looks_like_issue_report as controller_request_looks_like_issue_report,
     request_needs_exact_grounding as controller_request_needs_exact_grounding,
@@ -1157,16 +1158,7 @@ class OllamaCodeAgent:
         return requested
 
     def _request_is_continue_prompt(self, text: str) -> bool:
-        normalized = re.sub(r"\s+", " ", text.strip().lower())
-        return normalized in {
-            "continue",
-            "keep going",
-            "go on",
-            "resume",
-            "try again",
-            "fix it",
-            "finish it",
-        }
+        return controller_request_is_continue_prompt(text)
 
     def _path_looks_like_doc_target(self, path: str) -> bool:
         return controller_path_looks_like_doc_target(self._strip_relative_prefix(path))

@@ -16,6 +16,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - CLI flag-bundle request classification now lives in `ollama_code.controller.feature_delivery`; `agent.py` only delegates to it.
 - Mutation, test-run, test-edit, and validation request-intent policy now lives in `ollama_code.controller.request_policy`; `agent.py` keeps compatibility adapters.
 - Exact-grounding request detection now lives in `ollama_code.controller.request_policy` and feeds final verification through the agent adapter.
+- Continue/resume prompt classification now lives in `ollama_code.controller.request_policy`, preserving sticky obligation handling through an adapter.
 - Doc/test path classification now lives in `ollama_code.controller.request_policy` and is reused by obligation and proof adapters.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
