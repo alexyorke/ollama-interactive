@@ -89,6 +89,9 @@ from ollama_code.controller import (
     cli_feature_capabilities,
     cli_proof_command_argvs,
     cli_readme_additions,
+    derive_request_obligations as derive_feature_request_obligations,
+    merge_request_obligations,
+    request_obligation_proof_status as feature_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
@@ -1141,17 +1144,7 @@ class OllamaCodeAgent:
         return normalized.startswith("docs/") or normalized.endswith((".md", ".rst", ".txt"))
 
     def _merge_request_obligations(self, obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in obligations:
-            if not isinstance(item, dict):
-                continue
-            obligation_id = str(item.get("id") or "").strip()
-            if not obligation_id or obligation_id in seen:
-                continue
-            seen.add(obligation_id)
-            merged.append(dict(item))
-        return merged
+        return merge_request_obligations(obligations)
 
     def _merge_failed_edit_recovery(self, states: list[dict[str, Any]]) -> list[dict[str, Any]]:
         merged: list[dict[str, Any]] = []
@@ -1732,159 +1725,14 @@ class OllamaCodeAgent:
         code_mutation_required: bool,
         test_run_required: bool,
     ) -> list[dict[str, Any]]:
-        obligations: list[dict[str, Any]] = []
-        lowered = request_text.lower()
-        for tool_name in sorted(required_tool_names):
-            obligations.append(
-                {
-                    "id": f"tool:{tool_name}",
-                    "kind": "named_tool",
-                    "label": f"use {tool_name}",
-                    "token": tool_name,
-                }
-            )
-        feature_delivery_requested = bool(
-            code_mutation_required
-            or re.search(
-                r"\b(?:add|implement|create|change|modify|update|support|introduce)\b.*\b(?:subcommand|command|flag)\b",
-                lowered,
-            )
-        )
-        if feature_delivery_requested:
-            obligations.append(
-                {
-                    "id": "code-change",
-                    "kind": "code_change",
-                    "label": "implement the requested code change",
-                }
-            )
-        if test_run_required:
-            obligations.append(
-                {
-                    "id": "tests-run",
-                    "kind": "test_run",
-                    "label": "run tests successfully after the latest edit",
-                }
-            )
-        test_update_requested = bool(
-            re.search(
-                r"\b(?:add|write|create|update|extend|cover)\b[^.]{0,80}\btests?\b|"
-                r"\btests?\b[^.]{0,80}\b(?:add|write|create|update|extend|cover)\b",
-                lowered,
-            )
-        )
-        if test_update_requested:
-            obligations.append(
-                {
-                    "id": "tests-update",
-                    "kind": "tests_update",
-                    "label": "add or update the requested tests",
-                }
-            )
-        shell_proof_requested = bool(
-            re.search(
-                r"\bprove\b[^.]{0,120}\b(?:shell|command|cli)\b|"
-                r"\b(?:shell|command|cli)\b[^.]{0,120}\bproof\b",
-                lowered,
-            )
-        )
-        if shell_proof_requested:
-            obligations.append(
-                {
-                    "id": "shell-proof",
-                    "kind": "shell_proof",
-                    "label": "prove the requested behavior with a shell command",
-                }
-            )
         doc_targets = sorted(path for path in required_mutation_paths if self._path_looks_like_doc_target(path))
-        docs_update_requested = bool(
-            re.search(
-                r"\b(?:update|edit|change|modify|revise|add|write|document|sync|mention|include)\b.*\b(?:readme|docs?|documentation)\b|"
-                r"\b(?:readme|docs?|documentation)\b.*\b(?:update|edit|change|modify|revise|add|write|document|sync|mention|include)\b",
-                lowered,
-            )
+        return derive_feature_request_obligations(
+            request_text=request_text,
+            required_tool_names=required_tool_names,
+            doc_targets=doc_targets,
+            code_mutation_required=code_mutation_required,
+            test_run_required=test_run_required,
         )
-        if doc_targets or docs_update_requested:
-            obligations.append(
-                {
-                    "id": "docs-update",
-                    "kind": "docs_update",
-                    "label": "update the requested docs",
-                    "paths": doc_targets,
-                }
-            )
-        if feature_delivery_requested:
-            command_token_stopwords = {
-                "a",
-                "an",
-                "the",
-                "new",
-                "existing",
-                "current",
-                "requested",
-                "direct",
-                "targeted",
-                "shell",
-                "cli",
-            }
-            function_tokens: set[str] = set()
-            function_patterns = [
-                r"\b(?:add|implement|create|introduce|support)\s+(?:an?\s+)?([A-Za-z_][A-Za-z0-9_]{1,80})\s*\(",
-                r"\b(?:add|implement|create|introduce|support)\s+(?:an?\s+)?([A-Za-z_][A-Za-z0-9_]{1,80})\s+function\b",
-                r"\bfunction\s+([A-Za-z_][A-Za-z0-9_]{1,80})\s*\(",
-            ]
-            function_token_stopwords = {
-                "a",
-                "an",
-                "the",
-                "new",
-                "function",
-                "method",
-                "command",
-                "flag",
-                "tests",
-                "test",
-            }
-            for pattern in function_patterns:
-                for match in re.finditer(pattern, request_text, flags=re.IGNORECASE):
-                    token = str(match.group(1)).strip()
-                    if token.lower() in function_token_stopwords:
-                        continue
-                    function_tokens.add(token)
-            for token in sorted(function_tokens, key=str.lower):
-                obligations.append(
-                    {
-                        "id": f"function:{token.lower()}",
-                        "kind": "feature_token",
-                        "label": f'prove the "{token}" function exists',
-                        "token": token,
-                        "feature_class": "function",
-                    }
-                )
-            for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9_-]{1,40})\b\s+(?:subcommand|command)\b", request_text):
-                token = str(match.group(1)).strip()
-                if not token or token.lower() in command_token_stopwords:
-                    continue
-                obligations.append(
-                    {
-                        "id": f"command:{token.lower()}",
-                        "kind": "feature_token",
-                        "label": f'prove the "{token}" command exists',
-                        "token": token,
-                        "feature_class": "command",
-                    }
-                )
-            for token in sorted(set(re.findall(r"(--[A-Za-z0-9][A-Za-z0-9-]*)", request_text))):
-                obligations.append(
-                    {
-                        "id": f"flag:{token.lower()}",
-                        "kind": "feature_token",
-                        "label": f'prove the "{token}" flag exists',
-                        "token": token,
-                        "feature_class": "flag",
-                    }
-                )
-        return self._merge_request_obligations(obligations)
 
     def _request_obligation_proof_status(
         self,
@@ -1893,153 +1741,20 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]],
         required_tool_names: set[str],
     ) -> list[dict[str, Any]]:
-        statuses: list[dict[str, Any]] = []
-        require_cli_behavior_proof = any(
-            isinstance(item, dict) and str(item.get("kind") or "").strip() == "feature_token" and str(item.get("feature_class") or "").strip() == "flag"
-            for item in obligations
-        )
-        successful_tool_names = {str(item.get("name", "")).strip() for item in successful_tool_results}
         mutated_paths = self._mutated_paths_from_successful_results(successful_tool_results)
-        code_mutated = any(not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path) for path in mutated_paths)
-        docs_mutated = {path for path in mutated_paths if self._path_looks_like_doc_target(path)}
-        tests_mutated = {path for path in mutated_paths if self._path_looks_like_test_file(path)}
         test_ran = self._latest_successful_tool_result(successful_tool_results, "run_test") is not None
         shell_proof_ran = self._latest_successful_tool_result(successful_tool_results, "run_shell") is not None
-        source_reads: set[str] = set()
-        doc_reads: set[str] = set()
-        for item in successful_tool_results:
-            name = str(item.get("name", "")).strip()
-            result = item.get("result") if isinstance(item.get("result"), dict) else {}
-            arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
-            if not path or name not in {"read_file", "read_symbol", "code_outline"}:
-                continue
-            if self._path_looks_like_doc_target(path):
-                doc_reads.add(path)
-                continue
-            if not self._path_looks_like_test_file(path):
-                source_reads.add(path)
-        for obligation in obligations:
-            kind = str(obligation.get("kind") or "").strip()
-            label = str(obligation.get("label") or "").strip()
-            token = str(obligation.get("token") or "").strip()
-            status = {
-                "id": str(obligation.get("id") or "").strip(),
-                "kind": kind,
-                "label": label,
-                "status": "unproven",
-                "evidence": "",
-                "guidance": "",
-            }
-            if kind == "named_tool":
-                if token in successful_tool_names:
-                    status["status"] = "proven"
-                    status["evidence"] = token
-                else:
-                    status["guidance"] = f"Use {token} successfully before finishing."
-            elif kind == "code_change":
-                if code_mutated:
-                    status["status"] = "proven"
-                    evidence_paths = sorted(path for path in mutated_paths if not self._path_looks_like_doc_target(path))[:3]
-                    status["evidence"] = ", ".join(evidence_paths)
-                else:
-                    status["guidance"] = "The task still needs a real code change, not only docs or narration."
-            elif kind == "test_run":
-                if test_ran:
-                    status["status"] = "proven"
-                    status["evidence"] = "run_test"
-                else:
-                    status["guidance"] = "Run tests after the latest edit before finishing."
-            elif kind == "tests_update":
-                if tests_mutated:
-                    status["status"] = "proven"
-                    status["evidence"] = ", ".join(sorted(tests_mutated)[:3])
-                else:
-                    status["guidance"] = "The request asked to add or update tests; mutate a relevant test file before finishing."
-            elif kind == "shell_proof":
-                if shell_proof_ran:
-                    status["status"] = "proven"
-                    status["evidence"] = "run_shell"
-                else:
-                    status["guidance"] = "The request asked for shell-command proof; run a direct shell command that demonstrates the requested behavior before finishing."
-            elif kind == "docs_update":
-                requested_paths = [str(path).strip().replace("\\", "/") for path in list(obligation.get("paths") or []) if str(path).strip()]
-                if requested_paths:
-                    matching = sorted(path for path in docs_mutated if path in requested_paths)
-                    if not matching:
-                        matching = sorted(path for path in doc_reads if path in requested_paths)
-                    if matching:
-                        status["status"] = "proven"
-                        status["evidence"] = ", ".join(matching[:3])
-                    else:
-                        status["guidance"] = "Update the requested docs file and verify it from current evidence."
-                elif docs_mutated or doc_reads:
-                    status["status"] = "proven"
-                    status["evidence"] = ", ".join(sorted(docs_mutated or doc_reads)[:3])
-                else:
-                    status["guidance"] = "The request asked for docs updates, but no docs file has been changed yet."
-            elif kind == "feature_token":
-                token_lower = token.lower()
-                source_evidence = ""
-                behavior_evidence = ""
-                for item in reversed(successful_tool_results):
-                    name = str(item.get("name", "")).strip()
-                    result = item.get("result") if isinstance(item.get("result"), dict) else {}
-                    arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-                    path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
-                    if name not in {"read_file", "read_symbol", "code_outline", "run_shell", "run_test"}:
-                        continue
-                    samples = [
-                        str(result.get("output") or ""),
-                        str(result.get("summary") or ""),
-                        str(result.get("symbol") or arguments.get("symbol") or ""),
-                        str(arguments.get("command") or result.get("command") or ""),
-                    ]
-                    haystack = "\n".join(sample for sample in samples if sample).lower()
-                    if name in {"read_file", "read_symbol", "code_outline"}:
-                        if path and (self._path_looks_like_doc_target(path) or self._path_looks_like_test_file(path)):
-                            continue
-                        if token_lower and token_lower in haystack and not source_evidence:
-                            source_evidence = path or name
-                        continue
-                    if token_lower and token_lower in haystack and not behavior_evidence:
-                        behavior_evidence = name
-                        command_text = str(arguments.get("command") or result.get("command") or "").strip()
-                        if command_text:
-                            behavior_evidence = self._truncate_text(command_text, limit=120)
-                feature_class = str(obligation.get("feature_class") or "feature").strip()
-                needs_behavior_proof = feature_class == "flag" or (feature_class == "command" and require_cli_behavior_proof)
-                if source_evidence and (behavior_evidence or not needs_behavior_proof):
-                    status["status"] = "proven"
-                    status["evidence"] = source_evidence if not behavior_evidence else f"{source_evidence}; {behavior_evidence}"
-                if status["status"] != "proven":
-                    feature_class = str(obligation.get("feature_class") or "feature").strip()
-                    if needs_behavior_proof:
-                        status["guidance"] = (
-                            f'The requested {feature_class} "{token}" still needs both implementation proof and behavior proof. '
-                            + "Read the relevant source file and run a direct command or targeted test that demonstrates it before finishing."
-                        )
-                    else:
-                        status["guidance"] = (
-                            f'The requested {feature_class} "{token}" is still unproven. '
-                            + "Read the relevant source file or run a direct command that demonstrates it before finishing."
-                        )
-            else:
-                continue
-            statuses.append(status)
-        unresolved_required_tools = sorted(required_tool_names - successful_tool_names)
-        for tool_name in unresolved_required_tools:
-            statuses.append(
-                {
-                    "id": f"tool:{tool_name}",
-                    "kind": "named_tool",
-                    "label": f"use {tool_name}",
-                    "status": "unproven",
-                    "evidence": "",
-                    "guidance": f"Use {tool_name} successfully before finishing.",
-                }
-            )
-        return self._merge_request_obligations(statuses)
+        return feature_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=required_tool_names,
+            mutated_paths=mutated_paths,
+            is_doc_path=self._path_looks_like_doc_target,
+            is_test_path=self._path_looks_like_test_file,
+            test_ran=test_ran,
+            shell_proof_ran=shell_proof_ran,
+            truncate_text=lambda text, limit: self._truncate_text(text, limit=limit),
+        )
 
     def _apply_request_obligations_to_verification(
         self,

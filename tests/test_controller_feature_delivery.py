@@ -4,6 +4,8 @@ from ollama_code.controller.feature_delivery import (
     cli_feature_capabilities,
     cli_proof_command_argvs,
     cli_readme_additions,
+    derive_request_obligations,
+    request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
 
@@ -42,6 +44,87 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         additions = cli_readme_additions(source, "Update README for --due-before.", "Use --priority already.\n")
 
         self.assertEqual(additions, ["- `list --due-before YYYY-MM-DD` filters tasks by due date and can be combined with `--priority`."])
+
+    def test_derive_request_obligations_extracts_feature_delivery_contract(self) -> None:
+        obligations = derive_request_obligations(
+            request_text=(
+                "Add an export_ndjson(rows) function. Add tests, update README, "
+                "run tests, and prove the behavior with a shell command."
+            ),
+            required_tool_names={"read_file"},
+            doc_targets=["README.md"],
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+
+        self.assertEqual(
+            [item["id"] for item in obligations],
+            [
+                "tool:read_file",
+                "code-change",
+                "tests-run",
+                "tests-update",
+                "shell-proof",
+                "docs-update",
+                "function:export_ndjson",
+            ],
+        )
+
+    def test_request_obligation_proof_status_requires_source_and_behavior_for_flags(self) -> None:
+        obligations = [
+            {
+                "id": "flag:--due-before",
+                "kind": "feature_token",
+                "label": 'prove the "--due-before" flag exists',
+                "token": "--due-before",
+                "feature_class": "flag",
+            }
+        ]
+
+        source_only = request_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=[
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "task_cli.py"},
+                    "result": {"ok": True, "path": "task_cli.py", "output": "parser.add_argument('--due-before')"},
+                }
+            ],
+            required_tool_names=set(),
+            mutated_paths=set(),
+            is_doc_path=lambda path: path.endswith(".md"),
+            is_test_path=lambda path: path.startswith("tests/"),
+            test_ran=False,
+            shell_proof_ran=False,
+            truncate_text=lambda text, limit: text[:limit],
+        )
+        proven = request_obligation_proof_status(
+            obligations=obligations,
+            successful_tool_results=[
+                {
+                    "name": "read_file",
+                    "arguments": {"path": "task_cli.py"},
+                    "result": {"ok": True, "path": "task_cli.py", "output": "parser.add_argument('--due-before')"},
+                },
+                {
+                    "name": "run_shell",
+                    "arguments": {"command": "python task_cli.py list --due-before 2026-07-06"},
+                    "result": {"ok": True, "command": "python task_cli.py list --due-before 2026-07-06"},
+                },
+            ],
+            required_tool_names=set(),
+            mutated_paths=set(),
+            is_doc_path=lambda path: path.endswith(".md"),
+            is_test_path=lambda path: path.startswith("tests/"),
+            test_ran=False,
+            shell_proof_ran=True,
+            truncate_text=lambda text, limit: text[:limit],
+        )
+
+        self.assertEqual(source_only[0]["status"], "unproven")
+        self.assertIn("both implementation proof and behavior proof", source_only[0]["guidance"])
+        self.assertEqual(proven[0]["status"], "proven")
+        self.assertIn("task_cli.py", proven[0]["evidence"])
 
 
 if __name__ == "__main__":
