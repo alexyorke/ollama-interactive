@@ -75,10 +75,22 @@ from ollama_code.tools.contracts import (
     return_shape_compatible,
 )
 from ollama_code.tools.synthesis import (
+    call_expr,
     human_test_name,
+    method_name,
+    node_expr,
     select_test_spec_examples,
     split_test_example,
     test_example_probe_expressions,
+    test_spec_assigned_names,
+    test_spec_assignment_expr,
+    test_spec_assignment_value_node,
+    test_spec_call_may_mutate_state,
+    test_spec_call_name,
+    test_spec_cli_result_access,
+    test_spec_is_source_constructor,
+    test_spec_iter_test_functions,
+    test_spec_symbol_from_expr,
 )
 from ollama_code.tools.validation import (
     collapse_validation_targets,
@@ -4545,123 +4557,19 @@ class ToolExecutor:
         return aliases
 
     def _node_expr(self, node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
-        if local_exprs and isinstance(node, ast.Name) and node.id in local_exprs:
-            return local_exprs[node.id]
-        if local_exprs and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "self" and node.attr in local_exprs:
-            return local_exprs[node.attr]
-        if local_exprs and isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id in local_exprs:
-            return f"{local_exprs[node.value.id]}.{node.attr}"
-        try:
-            value = ast.literal_eval(node)
-            return repr(value)
-        except Exception:
-            try:
-                return ast.unparse(node)
-            except Exception:
-                return "?"
+        return node_expr(node, local_exprs)
 
     def _test_spec_call_name(self, call: ast.Call) -> str:
-        func = call.func
-        if isinstance(func, ast.Name):
-            return func.id
-        if isinstance(func, ast.Attribute):
-            return func.attr
-        try:
-            return ast.unparse(func)
-        except Exception:
-            return "call"
+        return test_spec_call_name(call)
 
     def _method_name(self, node: ast.AST) -> str:
-        if isinstance(node, ast.Call):
-            func = node.func
-            if isinstance(func, ast.Attribute):
-                return func.attr
-            if isinstance(func, ast.Name):
-                return func.id
-        return ""
+        return method_name(node)
 
     def _call_expr(self, call: ast.Call, local_exprs: dict[str, str] | None = None) -> str:
-        args = [self._node_expr(arg, local_exprs) for arg in call.args]
-        args.extend(f"{kw.arg}={self._node_expr(kw.value, local_exprs)}" for kw in call.keywords if kw.arg)
-        name = self._test_spec_call_name(call)
-        if isinstance(call.func, ast.Attribute):
-            receiver = self._node_expr(call.func.value, local_exprs)
-            name = f"{receiver}.{call.func.attr}"
-        return f"{name}({', '.join(args)})"
+        return call_expr(call, local_exprs)
 
     def _test_spec_symbol_from_expr(self, expr: str, source_symbols: set[str], aliases: dict[str, str]) -> str:
-        cleaned = expr.strip()
-        parts = [part.strip() for part in cleaned.split(";") if part.strip()]
-        if len(parts) > 1:
-            last = parts[-1]
-            receiver_attr = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<attr>[A-Za-z_][A-Za-z0-9_]*)$", last)
-            if receiver_attr:
-                receiver = receiver_attr.group("receiver")
-                for earlier in parts[:-1]:
-                    assignment = re.match(rf"^{re.escape(receiver)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
-                    if assignment and aliases.get(assignment.group("class"), assignment.group("class")) in source_symbols:
-                        return aliases.get(assignment.group("class"), assignment.group("class"))
-            len_call = re.match(r"^len\((?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\)$", last)
-            if len_call:
-                receiver = len_call.group("receiver")
-                for earlier in parts[:-1]:
-                    assignment = re.match(rf"^{re.escape(receiver)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
-                    if assignment and aliases.get(assignment.group("class"), assignment.group("class")) in source_symbols:
-                        return "__len__"
-            list_call = re.match(r"^list\((?P<inner>.+)\)$", last)
-            if list_call:
-                inner = list_call.group("inner").strip()
-                method = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", inner)
-                if method:
-                    return method.group("method")
-                receiver = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)$", inner)
-                if receiver:
-                    receiver_name = receiver.group("receiver")
-                    for earlier in parts[:-1]:
-                        assignment = re.match(rf"^{re.escape(receiver_name)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
-                        if assignment and aliases.get(assignment.group("class"), assignment.group("class")) in source_symbols:
-                            return "__iter__"
-            receiver_call = re.match(r"^(?P<receiver>[A-Za-z_][A-Za-z0-9_]*)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", last)
-            if receiver_call:
-                receiver = receiver_call.group("receiver")
-                for earlier in parts[:-1]:
-                    assignment = re.match(rf"^{re.escape(receiver)}\s*=\s*(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", earlier)
-                    if assignment:
-                        class_name = aliases.get(assignment.group("class"), assignment.group("class"))
-                        if class_name in source_symbols:
-                            return receiver_call.group("method")
-            cleaned = last
-        constructor = re.match(r"^(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
-        if constructor:
-            class_name = aliases.get(constructor.group("class"), constructor.group("class"))
-            if class_name in source_symbols:
-                method = re.match(r"^[A-Za-z_][A-Za-z0-9_]*\(.*\)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
-                if method:
-                    return method.group("method")
-                return class_name
-        call = re.match(r"^(?P<name>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
-        if call:
-            name = aliases.get(call.group("name"), call.group("name"))
-            if not source_symbols or name in source_symbols:
-                return name
-            len_constructor = re.match(r"^len\((?P<class>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\)$", cleaned)
-            if len_constructor and aliases.get(len_constructor.group("class"), len_constructor.group("class")) in source_symbols:
-                return "__len__"
-            list_method = re.match(r"^list\([A-Za-z_][A-Za-z0-9_]*\(.*\)\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\)$", cleaned)
-            if list_method:
-                return list_method.group("method")
-            list_constructor = re.match(r"^list\((?P<class>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\)$", cleaned)
-            if list_constructor and aliases.get(list_constructor.group("class"), list_constructor.group("class")) in source_symbols:
-                return "__iter__"
-        method_call = re.match(r"^.+\.(?P<method>[A-Za-z_][A-Za-z0-9_]*)\(", cleaned)
-        if method_call:
-            method = method_call.group("method")
-            if not source_symbols or method in source_symbols:
-                return method
-        attr = re.match(r"^(?P<class>[A-Za-z_][A-Za-z0-9_]*)\(.*\)\.[A-Za-z_][A-Za-z0-9_]*$", cleaned)
-        if attr and aliases.get(attr.group("class"), attr.group("class")) in source_symbols:
-            return aliases.get(attr.group("class"), attr.group("class"))
-        return ""
+        return test_spec_symbol_from_expr(expr, source_symbols, aliases)
 
     def _test_spec_add_raw_example(
         self,
@@ -4747,44 +4655,16 @@ class ToolExecutor:
         return human_test_name(name)
 
     def _test_spec_iter_test_functions(self, tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
-        functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-        for node in getattr(tree, "body", []):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test"):
-                functions.append(node)
-            if isinstance(node, ast.ClassDef):
-                for child in node.body:
-                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name.startswith("test"):
-                        functions.append(child)
-        return functions
+        return test_spec_iter_test_functions(tree)
 
     def _test_spec_assignment_expr(self, stmt: ast.stmt, local_exprs: dict[str, str]) -> tuple[str, str] | None:
-        if not isinstance(stmt, (ast.Assign, ast.AnnAssign)):
-            return None
-        target: ast.AST | None = None
-        value: ast.AST | None = None
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            target = stmt.targets[0]
-            value = stmt.value
-        elif isinstance(stmt, ast.AnnAssign):
-            target = stmt.target
-            value = stmt.value
-        if not isinstance(target, ast.Name) or value is None:
-            return None
-        return target.id, self._node_expr(value, local_exprs)
+        return test_spec_assignment_expr(stmt, local_exprs)
 
     def _test_spec_assignment_value_node(self, stmt: ast.stmt) -> ast.AST | None:
-        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
-            return stmt.value
-        if isinstance(stmt, ast.AnnAssign):
-            return stmt.value
-        return None
+        return test_spec_assignment_value_node(stmt)
 
     def _test_spec_is_source_constructor(self, expr: str, source_symbols: set[str], aliases: dict[str, str]) -> bool:
-        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(", expr)
-        if not match:
-            return False
-        name = aliases.get(match.group(1), match.group(1))
-        return not source_symbols or name in source_symbols
+        return test_spec_is_source_constructor(expr, source_symbols, aliases)
 
     def _test_spec_behavior_expr(
         self,
@@ -4828,22 +4708,7 @@ class ToolExecutor:
         return ""
 
     def _test_spec_assigned_names(self, node: ast.AST) -> set[str]:
-        names: set[str] = set()
-        for child in ast.walk(node):
-            targets: list[ast.AST] = []
-            if isinstance(child, ast.Assign):
-                targets = list(child.targets)
-            elif isinstance(child, ast.AnnAssign):
-                targets = [child.target]
-            elif isinstance(child, ast.AugAssign):
-                targets = [child.target]
-            elif isinstance(child, ast.For):
-                targets = [child.target]
-            for target in targets:
-                for item in ast.walk(target):
-                    if isinstance(item, ast.Name):
-                        names.add(item.id)
-        return names
+        return test_spec_assigned_names(node)
 
     def _test_spec_receiver_root_name_from_node(self, node: ast.AST) -> str:
         if isinstance(node, ast.Call):
@@ -4902,26 +4767,7 @@ class ToolExecutor:
         node: ast.AST,
         local_exprs: dict[str, str],
     ) -> tuple[str, str] | None:
-        attrs: list[str] = []
-        current = node
-        while isinstance(current, ast.Attribute):
-            attrs.append(current.attr)
-            current = current.value
-        if not isinstance(current, ast.Name) or not attrs:
-            return None
-        command_expr = local_exprs.get(current.id, "")
-        if not command_expr:
-            return None
-        command_lower = command_expr.lower()
-        if not (
-            "subprocess.run(" in command_lower
-            or re.search(r"\b(?:_run|run_cli|cli|invoke|run_command)\s*\(", command_expr)
-        ):
-            return None
-        attr_path = ".".join(reversed(attrs))
-        if attr_path not in {"returncode", "stdout", "stderr"}:
-            return None
-        return command_expr, attr_path
+        return test_spec_cli_result_access(node, local_exprs)
 
     def _test_spec_add_cli_example(
         self,
@@ -4981,23 +4827,7 @@ class ToolExecutor:
         return False
 
     def _test_spec_call_may_mutate_state(self, call: ast.Call) -> bool:
-        name = self._test_spec_call_name(call)
-        return name in {
-            "add",
-            "add_student",
-            "append",
-            "clear",
-            "delete",
-            "discard",
-            "insert",
-            "next",
-            "pop",
-            "push",
-            "remove",
-            "reset",
-            "set",
-            "update",
-        }
+        return test_spec_call_may_mutate_state(call)
 
     def _test_spec_record_side_effect_call(
         self,
