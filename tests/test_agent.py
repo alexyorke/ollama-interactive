@@ -822,22 +822,7 @@ class AgentTests(AgentTestBase):
 
     # Focused failure-delta coverage lives in test_agent_failure_compression.py.
 
-    def test_agent_context_pack_profile_preloads_context(self) -> None:
-        root = self._workspace_scratch()
-        (root / "src").mkdir()
-        (root / "src" / "calc.py").write_text("def sum_values(a, b):\n    return a - b\n", encoding="utf-8")
-        client = FakeClient(['{"type":"final","message":"inspected"}'])
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=4, debate_enabled=False)
-
-        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack,evidence-handles"}):
-            agent.handle_user("Use context_pack to inspect relevant context for src/calc.py and summarize only.")
-
-        calls = [event["name"] for event in agent.events if event["type"] == "tool_call"]
-        self.assertEqual(calls[0], "context_pack")
-        tool_messages = [message["content"] for message in agent.messages if message["role"] == "user" and str(message["content"]).startswith("Evidence:")]
-        self.assertTrue(tool_messages)
-        self.assertIn("context_pack", tool_messages[0])
+    # Focused context-pack preload coverage lives in test_agent_grounding_path_repair.py.
 
     def test_system_prompt_requires_assumption_checking(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

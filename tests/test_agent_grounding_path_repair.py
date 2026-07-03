@@ -14,6 +14,23 @@ from tests.agent_test_support import AgentTestBase, CountingToolExecutor, FakeCl
 
 
 class AgentGroundingPathRepairTests(AgentTestBase):
+    def test_agent_context_pack_profile_preloads_context(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "calc.py").write_text("def sum_values(a, b):\n    return a - b\n", encoding="utf-8")
+        client = FakeClient(['{"type":"final","message":"inspected"}'])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=4, debate_enabled=False)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack,evidence-handles"}):
+            agent.handle_user("Use context_pack to inspect relevant context for src/calc.py and summarize only.")
+
+        calls = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(calls[0], "context_pack")
+        tool_messages = [message["content"] for message in agent.messages if message["role"] == "user" and str(message["content"]).startswith("Evidence:")]
+        self.assertTrue(tool_messages)
+        self.assertIn("context_pack", tool_messages[0])
+
     def test_trajectory_ground_guard_rejects_ungrounded_mutation_then_allows_after_read(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("def value():\n    return 'old'\n", encoding="utf-8")
