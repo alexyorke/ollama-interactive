@@ -75,21 +75,32 @@ from ollama_code.tools.contracts import (
     return_shape_compatible,
 )
 from ollama_code.tools.synthesis import (
+    assert_raises_expected_message,
     call_expr,
+    first_behavior_call,
     human_test_name,
     method_name,
     node_expr,
     select_test_spec_examples,
     split_test_example,
     test_example_probe_expressions,
+    test_spec_add_cli_assertion_examples,
+    test_spec_add_cli_example,
+    test_spec_add_text_example,
     test_spec_assigned_names,
     test_spec_assignment_expr,
     test_spec_assignment_value_node,
+    test_spec_behavior_expr,
     test_spec_call_may_mutate_state,
     test_spec_call_name,
     test_spec_cli_result_access,
+    test_spec_expected_expr,
+    test_spec_expr_with_history,
     test_spec_is_source_constructor,
     test_spec_iter_test_functions,
+    test_spec_receiver_root_name,
+    test_spec_receiver_root_name_from_node,
+    test_spec_record_side_effect_call,
     test_spec_symbol_from_expr,
 )
 from ollama_code.tools.validation import (
@@ -4602,15 +4613,7 @@ class ToolExecutor:
             examples.append(item)
 
     def _first_behavior_call(self, statements: list[ast.stmt]) -> ast.Call | None:
-        for statement in statements:
-            for node in ast.walk(statement):
-                if not isinstance(node, ast.Call):
-                    continue
-                method = self._method_name(node)
-                if method.startswith("assert"):
-                    continue
-                return node
-        return None
+        return first_behavior_call(statements)
 
     def _test_spec_add_example(
         self,
@@ -4672,75 +4675,22 @@ class ToolExecutor:
         local_exprs: dict[str, str],
         object_history: dict[str, list[str]],
     ) -> str:
-        receiver = self._test_spec_receiver_root_name(call)
-        if receiver:
-            history = object_history.get(receiver)
-            if history:
-                expr = self._call_expr(call, None)
-                return "; ".join(history + [expr])
-        expr = self._call_expr(call, local_exprs)
-        return expr
+        return test_spec_behavior_expr(call, local_exprs, object_history)
 
     def _test_spec_receiver_root_name(self, call: ast.Call) -> str:
-        func = call.func
-        if isinstance(func, ast.Name) and func.id in {"len", "list", "tuple", "set"} and call.args:
-            first_arg = call.args[0]
-            if isinstance(first_arg, ast.Name):
-                return first_arg.id
-            if isinstance(first_arg, ast.Call):
-                return self._test_spec_receiver_root_name(first_arg)
-            if isinstance(first_arg, ast.Attribute):
-                return self._test_spec_receiver_root_name_from_node(first_arg)
-        if isinstance(func, ast.Attribute):
-            node: ast.AST = func.value
-            while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                node = node.func.value
-            if isinstance(node, ast.Name):
-                return node.id
-        for child in ast.walk(call):
-            if child is call or not isinstance(child, ast.Call) or not isinstance(child.func, ast.Attribute):
-                continue
-            node = child.func.value
-            while isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
-                node = node.func.value
-            if isinstance(node, ast.Name):
-                return node.id
-        return ""
+        return test_spec_receiver_root_name(call)
 
     def _test_spec_assigned_names(self, node: ast.AST) -> set[str]:
         return test_spec_assigned_names(node)
 
     def _test_spec_receiver_root_name_from_node(self, node: ast.AST) -> str:
-        if isinstance(node, ast.Call):
-            return self._test_spec_receiver_root_name(node)
-        if isinstance(node, ast.Attribute):
-            current: ast.AST = node.value
-            while isinstance(current, ast.Attribute):
-                current = current.value
-            if isinstance(current, ast.Call):
-                return self._test_spec_receiver_root_name(current)
-            if isinstance(current, ast.Name):
-                return current.id
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                receiver = self._test_spec_receiver_root_name(child)
-                if receiver:
-                    return receiver
-            if isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name):
-                return child.value.id
-        return ""
+        return test_spec_receiver_root_name_from_node(node)
 
     def _test_spec_expr_with_history(self, node: ast.AST, local_exprs: dict[str, str], object_history: dict[str, list[str]]) -> str:
-        receiver = self._test_spec_receiver_root_name_from_node(node)
-        if receiver and receiver in object_history:
-            return "; ".join(object_history[receiver] + [self._node_expr(node, None)])
-        return self._node_expr(node, local_exprs)
+        return test_spec_expr_with_history(node, local_exprs, object_history)
 
     def _test_spec_expected_expr(self, node: ast.AST, local_exprs: dict[str, str], object_history: dict[str, list[str]]) -> str:
-        receiver = self._test_spec_receiver_root_name_from_node(node)
-        if receiver and receiver in object_history:
-            return self._node_expr(node, None)
-        return self._node_expr(node, local_exprs)
+        return test_spec_expected_expr(node, local_exprs, object_history)
 
     def _test_spec_add_text_example(
         self,
@@ -4753,14 +4703,15 @@ class ToolExecutor:
         source_symbols: set[str],
         aliases: dict[str, str],
     ) -> None:
-        symbol = self._test_spec_symbol_from_expr(expr, source_symbols, aliases)
-        if source_symbols and not symbol:
-            return
-        item = {"symbol": symbol or "expression", "example": text, "line": line}
-        if test_name:
-            item["test_name"] = test_name
-        if item not in examples:
-            examples.append(item)
+        test_spec_add_text_example(
+            examples,
+            expr=expr,
+            text=text,
+            line=line,
+            test_name=test_name,
+            source_symbols=source_symbols,
+            aliases=aliases,
+        )
 
     def _test_spec_cli_result_access(
         self,
@@ -4778,11 +4729,13 @@ class ToolExecutor:
         line: int,
         test_name: str | None,
     ) -> None:
-        item = {"symbol": "cli", "example": f"{command_expr} {assertion}", "line": line}
-        if test_name:
-            item["test_name"] = test_name
-        if item not in examples:
-            examples.append(item)
+        test_spec_add_cli_example(
+            examples,
+            command_expr=command_expr,
+            assertion=assertion,
+            line=line,
+            test_name=test_name,
+        )
 
     def _test_spec_add_cli_assertion_examples(
         self,
@@ -4794,37 +4747,14 @@ class ToolExecutor:
         line: int,
         test_name: str | None,
     ) -> bool:
-        if method_name in {"assertEqual", "assertEquals"} and len(args) >= 2:
-            for actual_node, expected_node in ((args[0], args[1]), (args[1], args[0])):
-                access = self._test_spec_cli_result_access(actual_node, local_exprs)
-                if access is None:
-                    continue
-                command_expr, attr_path = access
-                expected = self._node_expr(expected_node, local_exprs)
-                self._test_spec_add_cli_example(
-                    examples,
-                    command_expr=command_expr,
-                    assertion=f"{attr_path} == {expected}",
-                    line=line,
-                    test_name=test_name,
-                )
-                return True
-        if method_name in {"assertIn", "assertNotIn"} and len(args) >= 2:
-            member = self._node_expr(args[0], local_exprs)
-            access = self._test_spec_cli_result_access(args[1], local_exprs)
-            if access is None:
-                return False
-            command_expr, attr_path = access
-            relation = "contains" if method_name == "assertIn" else "does not contain"
-            self._test_spec_add_cli_example(
-                examples,
-                command_expr=command_expr,
-                assertion=f"{attr_path} {relation} {member}",
-                line=line,
-                test_name=test_name,
-            )
-            return True
-        return False
+        return test_spec_add_cli_assertion_examples(
+            examples,
+            method_name_text=method_name,
+            args=args,
+            local_exprs=local_exprs,
+            line=line,
+            test_name=test_name,
+        )
 
     def _test_spec_call_may_mutate_state(self, call: ast.Call) -> bool:
         return test_spec_call_may_mutate_state(call)
@@ -4835,26 +4765,10 @@ class ToolExecutor:
         local_exprs: dict[str, str],
         object_history: dict[str, list[str]],
     ) -> None:
-        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
-            receiver = call.func.value.id
-            if receiver in object_history:
-                object_history[receiver].append(self._call_expr(call, None))
+        test_spec_record_side_effect_call(call, object_history)
 
     def _assert_raises_expected_message(self, statements: list[ast.stmt], context_var: ast.expr | None, local_exprs: dict[str, str]) -> str | None:
-        if not isinstance(context_var, ast.Name):
-            return None
-        pattern = f"{context_var.id}.exception.args[0]"
-        for statement in statements:
-            for node in ast.walk(statement):
-                if not isinstance(node, ast.Call) or self._method_name(node) not in {"assertEqual", "assertEquals"} or len(node.args) < 2:
-                    continue
-                left = self._node_expr(node.args[0], local_exprs)
-                right = self._node_expr(node.args[1], local_exprs)
-                if left == pattern:
-                    return right
-                if right == pattern:
-                    return left
-        return None
+        return assert_raises_expected_message(statements, context_var, local_exprs)
 
     def _select_test_spec_examples(self, examples: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
         return select_test_spec_examples(examples, limit)
