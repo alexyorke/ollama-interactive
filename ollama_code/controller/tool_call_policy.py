@@ -18,6 +18,7 @@ ToolArgumentsNormalizer = Callable[[str], dict[str, Any] | None]
 ArgvArgumentsNormalizer = Callable[[list[str]], dict[str, Any] | None]
 ArgvToolNormalizer = Callable[[list[str]], tuple[str, dict[str, Any]] | None]
 LineCountProvider = Callable[[str], int | None]
+ToolOperation = tuple[str, dict[str, Any]]
 
 
 def normalize_target_line_read_call(
@@ -196,6 +197,94 @@ def normalize_shell_inspection_call(
             tool_name, tool_arguments = normalized_find
             return tool_name, tool_arguments, "Normalized simple shell discovery to structured search for cacheable context."
     return name, arguments, None
+
+
+def _has_prior_non_context_tool_call(tool_calls_this_turn: list[dict[str, Any]]) -> bool:
+    prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
+    return any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names)
+
+
+def normalize_import_repair_bootstrap_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    tool_calls_this_turn: list[dict[str, Any]],
+    request_looks_like_explicit_python_import_bug_fix: bool,
+    default_test_command: str | None,
+) -> tuple[str, dict[str, Any], str | None]:
+    if name != "list_files":
+        return name, arguments, None
+    if _has_prior_non_context_tool_call(tool_calls_this_turn):
+        return name, arguments, None
+    if not request_looks_like_explicit_python_import_bug_fix:
+        return name, arguments, None
+    normalized: dict[str, Any] = {}
+    if default_test_command:
+        normalized["command"] = default_test_command
+    return (
+        "run_test",
+        normalized,
+        "Normalized initial list_files to run_test because the request already names a Python source path and needs concrete import/test failure evidence first.",
+    )
+
+
+def normalize_project_rename_bootstrap_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    tool_calls_this_turn: list[dict[str, Any]],
+    requested_tool_names: set[str],
+    rename_operations: list[ToolOperation] | None,
+) -> tuple[str, dict[str, Any], str | None]:
+    if name not in {"list_files", "edit_intent"}:
+        return name, arguments, None
+    if _has_prior_non_context_tool_call(tool_calls_this_turn):
+        return name, arguments, None
+    if name == "list_files" and "list_files" in requested_tool_names:
+        return name, arguments, None
+    if not rename_operations or len(rename_operations) != 1:
+        return name, arguments, None
+    tool_name, tool_arguments = rename_operations[0]
+    if tool_name != "edit_intent" or not isinstance(tool_arguments, dict):
+        return name, arguments, None
+    if name == "edit_intent":
+        target = str(arguments.get("target") or arguments.get("symbol") or "").strip()
+        replacement = str(arguments.get("replacement") or arguments.get("new") or "").strip()
+        if target != str(tool_arguments.get("target") or "").strip():
+            return name, arguments, None
+        if replacement != str(tool_arguments.get("replacement") or "").strip():
+            return name, arguments, None
+    return (
+        tool_name,
+        dict(tool_arguments),
+        f"Normalized initial {name} to edit_intent because the request already specifies a grounded project rename operation.",
+    )
+
+
+def normalize_optional_parameter_bootstrap_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    tool_calls_this_turn: list[dict[str, Any]],
+    requested_tool_names: set[str],
+    optional_parameter_operations: list[ToolOperation] | None,
+) -> tuple[str, dict[str, Any], str | None]:
+    if name != "search_symbols":
+        return name, arguments, None
+    if _has_prior_non_context_tool_call(tool_calls_this_turn):
+        return name, arguments, None
+    if "search_symbols" in requested_tool_names or "read_symbol" in requested_tool_names:
+        return name, arguments, None
+    if not optional_parameter_operations:
+        return name, arguments, None
+    tool_name, tool_arguments = optional_parameter_operations[0]
+    if tool_name != "edit_intent" or not isinstance(tool_arguments, dict):
+        return name, arguments, None
+    return (
+        tool_name,
+        dict(tool_arguments),
+        "Normalized initial search_symbols to edit_intent because the request already specifies a grounded optional-parameter update.",
+    )
 
 
 def normalize_unittest_file_command(

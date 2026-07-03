@@ -107,7 +107,10 @@ from ollama_code.controller import (
     normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
     normalize_head_tail_shell_inspection as controller_normalize_head_tail_shell_inspection,
+    normalize_import_repair_bootstrap_call as controller_normalize_import_repair_bootstrap_call,
+    normalize_optional_parameter_bootstrap_call as controller_normalize_optional_parameter_bootstrap_call,
     normalize_payload as controller_normalize_payload,
+    normalize_project_rename_bootstrap_call as controller_normalize_project_rename_bootstrap_call,
     normalize_run_test_call as controller_normalize_run_test_call,
     normalize_shell_inspection_call as controller_normalize_shell_inspection_call,
     normalize_shell_test_call as controller_normalize_shell_test_call,
@@ -4254,20 +4257,12 @@ class OllamaCodeAgent:
         request_text: str,
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "list_files":
-            return name, arguments, None
-        prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
-        if any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names):
-            return name, arguments, None
-        if not self._request_looks_like_explicit_python_import_bug_fix(request_text):
-            return name, arguments, None
-        normalized: dict[str, Any] = {}
-        if self.tools.default_test_command:
-            normalized["command"] = self.tools.default_test_command
-        return (
-            "run_test",
-            normalized,
-            "Normalized initial list_files to run_test because the request already names a Python source path and needs concrete import/test failure evidence first.",
+        return controller_normalize_import_repair_bootstrap_call(
+            name,
+            arguments,
+            tool_calls_this_turn=tool_calls_this_turn,
+            request_looks_like_explicit_python_import_bug_fix=self._request_looks_like_explicit_python_import_bug_fix(request_text),
+            default_test_command=self.tools.default_test_command,
         )
 
     def _normalize_project_rename_bootstrap_call(
@@ -4278,31 +4273,13 @@ class OllamaCodeAgent:
         request_text: str,
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name not in {"list_files", "edit_intent"}:
-            return name, arguments, None
-        prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
-        if any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names):
-            return name, arguments, None
         requested_tools = self._requested_tool_names(request_text, forbidden_tool_names=set())
-        if name == "list_files" and "list_files" in requested_tools:
-            return name, arguments, None
-        rename_ops = self._project_function_rename_operations(request_text)
-        if not rename_ops or len(rename_ops) != 1:
-            return name, arguments, None
-        tool_name, tool_arguments = rename_ops[0]
-        if tool_name != "edit_intent" or not isinstance(tool_arguments, dict):
-            return name, arguments, None
-        if name == "edit_intent":
-            target = str(arguments.get("target") or arguments.get("symbol") or "").strip()
-            replacement = str(arguments.get("replacement") or arguments.get("new") or "").strip()
-            if target != str(tool_arguments.get("target") or "").strip():
-                return name, arguments, None
-            if replacement != str(tool_arguments.get("replacement") or "").strip():
-                return name, arguments, None
-        return (
-            tool_name,
-            dict(tool_arguments),
-            f"Normalized initial {name} to edit_intent because the request already specifies a grounded project rename operation.",
+        return controller_normalize_project_rename_bootstrap_call(
+            name,
+            arguments,
+            tool_calls_this_turn=tool_calls_this_turn,
+            requested_tool_names=requested_tools,
+            rename_operations=self._project_function_rename_operations(request_text),
         )
 
     def _normalize_optional_parameter_bootstrap_call(
@@ -4313,24 +4290,13 @@ class OllamaCodeAgent:
         request_text: str,
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "search_symbols":
-            return name, arguments, None
-        prior_tool_names = [str(item.get("name") or "").strip() for item in tool_calls_this_turn]
-        if any(prior_name and prior_name != "context_pack" for prior_name in prior_tool_names):
-            return name, arguments, None
         requested_tools = self._requested_tool_names(request_text, forbidden_tool_names=set())
-        if "search_symbols" in requested_tools or "read_symbol" in requested_tools:
-            return name, arguments, None
-        optional_parameter_ops = self._optional_parameter_update_operations(request_text)
-        if not optional_parameter_ops:
-            return name, arguments, None
-        tool_name, tool_arguments = optional_parameter_ops[0]
-        if tool_name != "edit_intent" or not isinstance(tool_arguments, dict):
-            return name, arguments, None
-        return (
-            tool_name,
-            dict(tool_arguments),
-            "Normalized initial search_symbols to edit_intent because the request already specifies a grounded optional-parameter update.",
+        return controller_normalize_optional_parameter_bootstrap_call(
+            name,
+            arguments,
+            tool_calls_this_turn=tool_calls_this_turn,
+            requested_tool_names=requested_tools,
+            optional_parameter_operations=self._optional_parameter_update_operations(request_text),
         )
 
     def _normalize_unittest_file_command(self, command: str) -> str | None:

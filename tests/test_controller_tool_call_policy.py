@@ -6,6 +6,9 @@ from ollama_code.agent_protocol import TargetLineReadSpec
 from ollama_code.controller.tool_call_policy import (
     normalize_find_shell_inspection,
     normalize_head_tail_shell_inspection,
+    normalize_import_repair_bootstrap_call,
+    normalize_optional_parameter_bootstrap_call,
+    normalize_project_rename_bootstrap_call,
     normalize_run_test_call,
     normalize_shell_inspection_call,
     normalize_shell_test_call,
@@ -392,6 +395,144 @@ class ControllerToolCallPolicyTests(unittest.TestCase):
         self.assertIsNone(normalize_head_tail_shell_inspection(["head", "-n", "bad", "README.md"], line_count_for_file=line_count_for_file))
         self.assertIsNone(normalize_head_tail_shell_inspection(["head", "README.md", "extra"], line_count_for_file=line_count_for_file))
         self.assertIsNone(normalize_head_tail_shell_inspection(["tail", "missing.txt"], line_count_for_file=line_count_for_file))
+
+    def test_import_repair_bootstrap_routes_initial_listing_to_tests(self) -> None:
+        self.assertEqual(
+            normalize_import_repair_bootstrap_call(
+                "list_files",
+                {"path": "."},
+                tool_calls_this_turn=[],
+                request_looks_like_explicit_python_import_bug_fix=True,
+                default_test_command="python -m unittest discover -s tests -v",
+            ),
+            (
+                "run_test",
+                {"command": "python -m unittest discover -s tests -v"},
+                "Normalized initial list_files to run_test because the request already names a Python source path and needs concrete import/test failure evidence first.",
+            ),
+        )
+        self.assertEqual(
+            normalize_import_repair_bootstrap_call(
+                "list_files",
+                {"path": "."},
+                tool_calls_this_turn=[{"name": "context_pack"}],
+                request_looks_like_explicit_python_import_bug_fix=True,
+                default_test_command=None,
+            ),
+            (
+                "run_test",
+                {},
+                "Normalized initial list_files to run_test because the request already names a Python source path and needs concrete import/test failure evidence first.",
+            ),
+        )
+        self.assertEqual(
+            normalize_import_repair_bootstrap_call(
+                "list_files",
+                {"path": "."},
+                tool_calls_this_turn=[{"name": "read_file"}],
+                request_looks_like_explicit_python_import_bug_fix=True,
+                default_test_command="python -m unittest",
+            ),
+            ("list_files", {"path": "."}, None),
+        )
+
+    def test_project_rename_bootstrap_routes_initial_tools_to_edit_intent(self) -> None:
+        rename_ops = [
+            (
+                "edit_intent",
+                {"path": ".", "intent": "rename", "target": "old_name", "replacement": "new_name", "scope": "project"},
+            )
+        ]
+        self.assertEqual(
+            normalize_project_rename_bootstrap_call(
+                "list_files",
+                {"path": "."},
+                tool_calls_this_turn=[],
+                requested_tool_names=set(),
+                rename_operations=rename_ops,
+            ),
+            (
+                "edit_intent",
+                {"path": ".", "intent": "rename", "target": "old_name", "replacement": "new_name", "scope": "project"},
+                "Normalized initial list_files to edit_intent because the request already specifies a grounded project rename operation.",
+            ),
+        )
+        self.assertEqual(
+            normalize_project_rename_bootstrap_call(
+                "edit_intent",
+                {"target": "old_name", "replacement": "new_name"},
+                tool_calls_this_turn=[],
+                requested_tool_names=set(),
+                rename_operations=rename_ops,
+            ),
+            (
+                "edit_intent",
+                {"path": ".", "intent": "rename", "target": "old_name", "replacement": "new_name", "scope": "project"},
+                "Normalized initial edit_intent to edit_intent because the request already specifies a grounded project rename operation.",
+            ),
+        )
+        self.assertEqual(
+            normalize_project_rename_bootstrap_call(
+                "list_files",
+                {"path": "."},
+                tool_calls_this_turn=[],
+                requested_tool_names={"list_files"},
+                rename_operations=rename_ops,
+            ),
+            ("list_files", {"path": "."}, None),
+        )
+        self.assertEqual(
+            normalize_project_rename_bootstrap_call(
+                "edit_intent",
+                {"target": "other", "replacement": "new_name"},
+                tool_calls_this_turn=[],
+                requested_tool_names=set(),
+                rename_operations=rename_ops,
+            ),
+            ("edit_intent", {"target": "other", "replacement": "new_name"}, None),
+        )
+
+    def test_optional_parameter_bootstrap_routes_initial_search_to_edit_intent(self) -> None:
+        operations = [
+            (
+                "edit_intent",
+                {"path": "src/app.py", "intent": "change_signature", "target": "build", "replacement": "def build(flag: bool = False):"},
+            )
+        ]
+        self.assertEqual(
+            normalize_optional_parameter_bootstrap_call(
+                "search_symbols",
+                {"query": "build"},
+                tool_calls_this_turn=[],
+                requested_tool_names=set(),
+                optional_parameter_operations=operations,
+            ),
+            (
+                "edit_intent",
+                {"path": "src/app.py", "intent": "change_signature", "target": "build", "replacement": "def build(flag: bool = False):"},
+                "Normalized initial search_symbols to edit_intent because the request already specifies a grounded optional-parameter update.",
+            ),
+        )
+        self.assertEqual(
+            normalize_optional_parameter_bootstrap_call(
+                "search_symbols",
+                {"query": "build"},
+                tool_calls_this_turn=[],
+                requested_tool_names={"search_symbols"},
+                optional_parameter_operations=operations,
+            ),
+            ("search_symbols", {"query": "build"}, None),
+        )
+        self.assertEqual(
+            normalize_optional_parameter_bootstrap_call(
+                "search_symbols",
+                {"query": "build"},
+                tool_calls_this_turn=[{"name": "read_file"}],
+                requested_tool_names=set(),
+                optional_parameter_operations=operations,
+            ),
+            ("search_symbols", {"query": "build"}, None),
+        )
 
     def test_unittest_file_command_normalizes_test_file_paths_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
