@@ -482,34 +482,95 @@ def lint_typecheck_run_validators(
             float(phase_timings_ms.get(active_phase, 0.0) or 0.0) + ((timer() - active_phase_started) * 1000),
             3,
         )
-        timeout_summary = f"Command timed out after {exc.timeout} seconds."
         timeout_output = collect_timeout_output(exc)
         timeout_command = timeout_command_text(exc.cmd)
-        timeout_details = f"{timeout_summary} Validator: {timeout_command}"
-        if timeout_output != "(no output)":
-            timeout_details = f"{timeout_details}\n{timeout_output}"
         return {
             "timed_out": True,
-            "result": {
-                "ok": False,
-                "tool": "lint_typecheck",
-                "checked": checked,
-                "diagnostics": [*diagnostics, timeout_details],
-                "validator_commands": validator_commands,
-                "validator_targets": validator_targets,
-                "typechecker_targets": typechecker_targets,
-                "typechecker_skipped_reason": typechecker_skipped_reason,
-                **phase_timings_ms,
-                "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
-                "summary": timeout_summary,
-                "error_class": "timeout",
-                "timed_out": True,
-                "command": timeout_command,
-            },
+            "result": lint_typecheck_timeout_result(
+                checked=checked,
+                diagnostics=diagnostics,
+                validator_commands=validator_commands,
+                validator_targets=validator_targets,
+                typechecker_targets=typechecker_targets,
+                typechecker_skipped_reason=typechecker_skipped_reason,
+                phase_timings_ms=phase_timings_ms,
+                timeout_seconds=exc.timeout,
+                timeout_output=timeout_output,
+                timeout_command=timeout_command,
+            ),
         }
     return {
         "timed_out": False,
         "diagnostics": diagnostics,
         "validator_commands": validator_commands,
         "phase_timings_ms": phase_timings_ms,
+    }
+
+
+def lint_typecheck_cache_hit_result(cached: dict[str, Any], *, scan_ms: float) -> dict[str, Any]:
+    result = dict(cached)
+    result["cache_hit"] = True
+    result["scan_ms"] = scan_ms
+    result["ruff_ms"] = 0.0
+    result["typecheck_ms"] = 0.0
+    result["shell_ms"] = 0.0
+    return result
+
+
+def lint_typecheck_timeout_result(
+    *,
+    checked: list[str],
+    diagnostics: list[str],
+    validator_commands: list[str],
+    validator_targets: list[str],
+    typechecker_targets: list[str],
+    typechecker_skipped_reason: str,
+    phase_timings_ms: dict[str, float],
+    timeout_seconds: Any,
+    timeout_output: str,
+    timeout_command: str,
+) -> dict[str, Any]:
+    timeout_summary = f"Command timed out after {timeout_seconds} seconds."
+    timeout_details = f"{timeout_summary} Validator: {timeout_command}"
+    if timeout_output != "(no output)":
+        timeout_details = f"{timeout_details}\n{timeout_output}"
+    return {
+        "ok": False,
+        "tool": "lint_typecheck",
+        "checked": checked,
+        "diagnostics": [*diagnostics, timeout_details],
+        "validator_commands": validator_commands,
+        "validator_targets": validator_targets,
+        "typechecker_targets": typechecker_targets,
+        "typechecker_skipped_reason": typechecker_skipped_reason,
+        **phase_timings_ms,
+        "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
+        "summary": timeout_summary,
+        "error_class": "timeout",
+        "timed_out": True,
+        "command": timeout_command,
+    }
+
+
+def lint_typecheck_final_result(
+    *,
+    checked: list[str],
+    diagnostics: list[str],
+    validator_commands: list[str],
+    validator_targets: list[str],
+    typechecker_targets: list[str],
+    typechecker_skipped_reason: str,
+    phase_timings_ms: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "ok": not diagnostics,
+        "tool": "lint_typecheck",
+        "checked": checked,
+        "diagnostics": diagnostics,
+        "validator_commands": validator_commands,
+        "validator_targets": validator_targets,
+        "typechecker_targets": typechecker_targets,
+        "typechecker_skipped_reason": typechecker_skipped_reason,
+        **phase_timings_ms,
+        "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} code file(s)",
     }

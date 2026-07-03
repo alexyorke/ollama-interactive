@@ -20,9 +20,12 @@ from uuid import uuid4
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
 from ollama_code.tools.validation import (
     lint_typecheck_file_analysis,
+    lint_typecheck_cache_hit_result,
+    lint_typecheck_final_result,
     lint_typecheck_run_validators,
     lint_typecheck_scan_paths,
     lint_typecheck_target_plan,
+    lint_typecheck_timeout_result,
 )
 
 
@@ -5646,6 +5649,43 @@ def double(value: int) -> int:
         self.assertEqual(payload["command"], "ruff check --no-cache app.py")
         self.assertIn("existing", payload["output"])
         self.assertIn("partial", payload["output"])
+
+    def test_lint_typecheck_result_helpers_shape_cache_timeout_and_final_payloads(self) -> None:
+        cached = lint_typecheck_cache_hit_result(
+            {"ok": True, "scan_ms": 99.0, "ruff_ms": 15.0, "typecheck_ms": 16.0, "shell_ms": 17.0},
+            scan_ms=1.25,
+        )
+        final = lint_typecheck_final_result(
+            checked=["app.py"],
+            diagnostics=[],
+            validator_commands=["ruff check --no-cache app.py"],
+            validator_targets=["app.py"],
+            typechecker_targets=[],
+            typechecker_skipped_reason="",
+            phase_timings_ms={"scan_ms": 1.0, "ruff_ms": 2.0, "typecheck_ms": 0.0, "shell_ms": 0.0},
+        )
+        timeout = lint_typecheck_timeout_result(
+            checked=["app.py"],
+            diagnostics=["existing"],
+            validator_commands=["ruff check --no-cache app.py"],
+            validator_targets=["app.py"],
+            typechecker_targets=[],
+            typechecker_skipped_reason="",
+            phase_timings_ms={"scan_ms": 1.0, "ruff_ms": 2.0, "typecheck_ms": 0.0, "shell_ms": 0.0},
+            timeout_seconds=5,
+            timeout_output="partial",
+            timeout_command="ruff check --no-cache app.py",
+        )
+
+        self.assertTrue(cached["cache_hit"])
+        self.assertEqual(cached["scan_ms"], 1.25)
+        self.assertEqual(cached["ruff_ms"], 0.0)
+        self.assertTrue(final["ok"])
+        self.assertIn("syntax ok: 1 code file", final["output"])
+        self.assertFalse(timeout["ok"])
+        self.assertEqual(timeout["error_class"], "timeout")
+        self.assertIn("existing", timeout["output"])
+        self.assertIn("partial", timeout["output"])
 
     def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
         with self._temp_files_tools({"script.sh": "if true; then\n  echo ok\n"}) as (_root, tools):

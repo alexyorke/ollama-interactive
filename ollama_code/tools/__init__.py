@@ -114,10 +114,13 @@ from ollama_code.tools.validation import (
     collapse_validation_targets,
     ini_has_section,
     lint_typecheck_cache_key,
+    lint_typecheck_cache_hit_result,
     lint_typecheck_file_analysis,
+    lint_typecheck_final_result,
     lint_typecheck_run_validators,
     lint_typecheck_scan_paths,
     lint_typecheck_target_plan,
+    lint_typecheck_timeout_result,
     python_typechecker_configured,
     python_typechecker_targets,
     python_validation_targets,
@@ -11183,13 +11186,7 @@ import string
             )
             cached = self._lint_typecheck_cache.get(cache_key)
             if cached is not None:
-                result = deepcopy(cached)
-                result["cache_hit"] = True
-                result["scan_ms"] = phase_timings_ms["scan_ms"]
-                result["ruff_ms"] = 0.0
-                result["typecheck_ms"] = 0.0
-                result["shell_ms"] = 0.0
-                return result
+                return lint_typecheck_cache_hit_result(cached, scan_ms=phase_timings_ms["scan_ms"])
             runner = lint_typecheck_run_validators(
                 workspace_root=self.workspace_root,
                 timeout=timeout,
@@ -11219,40 +11216,29 @@ import string
                 float(phase_timings_ms.get(active_phase, 0.0) or 0.0) + ((time.perf_counter() - active_phase_started) * 1000),
                 3,
             )
-            timeout_summary = f"Command timed out after {exc.timeout} seconds."
             timeout_output = self._collect_timeout_output(exc)
             timeout_command = self._timeout_command_text(exc.cmd)
-            timeout_details = f"{timeout_summary} Validator: {timeout_command}"
-            if timeout_output != "(no output)":
-                timeout_details = f"{timeout_details}\n{timeout_output}"
-            return {
-                "ok": False,
-                "tool": "lint_typecheck",
-                "checked": checked,
-                "diagnostics": [*diagnostics, timeout_details],
-                "validator_commands": validator_commands,
-                "validator_targets": validator_targets,
-                "typechecker_targets": typechecker_targets,
-                "typechecker_skipped_reason": typechecker_skipped_reason,
-                **phase_timings_ms,
-                "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
-                "summary": timeout_summary,
-                "error_class": "timeout",
-                "timed_out": True,
-                "command": timeout_command,
-            }
-        result = {
-            "ok": not diagnostics,
-            "tool": "lint_typecheck",
-            "checked": checked,
-            "diagnostics": diagnostics,
-            "validator_commands": validator_commands,
-            "validator_targets": validator_targets,
-            "typechecker_targets": typechecker_targets,
-            "typechecker_skipped_reason": typechecker_skipped_reason,
-            **phase_timings_ms,
-            "output": "\n".join(diagnostics) if diagnostics else f"syntax ok: {len(checked)} code file(s)",
-        }
+            return lint_typecheck_timeout_result(
+                checked=checked,
+                diagnostics=diagnostics,
+                validator_commands=validator_commands,
+                validator_targets=validator_targets,
+                typechecker_targets=typechecker_targets,
+                typechecker_skipped_reason=typechecker_skipped_reason,
+                phase_timings_ms=phase_timings_ms,
+                timeout_seconds=exc.timeout,
+                timeout_output=timeout_output,
+                timeout_command=timeout_command,
+            )
+        result = lint_typecheck_final_result(
+            checked=checked,
+            diagnostics=diagnostics,
+            validator_commands=validator_commands,
+            validator_targets=validator_targets,
+            typechecker_targets=typechecker_targets,
+            typechecker_skipped_reason=typechecker_skipped_reason,
+            phase_timings_ms=phase_timings_ms,
+        )
         if "cache_key" in locals():
             self._lint_typecheck_cache[cache_key] = deepcopy(result)
         return result
