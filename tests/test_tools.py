@@ -30,6 +30,7 @@ from ollama_code.tools.validation import (
 from ollama_code.tools.synthesis import (
     candidate_signature_gate,
     candidate_validation_failure_result,
+    candidate_validation_run_in_temp_workspace,
     candidate_validation_success_result,
     candidate_workspace_ignored_names,
 )
@@ -4271,6 +4272,108 @@ class ToolExecutorTests(unittest.TestCase):
         )
 
         self.assertEqual(ignored, {".git", ".ollama-code", "__pycache__", "scratch", "generated-123"})
+
+    def test_candidate_validation_run_in_temp_workspace_success_writes_source_and_cleans_up(self) -> None:
+        class FakeTools:
+            def contract_check(self, paths: list[str], limit: int) -> dict[str, object]:
+                self.static_args = (paths, limit)
+                return {"ok": True}
+
+            def run_test_example_probes(self, source: str, test_path: str, limit: int, timeout: int) -> dict[str, object]:
+                self.probe_args = (source, test_path, limit, timeout)
+                return {"ok": True}
+
+            def run_test(self, **kwargs: object) -> dict[str, object]:
+                self.test_args = kwargs
+                return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_base = Path(tmp) / "candidate"
+            fake_tools = FakeTools()
+            created_roots: list[Path] = []
+            cleaned: list[Path] = []
+            timings = iter([1.0, 1.01, 2.0, 2.02, 3.0, 3.03, 4.0, 4.04, 5.0])
+
+            def copy_workspace(destination: Path) -> None:
+                destination.mkdir(parents=True)
+
+            def create_tools(temp_root: Path, selected_test_command: str | None) -> FakeTools:
+                created_roots.append(temp_root)
+                self.assertEqual(selected_test_command, "python -m unittest")
+                self.assertEqual((temp_root / "pkg" / "app.py").read_text(encoding="utf-8"), "def add(left, right):\n    return left + right\n")
+                return fake_tools
+
+            result = candidate_validation_run_in_temp_workspace(
+                tmp_base=tmp_base,
+                rel_source="pkg/app.py",
+                candidate_source="def add(left, right):\n    return left + right\n",
+                test_path="tests/test_app.py",
+                test_command="python -m unittest",
+                selected_test_command="python -m unittest",
+                probe_limit=80,
+                timeout=120,
+                phase_timings_ms={"copy_ms": 0.0, "static_ms": 0.0, "probe_ms": 0.0, "test_ms": 0.0},
+                timing_fields=lambda: {"copy_ms": 1.0, "static_ms": 2.0, "probe_ms": 3.0, "test_ms": 4.0, "total_ms": 10.0},
+                copy_workspace=copy_workspace,
+                create_tools=create_tools,
+                cleanup=lambda path: (cleaned.append(path), shutil.rmtree(path, ignore_errors=True)),
+                truncate_text=lambda text, _limit: text,
+                timer=lambda: next(timings),
+                normalized=None,
+                signature_warnings=[],
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stage"], "passed")
+        self.assertEqual(fake_tools.static_args, (["pkg/app.py"], 12))
+        self.assertEqual(fake_tools.probe_args, ("pkg/app.py", "tests/test_app.py", 24, 60))
+        self.assertEqual(fake_tools.test_args, {"timeout": 120, "command": "python -m unittest"})
+        self.assertEqual(cleaned, [tmp_base])
+        self.assertEqual(created_roots, [tmp_base / "workspace"])
+        self.assertFalse(tmp_base.exists())
+
+    def test_candidate_validation_run_in_temp_workspace_reports_test_failure_with_probe_context(self) -> None:
+        class FakeTools:
+            def contract_check(self, paths: list[str], limit: int) -> dict[str, object]:
+                return {"ok": True}
+
+            def run_test_example_probes(self, source: str, test_path: str, limit: int, timeout: int) -> dict[str, object]:
+                return {"ok": False, "output": "probe mismatch"}
+
+            def run_test(self, **kwargs: object) -> dict[str, object]:
+                return {"ok": False, "output": "test failed"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_base = Path(tmp) / "candidate"
+            timings = iter([1.0, 1.01, 2.0, 2.02, 3.0, 3.03, 4.0, 4.04, 5.0])
+
+            result = candidate_validation_run_in_temp_workspace(
+                tmp_base=tmp_base,
+                rel_source="app.py",
+                candidate_source="def add(left, right):\n    return left - right\n",
+                test_path="test_app.py",
+                test_command=None,
+                selected_test_command="python -m unittest",
+                probe_limit=4,
+                timeout=10,
+                phase_timings_ms={"copy_ms": 0.0, "static_ms": 0.0, "probe_ms": 0.0, "test_ms": 0.0},
+                timing_fields=lambda: {"copy_ms": 1.0, "static_ms": 2.0, "probe_ms": 3.0, "test_ms": 4.0, "total_ms": 10.0},
+                copy_workspace=lambda destination: destination.mkdir(parents=True),
+                create_tools=lambda _root, _command: FakeTools(),
+                cleanup=lambda path: shutil.rmtree(path, ignore_errors=True),
+                truncate_text=lambda text, limit: text[:limit],
+                timer=lambda: next(timings),
+                normalized="normalized",
+                signature_warnings=["warn"],
+            )
+
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(result["stage"], "tests")
+        self.assertIn("probe mismatch", result["output"])
+        self.assertIn("test failed", result["output"])
+        self.assertEqual(result["signature_warnings"], ["warn"])
+        self.assertEqual(result["normalized"], "normalized")
+        self.assertFalse(tmp_base.exists())
 
     def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
         with self._temp_python_tools(

@@ -79,6 +79,7 @@ from ollama_code.tools.synthesis import (
     call_expr,
     candidate_signature_gate,
     candidate_validation_failure_result,
+    candidate_validation_run_in_temp_workspace,
     candidate_validation_success_result,
     candidate_workspace_ignored_names,
     candidate_public_signature_map,
@@ -9020,78 +9021,36 @@ import string
                 timing_fields=timing_fields(),
             )
         tmp_base = self.workspace_root / ".ollama-code" / "tmp" / f"candidate-{uuid4().hex}"
-        try:
-            tmp_base.mkdir(parents=True, exist_ok=False)
-            temp_root = tmp_base / "workspace"
-            phase_started_at = time.perf_counter()
-            self._copy_workspace_for_candidate(temp_root)
-            phase_timings_ms["copy_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
-            temp_source = temp_root / rel_source
-            temp_source.parent.mkdir(parents=True, exist_ok=True)
-            temp_source.write_text(candidate_source, encoding="utf-8")
-            temp_tools = ToolExecutor(
+        def create_temp_tools(temp_root: Path, selected_test_command: str | None) -> ToolExecutor:
+            return ToolExecutor(
                 temp_root,
                 approval_mode="auto",
-                test_command=(test_command or self.default_test_command),
+                test_command=selected_test_command,
                 default_tools_enabled=self.default_tools_enabled,
                 disabled_tools=self.disabled_tools,
                 mcp_servers=self.mcp_servers,
                 browser_enabled=self.browser_enabled,
                 security_enabled=self.security_enabled,
             )
-            phase_started_at = time.perf_counter()
-            static_result = temp_tools.contract_check([rel_source], limit=12)
-            phase_timings_ms["static_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
-            if static_result.get("ok") is not True:
-                summary = str(static_result.get("output") or static_result.get("summary") or "candidate static sanity failed")
-                return candidate_validation_failure_result(
-                    path=rel_source,
-                    stage="static",
-                    summary=summary,
-                    output=summary,
-                    static=static_result,
-                    signature_warnings=signature_warnings,
-                    normalized=normalization,
-                    timing_fields=timing_fields(),
-                )
-            probe_result: dict[str, Any] | None = None
-            probe_failure_summary = ""
-            if test_path:
-                phase_started_at = time.perf_counter()
-                probe_result = temp_tools.run_test_example_probes(rel_source, test_path, limit=max(1, min(int(probe_limit), 24)), timeout=min(max(1, int(timeout)), 60))
-                phase_timings_ms["probe_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
-                if probe_result.get("ok") is not True:
-                    probe_failure_summary = str(probe_result.get("output") or probe_result.get("summary") or "candidate example probes failed")
-            run_args: dict[str, Any] = {"timeout": max(1, int(timeout))}
-            if test_command:
-                run_args["command"] = test_command
-            phase_started_at = time.perf_counter()
-            test_result = temp_tools.run_test(**run_args)
-            phase_timings_ms["test_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
-            if test_result.get("ok") is not True:
-                summary = str(test_result.get("output") or test_result.get("summary") or "candidate tests failed")
-                if probe_failure_summary:
-                    summary = f"example probe mismatches:\n{probe_failure_summary}\n\ntest output:\n{summary}"
-                return candidate_validation_failure_result(
-                    path=rel_source,
-                    stage="tests",
-                    summary=self._truncate_text(summary, limit=520),
-                    output=self._truncate_text(summary, limit=1600),
-                    static=static_result,
-                    probes=probe_result,
-                    test=test_result,
-                    signature_warnings=signature_warnings,
-                    normalized=normalization,
-                    timing_fields=timing_fields(),
-                )
-        finally:
-            shutil.rmtree(tmp_base, ignore_errors=True)
-        return candidate_validation_success_result(
-            path=rel_source,
+
+        return candidate_validation_run_in_temp_workspace(
+            tmp_base=tmp_base,
+            rel_source=rel_source,
             candidate_source=candidate_source,
+            test_path=test_path,
+            test_command=test_command,
+            selected_test_command=(test_command or self.default_test_command),
+            probe_limit=probe_limit,
+            timeout=timeout,
+            phase_timings_ms=phase_timings_ms,
+            timing_fields=timing_fields,
+            copy_workspace=self._copy_workspace_for_candidate,
+            create_tools=create_temp_tools,
+            cleanup=lambda path: shutil.rmtree(path, ignore_errors=True),
+            truncate_text=lambda text, limit: self._truncate_text(text, limit=limit),
+            timer=time.perf_counter,
             normalized=normalization,
             signature_warnings=signature_warnings,
-            timing_fields=timing_fields(),
         )
 
     def run_function_probe(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 import re
 from typing import Any, Callable
 
@@ -165,6 +166,97 @@ def candidate_workspace_ignored_names(
         "verify_scratch",
     }
     return {name for name in names if name in skipped or generated_dir_name(name)}
+
+
+def candidate_validation_run_in_temp_workspace(
+    *,
+    tmp_base: Path,
+    rel_source: str,
+    candidate_source: str,
+    test_path: str | None,
+    test_command: str | None,
+    selected_test_command: str | None,
+    probe_limit: int,
+    timeout: int,
+    phase_timings_ms: dict[str, float],
+    timing_fields: Callable[[], dict[str, float]],
+    copy_workspace: Callable[[Path], None],
+    create_tools: Callable[[Path, str | None], Any],
+    cleanup: Callable[[Path], None],
+    truncate_text: Callable[[str, int], str],
+    timer: Callable[[], float],
+    normalized: str | None,
+    signature_warnings: list[str],
+) -> dict[str, Any]:
+    try:
+        tmp_base.mkdir(parents=True, exist_ok=False)
+        temp_root = tmp_base / "workspace"
+        phase_started_at = timer()
+        copy_workspace(temp_root)
+        phase_timings_ms["copy_ms"] = round((timer() - phase_started_at) * 1000, 3)
+        temp_source = temp_root / rel_source
+        temp_source.parent.mkdir(parents=True, exist_ok=True)
+        temp_source.write_text(candidate_source, encoding="utf-8")
+        temp_tools = create_tools(temp_root, selected_test_command)
+        phase_started_at = timer()
+        static_result = temp_tools.contract_check([rel_source], limit=12)
+        phase_timings_ms["static_ms"] = round((timer() - phase_started_at) * 1000, 3)
+        if static_result.get("ok") is not True:
+            summary = str(static_result.get("output") or static_result.get("summary") or "candidate static sanity failed")
+            return candidate_validation_failure_result(
+                path=rel_source,
+                stage="static",
+                summary=summary,
+                output=summary,
+                static=static_result,
+                signature_warnings=signature_warnings,
+                normalized=normalized,
+                timing_fields=timing_fields(),
+            )
+        probe_result: dict[str, Any] | None = None
+        probe_failure_summary = ""
+        if test_path:
+            phase_started_at = timer()
+            probe_result = temp_tools.run_test_example_probes(
+                rel_source,
+                test_path,
+                limit=max(1, min(int(probe_limit), 24)),
+                timeout=min(max(1, int(timeout)), 60),
+            )
+            phase_timings_ms["probe_ms"] = round((timer() - phase_started_at) * 1000, 3)
+            if probe_result.get("ok") is not True:
+                probe_failure_summary = str(probe_result.get("output") or probe_result.get("summary") or "candidate example probes failed")
+        run_args: dict[str, Any] = {"timeout": max(1, int(timeout))}
+        if test_command:
+            run_args["command"] = test_command
+        phase_started_at = timer()
+        test_result = temp_tools.run_test(**run_args)
+        phase_timings_ms["test_ms"] = round((timer() - phase_started_at) * 1000, 3)
+        if test_result.get("ok") is not True:
+            summary = str(test_result.get("output") or test_result.get("summary") or "candidate tests failed")
+            if probe_failure_summary:
+                summary = f"example probe mismatches:\n{probe_failure_summary}\n\ntest output:\n{summary}"
+            return candidate_validation_failure_result(
+                path=rel_source,
+                stage="tests",
+                summary=truncate_text(summary, 520),
+                output=truncate_text(summary, 1600),
+                static=static_result,
+                probes=probe_result,
+                test=test_result,
+                signature_warnings=signature_warnings,
+                normalized=normalized,
+                timing_fields=timing_fields(),
+            )
+    finally:
+        cleanup(tmp_base)
+    return candidate_validation_success_result(
+        path=rel_source,
+        candidate_source=candidate_source,
+        normalized=normalized,
+        signature_warnings=signature_warnings,
+        timing_fields=timing_fields(),
+    )
 
 
 def node_expr(node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
