@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 import re
 from typing import Any, Callable
@@ -79,6 +80,59 @@ def request_looks_like_python_test_driven_repair(
             lowered,
         )
     )
+
+
+def spec_guided_repair_has_actionable_spec(
+    *,
+    source_text: str,
+    quick_spec: dict[str, Any],
+    failed_output: str,
+    split_test_example: Callable[[str], tuple[str, str, str]],
+    test_spec_call_name: Callable[[ast.Call], str],
+) -> bool:
+    quick_examples = [item for item in list(quick_spec.get("examples") or []) if isinstance(item, dict)]
+    quick_stubs = [item for item in list(quick_spec.get("stubs") or []) if str(item).strip()]
+    quick_definitions = [item for item in list(quick_spec.get("definitions") or []) if isinstance(item, dict)]
+    quick_example_text = "\n".join(str(item.get("example") or "") for item in quick_examples)
+    has_structured_behavior_constraints = " matches " in quick_example_text or " != " in quick_example_text
+    has_import_failure = "ModuleNotFoundError" in failed_output or "ImportError" in failed_output
+    has_string_transform_hints = bool(quick_spec.get("string_transform_hints"))
+    has_definition_risks = any(list(item.get("risks") or []) for item in quick_definitions)
+    source_line_count = len(source_text.splitlines())
+    small_module = source_line_count <= 220 and len(quick_definitions) <= 8
+    literal_example_count = 0
+    if small_module and len(quick_definitions) == 1:
+        target_names = {
+            str(quick_definitions[0].get("name") or "").strip(),
+            str(quick_definitions[0].get("symbol") or "").strip(),
+        } - {""}
+        for item in quick_examples:
+            if str(item.get("symbol") or "").strip() not in target_names:
+                continue
+            kind, expr, expected = split_test_example(str(item.get("example") or ""))
+            if kind != "value":
+                continue
+            try:
+                parsed = ast.parse(expr, mode="eval")
+                ast.literal_eval(expected)
+            except (SyntaxError, ValueError):
+                continue
+            call = parsed.body
+            if not isinstance(call, ast.Call) or call.keywords:
+                continue
+            if test_spec_call_name(call) not in target_names:
+                continue
+            try:
+                [ast.literal_eval(arg) for arg in call.args]
+            except (SyntaxError, ValueError):
+                continue
+            literal_example_count += 1
+    has_small_literal_example_repair = small_module and len(quick_definitions) == 1 and literal_example_count >= 1
+    if has_import_failure or has_structured_behavior_constraints or has_string_transform_hints or has_definition_risks:
+        return True
+    if quick_stubs:
+        return True
+    return small_module and (len(quick_examples) >= 4 or has_small_literal_example_repair)
 
 
 def merge_request_obligations(obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:

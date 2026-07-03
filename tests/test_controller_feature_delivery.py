@@ -1,3 +1,4 @@
+import ast
 import unittest
 
 from ollama_code.controller.feature_delivery import (
@@ -9,6 +10,7 @@ from ollama_code.controller.feature_delivery import (
     request_is_cli_flag_bundle,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
+    spec_guided_repair_has_actionable_spec,
     typed_cli_flag_protocol_enabled,
 )
 
@@ -86,6 +88,58 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         self.assertFalse(request_looks_like_python_test_driven_repair(**{**base, "default_test_command_configured": False}))
         self.assertFalse(request_looks_like_python_test_driven_repair(**{**base, "required_tool_names": {"read_file"}}))
         self.assertFalse(request_looks_like_python_test_driven_repair(**{**base, "session_memory_request": True}))
+
+    def test_spec_guided_repair_has_actionable_spec_accepts_explicit_failure_signals(self) -> None:
+        weak_spec = {"examples": [], "definitions": []}
+
+        self.assertTrue(
+            spec_guided_repair_has_actionable_spec(
+                source_text="def parse(value):\n    return value\n",
+                quick_spec=weak_spec,
+                failed_output="ModuleNotFoundError: No module named 'app'",
+                split_test_example=lambda example: ("", "", ""),
+                test_spec_call_name=lambda call: "",
+            )
+        )
+        self.assertTrue(
+            spec_guided_repair_has_actionable_spec(
+                source_text="def parse(value):\n    return value\n",
+                quick_spec={"examples": [{"example": "parse('x') != 'x'"}], "definitions": []},
+                failed_output="",
+                split_test_example=lambda example: ("", "", ""),
+                test_spec_call_name=lambda call: "",
+            )
+        )
+
+    def test_spec_guided_repair_has_actionable_spec_rejects_weak_large_spec(self) -> None:
+        source_text = "\n".join(f"line_{index} = {index}" for index in range(230))
+
+        self.assertFalse(
+            spec_guided_repair_has_actionable_spec(
+                source_text=source_text,
+                quick_spec={"examples": [{"example": "parse('x') == 'x'"}], "definitions": [{"name": "parse"}]},
+                failed_output="",
+                split_test_example=lambda example: ("value", "parse('x')", "'x'"),
+                test_spec_call_name=lambda call: "parse",
+            )
+        )
+
+    def test_spec_guided_repair_has_actionable_spec_accepts_small_literal_example(self) -> None:
+        def call_name(call: ast.Call) -> str:
+            return call.func.id if isinstance(call.func, ast.Name) else ""
+
+        self.assertTrue(
+            spec_guided_repair_has_actionable_spec(
+                source_text="def parse(value):\n    return value\n",
+                quick_spec={
+                    "examples": [{"symbol": "parse", "example": "parse('x') == 'X'"}],
+                    "definitions": [{"name": "parse"}],
+                },
+                failed_output="",
+                split_test_example=lambda example: ("value", "parse('x')", "'X'"),
+                test_spec_call_name=call_name,
+            )
+        )
 
     def test_cli_feature_capabilities_detect_due_before_priority_and_limit(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"

@@ -9,6 +9,7 @@ from .feature_delivery import (
     request_is_cli_flag_bundle,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
+    spec_guided_repair_has_actionable_spec,
     typed_cli_flag_protocol_enabled,
 )
 from .edit_policy import (
@@ -263,6 +264,7 @@ __all__ = [
     "merge_request_obligations",
     "request_is_cli_flag_bundle",
     "request_looks_like_python_test_driven_repair",
+    "spec_guided_repair_has_actionable_spec",
     "cli_patch_bundle_instruction",
     "repair_decision_for_tool",
     "repair_spec_broad_repair_hint",
