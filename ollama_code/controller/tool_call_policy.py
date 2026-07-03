@@ -17,6 +17,7 @@ ShellTestRunPredicate = Callable[[str], bool]
 ToolArgumentsNormalizer = Callable[[str], dict[str, Any] | None]
 ArgvArgumentsNormalizer = Callable[[list[str]], dict[str, Any] | None]
 ArgvToolNormalizer = Callable[[list[str]], tuple[str, dict[str, Any]] | None]
+LineCountProvider = Callable[[str], int | None]
 
 
 def normalize_target_line_read_call(
@@ -220,6 +221,53 @@ def normalize_unittest_file_command(
         return None
     test_dir = relative_label(target.parent)
     return f"{match.group('prefix')} discover -s {test_dir} -p {target.name}"
+
+
+def normalize_head_tail_shell_inspection(
+    argv: list[str],
+    *,
+    line_count_for_file: LineCountProvider,
+) -> dict[str, Any] | None:
+    if not argv:
+        return None
+    command = argv[0].lower()
+    if command not in {"head", "tail"}:
+        return None
+    count = 10
+    path: str | None = None
+    index = 1
+    if index < len(argv):
+        token = argv[index]
+        if token == "-n":
+            if index + 2 >= len(argv):
+                return None
+            try:
+                count = int(argv[index + 1])
+            except ValueError:
+                return None
+            path = argv[index + 2]
+            index += 3
+        elif re.fullmatch(r"-\d+", token):
+            count = int(token[1:])
+            if index + 1 >= len(argv):
+                return None
+            path = argv[index + 1]
+            index += 2
+        elif token.startswith("-"):
+            return None
+        else:
+            path = token
+            index += 1
+    if index != len(argv) or not path or path.startswith("-") or count <= 0:
+        return None
+    count = min(count, 200)
+    if command == "head":
+        return {"path": path, "start": 1, "end": count}
+    line_count = line_count_for_file(path)
+    if line_count is None:
+        return None
+    start = max(1, line_count - count + 1)
+    return {"path": path, "start": start, "end": max(start, line_count)}
 
 
 def normalize_find_shell_inspection(argv: list[str]) -> tuple[str, dict[str, Any]] | None:

@@ -115,6 +115,7 @@ from .repair_protocol import (
 from .state import ControllerTurnState
 from .tool_call_policy import (
     normalize_find_shell_inspection,
+    normalize_head_tail_shell_inspection,
     normalize_run_test_call,
     normalize_shell_inspection_call,
     normalize_shell_test_call,
@@ -141,6 +142,7 @@ __all__ = [
     "normalize_edit_payload_aliases",
     "normalize_file_tool_alias_call",
     "normalize_find_shell_inspection",
+    "normalize_head_tail_shell_inspection",
     "normalize_payload",
     "normalize_run_test_call",
     "normalize_shell_inspection_call",

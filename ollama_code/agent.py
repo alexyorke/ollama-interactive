@@ -106,6 +106,7 @@ from ollama_code.controller import (
     normalize_find_shell_inspection as controller_normalize_find_shell_inspection,
     normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
+    normalize_head_tail_shell_inspection as controller_normalize_head_tail_shell_inspection,
     normalize_payload as controller_normalize_payload,
     normalize_run_test_call as controller_normalize_run_test_call,
     normalize_shell_inspection_call as controller_normalize_shell_inspection_call,
@@ -4420,50 +4421,16 @@ class OllamaCodeAgent:
         return dict(result) if isinstance(result, dict) else None
 
     def _normalize_head_tail_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
-        if not argv:
-            return None
-        command = argv[0].lower()
-        if command not in {"head", "tail"}:
-            return None
-        count = 10
-        path: str | None = None
-        index = 1
-        if index < len(argv):
-            token = argv[index]
-            if token == "-n":
-                if index + 2 >= len(argv):
-                    return None
-                try:
-                    count = int(argv[index + 1])
-                except ValueError:
-                    return None
-                path = argv[index + 2]
-                index += 3
-            elif re.fullmatch(r"-\d+", token):
-                count = int(token[1:])
-                if index + 1 >= len(argv):
-                    return None
-                path = argv[index + 1]
-                index += 2
-            elif token.startswith("-"):
-                return None
-            else:
-                path = token
-                index += 1
-        if index != len(argv) or not path or path.startswith("-") or count <= 0:
-            return None
-        count = min(count, 200)
-        if command == "head":
-            return {"path": path, "start": 1, "end": count}
+        return controller_normalize_head_tail_shell_inspection(argv, line_count_for_file=self._line_count_for_shell_preview)
+
+    def _line_count_for_shell_preview(self, path: str) -> int | None:
         try:
             target = self.tools.resolve_path(path, allow_missing=False)
             if target.is_dir():
                 return None
-            line_count = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+            return len(target.read_text(encoding="utf-8", errors="replace").splitlines())
         except OSError:
             return None
-        start = max(1, line_count - count + 1)
-        return {"path": path, "start": start, "end": max(start, line_count)}
 
     def _normalize_find_shell_inspection(self, argv: list[str]) -> tuple[str, dict[str, Any]] | None:
         return controller_normalize_find_shell_inspection(argv)

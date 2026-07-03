@@ -5,6 +5,7 @@ from pathlib import Path
 from ollama_code.agent_protocol import TargetLineReadSpec
 from ollama_code.controller.tool_call_policy import (
     normalize_find_shell_inspection,
+    normalize_head_tail_shell_inspection,
     normalize_run_test_call,
     normalize_shell_inspection_call,
     normalize_shell_test_call,
@@ -357,6 +358,40 @@ class ControllerToolCallPolicyTests(unittest.TestCase):
             normalize_shell_inspection_call("run_shell", {"command": "find . -name '*.py'"}, **base_kwargs),
             ("file_search", {"query": ".py", "path": ".", "limit": 100}, "Normalized simple shell discovery to structured search for cacheable context."),
         )
+
+    def test_head_tail_shell_inspection_normalizes_bounded_previews(self) -> None:
+        line_counts = {"README.md": 50, "short.txt": 4}
+        line_count_for_file = lambda path: line_counts.get(path)
+
+        self.assertEqual(
+            normalize_head_tail_shell_inspection(["head", "README.md"], line_count_for_file=line_count_for_file),
+            {"path": "README.md", "start": 1, "end": 10},
+        )
+        self.assertEqual(
+            normalize_head_tail_shell_inspection(["head", "-n", "5", "README.md"], line_count_for_file=line_count_for_file),
+            {"path": "README.md", "start": 1, "end": 5},
+        )
+        self.assertEqual(
+            normalize_head_tail_shell_inspection(["head", "-999", "README.md"], line_count_for_file=line_count_for_file),
+            {"path": "README.md", "start": 1, "end": 200},
+        )
+        self.assertEqual(
+            normalize_head_tail_shell_inspection(["tail", "-5", "README.md"], line_count_for_file=line_count_for_file),
+            {"path": "README.md", "start": 46, "end": 50},
+        )
+        self.assertEqual(
+            normalize_head_tail_shell_inspection(["tail", "-10", "short.txt"], line_count_for_file=line_count_for_file),
+            {"path": "short.txt", "start": 1, "end": 4},
+        )
+
+    def test_head_tail_shell_inspection_rejects_invalid_or_unresolved_shapes(self) -> None:
+        line_count_for_file = lambda path: None
+
+        self.assertIsNone(normalize_head_tail_shell_inspection([], line_count_for_file=line_count_for_file))
+        self.assertIsNone(normalize_head_tail_shell_inspection(["head", "-x", "README.md"], line_count_for_file=line_count_for_file))
+        self.assertIsNone(normalize_head_tail_shell_inspection(["head", "-n", "bad", "README.md"], line_count_for_file=line_count_for_file))
+        self.assertIsNone(normalize_head_tail_shell_inspection(["head", "README.md", "extra"], line_count_for_file=line_count_for_file))
+        self.assertIsNone(normalize_head_tail_shell_inspection(["tail", "missing.txt"], line_count_for_file=line_count_for_file))
 
     def test_unittest_file_command_normalizes_test_file_paths_only(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
