@@ -12,6 +12,64 @@ def human_test_name(name: str) -> str:
     return text or name
 
 
+def python_parse_text(content: str) -> str:
+    return content[1:] if content.startswith("\ufeff") else content
+
+
+def candidate_public_signature_map(source: str) -> dict[str, str]:
+    try:
+        tree = ast.parse(python_parse_text(source))
+    except SyntaxError:
+        return {}
+    signatures: dict[str, str] = {}
+
+    def arg_shape(arg: ast.arg, has_default: bool = False) -> str:
+        return arg.arg + ("=*" if has_default else "")
+
+    def function_shape(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+        args = node.args
+        defaults = [False] * (len(args.posonlyargs) + len(args.args) - len(args.defaults)) + [True] * len(args.defaults)
+        positional = [arg_shape(arg, defaults[index]) for index, arg in enumerate([*args.posonlyargs, *args.args])]
+        if args.vararg:
+            positional.append("*" + args.vararg.arg)
+        elif args.kwonlyargs:
+            positional.append("*")
+        positional.extend(arg_shape(arg, args.kw_defaults[index] is not None) for index, arg in enumerate(args.kwonlyargs))
+        if args.kwarg:
+            positional.append("**" + args.kwarg.arg)
+        prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+        return f"{prefix} {node.name}({', '.join(positional)})"
+
+    def visit(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.ClassDef):
+                qualname = ".".join([*stack, child.name])
+                signatures[qualname] = f"class {child.name}"
+                visit(child, [*stack, child.name])
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                qualname = ".".join([*stack, child.name])
+                signatures[qualname] = function_shape(child)
+                visit(child, [*stack, child.name])
+            else:
+                visit(child, stack)
+
+    visit(tree, [])
+    return signatures
+
+
+def candidate_signature_diagnostics(original: str, candidate: str) -> list[str]:
+    original_map = candidate_public_signature_map(original)
+    candidate_map = candidate_public_signature_map(candidate)
+    diagnostics: list[str] = []
+    for symbol, signature in original_map.items():
+        if symbol not in candidate_map:
+            diagnostics.append(f"candidate removed public symbol {symbol}")
+            continue
+        if candidate_map[symbol] != signature:
+            diagnostics.append(f"candidate changed signature for {symbol}: {signature} -> {candidate_map[symbol]}")
+    return diagnostics
+
+
 def node_expr(node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
     if local_exprs and isinstance(node, ast.Name) and node.id in local_exprs:
         return local_exprs[node.id]

@@ -77,10 +77,13 @@ from ollama_code.tools.contracts import (
 from ollama_code.tools.synthesis import (
     assert_raises_expected_message,
     call_expr,
+    candidate_public_signature_map,
+    candidate_signature_diagnostics,
     first_behavior_call,
     human_test_name,
     method_name,
     node_expr,
+    python_parse_text,
     select_test_spec_examples,
     split_test_example,
     test_example_probe_expressions,
@@ -8906,56 +8909,10 @@ import string
         }
 
     def _candidate_public_signature_map(self, source: str) -> dict[str, str]:
-        try:
-            tree = ast.parse(self._python_parse_text(source))
-        except SyntaxError:
-            return {}
-        signatures: dict[str, str] = {}
-
-        def arg_shape(arg: ast.arg, has_default: bool = False) -> str:
-            return arg.arg + ("=*" if has_default else "")
-
-        def function_shape(node: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
-            args = node.args
-            defaults = [False] * (len(args.posonlyargs) + len(args.args) - len(args.defaults)) + [True] * len(args.defaults)
-            positional = [arg_shape(arg, defaults[index]) for index, arg in enumerate([*args.posonlyargs, *args.args])]
-            if args.vararg:
-                positional.append("*" + args.vararg.arg)
-            elif args.kwonlyargs:
-                positional.append("*")
-            positional.extend(arg_shape(arg, args.kw_defaults[index] is not None) for index, arg in enumerate(args.kwonlyargs))
-            if args.kwarg:
-                positional.append("**" + args.kwarg.arg)
-            prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
-            return f"{prefix} {node.name}({', '.join(positional)})"
-
-        def visit(node: ast.AST, stack: list[str]) -> None:
-            for child in ast.iter_child_nodes(node):
-                if isinstance(child, ast.ClassDef):
-                    qualname = ".".join([*stack, child.name])
-                    signatures[qualname] = f"class {child.name}"
-                    visit(child, [*stack, child.name])
-                elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    qualname = ".".join([*stack, child.name])
-                    signatures[qualname] = function_shape(child)
-                    visit(child, [*stack, child.name])
-                else:
-                    visit(child, stack)
-
-        visit(tree, [])
-        return signatures
+        return candidate_public_signature_map(source)
 
     def _candidate_signature_diagnostics(self, original: str, candidate: str) -> list[str]:
-        original_map = self._candidate_public_signature_map(original)
-        candidate_map = self._candidate_public_signature_map(candidate)
-        diagnostics: list[str] = []
-        for symbol, signature in original_map.items():
-            if symbol not in candidate_map:
-                diagnostics.append(f"candidate removed public symbol {symbol}")
-                continue
-            if candidate_map[symbol] != signature:
-                diagnostics.append(f"candidate changed signature for {symbol}: {signature} -> {candidate_map[symbol]}")
-        return diagnostics
+        return candidate_signature_diagnostics(original, candidate)
 
     def _normalize_candidate_python_source(self, source_file: Path, candidate_source: str) -> tuple[str, str | None]:
         try:
@@ -13173,7 +13130,7 @@ import string
         return None
 
     def _python_parse_text(self, content: str) -> str:
-        return content[1:] if content.startswith("\ufeff") else content
+        return python_parse_text(content)
 
     def _python_top_level_symbol_names(self, target: Path, content: str) -> list[str]:
         if target.suffix.lower() != ".py":
