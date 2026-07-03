@@ -121,6 +121,8 @@ from ollama_code.controller import (
     path_looks_like_code_file as controller_path_looks_like_code_file,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
+    optional_parameter_update_operations_from_source as controller_optional_parameter_update_operations_from_source,
+    optional_parameter_update_spec as controller_optional_parameter_update_spec,
     project_function_rename_already_satisfied as controller_project_function_rename_already_satisfied,
     project_function_rename_operations as controller_project_function_rename_operations,
     request_allows_any_validation as controller_request_allows_any_validation,
@@ -182,6 +184,7 @@ from ollama_code.controller import (
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
     symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
     symbol_return_update_spec as controller_symbol_return_update_spec,
+    signature_with_appended_parameter as controller_signature_with_appended_parameter,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
@@ -7905,96 +7908,29 @@ class OllamaCodeAgent:
         return controller_clean_return_expression(expression)
 
     def _optional_parameter_update_operations(self, request_text: str) -> list[tuple[str, dict[str, Any]]] | None:
-        match = re.search(
-            r"\badd\s+an?\s+optional\s+(?P<param>[A-Za-z_]\w*)\s*:\s*(?P<annotation>[^=]+?)\s*=\s*(?P<default>False|True|None|[-+]?\d+(?:\.\d+)?|['\"][^'\"]*['\"])\s+parameter\s+to\s+(?P<symbol>[A-Za-z_]\w*)\s+in\s+(?P<src>[\w./-]+\.py)\b(?:(?!\n\n).){0,240}?\bupdate\s+(?P<doc>[\w./-]+\.md)\b",
-            request_text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not match:
+        spec = controller_optional_parameter_update_spec(request_text)
+        if not spec:
             return None
-        src_path = match.group("src")
-        doc_path = match.group("doc")
-        symbol = match.group("symbol")
-        param = match.group("param")
-        annotation = re.sub(r"\s+", " ", match.group("annotation")).strip()
-        default = match.group("default").strip()
         try:
-            source_target = self.tools.resolve_path(src_path, allow_missing=False)
+            source_target = self.tools.resolve_path(spec["src_path"], allow_missing=False)
             source = source_target.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(source)
-            doc_target = self.tools.resolve_path(doc_path, allow_missing=False)
+            doc_target = self.tools.resolve_path(spec["doc_path"], allow_missing=False)
             docs = doc_target.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return None
-
-        node = next(
-            (
-                child
-                for child in tree.body
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == symbol
-            ),
-            None,
+        return controller_optional_parameter_update_operations_from_source(
+            src_path=spec["src_path"],
+            doc_path=spec["doc_path"],
+            symbol=spec["symbol"],
+            param=spec["param"],
+            annotation=spec["annotation"],
+            default=spec["default"],
+            source=source,
+            docs=docs,
         )
-        if node is None:
-            return None
-        existing_params = {arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]}
-        operations: list[tuple[str, dict[str, Any]]] = []
-        if param not in existing_params:
-            signature = self._signature_with_appended_parameter(source, node, f"{param}: {annotation} = {default}")
-            if not signature:
-                return None
-            operations.append(
-                (
-                    "edit_intent",
-                    {
-                        "path": src_path,
-                        "intent": "change_signature",
-                        "target": symbol,
-                        "replacement": signature,
-                    },
-                )
-            )
-
-        if param not in docs:
-            call_match = re.search(rf"`{re.escape(symbol)}\((?P<args>[^`]*)\)`", docs)
-            if call_match and param not in call_match.group("args"):
-                old_call = call_match.group(0)
-                args = call_match.group("args").strip()
-                separator = ", " if args else ""
-                new_call = f"`{symbol}({args}{separator}{param}={default})`"
-                operations.append(("replace_in_file", {"path": doc_path, "old": old_call, "new": new_call}))
-        if not operations:
-            return None
-        return operations
 
     def _signature_with_appended_parameter(self, source: str, node: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) -> str:
-        lines = source.splitlines()
-        start = int(getattr(node, "lineno", 1)) - 1
-        if start < 0 or start >= len(lines):
-            return ""
-        signature_line = lines[start].strip()
-        if "\n" in signature_line or not signature_line.startswith(("def ", "async def ")):
-            return ""
-        open_index = signature_line.find("(")
-        if open_index < 0:
-            return ""
-        depth = 0
-        close_index = -1
-        for index, char in enumerate(signature_line[open_index:], start=open_index):
-            if char == "(":
-                depth += 1
-            elif char == ")":
-                depth -= 1
-                if depth == 0:
-                    close_index = index
-                    break
-        if close_index < 0:
-            return ""
-        current_params = signature_line[open_index + 1 : close_index].strip()
-        if parameter.split(":", 1)[0].strip() in {part.split(":", 1)[0].split("=", 1)[0].strip() for part in current_params.split(",")}:
-            return signature_line
-        separator = ", " if current_params else ""
-        return f"{signature_line[: open_index + 1]}{current_params}{separator}{parameter}{signature_line[close_index:]}"
+        return controller_signature_with_appended_parameter(source, node, parameter)
 
     def _try_handle_deterministic_turn(
         self,

@@ -1,9 +1,13 @@
 import unittest
+import ast
 
 from ollama_code.controller.operation_policy import (
     clean_return_expression,
+    optional_parameter_update_operations_from_source,
+    optional_parameter_update_spec,
     project_function_rename_already_satisfied,
     project_function_rename_operations,
+    signature_with_appended_parameter,
     symbol_return_update_operations_from_source,
     symbol_return_update_spec,
     workflow_config_update_operations,
@@ -85,6 +89,131 @@ class ControllerOperationPolicyTests(unittest.TestCase):
                 source=source,
                 requested_tool_names=set(),
                 required_tool_names=set(),
+            )
+        )
+
+    def test_optional_parameter_update_spec_parses_request(self) -> None:
+        self.assertEqual(
+            optional_parameter_update_spec("Add an optional verbose: bool = False parameter to build in src/app.py and update docs/api.md."),
+            {
+                "src_path": "src/app.py",
+                "doc_path": "docs/api.md",
+                "symbol": "build",
+                "param": "verbose",
+                "annotation": "bool",
+                "default": "False",
+            },
+        )
+        self.assertEqual(
+            optional_parameter_update_spec("Add an optional limit: int = 10 parameter to fetch in src/api.py; update README.md."),
+            {
+                "src_path": "src/api.py",
+                "doc_path": "README.md",
+                "symbol": "fetch",
+                "param": "limit",
+                "annotation": "int",
+                "default": "10",
+            },
+        )
+        self.assertIsNone(optional_parameter_update_spec("Add verbose to build in src/app.py."))
+
+    def test_signature_with_appended_parameter_adds_missing_parameter(self) -> None:
+        source = "def build(name: str):\n    return name\n"
+        node = ast.parse(source).body[0]
+        self.assertIsInstance(node, ast.FunctionDef)
+        self.assertEqual(signature_with_appended_parameter(source, node, "verbose: bool = False"), "def build(name: str, verbose: bool = False):")
+
+    def test_signature_with_appended_parameter_preserves_existing_parameter(self) -> None:
+        source = "async def build(name: str, verbose: bool = False):\n    return name\n"
+        node = ast.parse(source).body[0]
+        self.assertIsInstance(node, ast.AsyncFunctionDef)
+        self.assertEqual(
+            signature_with_appended_parameter(source, node, "verbose: bool = False"),
+            "async def build(name: str, verbose: bool = False):",
+        )
+
+    def test_optional_parameter_update_operations_updates_source_and_docs(self) -> None:
+        source = "def build(name: str):\n    return name\n"
+        docs = "Call `build(name)` to construct a value.\n"
+        self.assertEqual(
+            optional_parameter_update_operations_from_source(
+                src_path="src/app.py",
+                doc_path="docs/api.md",
+                symbol="build",
+                param="verbose",
+                annotation="bool",
+                default="False",
+                source=source,
+                docs=docs,
+            ),
+            [
+                (
+                    "edit_intent",
+                    {
+                        "path": "src/app.py",
+                        "intent": "change_signature",
+                        "target": "build",
+                        "replacement": "def build(name: str, verbose: bool = False):",
+                    },
+                ),
+                (
+                    "replace_in_file",
+                    {
+                        "path": "docs/api.md",
+                        "old": "`build(name)`",
+                        "new": "`build(name, verbose=False)`",
+                    },
+                ),
+            ],
+        )
+
+    def test_optional_parameter_update_operations_handles_partial_and_invalid_cases(self) -> None:
+        source = "def build(name: str, verbose: bool = False):\n    return name\n"
+        docs = "Call `build(name)` to construct a value.\n"
+        self.assertEqual(
+            optional_parameter_update_operations_from_source(
+                src_path="src/app.py",
+                doc_path="docs/api.md",
+                symbol="build",
+                param="verbose",
+                annotation="bool",
+                default="False",
+                source=source,
+                docs=docs,
+            ),
+            [
+                (
+                    "replace_in_file",
+                    {
+                        "path": "docs/api.md",
+                        "old": "`build(name)`",
+                        "new": "`build(name, verbose=False)`",
+                    },
+                )
+            ],
+        )
+        self.assertIsNone(
+            optional_parameter_update_operations_from_source(
+                src_path="src/app.py",
+                doc_path="docs/api.md",
+                symbol="missing",
+                param="verbose",
+                annotation="bool",
+                default="False",
+                source=source,
+                docs="No call here.\n",
+            )
+        )
+        self.assertIsNone(
+            optional_parameter_update_operations_from_source(
+                src_path="src/app.py",
+                doc_path="docs/api.md",
+                symbol="build",
+                param="verbose",
+                annotation="bool",
+                default="False",
+                source="def broken(",
+                docs=docs,
             )
         )
 

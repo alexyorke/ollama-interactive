@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from typing import Any
 
@@ -136,6 +137,110 @@ def symbol_return_update_operations_from_source(
     if "read_symbol" in requested_tool_names or "read_symbol" in required_tool_names:
         operations.append(("read_symbol", {"path": path, "symbol": symbol, "include_context": 0}))
     operations.append(("replace_in_file", {"path": path, "old": old_line, "new": new_line}))
+    return operations
+
+
+def optional_parameter_update_spec(request_text: str) -> dict[str, str] | None:
+    match = re.search(
+        r"\badd\s+an?\s+optional\s+(?P<param>[A-Za-z_]\w*)\s*:\s*(?P<annotation>[^=]+?)\s*=\s*(?P<default>False|True|None|[-+]?\d+(?:\.\d+)?|['\"][^'\"]*['\"])\s+parameter\s+to\s+(?P<symbol>[A-Za-z_]\w*)\s+in\s+(?P<src>[\w./-]+\.py)\b(?:(?!\n\n).){0,240}?\bupdate\s+(?P<doc>[\w./-]+\.md)\b",
+        request_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    return {
+        "src_path": match.group("src"),
+        "doc_path": match.group("doc"),
+        "symbol": match.group("symbol"),
+        "param": match.group("param"),
+        "annotation": re.sub(r"\s+", " ", match.group("annotation")).strip(),
+        "default": match.group("default").strip(),
+    }
+
+
+def signature_with_appended_parameter(source: str, node: ast.FunctionDef | ast.AsyncFunctionDef, parameter: str) -> str:
+    lines = source.splitlines()
+    start = int(getattr(node, "lineno", 1)) - 1
+    if start < 0 or start >= len(lines):
+        return ""
+    signature_line = lines[start].strip()
+    if "\n" in signature_line or not signature_line.startswith(("def ", "async def ")):
+        return ""
+    open_index = signature_line.find("(")
+    if open_index < 0:
+        return ""
+    depth = 0
+    close_index = -1
+    for index, char in enumerate(signature_line[open_index:], start=open_index):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                close_index = index
+                break
+    if close_index < 0:
+        return ""
+    current_params = signature_line[open_index + 1 : close_index].strip()
+    if parameter.split(":", 1)[0].strip() in {part.split(":", 1)[0].split("=", 1)[0].strip() for part in current_params.split(",")}:
+        return signature_line
+    separator = ", " if current_params else ""
+    return f"{signature_line[: open_index + 1]}{current_params}{separator}{parameter}{signature_line[close_index:]}"
+
+
+def optional_parameter_update_operations_from_source(
+    *,
+    src_path: str,
+    doc_path: str,
+    symbol: str,
+    param: str,
+    annotation: str,
+    default: str,
+    source: str,
+    docs: str,
+) -> list[ToolOperation] | None:
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    node = next(
+        (
+            child
+            for child in tree.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == symbol
+        ),
+        None,
+    )
+    if node is None:
+        return None
+    existing_params = {arg.arg for arg in [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]}
+    operations: list[ToolOperation] = []
+    if param not in existing_params:
+        signature = signature_with_appended_parameter(source, node, f"{param}: {annotation} = {default}")
+        if not signature:
+            return None
+        operations.append(
+            (
+                "edit_intent",
+                {
+                    "path": src_path,
+                    "intent": "change_signature",
+                    "target": symbol,
+                    "replacement": signature,
+                },
+            )
+        )
+
+    if param not in docs:
+        call_match = re.search(rf"`{re.escape(symbol)}\((?P<args>[^`]*)\)`", docs)
+        if call_match and param not in call_match.group("args"):
+            old_call = call_match.group(0)
+            args = call_match.group("args").strip()
+            separator = ", " if args else ""
+            new_call = f"`{symbol}({args}{separator}{param}={default})`"
+            operations.append(("replace_in_file", {"path": doc_path, "old": old_call, "new": new_call}))
+    if not operations:
+        return None
     return operations
 
 
