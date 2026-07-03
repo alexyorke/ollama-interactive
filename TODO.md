@@ -22,7 +22,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 
 - Do not keep extracting tiny wrappers just to reduce line count.
 - Next meaningful split is the remaining `lint_typecheck` subprocess/cache orchestration.
-- File-level lint analysis and target planning already live in `ollama_code/tools/validation.py` with direct tests.
+- File-level lint analysis, scan-state collection, and target planning already live in `ollama_code/tools/validation.py` with direct tests.
 - Treat the remaining subprocess runner as a separate measured tranche because it couples cache hits, timeout behavior, ruff, basedpyright/pyright, bash, command rendering, and result assembly.
 - Preserve the current compatibility wrappers until the extracted validator implementation has direct focused tests.
 
