@@ -142,6 +142,22 @@ class ProductReadinessReportTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertIn("live_model_gate", payload["blocking_checks"])
+        live_gate = next(check for check in payload["checks"] if check["name"] == "live_model_gate")
+        self.assertIn("scripts/live_model_gate.py", live_gate["refresh_command"])
+
+    def test_render_text_includes_refresh_commands_for_blocking_checks(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = self._write_green_artifacts(root, now=now)
+            artifacts["doctor"].unlink()
+
+            payload = self._build(root, now=now)
+            rendered = product_readiness_report.render_text(payload)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("Refresh commands:", rendered)
+        self.assertIn("doctor: python scripts/doctor_report.py", rendered)
 
     def test_missing_doctor_artifact_blocks_readiness(self) -> None:
         now = datetime(2026, 7, 3, tzinfo=timezone.utc)

@@ -17,6 +17,13 @@ from scripts import live_model_gate
 
 DEFAULT_MAX_AGE_HOURS = 72.0
 DEFAULT_REQUIRED_HARD_CASES = ("task_due_filter",)
+REFRESH_COMMANDS = {
+    "doctor": "python scripts/doctor_report.py",
+    "local_validation": "python scripts/local_validation.py --tier agent",
+    "live_model_gate": "python scripts/live_model_gate.py --models granite4.1:8b gemma4:e4b qwen3:8b --benchmark-suite local-small --benchmark-jobs 1 --continue-on-failure",
+    "local_small": "python scripts/live_model_gate.py --models granite4.1:8b gemma4:e4b qwen3:8b --benchmark-suite local-small --benchmark-jobs 1 --continue-on-failure",
+    "hard_cases": "python scripts/coding_benchmark_eval.py --suite local-full --models granite4.1:8b --modes off --cases task_due_filter --feature-profiles all --benchmark-classes agent controller --jobs 1 --strict-accuracy --strict-budget --require-llm-for-agent-benchmarks",
+}
 
 
 def _repo_root() -> Path:
@@ -89,6 +96,7 @@ def _check(
         "ok": bool(ok),
         "required": bool(required),
         "summary": summary,
+        "refresh_command": REFRESH_COMMANDS.get(name),
         "details": details or {},
     }
 
@@ -333,6 +341,7 @@ def build_report(
 def render_text(payload: dict[str, Any]) -> str:
     status = "PASS" if payload.get("ok") else "FAIL"
     lines = [f"Product readiness: {status}", f"Repo: {payload.get('repo_root')}", ""]
+    checks = payload.get("checks", [])
     for check in payload.get("checks", []):
         marker = "PASS" if check.get("ok") else ("WARN" if not check.get("required") else "FAIL")
         lines.append(f"- {marker} {check.get('name')}: {check.get('summary')}")
@@ -340,6 +349,16 @@ def render_text(payload: dict[str, Any]) -> str:
     if blocking:
         lines.append("")
         lines.append("Blocking checks: " + ", ".join(str(item) for item in blocking))
+        refresh_commands = [
+            (check.get("name"), check.get("refresh_command"))
+            for check in checks
+            if check.get("name") in blocking and check.get("refresh_command")
+        ]
+        if refresh_commands:
+            lines.append("")
+            lines.append("Refresh commands:")
+            for name, command in refresh_commands:
+                lines.append(f"- {name}: {command}")
     return "\n".join(lines) + "\n"
 
 

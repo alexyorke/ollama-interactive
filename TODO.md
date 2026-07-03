@@ -7,6 +7,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - No active product-readiness blocker is expected when `scripts/product_readiness_report.py --strict` is green.
 - Keep `task_due_filter` green as the product-critical feature-delivery hard case for CLI flag work, tests, docs, parser errors, priority preservation, and shell proof.
 - Treat `scripts/product_readiness_report.py --strict` as the current-state release summary after refreshing doctor, validation, live-gate, and benchmark artifacts.
+- When readiness artifacts are stale, `scripts/product_readiness_report.py --strict` prints the exact refresh commands for the blocking checks.
 
 ## Completed Controller Tranche
 
