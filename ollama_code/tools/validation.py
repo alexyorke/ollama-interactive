@@ -4,6 +4,7 @@ import configparser
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 
@@ -58,6 +59,62 @@ def requested_validator_file_hints(requested_rel: str) -> dict[str, str]:
     if requested_name.endswith(".schema.json") or requested_name.endswith(".jsonschema"):
         hints["schema_file"] = requested_rel
     return hints
+
+
+def python_module_label(label: str) -> str:
+    rel = str(label or "").replace("\\", "/")
+    if rel.endswith(".py"):
+        rel = rel[:-3]
+    return rel.replace("/", ".")
+
+
+def source_module_labels(label: str) -> set[str]:
+    rel = str(label or "").replace("\\", "/")
+    without_suffix = rel[:-3] if rel.endswith(".py") else rel
+    modules = {without_suffix.replace("/", ".")}
+    if without_suffix.startswith("src/"):
+        modules.add(without_suffix[4:].replace("/", "."))
+    return modules
+
+
+def path_label_looks_like_test(label: str, name: str) -> bool:
+    rel = str(label or "").replace("\\", "/").lower()
+    clean_name = str(name or "").lower()
+    return clean_name.startswith("test_") or clean_name.endswith("_test.py") or "/tests/" in rel
+
+
+def targeted_unittest_command(python_executable: str, test_dir: str, test_name: str) -> str:
+    return f"{python_executable} -m unittest discover -s {test_dir} -p {test_name}"
+
+
+def test_source_match_score(
+    *,
+    test_text: str,
+    test_stem: str,
+    imported_paths: set[str],
+    rel_source: str,
+    source_modules: set[str],
+    source_stem: str,
+    symbols: set[str],
+) -> tuple[int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    if rel_source in imported_paths:
+        score += 6
+        reasons.append(f"imports {rel_source}")
+    for module in source_modules:
+        if re.search(rf"\b(?:from|import)\s+{re.escape(module)}\b", test_text):
+            score += 5
+            reasons.append(f"imports module {module}")
+            break
+    if source_stem and source_stem.lower() in test_stem.lower():
+        score += 3
+        reasons.append(f"filename matches {source_stem}")
+    matched_symbols = sorted(symbol for symbol in symbols if symbol and re.search(rf"\b{re.escape(symbol)}\b", test_text))
+    if matched_symbols:
+        score += min(4, len(matched_symbols) * 2)
+        reasons.append("mentions " + ", ".join(matched_symbols[:4]))
+    return score, reasons
 
 
 def collapse_validation_targets(labels: Iterable[str], *, limit: int = 100) -> list[str]:

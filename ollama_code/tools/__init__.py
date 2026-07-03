@@ -62,7 +62,12 @@ from ollama_code.tools.validation import (
     python_typechecker_configured,
     python_typechecker_targets,
     python_validation_targets,
+    path_label_looks_like_test,
+    python_module_label,
     requested_validator_file_hints,
+    source_module_labels,
+    targeted_unittest_command,
+    test_source_match_score,
     toml_tool_section,
 )
 
@@ -11849,18 +11854,10 @@ import string
         return result
 
     def _test_module_for_path(self, test_path: Path) -> str:
-        rel = self.relative_label(test_path)
-        if rel.endswith(".py"):
-            rel = rel[:-3]
-        return rel.replace("/", ".").replace("\\", ".")
+        return python_module_label(self.relative_label(test_path))
 
     def _source_modules_for_path(self, source_path: Path) -> set[str]:
-        rel = self.relative_label(source_path)
-        without_suffix = rel[:-3] if rel.endswith(".py") else rel
-        modules = {without_suffix.replace("/", ".").replace("\\", ".")}
-        if without_suffix.startswith("src/"):
-            modules.add(without_suffix[4:].replace("/", ".").replace("\\", "."))
-        return modules
+        return source_module_labels(self.relative_label(source_path))
 
     def _iter_python_test_files(self) -> list[Path]:
         candidates: list[Path] = []
@@ -11874,38 +11871,25 @@ import string
         return candidates
 
     def _path_looks_like_test(self, path: Path) -> bool:
-        rel = self.relative_label(path).replace("\\", "/").lower()
-        name = path.name.lower()
-        return name.startswith("test_") or name.endswith("_test.py") or "/tests/" in rel
+        return path_label_looks_like_test(self.relative_label(path), path.name)
 
     def _test_matches_source(self, test_path: Path, source_path: Path, symbols: set[str]) -> tuple[int, list[str]]:
         text = test_path.read_text(encoding="utf-8", errors="replace")
-        score = 0
-        reasons: list[str] = []
         imported_paths = {str(item.get("path", "")) for item in self._python_import_targets(test_path)}
         rel_source = self.relative_label(source_path)
-        if rel_source in imported_paths:
-            score += 6
-            reasons.append(f"imports {rel_source}")
-        source_modules = self._source_modules_for_path(source_path)
-        for module in source_modules:
-            if re.search(rf"\b(?:from|import)\s+{re.escape(module)}\b", text):
-                score += 5
-                reasons.append(f"imports module {module}")
-                break
-        source_stem = source_path.stem
-        if source_stem and source_stem.lower() in test_path.stem.lower():
-            score += 3
-            reasons.append(f"filename matches {source_stem}")
-        matched_symbols = sorted(symbol for symbol in symbols if symbol and re.search(rf"\b{re.escape(symbol)}\b", text))
-        if matched_symbols:
-            score += min(4, len(matched_symbols) * 2)
-            reasons.append("mentions " + ", ".join(matched_symbols[:4]))
-        return score, reasons
+        return test_source_match_score(
+            test_text=text,
+            test_stem=test_path.stem,
+            imported_paths=imported_paths,
+            rel_source=rel_source,
+            source_modules=self._source_modules_for_path(source_path),
+            source_stem=source_path.stem,
+            symbols=symbols,
+        )
 
     def _targeted_unittest_command(self, test_path: Path, symbols: set[str]) -> str:
         test_dir = self.relative_label(test_path.parent)
-        return f"{sys.executable} -m unittest discover -s {test_dir} -p {test_path.name}"
+        return targeted_unittest_command(sys.executable, test_dir, test_path.name)
 
     def select_tests(
         self,
