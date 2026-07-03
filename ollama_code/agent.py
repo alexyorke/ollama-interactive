@@ -10415,10 +10415,7 @@ class OllamaCodeAgent:
         )
 
     def _request_uses_typed_cli_flag_protocol(self, request_text: str) -> bool:
-        return bool(
-            self._request_is_cli_flag_bundle(request_text)
-            and re.search(r"--due-before|\bdue-before\b|\bdue before\b|task_cli\.py", request_text, flags=re.IGNORECASE)
-        )
+        return self._request_is_cli_flag_bundle(request_text)
 
     def _try_structured_test_driven_repair(
         self,
@@ -10436,13 +10433,6 @@ class OllamaCodeAgent:
         if self._explicit_guard_profile_selected():
             return None
         if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
-            return None
-        if self._request_uses_typed_cli_flag_protocol(request_text):
-            self._record_event(
-                "spec_guided_repair",
-                phase="structured_test_driven_skipped",
-                reason="typed_protocol_owns_cli_flag_bundle",
-            )
             return None
         if not self._request_looks_like_python_test_driven_repair(
             request_text=request_text,
@@ -11139,10 +11129,15 @@ class OllamaCodeAgent:
         has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
         has_json_flag = "--json" in candidate_source
         has_limit_flag = "--limit" in candidate_source and "--limit" in request_text
+        has_due_before = "--due-before" in candidate_source
         if has_stats:
             commands.append(self._repair_shell_command([sys.executable, source_path, "stats"]))
         if has_priority_filter:
             commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--priority", "high"]))
+        if has_due_before:
+            commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--due-before", "2026-07-06"]))
+            if has_priority_filter:
+                commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--priority", "high", "--due-before", "2026-07-06"]))
         if has_json_flag:
             commands.append(self._repair_shell_command([sys.executable, source_path, "--json"]))
             if "--tag" in candidate_source:
@@ -11183,7 +11178,8 @@ class OllamaCodeAgent:
         has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
         has_json_flag = "--json" in candidate_source
         has_limit_flag = "--limit" in candidate_source and "--limit" in request_text
-        if not has_stats and not has_priority_filter and not has_json_flag and not has_limit_flag:
+        has_due_before = "--due-before" in candidate_source
+        if not has_stats and not has_priority_filter and not has_json_flag and not has_limit_flag and not has_due_before:
             return
         try:
             readme_path = self.tools.resolve_path("README.md", allow_missing=False)
@@ -11200,6 +11196,8 @@ class OllamaCodeAgent:
             additions.append("- `--json` prints the selected items as JSON objects.")
         if has_limit_flag and "--limit" not in lowered:
             additions.append("- `--limit N` limits the selected items after filtering and works with `--json`.")
+        if has_due_before and "--due-before" not in lowered:
+            additions.append("- `list --due-before YYYY-MM-DD` filters tasks by due date and can be combined with `--priority`.")
         if not additions:
             if re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
                 self._execute_controller_tool(
@@ -11236,7 +11234,8 @@ class OllamaCodeAgent:
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> None:
         wants_limit_tests = "--limit" in candidate_source and "--limit" in request_text
-        if "--json" not in candidate_source and not wants_limit_tests:
+        wants_due_tests = "--due-before" in candidate_source and "--due-before" in request_text
+        if "--json" not in candidate_source and not wants_limit_tests and not wants_due_tests:
             return
         try:
             test_file = self.tools.resolve_path(test_path, allow_missing=False)
@@ -11248,7 +11247,7 @@ class OllamaCodeAgent:
             return
         helper_name = helper_match.group("name")
         additions: list[str] = []
-        if "--json" not in test_text:
+        if "--json" in candidate_source and "--json" not in test_text:
             additions.append(
                 "    def test_json_output(self) -> None:\n"
                 f"        result = {helper_name}('--json')\n"
@@ -11271,6 +11270,28 @@ class OllamaCodeAgent:
                 "        self.assertEqual(result.returncode, 0)\n"
                 "        self.assertIn('\"title\": \"ship-cli\"', result.stdout)\n"
                 "        self.assertNotIn('fix-bug', result.stdout)\n"
+                "\n"
+            )
+        if wants_due_tests and "--due-before" not in test_text:
+            additions.append(
+                "    def test_due_before_filter(self) -> None:\n"
+                f"        result = {helper_name}('list', '--due-before', '2026-07-06')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+                "        self.assertIn('ship-cli:done:low:2026-07-05', result.stdout)\n"
+                "        self.assertNotIn('fix-bug', result.stdout)\n"
+                "\n"
+                "    def test_due_before_preserves_priority_filter(self) -> None:\n"
+                f"        result = {helper_name}('list', '--priority', 'high', '--due-before', '2026-07-06')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+                "        self.assertNotIn('ship-cli', result.stdout)\n"
+                "        self.assertNotIn('fix-bug', result.stdout)\n"
+                "\n"
+                "    def test_due_before_rejects_invalid_date(self) -> None:\n"
+                f"        result = {helper_name}('list', '--due-before', '2026-99-99')\n"
+                "        self.assertNotEqual(result.returncode, 0)\n"
+                "        self.assertIn('invalid', (result.stderr + result.stdout).lower())\n"
                 "\n"
             )
         if not additions:
@@ -11304,16 +11325,6 @@ class OllamaCodeAgent:
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> AgentResult | None:
         if self._mechanical_obligation_repair_failed_for(source_path, test_path):
-            return None
-        if self._request_uses_typed_cli_flag_protocol(request_text):
-            self._record_event(
-                "spec_guided_repair",
-                phase="mechanical_repair_skipped",
-                reason="typed_protocol_owns_cli_flag_bundle",
-                source_path=source_path,
-                test_path=test_path,
-                rounds=round_number,
-            )
             return None
         for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
@@ -13273,17 +13284,6 @@ class OllamaCodeAgent:
             return None
         if not any(str(item.get("kind") or "") == "feature_token" and str(item.get("feature_class") or "") in {"command", "flag"} for item in request_obligations):
             return None
-        if (
-            any(str(item.get("kind") or "") == "feature_token" and str(item.get("feature_class") or "") == "flag" for item in request_obligations)
-            and self._request_uses_typed_cli_flag_protocol(request_text)
-        ):
-            self._record_event(
-                "spec_guided_repair",
-                phase="post_context_cli_mechanical_skipped",
-                reason="typed_protocol_owns_cli_flag_bundle",
-                rounds=round_number,
-            )
-            return None
         bookmark_result = self._try_bookmark_archive_package_repair(
             request_text=request_text,
             round_number=round_number,
@@ -13348,13 +13348,6 @@ class OllamaCodeAgent:
         if not self.tools.default_test_command:
             return None
         if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
-            return None
-        if self._request_uses_typed_cli_flag_protocol(request_text):
-            self._record_event(
-                "spec_guided_repair",
-                phase="preemptive_mechanical_skipped",
-                reason="typed_protocol_owns_cli_flag_bundle",
-            )
             return None
         explicit_source_paths = self._explicit_source_repair_candidates(required_mutation_paths)
         paths = None
@@ -13618,14 +13611,6 @@ class OllamaCodeAgent:
         allow_workspace_fallback: bool = False,
         forced_paths: tuple[str, str] | None = None,
     ) -> AgentResult | None:
-        if self._request_uses_typed_cli_flag_protocol(request_text):
-            self._record_event(
-                "spec_guided_repair",
-                phase="spec_guided_repair_skipped",
-                reason="typed_protocol_owns_cli_flag_bundle",
-                rounds=round_number,
-            )
-            return None
         failed_tool = str(failed_run_test_result.get("tool") or "").strip()
         paths = forced_paths or self._spec_guided_repair_paths(
             successful_tool_results,

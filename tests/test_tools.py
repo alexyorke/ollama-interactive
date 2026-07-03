@@ -3926,6 +3926,75 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("write-docs:todo:high", filtered.stdout)
         self.assertNotIn("ship-cli", filtered.stdout)
 
+    def test_synthesize_argparse_task_cli_candidate_for_due_before_filter(self) -> None:
+        with self._temp_python_tools(
+            {
+                "task_cli.py": (
+                    "from __future__ import annotations\n\n"
+                    "import argparse\n\n"
+                    "TASKS = [\n"
+                    "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high', 'due': '2026-07-01'},\n"
+                    "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low', 'due': '2026-07-05'},\n"
+                    "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium', 'due': '2026-07-10'},\n"
+                    "]\n\n"
+                    "def list_tasks(priority: str | None = None) -> list[str]:\n"
+                    "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+                    "    return [f\"{task['title']}:{task['status']}:{task['priority']}:{task['due']}\" for task in tasks]\n\n"
+                    "def main(argv: list[str] | None = None) -> int:\n"
+                    "    parser = argparse.ArgumentParser()\n"
+                    "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                    "    list_parser = subparsers.add_parser('list')\n"
+                    "    list_parser.add_argument('--priority')\n"
+                    "    args = parser.parse_args(argv)\n"
+                    "    if args.command == 'list':\n"
+                    "        print('\\n'.join(list_tasks(args.priority)))\n"
+                    "        return 0\n"
+                    "    return 1\n"
+                ),
+                "tests/test_task_cli.py": (
+                    "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                    "ROOT = Path(__file__).resolve().parents[1]\n\n"
+                    "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                    "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                    "class TaskCliTests(unittest.TestCase):\n"
+                    "    def test_priority_filter(self) -> None:\n"
+                    "        result = _run('list', '--priority', 'high')\n"
+                    "        self.assertEqual(result.returncode, 0)\n"
+                    "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+                ),
+            },
+            test_discover_args=("-s", "tests", "-v"),
+        ) as (root, tools, command):
+            synthesized = tools.synthesize_argparse_task_cli_candidate(
+                "task_cli.py",
+                "tests/test_task_cli.py",
+                request_text="Add a --due-before option to list tasks.",
+            )
+            validation = tools.validate_implementation_candidate(
+                "task_cli.py",
+                str(synthesized.get("candidate_source") or ""),
+                test_path="tests/test_task_cli.py",
+                test_command=command,
+            )
+            source = str(synthesized.get("candidate_source") or "")
+            (root / "task_cli.py").write_text(source, encoding="utf-8")
+            due = subprocess.run([sys.executable, str(root / "task_cli.py"), "list", "--due-before", "2026-07-06"], capture_output=True, text=True, check=False)
+            combined = subprocess.run([sys.executable, str(root / "task_cli.py"), "list", "--priority", "high", "--due-before", "2026-07-06"], capture_output=True, text=True, check=False)
+            invalid = subprocess.run([sys.executable, str(root / "task_cli.py"), "list", "--due-before", "2026-99-99"], capture_output=True, text=True, check=False)
+
+        self.assertTrue(synthesized["ok"], synthesized)
+        self.assertIn("--due-before", source)
+        self.assertTrue(validation["ok"], validation)
+        self.assertEqual(due.returncode, 0, due.stderr)
+        self.assertIn("write-docs:todo:high:2026-07-01", due.stdout)
+        self.assertIn("ship-cli:done:low:2026-07-05", due.stdout)
+        self.assertNotIn("fix-bug", due.stdout)
+        self.assertEqual(combined.returncode, 0, combined.stderr)
+        self.assertIn("write-docs:todo:high:2026-07-01", combined.stdout)
+        self.assertNotIn("ship-cli", combined.stdout)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("invalid", (invalid.stderr + invalid.stdout).lower())
+
     def test_synthesize_argparse_dataclass_json_cli_candidate_for_tagged_notes(self) -> None:
         with self._temp_python_tools(
             {

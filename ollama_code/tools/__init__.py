@@ -8698,7 +8698,13 @@ import string
             "summary": f"synthesized relative import candidate for {len(replacements)} sibling import(s)",
         }
 
-    def synthesize_argparse_task_cli_candidate(self, source_path: str, test_path: str | None = None, limit: int = 80) -> dict[str, Any]:
+    def synthesize_argparse_task_cli_candidate(
+        self,
+        source_path: str,
+        test_path: str | None = None,
+        limit: int = 80,
+        request_text: str | None = None,
+    ) -> dict[str, Any]:
         self._check_interrupted()
         source_file = self.resolve_path(source_path, allow_missing=False)
         rel_source = self.relative_label(source_file)
@@ -8710,8 +8716,13 @@ import string
         except SyntaxError as exc:
             return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": f"Could not parse source: {exc}"}
         names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-        if not {"list_tasks", "complete_task", "main"}.issubset(names):
-            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires list_tasks, complete_task, and main functions."}
+        wants_due_filter = bool(
+            re.search(r"--due-before|\bdue-before\b|\bdue before\b", str(request_text or ""), flags=re.IGNORECASE)
+        )
+        required_names = {"list_tasks", "main"} if wants_due_filter else {"list_tasks", "complete_task", "main"}
+        if not required_names.issubset(names):
+            required_list = ", ".join(sorted(required_names))
+            return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": f"Requires {required_list} functions."}
         if "argparse" not in source_text:
             return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires argparse CLI source."}
         tasks_value: object | None = None
@@ -8730,6 +8741,7 @@ import string
         task_rows = [dict(item) for item in tasks_value]
         if not task_rows or not all({"title", "status", "priority"}.issubset(item.keys()) for item in task_rows):
             return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "TASKS rows must include title, status, and priority."}
+        has_due_values = any("due" in item for item in task_rows)
         test_text = ""
         if test_path:
             try:
@@ -8739,6 +8751,70 @@ import string
         combined = source_text + "\n" + test_text
         if "subprocess" not in combined and "_run(" not in combined:
             return {"ok": False, "tool": "synthesize_argparse_task_cli_candidate", "path": rel_source, "summary": "Requires CLI subprocess-style tests or evidence."}
+        if wants_due_filter and has_due_values:
+            complete_task_block = ""
+            complete_parser_block = ""
+            complete_branch = ""
+            if "complete_task" in names:
+                complete_task_block = (
+                    "\n"
+                    "def complete_task(title: str) -> str:\n"
+                    "    for task in TASKS:\n"
+                    "        if task['title'] == title:\n"
+                    "            task['status'] = 'done'\n"
+                    "            return f\"completed:{title}\"\n"
+                    "    raise SystemExit(f\"unknown task: {title}\")\n"
+                )
+                complete_parser_block = (
+                    "    complete_parser = subparsers.add_parser('complete')\n"
+                    "    complete_parser.add_argument('title')\n"
+                )
+                complete_branch = (
+                    "    if args.command == 'complete':\n"
+                    "        print(complete_task(args.title))\n"
+                    "        return 0\n"
+                )
+            candidate = (
+                "from __future__ import annotations\n\n"
+                "import argparse\n"
+                "from datetime import date\n\n"
+                f"TASKS = {task_rows!r}\n\n"
+                "def _parse_due_before(value: str) -> date:\n"
+                "    try:\n"
+                "        return date.fromisoformat(value)\n"
+                "    except ValueError as exc:\n"
+                "        raise argparse.ArgumentTypeError('invalid ISO date') from exc\n\n"
+                "def list_tasks(priority: str | None = None, due_before: date | None = None) -> list[str]:\n"
+                "    tasks = list(TASKS)\n"
+                "    if priority is not None:\n"
+                "        tasks = [task for task in tasks if task['priority'] == priority]\n"
+                "    if due_before is not None:\n"
+                "        tasks = [task for task in tasks if task.get('due') and date.fromisoformat(str(task['due'])) <= due_before]\n"
+                "    return [f\"{task['title']}:{task['status']}:{task['priority']}:{task.get('due', '')}\" for task in tasks]\n"
+                f"{complete_task_block}\n"
+                "def main(argv: list[str] | None = None) -> int:\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                "    list_parser = subparsers.add_parser('list')\n"
+                "    list_parser.add_argument('--priority', default=None)\n"
+                "    list_parser.add_argument('--due-before', type=_parse_due_before, default=None)\n"
+                f"{complete_parser_block}"
+                "    args = parser.parse_args(argv)\n"
+                "    if args.command == 'list':\n"
+                "        print('\\n'.join(list_tasks(priority=args.priority, due_before=args.due_before)))\n"
+                "        return 0\n"
+                f"{complete_branch}"
+                "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+                "if __name__ == '__main__':\n"
+                "    raise SystemExit(main())\n"
+            )
+            return {
+                "ok": True,
+                "tool": "synthesize_argparse_task_cli_candidate",
+                "path": rel_source,
+                "candidate_source": candidate,
+                "summary": f"argparse task CLI due-date filter candidate for {rel_source}",
+            }
         candidate = (
             "from __future__ import annotations\n\n"
             "import argparse\n"

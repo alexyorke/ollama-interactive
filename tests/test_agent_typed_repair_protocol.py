@@ -136,12 +136,49 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("full command-surface bundle", feedback)
 
-    def test_cli_flag_bundle_skips_legacy_mechanical_repair_path(self) -> None:
+    def test_cli_flag_bundle_legacy_mechanical_repair_path_allows_typed_synthesis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "task_cli.py").write_text("def list_tasks(priority=None):\n    return []\n", encoding="utf-8")
+            (root / "task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "import argparse\n\n"
+                "TASKS = [\n"
+                "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high', 'due': '2026-07-01'},\n"
+                "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low', 'due': '2026-07-05'},\n"
+                "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium', 'due': '2026-07-10'},\n"
+                "]\n\n"
+                "def list_tasks(priority: str | None = None) -> list[str]:\n"
+                "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+                "    return [f\"{task['title']}:{task['status']}:{task['priority']}:{task['due']}\" for task in tasks]\n\n"
+                "def main(argv: list[str] | None = None) -> int:\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                "    list_parser = subparsers.add_parser('list')\n"
+                "    list_parser.add_argument('--priority')\n"
+                "    args = parser.parse_args(argv)\n"
+                "    if args.command == 'list':\n"
+                "        print('\\n'.join(list_tasks(args.priority)))\n"
+                "        return 0\n"
+                "    return 1\n",
+                encoding="utf-8",
+            )
             (root / "tests").mkdir()
-            (root / "tests" / "test_task_cli.py").write_text("import unittest\n", encoding="utf-8")
+            (root / "README.md").write_text("# Task CLI\n", encoding="utf-8")
+            (root / "tests" / "test_task_cli.py").write_text(
+                "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                "ROOT = Path(__file__).resolve().parents[1]\n\n"
+                "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_priority_filter(self) -> None:\n"
+                "        result = _run('list', '--priority', 'high')\n"
+                "        self.assertEqual(result.returncode, 0)\n"
+                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+                "        self.assertNotIn('ship-cli', result.stdout)\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
             client = FakeClient([])
             tools = CountingToolExecutor(root, approval_mode="auto", test_command="python -m unittest discover -s tests")
             agent = OllamaCodeAgent(
@@ -150,8 +187,9 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
                 model="fake-model",
                 debate_enabled=False,
             )
+            request_text = "Add a --due-before option to task_cli.py, update tests and README, run tests, and prove it with a shell command."
             obligations = agent._derive_request_obligations(
-                request_text="Add a --due-before option to task_cli.py, update tests, run tests, and prove it with a shell command.",
+                request_text=request_text,
                 required_tool_names=set(),
                 required_mutation_paths=set(),
                 code_mutation_required=True,
@@ -159,7 +197,7 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
             )
 
             result = agent._try_post_context_cli_feature_repair(
-                request_text="Add a --due-before option to task_cli.py, update tests, run tests, and prove it with a shell command.",
+                request_text=request_text,
                 round_number=1,
                 request_obligations=obligations,
                 forbidden_tool_names=set(),
@@ -167,15 +205,18 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
                 satisfied_tool_names=set(),
                 tool_calls_this_turn=[],
             )
+            task_source = (root / "task_cli.py").read_text(encoding="utf-8")
+            readme_text = (root / "README.md").read_text(encoding="utf-8")
+            test_source = (root / "tests" / "test_task_cli.py").read_text(encoding="utf-8")
 
-        self.assertIsNone(result)
-        spec_events = [event for event in agent.events if event.get("type") == "spec_guided_repair"]
-        self.assertTrue(
-            any(event.get("phase") == "post_context_cli_mechanical_skipped" for event in spec_events)
-        )
-        self.assertIsNone(tools.execute_counts.get("implementation_spec"))
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertTrue(result.completed)
+        self.assertIn("--due-before", task_source)
+        self.assertIn("--due-before", readme_text)
+        self.assertIn("test_due_before_filter", test_source)
 
-    def test_cli_flag_bundle_skips_preemptive_mechanical_repair_path(self) -> None:
+    def test_cli_flag_bundle_preemptive_mechanical_repair_path_is_not_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "task_cli.py").write_text("def list_tasks(priority=None):\n    return []\n", encoding="utf-8")
@@ -195,10 +236,10 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
 
         self.assertIsNone(result)
         spec_events = [event for event in agent.events if event.get("type") == "spec_guided_repair"]
-        self.assertTrue(any(event.get("phase") == "preemptive_mechanical_skipped" for event in spec_events))
+        self.assertFalse(any(event.get("phase") == "preemptive_mechanical_skipped" for event in spec_events))
         self.assertIsNone(tools.execute_counts.get("implementation_spec"))
 
-    def test_cli_flag_bundle_skips_shared_mechanical_repair_path(self) -> None:
+    def test_cli_flag_bundle_shared_mechanical_repair_path_is_not_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "task_cli.py").write_text("def list_tasks(priority=None):\n    return []\n", encoding="utf-8")
@@ -220,9 +261,9 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
 
         self.assertIsNone(result)
         spec_events = [event for event in agent.events if event.get("type") == "spec_guided_repair"]
-        self.assertTrue(any(event.get("phase") == "mechanical_repair_skipped" for event in spec_events))
+        self.assertFalse(any(event.get("phase") == "mechanical_repair_skipped" for event in spec_events))
 
-    def test_cli_flag_bundle_skips_structured_and_spec_guided_repair_paths(self) -> None:
+    def test_cli_flag_bundle_structured_and_spec_guided_repair_paths_are_not_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "task_cli.py").write_text("def list_tasks(priority=None):\n    return []\n", encoding="utf-8")
@@ -257,8 +298,8 @@ class AgentTypedRepairProtocolTests(unittest.TestCase):
         self.assertIsNone(structured)
         self.assertIsNone(spec)
         spec_events = [event for event in agent.events if event.get("type") == "spec_guided_repair"]
-        self.assertTrue(any(event.get("phase") == "structured_test_driven_skipped" for event in spec_events))
-        self.assertTrue(any(event.get("phase") == "spec_guided_repair_skipped" for event in spec_events))
+        self.assertFalse(any(event.get("phase") == "structured_test_driven_skipped" for event in spec_events))
+        self.assertFalse(any(event.get("phase") == "spec_guided_repair_skipped" for event in spec_events))
 
     def test_controller_tool_wrapper_rejects_due_before_narrow_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
