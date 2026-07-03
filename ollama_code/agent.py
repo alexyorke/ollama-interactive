@@ -91,6 +91,13 @@ from ollama_code.controller import (
     cli_readme_additions,
     cli_test_additions,
     derive_request_obligations as derive_feature_request_obligations,
+    final_acknowledges_missing_path as controller_final_acknowledges_missing_path,
+    final_claims_file_mutation as controller_final_claims_file_mutation,
+    final_claims_path_exists as controller_final_claims_path_exists,
+    final_claims_run_shell_success as controller_final_claims_run_shell_success,
+    final_claims_test_success as controller_final_claims_test_success,
+    final_claims_timeout_success as controller_final_claims_timeout_success,
+    final_requires_verification as controller_final_requires_verification,
     merge_request_obligations,
     request_allows_any_validation as controller_request_allows_any_validation,
     request_allows_mutation as controller_request_allows_mutation,
@@ -3416,20 +3423,18 @@ class OllamaCodeAgent:
         expected_exact_file_line: str | None,
         request_obligations: list[dict[str, Any]],
     ) -> bool:
-        if request_obligations:
-            return True
-        if required_tool_names or forbidden_tool_names:
-            return True
-        if mutation_verified_this_turn or self._final_claims_file_mutation(assistant_text):
-            return True
-        if expected_exact_file_line is not None:
-            return True
-        if tool_calls and self._request_needs_exact_grounding(request_text):
-            return True
         tool_names = {str(item.get("name", "")).strip() for item in tool_calls}
-        if len(tool_calls) >= 2:
-            return True
-        return any(name in RISKY_VERIFICATION_TOOL_NAMES for name in tool_names)
+        return controller_final_requires_verification(
+            has_request_obligations=bool(request_obligations),
+            has_required_or_forbidden_tools=bool(required_tool_names or forbidden_tool_names),
+            mutation_verified_this_turn=mutation_verified_this_turn,
+            final_claims_mutation=self._final_claims_file_mutation(assistant_text),
+            has_expected_exact_file_line=expected_exact_file_line is not None,
+            tool_call_count=len(tool_calls),
+            request_needs_exact_grounding=self._request_needs_exact_grounding(request_text),
+            tool_names=tool_names,
+            risky_verification_tool_names=set(RISKY_VERIFICATION_TOOL_NAMES),
+        )
 
     def _final_acknowledges_tool_error_class(self, assistant_text: str, error_class: str) -> bool:
         lowered = assistant_text.lower()
@@ -7461,57 +7466,16 @@ class OllamaCodeAgent:
         return message + " Next JSON only."
 
     def _final_claims_timeout_success(self, message: str) -> bool:
-        lowered = str(message or "").lower()
-        if not lowered.strip():
-            return False
-        if re.search(r"\b(?:timed out|timeout|failed|could not|unable|did not|didn't|not working|still needs)\b", lowered):
-            return False
-        patterns = [
-            r"\bservice\s+(?:is\s+)?working\b",
-            r"\bverification\s+passed\b",
-            r"\bworks\b",
-            r"\bverified\b",
-            r"\bsucceeded\b",
-            r"\bstarted\b",
-            r"\brunning\b",
-            r"\bhealthy\b",
-            r"\bavailable\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in patterns)
+        return controller_final_claims_timeout_success(message)
 
     def _final_claims_run_shell_success(self, message: str) -> bool:
-        lowered = str(message or "").lower()
-        if not lowered.strip():
-            return False
-        if re.search(r"\b(?:timed out|timeout|failed|could not|unable|did not|didn't|not installed|missing|not found|still needs)\b", lowered):
-            return False
-        patterns = [
-            r"\bcommand\s+works\b",
-            r"\bservice\s+(?:is\s+)?working\b",
-            r"\bverification\s+passed\b",
-            r"\bworks\b",
-            r"\bverified\b",
-            r"\bsucceeded\b",
-            r"\bstarted\b",
-            r"\brunning\b",
-            r"\bhealthy\b",
-            r"\bavailable\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in patterns)
+        return controller_final_claims_run_shell_success(message)
 
     def _final_claims_path_exists(self, message: str) -> bool:
-        lowered = str(message or "").lower().strip()
-        if not lowered:
-            return False
-        if re.search(r"\b(?:does not exist|is missing|are missing|not found|path_missing|no such file|no such directory)\b", lowered):
-            return False
-        return bool(re.search(r"\bexists\b", lowered))
+        return controller_final_claims_path_exists(message)
 
     def _final_acknowledges_missing_path(self, message: str) -> bool:
-        lowered = str(message or "").lower().strip()
-        if not lowered:
-            return False
-        return bool(re.search(r"\b(?:does not exist|is missing|are missing|not found|path_missing|no such file|no such directory)\b", lowered))
+        return controller_final_acknowledges_missing_path(message)
 
     def _forbidden_tool_feedback_message(
         self,
@@ -9160,13 +9124,7 @@ class OllamaCodeAgent:
         return "write_file", {"path": path, "content": "placeholder\n"}
 
     def _final_claims_file_mutation(self, message: str) -> bool:
-        lowered = message.lower()
-        patterns = [
-            r"\b(?:i|we)\s+(?:updated|edited|changed|modified|created|wrote|rewrote|deleted|removed|renamed)\b",
-            r"\bhas been\s+(?:updated|edited|changed|modified|created|written|rewritten|deleted|removed|renamed)\b",
-            r"\bwas\s+(?:updated|edited|changed|modified|created|written|rewritten|deleted|removed|renamed)\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in patterns)
+        return controller_final_claims_file_mutation(message)
 
     def _display_path_basename(self, raw_path: str) -> str:
         normalized = str(raw_path or "").replace("\\", "/").rstrip("/")
@@ -9175,16 +9133,7 @@ class OllamaCodeAgent:
         return normalized.rsplit("/", 1)[-1]
 
     def _final_claims_test_success(self, message: str) -> bool:
-        lowered = message.lower()
-        patterns = [
-            r"\btests?\s+(?:pass|passed|passing|succeed|succeeded|successful)\b",
-            r"\btest suite\s+(?:passes|passed|succeeded|is successful)\b",
-            r"\ball (?:provided )?tests?\s+(?:pass|passed|are passing)\b",
-            r"\brun_test\s+(?:pass|passed|succeeded)\b",
-            r"\bsuccessfully\s+(?:ran|executed).{0,40}\btests?\b",
-            r"\btests?\s+(?:have been|were)\s+(?:executed|run)\s+successfully\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in patterns)
+        return controller_final_claims_test_success(message)
 
     def _requested_git_diff_mode(self, text: str) -> str | None:
         lowered = text.lower()

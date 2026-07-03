@@ -10,6 +10,15 @@ from .feature_delivery import (
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
+from .final_policy import (
+    final_acknowledges_missing_path,
+    final_claims_file_mutation,
+    final_claims_path_exists,
+    final_claims_run_shell_success,
+    final_claims_test_success,
+    final_claims_timeout_success,
+    final_requires_verification,
+)
 from .navigation_validation import NavigationValidationController, NavigationValidationTurn
 from .request_policy import (
     request_allows_any_validation,
@@ -58,6 +67,13 @@ __all__ = [
     "RepairProtocolState",
     "RequestedDeliverable",
     "ValidationPlan",
+    "final_acknowledges_missing_path",
+    "final_claims_file_mutation",
+    "final_claims_path_exists",
+    "final_claims_run_shell_success",
+    "final_claims_test_success",
+    "final_claims_timeout_success",
+    "final_requires_verification",
     "request_allows_any_validation",
     "request_allows_mutation",
     "request_explicitly_allows_test_mutation",
