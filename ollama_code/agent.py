@@ -246,6 +246,10 @@ from ollama_code.controller.repair_protocol import (
     cli_patch_bundle_instruction,
     failed_test_repair_retry_message as controller_failed_test_repair_retry_message,
     failed_test_still_needs_repair as controller_failed_test_still_needs_repair,
+    merge_failed_edit_recovery as controller_merge_failed_edit_recovery,
+    mutation_edit_granularity as controller_mutation_edit_granularity,
+    recovery_target_from_mutation as controller_recovery_target_from_mutation,
+    recovery_target_matches as controller_recovery_target_matches,
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths as controller_repair_spec_behavior_paths,
@@ -1256,40 +1260,10 @@ class OllamaCodeAgent:
         return merge_request_obligations(obligations)
 
     def _merge_failed_edit_recovery(self, states: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        merged: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        for item in states:
-            if not isinstance(item, dict):
-                continue
-            target_id = str(item.get("target_id") or "").strip()
-            if not target_id or target_id in seen:
-                continue
-            seen.add(target_id)
-            merged.append(dict(item))
-        return merged
+        return controller_merge_failed_edit_recovery(states)
 
     def _mutation_edit_granularity(self, *, name: str, arguments: dict[str, Any]) -> str:
-        if name == "write_file":
-            return "broad_file"
-        if name in {"replace_symbol", "replace_symbols"}:
-            return "broad_symbol"
-        if name == "replace_in_file":
-            return "narrow"
-        if name == "apply_structured_edit":
-            operation = arguments.get("operation")
-            op_name = ""
-            if isinstance(operation, dict):
-                op_name = str(operation.get("op") or "").strip().lower()
-            if op_name in {"replace_symbol"}:
-                return "broad_symbol"
-            return "narrow"
-        if name == "edit_intent":
-            intent = str(arguments.get("intent") or "").strip().lower()
-            if intent in {"replace_symbol"}:
-                return "broad_symbol"
-            if intent:
-                return "narrow"
-        return "other"
+        return controller_mutation_edit_granularity(name=name, arguments=arguments)
 
     def _recovery_target_from_mutation(
         self,
@@ -1299,55 +1273,16 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]] | None = None,
         result: dict[str, Any] | None = None,
     ) -> dict[str, str] | None:
-        symbol_target = self._mutation_symbol_grounding_target(name=name, arguments=arguments)
-        if symbol_target is not None:
-            path, symbol = symbol_target
-            return {
-                "target_id": f"symbol:{path.lower()}:{symbol}",
-                "kind": "symbol",
-                "path": path,
-                "symbol": symbol,
-            }
-        for raw_path in self._mutation_target_paths(arguments):
-            normalized = str(raw_path or "").strip().replace("\\", "/").lstrip("./")
-            if normalized and normalized.endswith(".py") and not self._path_looks_like_test_file(normalized):
-                return {
-                    "target_id": f"path:{normalized.lower()}",
-                    "kind": "path",
-                    "path": normalized,
-                    "symbol": "",
-                }
-        result_dict = result if isinstance(result, dict) else {}
-        result_path = str(result_dict.get("path") or "").strip().replace("\\", "/").lstrip("./")
-        if result_path and result_path.endswith(".py") and not self._path_looks_like_test_file(result_path):
-            return {
-                "target_id": f"path:{result_path.lower()}",
-                "kind": "path",
-                "path": result_path,
-                "symbol": "",
-            }
-        source_paths = self._recent_source_paths(successful_tool_results or [])
-        if len(source_paths) == 1:
-            return {
-                "target_id": f"path:{source_paths[0].lower()}",
-                "kind": "path",
-                "path": source_paths[0],
-                "symbol": "",
-            }
-        return None
+        return controller_recovery_target_from_mutation(
+            symbol_target=self._mutation_symbol_grounding_target(name=name, arguments=arguments),
+            mutation_target_paths=self._mutation_target_paths(arguments),
+            result=result,
+            recent_source_paths=self._recent_source_paths(successful_tool_results or []),
+            path_looks_like_test_file=self._path_looks_like_test_file,
+        )
 
     def _recovery_target_matches(self, state: dict[str, Any], target: dict[str, str]) -> bool:
-        state_id = str(state.get("target_id") or "").strip()
-        target_id = str(target.get("target_id") or "").strip()
-        if state_id and target_id:
-            return state_id == target_id
-        state_path = str(state.get("path") or "").strip().lower()
-        target_path = str(target.get("path") or "").strip().lower()
-        if not state_path or not target_path or state_path != target_path:
-            return False
-        state_symbol = str(state.get("symbol") or "").strip()
-        target_symbol = str(target.get("symbol") or "").strip()
-        return not state_symbol or not target_symbol or state_symbol == target_symbol
+        return controller_recovery_target_matches(state, target)
 
     def _active_failed_edit_recovery_state(
         self,

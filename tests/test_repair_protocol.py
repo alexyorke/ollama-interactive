@@ -7,6 +7,10 @@ from ollama_code.controller.repair_protocol import (
     cli_patch_bundle_instruction,
     failed_test_repair_retry_message,
     failed_test_still_needs_repair,
+    merge_failed_edit_recovery,
+    mutation_edit_granularity,
+    recovery_target_from_mutation,
+    recovery_target_matches,
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths,
@@ -238,6 +242,78 @@ class RepairProtocolTests(unittest.TestCase):
         self.assertIn("read_file on tests/test_task_cli.py", message)
         self.assertIn("a full-symbol replacement", message)
         self.assertIn("Last run_test: expected --due-before output", message)
+
+    def test_failed_edit_recovery_merge_keeps_first_state_per_target(self) -> None:
+        merged = merge_failed_edit_recovery(
+            [
+                {"target_id": "path:task_cli.py", "path": "task_cli.py", "diagnostic": "first"},
+                {"target_id": "path:task_cli.py", "path": "task_cli.py", "diagnostic": "second"},
+                {"path": "missing-id.py"},
+                {"target_id": "path:other.py", "path": "other.py"},
+            ]
+        )
+
+        self.assertEqual([item["path"] for item in merged], ["task_cli.py", "other.py"])
+        self.assertEqual(merged[0]["diagnostic"], "first")
+
+    def test_mutation_edit_granularity_classifies_repair_width(self) -> None:
+        self.assertEqual(mutation_edit_granularity(name="write_file", arguments={}), "broad_file")
+        self.assertEqual(mutation_edit_granularity(name="replace_symbol", arguments={}), "broad_symbol")
+        self.assertEqual(mutation_edit_granularity(name="replace_in_file", arguments={}), "narrow")
+        self.assertEqual(
+            mutation_edit_granularity(name="apply_structured_edit", arguments={"operation": {"op": "replace_symbol"}}),
+            "broad_symbol",
+        )
+        self.assertEqual(mutation_edit_granularity(name="edit_intent", arguments={"intent": "replace_body"}), "narrow")
+
+    def test_recovery_target_from_mutation_prefers_symbol_then_source_path(self) -> None:
+        is_test = lambda path: path.startswith("tests/") or path.endswith("_test.py")
+
+        symbol_target = recovery_target_from_mutation(
+            symbol_target=("src/task_cli.py", "main"),
+            mutation_target_paths=["tests/test_task_cli.py"],
+            result={"path": "src/other.py"},
+            recent_source_paths=["src/recent.py"],
+            path_looks_like_test_file=is_test,
+        )
+        path_target = recovery_target_from_mutation(
+            symbol_target=None,
+            mutation_target_paths=["tests/test_task_cli.py", ".\\src\\task_cli.py"],
+            result={},
+            recent_source_paths=[],
+            path_looks_like_test_file=is_test,
+        )
+
+        self.assertEqual(symbol_target, {"target_id": "symbol:src/task_cli.py:main", "kind": "symbol", "path": "src/task_cli.py", "symbol": "main"})
+        self.assertEqual(path_target, {"target_id": "path:src/task_cli.py", "kind": "path", "path": "src/task_cli.py", "symbol": ""})
+
+    def test_recovery_target_from_mutation_falls_back_to_result_or_single_recent_source(self) -> None:
+        is_test = lambda path: path.startswith("tests/")
+
+        from_result = recovery_target_from_mutation(
+            symbol_target=None,
+            mutation_target_paths=[],
+            result={"path": "./task_cli.py"},
+            recent_source_paths=[],
+            path_looks_like_test_file=is_test,
+        )
+        from_recent = recovery_target_from_mutation(
+            symbol_target=None,
+            mutation_target_paths=[],
+            result={},
+            recent_source_paths=[".\\src\\task_cli.py"],
+            path_looks_like_test_file=is_test,
+        )
+
+        self.assertEqual(from_result, {"target_id": "path:task_cli.py", "kind": "path", "path": "task_cli.py", "symbol": ""})
+        self.assertEqual(from_recent, {"target_id": "path:src/task_cli.py", "kind": "path", "path": "src/task_cli.py", "symbol": ""})
+
+    def test_recovery_target_matches_exact_id_or_compatible_path_symbol(self) -> None:
+        self.assertTrue(recovery_target_matches({"target_id": "path:task_cli.py"}, {"target_id": "path:task_cli.py"}))
+        self.assertFalse(recovery_target_matches({"target_id": "path:task_cli.py"}, {"target_id": "path:other.py"}))
+        self.assertTrue(recovery_target_matches({"path": "task_cli.py", "symbol": ""}, {"path": "task_cli.py", "symbol": "main"}))
+        self.assertTrue(recovery_target_matches({"path": "task_cli.py", "symbol": "main"}, {"path": "task_cli.py", "symbol": "main"}))
+        self.assertFalse(recovery_target_matches({"path": "task_cli.py", "symbol": "main"}, {"path": "task_cli.py", "symbol": "parse"}))
 
     def test_failed_test_repair_policy_tracks_current_mutation_version(self) -> None:
         self.assertTrue(
