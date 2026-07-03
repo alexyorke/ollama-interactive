@@ -111,16 +111,23 @@ from ollama_code.controller import (
     request_asks_specific_file_line as controller_request_asks_specific_file_line,
     request_asks_symbol_return as controller_request_asks_symbol_return,
     request_asks_token_only as controller_request_asks_token_only,
+    request_benefits_from_systems_lens as controller_request_benefits_from_systems_lens,
+    request_benefits_from_todos as controller_request_benefits_from_todos,
     request_explicitly_allows_test_mutation as controller_request_explicitly_allows_test_mutation,
     request_explicitly_requests_tool as controller_request_explicitly_requests_tool,
+    request_explicitly_wants_clarification as controller_request_explicitly_wants_clarification,
     request_expects_exact_tool_error as controller_request_expects_exact_tool_error,
+    request_forbids_clarifying_questions as controller_request_forbids_clarifying_questions,
     request_forbids_test_mutation as controller_request_forbids_test_mutation,
     request_forbids_tests as controller_request_forbids_tests,
     request_forbids_validation as controller_request_forbids_validation,
+    request_has_clarification_risk_signal as controller_request_has_clarification_risk_signal,
+    request_is_broad_or_ambiguous as controller_request_is_broad_or_ambiguous,
     request_is_continue_prompt as controller_request_is_continue_prompt,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
     request_looks_like_issue_report as controller_request_looks_like_issue_report,
     request_mentions_repeated_read as controller_request_mentions_repeated_read,
+    request_mentions_workspace_path as controller_request_mentions_workspace_path,
     request_needs_exact_grounding as controller_request_needs_exact_grounding,
     request_obligation_proof_status as feature_obligation_proof_status,
     request_prefers_structured_file_tools as controller_request_prefers_structured_file_tools,
@@ -5100,41 +5107,17 @@ class OllamaCodeAgent:
         )
 
     def _request_is_broad_or_ambiguous(self, text: str) -> bool:
-        lowered = text.lower()
-        broad_phrases = [
-            "inspect this repo",
-            "inspect the repo",
-            "summarize this repo",
-            "summarize the project",
-            "what does this project",
-            "find bugs",
-            "review the codebase",
-            "search the codebase",
-        ]
-        if any(phrase in lowered for phrase in broad_phrases):
-            return True
-        return "repo" in lowered and not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)
+        return controller_request_is_broad_or_ambiguous(text)
 
     def _request_benefits_from_systems_lens(self, text: str) -> bool:
-        if self._request_is_broad_or_ambiguous(text):
-            return True
-        return bool(
-            re.search(
-                r"\b(?:debug|root cause|flaky|regression|perf|performance|slow|throughput|profile|benchmark|architecture|design|workflow|pipeline|integration|refactor|migration|system|systems)\b",
-                text,
-                flags=re.IGNORECASE,
-            )
-        )
+        return controller_request_benefits_from_systems_lens(text)
 
     def _request_benefits_from_todos(self, text: str, *, mutation_required: bool, test_run_required: bool) -> bool:
-        lowered = text.lower()
-        if re.search(r"\b(?:todo|to-do|checklist|task list|plan steps|track progress)\b", lowered):
-            return True
-        if self._request_is_broad_or_ambiguous(text) or test_run_required:
-            return True
-        if mutation_required and re.search(r"\b(?:implement|fix|refactor|debug|profile|migrate|integrate|keep fixing)\b", lowered):
-            return True
-        return False
+        return controller_request_benefits_from_todos(
+            text,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+        )
 
     def _tool_output_without_line_prefixes(self, text: str) -> str:
         return "\n".join(re.sub(r"^\s*\d+\s+\|\s?", "", line) for line in text.splitlines())
@@ -9004,7 +8987,7 @@ class OllamaCodeAgent:
         return None
 
     def _request_mentions_workspace_path(self, text: str) -> bool:
-        return bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text))
+        return controller_request_mentions_workspace_path(text)
 
     def _should_preload_context_pack(
         self,
@@ -9040,29 +9023,13 @@ class OllamaCodeAgent:
         return False
 
     def _request_forbids_clarifying_questions(self, text: str) -> bool:
-        return bool(re.search(r"\b(?:do not|don't|dont|never|no)\s+(?:ask|clarify|question)s?\b", text, flags=re.IGNORECASE))
+        return controller_request_forbids_clarifying_questions(text)
 
     def _request_explicitly_wants_clarification(self, text: str) -> bool:
-        return bool(
-            re.search(
-                r"\b(?:ask (?:me )?(?:a )?questions?|clarify|clarifying question|before you (?:edit|change|implement)|don't assume|do not assume)\b",
-                text,
-                flags=re.IGNORECASE,
-            )
-        )
+        return controller_request_explicitly_wants_clarification(text)
 
     def _request_has_clarification_risk_signal(self, text: str) -> bool:
-        if self._request_is_broad_or_ambiguous(text):
-            return True
-        return bool(
-            re.search(
-                r"\b(?:keep fixing|make (?:it|this|the app|the cli|the repo) better|improve|optimi[sz]e|throughput|profile|benchmark|"
-                r"architecture|design|workflow|integration|migration|public api|schema|compatib|delete|remove|security|auth|permission|"
-                r"out of the box|first use|e2e|user experience|ux|tradeoff|default model|default behavior)\b",
-                text,
-                flags=re.IGNORECASE,
-            )
-        )
+        return controller_request_has_clarification_risk_signal(text)
 
     def _should_plan_clarifying_questions(
         self,

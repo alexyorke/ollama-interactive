@@ -13,15 +13,22 @@ from ollama_code.controller.request_policy import (
     request_asks_specific_file_line,
     request_asks_symbol_return,
     request_asks_token_only,
+    request_benefits_from_systems_lens,
+    request_benefits_from_todos,
     request_explicitly_allows_test_mutation,
     request_explicitly_requests_tool,
+    request_explicitly_wants_clarification,
     request_expects_exact_tool_error,
+    request_forbids_clarifying_questions,
     request_forbids_test_mutation,
     request_forbids_tests,
     request_forbids_validation,
+    request_has_clarification_risk_signal,
+    request_is_broad_or_ambiguous,
     request_is_continue_prompt,
     request_looks_like_issue_report,
     request_mentions_repeated_read,
+    request_mentions_workspace_path,
     request_needs_exact_grounding,
     request_prefers_structured_file_tools,
     request_requires_code_mutation,
@@ -156,6 +163,24 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         self.assertTrue(request_asks_symbol_return("Tell me what parse_args returns."))
         self.assertFalse(request_asks_specific_file_line("Read line 12."))
         self.assertFalse(request_asks_exact_line_text("Summarize line 4."))
+
+    def test_planning_lens_policy_identifies_broad_and_systems_work(self) -> None:
+        self.assertTrue(request_is_broad_or_ambiguous("Review the codebase for bugs."))
+        self.assertTrue(request_is_broad_or_ambiguous("Inspect this repo."))
+        self.assertFalse(request_is_broad_or_ambiguous("Inspect src/app.py."))
+        self.assertTrue(request_mentions_workspace_path("Inspect src/app.py."))
+        self.assertTrue(request_benefits_from_systems_lens("Profile this pipeline regression."))
+        self.assertTrue(request_benefits_from_todos("Implement the feature.", mutation_required=True, test_run_required=False))
+        self.assertTrue(request_benefits_from_todos("Run tests and report.", mutation_required=False, test_run_required=True))
+        self.assertFalse(request_benefits_from_todos("Explain Python decorators.", mutation_required=False, test_run_required=False))
+
+    def test_clarification_policy_is_controller_owned(self) -> None:
+        self.assertTrue(request_forbids_clarifying_questions("Do not ask questions; just inspect the repo."))
+        self.assertTrue(request_explicitly_wants_clarification("Ask me a question before you edit."))
+        self.assertTrue(request_explicitly_wants_clarification("Do not assume the API shape."))
+        self.assertTrue(request_has_clarification_risk_signal("Improve the CLI user experience."))
+        self.assertTrue(request_has_clarification_risk_signal("Find bugs in this repo."))
+        self.assertFalse(request_has_clarification_risk_signal("Read README.md and summarize it."))
 
 
 if __name__ == "__main__":

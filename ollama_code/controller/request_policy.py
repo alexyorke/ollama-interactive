@@ -302,6 +302,78 @@ def request_asks_symbol_return(text: str) -> bool:
     )
 
 
+def request_mentions_workspace_path(text: str) -> bool:
+    return bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", str(text or "")))
+
+
+def request_is_broad_or_ambiguous(text: str) -> bool:
+    lowered = str(text or "").lower()
+    broad_phrases = [
+        "inspect this repo",
+        "inspect the repo",
+        "summarize this repo",
+        "summarize the project",
+        "what does this project",
+        "find bugs",
+        "review the codebase",
+        "search the codebase",
+    ]
+    if any(phrase in lowered for phrase in broad_phrases):
+        return True
+    return "repo" in lowered and not request_mentions_workspace_path(str(text or ""))
+
+
+def request_benefits_from_systems_lens(text: str) -> bool:
+    if request_is_broad_or_ambiguous(text):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:debug|root cause|flaky|regression|perf|performance|slow|throughput|profile|benchmark|architecture|design|workflow|pipeline|integration|refactor|migration|system|systems)\b",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def request_benefits_from_todos(text: str, *, mutation_required: bool, test_run_required: bool) -> bool:
+    lowered = str(text or "").lower()
+    if re.search(r"\b(?:todo|to-do|checklist|task list|plan steps|track progress)\b", lowered):
+        return True
+    if request_is_broad_or_ambiguous(text) or test_run_required:
+        return True
+    if mutation_required and re.search(r"\b(?:implement|fix|refactor|debug|profile|migrate|integrate|keep fixing)\b", lowered):
+        return True
+    return False
+
+
+def request_forbids_clarifying_questions(text: str) -> bool:
+    return bool(re.search(r"\b(?:do not|don't|dont|never|no)\s+(?:ask|clarify|question)s?\b", str(text or ""), flags=re.IGNORECASE))
+
+
+def request_explicitly_wants_clarification(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:ask (?:me )?(?:a )?questions?|clarify|clarifying question|before you (?:edit|change|implement)|don't assume|do not assume)\b",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def request_has_clarification_risk_signal(text: str) -> bool:
+    if request_is_broad_or_ambiguous(text):
+        return True
+    return bool(
+        re.search(
+            r"\b(?:keep fixing|make (?:it|this|the app|the cli|the repo) better|improve|optimi[sz]e|throughput|profile|benchmark|"
+            r"architecture|design|workflow|integration|migration|public api|schema|compatib|delete|remove|security|auth|permission|"
+            r"out of the box|first use|e2e|user experience|ux|tradeoff|default model|default behavior)\b",
+            str(text or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def request_looks_like_issue_report(text: str) -> bool:
     lowered = text.lower()
     has_code_context = bool(
