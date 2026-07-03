@@ -5,19 +5,30 @@ from ollama_code.controller.request_policy import (
     path_looks_like_doc_target,
     path_looks_like_test_file,
     request_allows_any_validation,
+    request_allows_commit,
     request_allows_mutation,
+    request_asks_exact_line_text,
+    request_asks_if_command_works,
+    request_asks_if_path_exists,
+    request_asks_specific_file_line,
+    request_asks_symbol_return,
+    request_asks_token_only,
     request_explicitly_allows_test_mutation,
     request_explicitly_requests_tool,
+    request_expects_exact_tool_error,
     request_forbids_test_mutation,
     request_forbids_tests,
     request_forbids_validation,
     request_is_continue_prompt,
     request_looks_like_issue_report,
+    request_mentions_repeated_read,
     request_needs_exact_grounding,
+    request_prefers_structured_file_tools,
     request_requires_code_mutation,
     request_requires_mutation,
     request_requires_test_run,
     request_requires_tools,
+    request_targets_session_memory,
     requested_tool_names_from_request,
     tool_names_in_fragment,
     validation_preferences,
@@ -124,6 +135,27 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         self.assertTrue(request_requires_tools("Read src/app.py and explain the bug."))
         self.assertTrue(request_requires_tools("Run pytest and keep tests green."))
         self.assertFalse(request_requires_tools("What is a decorator in Python?"))
+
+    def test_structured_file_tool_and_session_memory_policy(self) -> None:
+        self.assertTrue(request_prefers_structured_file_tools("Update docs/setup.md with the new option."))
+        self.assertFalse(request_prefers_structured_file_tools("Run this shell command against docs/setup.md."))
+        self.assertFalse(request_prefers_structured_file_tools("Explain the design."))
+        self.assertTrue(request_targets_session_memory("What token did I ask you to remember earlier in this session?"))
+        self.assertFalse(request_targets_session_memory("Read the current README token section."))
+
+    def test_exact_request_predicates_are_controller_owned(self) -> None:
+        self.assertTrue(request_allows_commit("Commit the validated fix."))
+        self.assertFalse(request_allows_commit("Summarize the diff."))
+        self.assertTrue(request_asks_if_command_works("Run this and tell me whether the command works."))
+        self.assertTrue(request_asks_if_path_exists("Check if the file exists."))
+        self.assertTrue(request_expects_exact_tool_error("If it fails, tell me the exact tool error."))
+        self.assertTrue(request_mentions_repeated_read("Read it twice before answering."))
+        self.assertTrue(request_asks_token_only("Reply with the exact token only."))
+        self.assertTrue(request_asks_exact_line_text("Return the exact line text on line 4."))
+        self.assertTrue(request_asks_specific_file_line("Read src/app.py line 12."))
+        self.assertTrue(request_asks_symbol_return("Tell me what parse_args returns."))
+        self.assertFalse(request_asks_specific_file_line("Read line 12."))
+        self.assertFalse(request_asks_exact_line_text("Summarize line 4."))
 
 
 if __name__ == "__main__":

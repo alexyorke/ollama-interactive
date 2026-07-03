@@ -187,6 +187,121 @@ def request_requires_tools(text: str) -> bool:
     return bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", str(text or "")))
 
 
+def request_prefers_structured_file_tools(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "run_shell" in lowered and "not run_shell" not in lowered:
+        return False
+    if "shell" in lowered and "not shell" not in lowered:
+        return False
+    if "command" in lowered and "run_test" not in lowered:
+        return False
+    file_verbs = ["create ", "write ", "replace ", "edit ", "update ", "rewrite ", "append "]
+    has_file_target = bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", str(text or ""))) or "/" in str(text or "")
+    return has_file_target and any(verb in lowered for verb in file_verbs)
+
+
+def request_targets_session_memory(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "earlier in this session",
+            "earlier in this conversation",
+            "what token did i ask you to remember",
+            "what did i ask you to remember",
+            "remember earlier",
+            "remember in this session",
+        ]
+    )
+
+
+def request_allows_commit(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return bool(re.search(r"\b(?:commit|git_commit)\b", lowered))
+
+
+def request_asks_if_command_works(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "whether it works",
+            "if it works",
+            "whether the command works",
+            "if the command works",
+            "tell me whether it works",
+            "tell me if it works",
+        ]
+    )
+
+
+def request_asks_if_path_exists(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "whether it exists",
+            "if it exists",
+            "whether the file exists",
+            "if the file exists",
+            "whether the path exists",
+            "if the path exists",
+            "tell me whether it exists",
+            "tell me if it exists",
+        ]
+    )
+
+
+def request_expects_exact_tool_error(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(
+        phrase in lowered
+        for phrase in [
+            "exact tool error",
+            "tell me the exact tool error",
+            "reply with the exact tool error",
+            "what happened",
+            "tell me what happened",
+        ]
+    )
+
+
+def request_mentions_repeated_read(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return "twice" in lowered or "two times" in lowered or "2 times" in lowered
+
+
+def request_asks_token_only(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return "token" in lowered and ("only" in lowered or "exact marker" in lowered or "exact token" in lowered)
+
+
+def request_asks_exact_line_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "line" not in lowered or "exact" not in lowered:
+        return False
+    return any(phrase in lowered for phrase in ["text on line", "line text", "line only", "that line only"])
+
+
+def request_asks_specific_file_line(text: str) -> bool:
+    lowered = str(text or "").lower()
+    if "line" not in lowered:
+        return False
+    if not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", str(text or "")):
+        return False
+    return bool(re.search(r"\bline\s+\d+\b", lowered))
+
+
+def request_asks_symbol_return(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return bool(
+        re.search(
+            r"\bwhat\s+does\b.*\breturn\b|\breturns?\s+what\b|\btell\s+me\s+what\b.*\breturns?\b|\bsummarize\b.*\breturns?\b|\breturn\s+value\b|\bvalue\s+it\s+returns?\b",
+            lowered,
+        )
+    )
+
+
 def request_looks_like_issue_report(text: str) -> bool:
     lowered = text.lower()
     has_code_context = bool(

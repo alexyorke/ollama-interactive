@@ -103,21 +103,32 @@ from ollama_code.controller import (
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
     request_allows_any_validation as controller_request_allows_any_validation,
+    request_allows_commit as controller_request_allows_commit,
     request_allows_mutation as controller_request_allows_mutation,
+    request_asks_exact_line_text as controller_request_asks_exact_line_text,
+    request_asks_if_command_works as controller_request_asks_if_command_works,
+    request_asks_if_path_exists as controller_request_asks_if_path_exists,
+    request_asks_specific_file_line as controller_request_asks_specific_file_line,
+    request_asks_symbol_return as controller_request_asks_symbol_return,
+    request_asks_token_only as controller_request_asks_token_only,
     request_explicitly_allows_test_mutation as controller_request_explicitly_allows_test_mutation,
     request_explicitly_requests_tool as controller_request_explicitly_requests_tool,
+    request_expects_exact_tool_error as controller_request_expects_exact_tool_error,
     request_forbids_test_mutation as controller_request_forbids_test_mutation,
     request_forbids_tests as controller_request_forbids_tests,
     request_forbids_validation as controller_request_forbids_validation,
     request_is_continue_prompt as controller_request_is_continue_prompt,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
     request_looks_like_issue_report as controller_request_looks_like_issue_report,
+    request_mentions_repeated_read as controller_request_mentions_repeated_read,
     request_needs_exact_grounding as controller_request_needs_exact_grounding,
     request_obligation_proof_status as feature_obligation_proof_status,
+    request_prefers_structured_file_tools as controller_request_prefers_structured_file_tools,
     request_requires_code_mutation as controller_request_requires_code_mutation,
     request_requires_mutation as controller_request_requires_mutation,
     request_requires_test_run as controller_request_requires_test_run,
     request_requires_tools as controller_request_requires_tools,
+    request_targets_session_memory as controller_request_targets_session_memory,
     requested_tool_names_from_request as controller_requested_tool_names_from_request,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
@@ -3453,30 +3464,10 @@ class OllamaCodeAgent:
         return controller_request_requires_tools(text)
 
     def _request_prefers_structured_file_tools(self, text: str) -> bool:
-        lowered = text.lower()
-        if "run_shell" in lowered and "not run_shell" not in lowered:
-            return False
-        if "shell" in lowered and "not shell" not in lowered:
-            return False
-        if "command" in lowered and "run_test" not in lowered:
-            return False
-        file_verbs = ["create ", "write ", "replace ", "edit ", "update ", "rewrite ", "append "]
-        has_file_target = bool(re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text)) or "/" in text
-        return has_file_target and any(verb in lowered for verb in file_verbs)
+        return controller_request_prefers_structured_file_tools(text)
 
     def _request_targets_session_memory(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in [
-                "earlier in this session",
-                "earlier in this conversation",
-                "what token did i ask you to remember",
-                "what did i ask you to remember",
-                "remember earlier",
-                "remember in this session",
-            ]
-        )
+        return controller_request_targets_session_memory(text)
 
     def _clean_match_group(
         self,
@@ -3977,8 +3968,7 @@ class OllamaCodeAgent:
         return controller_path_looks_like_test_file(path)
 
     def _request_allows_commit(self, text: str) -> bool:
-        lowered = text.lower()
-        return bool(re.search(r"\b(?:commit|git_commit)\b", lowered))
+        return controller_request_allows_commit(text)
 
     def _shell_looks_like_file_mutation(self, command: str) -> bool:
         lowered = command.lower()
@@ -4099,69 +4089,25 @@ class OllamaCodeAgent:
         return bool(summary or output)
 
     def _request_asks_if_command_works(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in [
-                "whether it works",
-                "if it works",
-                "whether the command works",
-                "if the command works",
-                "tell me whether it works",
-                "tell me if it works",
-            ]
-        )
+        return controller_request_asks_if_command_works(text)
 
     def _request_asks_if_path_exists(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in [
-                "whether it exists",
-                "if it exists",
-                "whether the file exists",
-                "if the file exists",
-                "whether the path exists",
-                "if the path exists",
-                "tell me whether it exists",
-                "tell me if it exists",
-            ]
-        )
+        return controller_request_asks_if_path_exists(text)
 
     def _request_expects_exact_tool_error(self, text: str) -> bool:
-        lowered = text.lower()
-        return any(
-            phrase in lowered
-            for phrase in [
-                "exact tool error",
-                "tell me the exact tool error",
-                "reply with the exact tool error",
-                "what happened",
-                "tell me what happened",
-            ]
-        )
+        return controller_request_expects_exact_tool_error(text)
 
     def _request_mentions_repeated_read(self, text: str) -> bool:
-        lowered = text.lower()
-        return "twice" in lowered or "two times" in lowered or "2 times" in lowered
+        return controller_request_mentions_repeated_read(text)
 
     def _request_asks_token_only(self, text: str) -> bool:
-        lowered = text.lower()
-        return "token" in lowered and ("only" in lowered or "exact marker" in lowered or "exact token" in lowered)
+        return controller_request_asks_token_only(text)
 
     def _request_asks_exact_line_text(self, text: str) -> bool:
-        lowered = text.lower()
-        if "line" not in lowered or "exact" not in lowered:
-            return False
-        return any(phrase in lowered for phrase in ["text on line", "line text", "line only", "that line only"])
+        return controller_request_asks_exact_line_text(text)
 
     def _request_asks_specific_file_line(self, text: str) -> bool:
-        lowered = text.lower()
-        if "line" not in lowered:
-            return False
-        if not re.search(r"\b[\w./-]+\.[A-Za-z0-9]+\b", text):
-            return False
-        return bool(re.search(r"\bline\s+\d+\b", lowered))
+        return controller_request_asks_specific_file_line(text)
 
     def _request_asks_direct_file_contents(self, text: str) -> bool:
         lowered = text.lower()
@@ -4170,13 +4116,7 @@ class OllamaCodeAgent:
         return self._requested_natural_read_file_path(text) is not None
 
     def _request_asks_symbol_return(self, text: str) -> bool:
-        lowered = text.lower()
-        return bool(
-            re.search(
-                r"\bwhat\s+does\b.*\breturn\b|\breturns?\s+what\b|\btell\s+me\s+what\b.*\breturns?\b|\bsummarize\b.*\breturns?\b|\breturn\s+value\b|\bvalue\s+it\s+returns?\b",
-                lowered,
-            )
-        )
+        return controller_request_asks_symbol_return(text)
 
     def _extract_uppercase_token_from_output(self, output: str) -> str | None:
         for token in re.findall(r"\b[A-Z][A-Z0-9_]{2,}\b", output):
