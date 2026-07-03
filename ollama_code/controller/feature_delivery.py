@@ -213,6 +213,19 @@ def select_focused_python_repair_test(candidates: list[tuple[int, str]]) -> str 
     return ordered[0][1]
 
 
+def normalize_repair_strategy_payload(payload: dict[str, Any] | None) -> dict[str, Any]:
+    decision = payload if isinstance(payload, dict) else {}
+    strategy = str(decision.get("strategy", "")).strip().lower()
+    if strategy not in {"spec_guided_repair", "normal_loop"}:
+        strategy = "normal_loop"
+    notes = [str(item).strip() for item in list(decision.get("notes") or []) if isinstance(item, str) and str(item).strip()]
+    return {
+        "strategy": strategy,
+        "reason": str(decision.get("reason", "")).strip(),
+        "notes": notes,
+    }
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,

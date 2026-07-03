@@ -16,6 +16,7 @@ from ollama_code.controller.feature_delivery import (
     effective_repair_test_command,
     focused_python_repair_test_score,
     mechanical_obligation_repair_failed_for,
+    normalize_repair_strategy_payload,
     normalized_test_or_source_stem,
     preemptive_repair_source_score,
     preemptive_repair_test_score,
@@ -273,6 +274,30 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
             "tests/test_a.py",
         )
         self.assertIsNone(select_focused_python_repair_test([]))
+
+    def test_normalize_repair_strategy_payload_defaults_and_filters_notes(self) -> None:
+        self.assertEqual(
+            normalize_repair_strategy_payload(
+                {
+                    "strategy": "SPEC_GUIDED_REPAIR",
+                    "reason": " small repair ",
+                    "notes": [" use tests ", "", 3],
+                }
+            ),
+            {
+                "strategy": "spec_guided_repair",
+                "reason": "small repair",
+                "notes": ["use tests"],
+            },
+        )
+        self.assertEqual(
+            normalize_repair_strategy_payload({"strategy": "unsafe", "reason": None}),
+            {
+                "strategy": "normal_loop",
+                "reason": "None",
+                "notes": [],
+            },
+        )
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:
         events = [

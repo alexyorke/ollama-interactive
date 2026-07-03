@@ -118,6 +118,7 @@ from ollama_code.controller import (
     normalize_optional_parameter_bootstrap_call as controller_normalize_optional_parameter_bootstrap_call,
     normalize_payload as controller_normalize_payload,
     normalize_project_rename_bootstrap_call as controller_normalize_project_rename_bootstrap_call,
+    normalize_repair_strategy_payload as feature_normalize_repair_strategy_payload,
     normalize_run_test_call as controller_normalize_run_test_call,
     normalize_shell_inspection_call as controller_normalize_shell_inspection_call,
     normalize_shell_test_call as controller_normalize_shell_test_call,
@@ -8734,16 +8735,7 @@ class OllamaCodeAgent:
         ]
 
     def _normalize_repair_strategy_payload(self, payload: dict[str, Any] | None) -> dict[str, Any]:
-        decision = payload if isinstance(payload, dict) else {}
-        strategy = str(decision.get("strategy", "")).strip().lower()
-        if strategy not in {"spec_guided_repair", "normal_loop"}:
-            strategy = "normal_loop"
-        notes = [str(item).strip() for item in list(decision.get("notes") or []) if isinstance(item, str) and str(item).strip()]
-        return {
-            "strategy": strategy,
-            "reason": str(decision.get("reason", "")).strip(),
-            "notes": notes,
-        }
+        return feature_normalize_repair_strategy_payload(payload)
 
     def _plan_repair_strategy(
         self,
