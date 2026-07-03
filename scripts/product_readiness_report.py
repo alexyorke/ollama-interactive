@@ -268,6 +268,25 @@ def _check_local_small(
     )
 
 
+def _live_gate_selected_benchmark_artifact(repo_root: Path, live_gate_json: Path) -> Path | None:
+    payload, error = _load_json(live_gate_json)
+    if error or payload is None:
+        return None
+    selected_model = payload.get("selected_default_model")
+    models = payload.get("models") if isinstance(payload.get("models"), list) else []
+    for row in models:
+        if not isinstance(row, dict) or row.get("model") != selected_model:
+            continue
+        artifact = row.get("benchmark_artifact")
+        if not isinstance(artifact, str) or not artifact.strip():
+            return None
+        path = Path(artifact)
+        if not path.is_absolute():
+            path = repo_root / path
+        return path if path.exists() else None
+    return None
+
+
 def _check_hard_cases(
     path: Path,
     *,
@@ -312,7 +331,11 @@ def build_report(
     local_validation_json = local_validation_json or repo_root / "scratch" / "validation" / "local-validation-summary.json"
     doctor_json = doctor_json or repo_root / "scratch" / "validation" / "doctor-report.json"
     live_gate_json = live_gate_json or repo_root / "scratch" / "live-model-gate" / "live-model-gate-summary.json"
-    local_small_json = local_small_json or repo_root / "scratch" / "coding-benchmark" / "local-small.json"
+    local_small_json = (
+        local_small_json
+        or _live_gate_selected_benchmark_artifact(repo_root, live_gate_json)
+        or repo_root / "scratch" / "coding-benchmark" / "local-small.json"
+    )
     hard_cases_json = hard_cases_json or repo_root / "scratch" / "coding-benchmark" / "local-full.json"
 
     git_check = _check_git(repo_root, allow_dirty=allow_dirty)

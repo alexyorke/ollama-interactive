@@ -239,6 +239,47 @@ class ProductReadinessReportTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("local_small", payload["blocking_checks"])
 
+    def test_local_small_can_use_selected_live_gate_benchmark_artifact(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        stale = now - timedelta(hours=10)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_green_artifacts(root, now=now)
+            selected_artifact = root / "scratch" / "live-model-gate" / "coding-benchmark-granite4.1-8b.json"
+            self._write_json(
+                selected_artifact,
+                {
+                    "suite": "local-small",
+                    "git_commit": "abc123",
+                    "git_dirty": False,
+                    "summary": {"runs": 8, "pass": 8},
+                    "accuracy_regressions": [],
+                    "budget_failures": [],
+                    "llm_bypass_failures": [],
+                },
+                mtime=now,
+            )
+            self._write_json(
+                root / "scratch" / "coding-benchmark" / "local-small.json",
+                {
+                    "suite": "local-small",
+                    "git_commit": "old123",
+                    "git_dirty": False,
+                    "summary": {"runs": 1, "pass": 1},
+                    "accuracy_regressions": [],
+                    "budget_failures": [],
+                    "llm_bypass_failures": [],
+                },
+                mtime=stale,
+            )
+
+            payload = self._build(root, now=now)
+            local_small = next(check for check in payload["checks"] if check["name"] == "local_small")
+
+        self.assertTrue(local_small["ok"])
+        self.assertIn("scratch", local_small["details"]["path"])
+        self.assertNotIn("local_small", payload["blocking_checks"])
+
     def test_stale_doctor_git_metadata_blocks_readiness(self) -> None:
         now = datetime(2026, 7, 3, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as tmp:
