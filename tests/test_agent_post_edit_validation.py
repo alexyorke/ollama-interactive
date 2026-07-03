@@ -1749,6 +1749,121 @@ class AgentPostEditValidationTests(AgentTestBase):
         self.assertIn("set-price pen 3.75", readme_after)
         self.assertIn("pen | Gel Pen | $3.75 | office", listed.stdout)
 
+    def test_invoice_discount_cap_package_repair_updates_api_tests_docs_and_proof(self) -> None:
+        root = self._workspace_scratch()
+        (root / "invoice").mkdir()
+        (root / "tests").mkdir()
+        (root / "invoice" / "__init__.py").write_text(
+            "from .calculator import InvoiceLine, calculate_invoice\n\n"
+            "__all__ = [\"InvoiceLine\", \"calculate_invoice\"]\n",
+            encoding="utf-8",
+        )
+        (root / "invoice" / "rules.py").write_text(
+            "from __future__ import annotations\n\n\n"
+            "def category_discount_rate(category: str) -> float:\n"
+            "    rates = {\n"
+            "        \"books\": 0.10,\n"
+            "        \"software\": 0.05,\n"
+            "        \"hardware\": 0.00,\n"
+            "    }\n"
+            "    return rates.get(category, 0.0)\n\n\n"
+            "def loyalty_discount_rate(customer_tier: str) -> float:\n"
+            "    if customer_tier == \"gold\":\n"
+            "        return 0.05\n"
+            "    return 0.0\n",
+            encoding="utf-8",
+        )
+        (root / "invoice" / "calculator.py").write_text(
+            "from __future__ import annotations\n\n"
+            "from dataclasses import dataclass\n\n"
+            "from .rules import category_discount_rate, loyalty_discount_rate\n\n\n"
+            "@dataclass(frozen=True)\n"
+            "class InvoiceLine:\n"
+            "    sku: str\n"
+            "    category: str\n"
+            "    unit_price: float\n"
+            "    quantity: int\n\n\n"
+            "def calculate_invoice(lines: list[InvoiceLine], customer_tier: str = \"standard\") -> dict[str, float]:\n"
+            "    subtotal = sum(line.unit_price * line.quantity for line in lines)\n"
+            "    category_discount = sum(\n"
+            "        line.unit_price * line.quantity * category_discount_rate(line.category)\n"
+            "        for line in lines\n"
+            "    )\n"
+            "    loyalty_discount = subtotal * loyalty_discount_rate(customer_tier)\n"
+            "    discount = round(category_discount + loyalty_discount, 2)\n"
+            "    total = round(subtotal - discount, 2)\n"
+            "    return {\"subtotal\": round(subtotal, 2), \"discount\": discount, \"total\": total}\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_invoice.py").write_text(
+            "import unittest\n\n"
+            "from invoice import InvoiceLine, calculate_invoice\n\n\n"
+            "class InvoiceTests(unittest.TestCase):\n"
+            "    def test_category_discount(self) -> None:\n"
+            "        result = calculate_invoice([InvoiceLine(\"book-1\", \"books\", 20.0, 2)])\n"
+            "        self.assertEqual(result, {\"subtotal\": 40.0, \"discount\": 4.0, \"total\": 36.0})\n\n"
+            "    def test_gold_loyalty_discount(self) -> None:\n"
+            "        result = calculate_invoice([InvoiceLine(\"app\", \"software\", 100.0, 1)], customer_tier=\"gold\")\n"
+            "        self.assertEqual(result, {\"subtotal\": 100.0, \"discount\": 10.0, \"total\": 90.0})\n\n\n"
+            "if __name__ == \"__main__\":\n"
+            "    unittest.main()\n",
+            encoding="utf-8",
+        )
+        (root / "README.md").write_text(
+            "# Invoice Discount API\n\nGold customers receive 5% off the subtotal.\n",
+            encoding="utf-8",
+        )
+        command = f"{sys.executable} -m unittest discover -s tests -v"
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+        successful_tool_results: list[dict[str, object]] = []
+        satisfied_tool_names: set[str] = set()
+        tool_calls: list[dict[str, object]] = []
+        request_text = (
+            "Add a vip customer tier to this invoice discount API. VIP customers should receive a 12% "
+            "loyalty discount, but total combined discounts must be capped at 20% of the subtotal. "
+            "Preserve the existing category discounts and gold behavior. Update README with the new vip tier "
+            "and cap. Add tests for vip discount and for the 20% cap when vip is combined with category discounts. "
+            "Run the tests and prove the behavior with a shell command."
+        )
+        obligations = agent._derive_request_obligations(
+            request_text=request_text,
+            required_tool_names=set(),
+            required_mutation_paths=set(),
+            code_mutation_required=True,
+            test_run_required=True,
+        )
+
+        result = agent._try_invoice_discount_cap_package_repair(
+            request_text=request_text,
+            round_number=2,
+            request_obligations=obligations,
+            forbidden_tool_names=set(),
+            successful_tool_results=successful_tool_results,  # type: ignore[arg-type]
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result.completed)
+        self.assertIn("customer_tier == \"vip\"", (root / "invoice" / "rules.py").read_text(encoding="utf-8"))
+        self.assertIn("subtotal * 0.20", (root / "invoice" / "calculator.py").read_text(encoding="utf-8"))
+        self.assertIn("test_vip_loyalty_discount", (root / "tests" / "test_invoice.py").read_text(encoding="utf-8"))
+        self.assertIn("VIP customers receive 12%", (root / "README.md").read_text(encoding="utf-8"))
+        proof = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from invoice import InvoiceLine, calculate_invoice; print(calculate_invoice([InvoiceLine('book','books',100.0,1)], customer_tier='vip'))",
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proof.returncode, 0, proof.stderr)
+        self.assertIn("'discount': 20.0", proof.stdout)
+
     def test_final_chance_test_success_does_not_complete_unproven_obligations(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
