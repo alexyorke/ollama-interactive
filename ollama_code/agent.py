@@ -100,8 +100,10 @@ from ollama_code.controller import (
     final_requires_verification as controller_final_requires_verification,
     forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
     merge_request_obligations,
+    normalize_exact_literal_tool_call as controller_normalize_exact_literal_tool_call,
     normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
+    normalize_snippet_symbol_edit_call as controller_normalize_snippet_symbol_edit_call,
     path_looks_like_code_file as controller_path_looks_like_code_file,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
@@ -3589,21 +3591,11 @@ class OllamaCodeAgent:
         *,
         exact_file_write: ExactFileWriteSpec | None,
     ) -> tuple[str, dict[str, Any], str | None]:
-        if exact_file_write is None:
-            return name, arguments, None
-        if name == "write_file" or name == "replace_in_file":
-            return (
-                "write_file",
-                {"path": exact_file_write.path, "content": exact_file_write.line + "\n"},
-                "Normalized exact single-line file write to a deterministic write_file call.",
-            )
-        if name == "read_file":
-            return (
-                "read_file",
-                {"path": exact_file_write.path, "start": 1, "end": 1},
-                "Normalized exact single-line confirmation read to the requested file and line range.",
-            )
-        return name, arguments, None
+        return controller_normalize_exact_literal_tool_call(
+            name,
+            arguments,
+            exact_file_write=exact_file_write,
+        )
 
     def _normalize_file_tool_alias_call(
         self,
@@ -3826,20 +3818,7 @@ class OllamaCodeAgent:
         name: str,
         arguments: dict[str, Any],
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "replace_symbol":
-            return name, arguments, None
-        path = str(arguments.get("path", "")).strip()
-        symbol = arguments.get("symbol")
-        content = arguments.get("content")
-        if not path or not isinstance(symbol, str) or not isinstance(content, str):
-            return name, arguments, None
-        if not self._snippet_symbol_argument_looks_like_text(symbol):
-            return name, arguments, None
-        return (
-            "replace_in_file",
-            {"path": path, "old": symbol, "new": content, "all": False},
-            "Normalized snippet-style replace_symbol call to replace_in_file.",
-        )
+        return controller_normalize_snippet_symbol_edit_call(name, arguments)
 
     def _request_needs_exact_grounding(self, text: str) -> bool:
         return controller_request_needs_exact_grounding(text)
