@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "scratch" / "validation" / "local-validation-summary.json"
 
 SMOKE_MODULES = (
+    "tests.test_doctor_report",
     "tests.test_local_validation",
     "tests.test_live_model_gate",
     "tests.test_nightly_self_improvement_report",

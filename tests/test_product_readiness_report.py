@@ -21,6 +21,15 @@ class ProductReadinessReportTests(unittest.TestCase):
         return path
 
     def _write_green_artifacts(self, root: Path, *, now: datetime) -> dict[str, Path]:
+        doctor = self._write_json(
+            root / "scratch" / "validation" / "doctor-report.json",
+            {
+                "ok": True,
+                "status": "pass",
+                "summary": "Ollama Code doctor",
+            },
+            mtime=now,
+        )
         local_validation = self._write_json(
             root / "scratch" / "validation" / "local-validation-summary.json",
             {
@@ -75,6 +84,7 @@ class ProductReadinessReportTests(unittest.TestCase):
             mtime=now,
         )
         return {
+            "doctor": doctor,
             "local_validation": local_validation,
             "live_gate": live_gate,
             "local_small": local_small,
@@ -121,6 +131,34 @@ class ProductReadinessReportTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertIn("live_model_gate", payload["blocking_checks"])
+
+    def test_missing_doctor_artifact_blocks_readiness(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            artifacts = self._write_green_artifacts(root, now=now)
+            artifacts["doctor"].unlink()
+
+            payload = self._build(root, now=now)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("doctor", payload["blocking_checks"])
+
+    def test_failing_doctor_artifact_blocks_readiness(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_green_artifacts(root, now=now)
+            self._write_json(
+                root / "scratch" / "validation" / "doctor-report.json",
+                {"ok": False, "status": "fail", "summary": "model missing"},
+                mtime=now,
+            )
+
+            payload = self._build(root, now=now)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("doctor", payload["blocking_checks"])
 
     def test_failing_hard_case_blocks_readiness(self) -> None:
         now = datetime(2026, 7, 3, tzinfo=timezone.utc)

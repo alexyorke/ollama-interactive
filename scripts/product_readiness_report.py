@@ -121,9 +121,9 @@ def _check_doctor(path: Path | None, *, max_age_hours: float, now: datetime | No
         details["ok"] = payload.get("ok")
         details["status"] = payload.get("status")
     if error:
-        return _check("doctor", True, f"Doctor artifact unavailable ({error}); skipped.", required=False, details=details)
+        return _check("doctor", False, f"Doctor artifact {error}.", details=details)
     ok = fresh and bool(payload.get("ok", payload.get("status") in {"ok", "pass"}))
-    return _check("doctor", ok, "Doctor artifact is green." if ok else "Doctor artifact is stale or not green.", required=False, details=details)
+    return _check("doctor", ok, "Doctor artifact is green." if ok else "Doctor artifact is stale or not green.", details=details)
 
 
 def _check_local_validation(path: Path, *, max_age_hours: float, now: datetime | None = None) -> dict[str, Any]:
@@ -245,6 +245,7 @@ def build_report(
     repo_root = repo_root.resolve()
     now = now or _now()
     local_validation_json = local_validation_json or repo_root / "scratch" / "validation" / "local-validation-summary.json"
+    doctor_json = doctor_json or repo_root / "scratch" / "validation" / "doctor-report.json"
     live_gate_json = live_gate_json or repo_root / "scratch" / "live-model-gate" / "live-model-gate-summary.json"
     local_small_json = local_small_json or repo_root / "scratch" / "coding-benchmark" / "local-small.json"
     hard_cases_json = hard_cases_json or repo_root / "scratch" / "coding-benchmark" / "local-full.json"
@@ -291,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, default=_repo_root() / "scratch" / "validation" / "product-readiness-report.json")
     parser.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     parser.add_argument("--allow-dirty", action="store_true", help="Do not fail the git check for a dirty worktree.")
-    parser.add_argument("--doctor-json", type=Path, default=None, help="Optional JSON artifact from a prior doctor/setup check.")
+    parser.add_argument("--doctor-json", type=Path, default=None, help="JSON artifact from scripts/doctor_report.py.")
     parser.add_argument("--local-validation-json", type=Path, default=None)
     parser.add_argument("--live-gate-json", type=Path, default=None)
     parser.add_argument("--local-small-json", type=Path, default=None)

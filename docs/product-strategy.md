@@ -56,10 +56,11 @@ Preferred readiness flow:
 
 ```bash
 python -m ollama_code --doctor
+python scripts/doctor_report.py
 python scripts/local_validation.py --tier smoke
 python scripts/local_validation.py --tier agent
 python scripts/coding_benchmark_eval.py --suite local-full --models granite4.1:8b --modes off --cases task_due_filter --feature-profiles all --benchmark-classes agent controller --jobs 1 --strict-accuracy --strict-budget --require-llm-for-agent-benchmarks
 python scripts/product_readiness_report.py --strict
 ```
 
-Run full local and live-model gates before release-style claims, not during every small controller iteration.
+`scripts/doctor_report.py` writes `scratch/validation/doctor-report.json`, which is the first-use setup artifact consumed by the strict readiness summary. Run full local and live-model gates before release-style claims, not during every small controller iteration.

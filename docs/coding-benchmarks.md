@@ -69,10 +69,11 @@ Use the `agent` tier before `local-full` when you are iterating on controller lo
 Summarize the current release-readiness artifacts with:
 
 ```bash
+python scripts/doctor_report.py
 python scripts/product_readiness_report.py --strict
 ```
 
-The readiness report reads existing JSON artifacts; refresh the underlying validation, live-gate, and targeted benchmark outputs before using it for a release claim.
+The readiness report reads existing JSON artifacts; refresh the doctor, validation, live-gate, and targeted benchmark outputs before using it for a release claim.
 
 Run the full local validation stack before merging larger controller changes:
 

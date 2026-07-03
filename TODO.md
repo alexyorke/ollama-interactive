@@ -6,7 +6,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 
 - No active product-readiness blocker is expected when `scripts/product_readiness_report.py --strict` is green.
 - Keep `task_due_filter` green as the product-critical feature-delivery hard case for CLI flag work, tests, docs, parser errors, priority preservation, and shell proof.
-- Treat `scripts/product_readiness_report.py --strict` as the current-state release summary after meaningful controller, validation, or model-default changes.
+- Treat `scripts/product_readiness_report.py --strict` as the current-state release summary after refreshing doctor, validation, live-gate, and benchmark artifacts.
 
 ## Completed Controller Tranche
 
@@ -18,6 +18,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 ## Readiness Gates
 
 - `python -m ollama_code --doctor`
+- `python scripts/doctor_report.py`
 - `python scripts/local_validation.py --tier smoke`
 - `python scripts/local_validation.py --tier agent`
 - `python scripts/coding_benchmark_eval.py --suite local-full --models granite4.1:8b --modes off --cases task_due_filter --feature-profiles all --benchmark-classes agent controller --jobs 1 --strict-accuracy --strict-budget --require-llm-for-agent-benchmarks`
