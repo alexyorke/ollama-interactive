@@ -395,6 +395,106 @@ class AgentGroundingPathRepairTests(AgentTestBase):
 
         self.assertEqual(probe, ("code_outline", {"path": "src/pricing.py"}))
 
+    def test_context_planner_auto_narrows_identifier_search_to_search_symbols(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped","path":"src/core.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect src/core.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["read_file", "search", "search_symbols"])
+        self.assertTrue(any("Use the symbol-level matches for wrapped in src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_context_planner_auto_narrows_identifier_search_without_source_context(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:2], ["search", "search_symbols"])
+        self.assertTrue(any("Use the symbol-level matches for wrapped in src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_context_planner_blocks_for_unique_context_pack_target_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "context_pack",
+                "arguments": {"request": "Fix calculate_discount", "path": ".", "limit": 8},
+                "result": {
+                    "ok": True,
+                    "tool": "context_pack",
+                    "suggested_next_tool": "read_symbol",
+                    "ranked_paths": ["src/pricing.py"],
+                    "ranked_symbols": [{"path": "src/pricing.py", "qualname": "calculate_discount"}],
+                    "output": "context_pack:\nsuggested_next_tool=read_symbol",
+                },
+            }
+        ]
+
+        self.assertTrue(
+            agent._context_planner_blocks(
+                name="search",
+                tool_calls=[],
+                latest_run_test_failed=False,
+                successful_tool_results=successful_tool_results,
+            )
+        )
+
+    def test_context_planner_probe_prefers_unique_context_pack_symbol_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "context_pack",
+                "arguments": {"request": "Fix calculate_discount", "path": ".", "limit": 8},
+                "result": {
+                    "ok": True,
+                    "tool": "context_pack",
+                    "suggested_next_tool": "read_symbol",
+                    "ranked_paths": ["src/pricing.py"],
+                    "ranked_symbols": [{"path": "src/pricing.py", "qualname": "calculate_discount"}],
+                    "output": "context_pack:\nsuggested_next_tool=read_symbol",
+                },
+            }
+        ]
+
+        probe = agent._context_planner_probe(
+            successful_tool_results=successful_tool_results,
+            forbidden_tool_names=set(),
+        )
+
+        self.assertEqual(probe, ("read_symbol", {"path": "src/pricing.py", "symbol": "calculate_discount", "include_context": 0}))
+
     def test_context_pack_auto_outlines_unique_ranked_source_before_broad_search(self) -> None:
         client = FakeClient(
             [
@@ -1681,4 +1781,3 @@ class AgentGroundingPathRepairTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Re-ground app.py", feedback)
         self.assertIn("broader repair", feedback)
-

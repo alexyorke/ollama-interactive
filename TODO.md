@@ -74,6 +74,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Dead legacy failed-edit recovery helper bodies were removed from `tests/test_agent.py`; runnable coverage remains in the focused grounding and post-edit-validation modules.
 - Loop-cap failure-compression coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner broad-context guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
+- Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - `ToolExecutor` contract and synthesis helper policy has started moving into focused modules:
   `ollama_code/tools/contracts.py`, `ollama_code/tools/synthesis.py`, `ollama_code/tools/validation.py`, and
   `ollama_code/tools/command_validation.py`.
