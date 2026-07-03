@@ -141,8 +141,13 @@ from ollama_code.controller import (
     requested_code_outline_path as controller_requested_code_outline_path,
     requested_find_implementation_target_spec as controller_requested_find_implementation_target_spec,
     requested_git_tool_path as controller_requested_git_tool_path,
+    requested_exact_file_line as controller_requested_exact_file_line,
+    requested_exact_reply_text as controller_requested_exact_reply_text,
+    requested_exact_shell_command as controller_requested_exact_shell_command,
+    requested_exact_single_line_file_write as controller_requested_exact_single_line_file_write,
     requested_list_files_path as controller_requested_list_files_path,
     requested_local_search_spec as controller_requested_local_search_spec,
+    requested_loose_file_create_path as controller_requested_loose_file_create_path,
     requested_mutation_paths as controller_requested_mutation_paths,
     requested_natural_read_file_path as controller_requested_natural_read_file_path,
     requested_read_file_path as controller_requested_read_file_path,
@@ -3538,47 +3543,16 @@ class OllamaCodeAgent:
         return None
 
     def _requested_exact_file_line(self, text: str) -> str | None:
-        return self._first_request_match(
-            text,
-            [
-                r"exactly the text ['\"]([^'\"]+)['\"] followed by a newline",
-                r"exactly the single line ['\"]([^'\"]+)['\"] followed by a newline",
-                r"exactly the text ([^\n.]+?) followed by a newline",
-                r"exactly the single line ([^\n.]+?) followed by a newline",
-                r"exactly the single line ([A-Za-z0-9_.:/@+-]+) followed by a newline",
-            ],
-        )
+        return controller_requested_exact_file_line(text)
 
     def _requested_exact_single_line_file_write(self, text: str) -> ExactFileWriteSpec | None:
-        line = self._requested_exact_file_line(text)
-        if line is None:
-            return None
-        path = self._first_request_match(
-            text,
-            [
-                r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the single line\b",
-                r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the text\b",
-            ],
-            group="path",
-        )
-        return ExactFileWriteSpec(path=path, line=line) if path else None
+        return controller_requested_exact_single_line_file_write(text)
 
     def _requested_loose_file_create_path(self, text: str) -> str | None:
-        return self._first_request_match(
-            text,
-            [r"\b(?:create|write)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\b"],
-            group="path",
-            strip_suffix=".,;:",
-        )
+        return controller_requested_loose_file_create_path(text)
 
     def _requested_exact_reply_text(self, text: str) -> str | None:
-        return self._first_request_match(
-            text,
-            [
-                r"\b(?:reply|respond)\s+with\s+['\"]([^'\"]+)['\"]\s+only\b",
-                r"\b(?:reply|respond)\s+with\s+(?:exactly\s+)?([A-Z0-9_.:/@+-]+)\s+only\b",
-            ],
-        )
+        return controller_requested_exact_reply_text(text)
 
     def _latest_read_confirms_exact_line(
         self,
@@ -4171,24 +4145,7 @@ class OllamaCodeAgent:
         return None
 
     def _requested_exact_shell_command(self, text: str) -> str | None:
-        lowered = text.lower()
-        if re.search(r"\bnot\s+run_shell\b", lowered) or re.search(r"\bnot\s+shell\b", lowered):
-            return None
-        patterns = [
-            r"\b(?:execute|run)\s+exactly:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
-            r"\b(?:execute|run)\s+the\s+exact\s+command:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            if not match:
-                continue
-            command = match.group("command").strip()
-            command = command.strip("`")
-            if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
-                command = command[1:-1].strip()
-            if command:
-                return command
-        return None
+        return controller_requested_exact_shell_command(text)
 
     def _requested_read_file_path(self, text: str) -> str | None:
         return controller_requested_read_file_path(text)

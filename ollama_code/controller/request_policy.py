@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
-from ollama_code.agent_protocol import SymbolReadSpec, TargetLineReadSpec
+from ollama_code.agent_protocol import ExactFileWriteSpec, SymbolReadSpec, TargetLineReadSpec
 
 
 ToolNamePredicate = Callable[[str], bool]
@@ -338,6 +338,74 @@ def request_asks_symbol_return(text: str) -> bool:
             lowered,
         )
     )
+
+
+def requested_exact_file_line(text: str) -> str | None:
+    return _first_request_match(
+        text,
+        [
+            r"exactly the text ['\"]([^'\"]+)['\"] followed by a newline",
+            r"exactly the single line ['\"]([^'\"]+)['\"] followed by a newline",
+            r"exactly the text ([^\n.]+?) followed by a newline",
+            r"exactly the single line ([^\n.]+?) followed by a newline",
+            r"exactly the single line ([A-Za-z0-9_.:/@+-]+) followed by a newline",
+        ],
+    )
+
+
+def requested_exact_single_line_file_write(text: str) -> ExactFileWriteSpec | None:
+    line = requested_exact_file_line(text)
+    if line is None:
+        return None
+    path = _first_request_match(
+        text,
+        [
+            r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the single line\b",
+            r"\b(?:create|write|rewrite|replace|update)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\s+with exactly the text\b",
+        ],
+        group="path",
+    )
+    return ExactFileWriteSpec(path=path, line=line) if path else None
+
+
+def requested_loose_file_create_path(text: str) -> str | None:
+    return _first_request_match(
+        text,
+        [r"\b(?:create|write)\s+(?:file\s+)?(?P<path>[\w./\\-]+)\b"],
+        group="path",
+        strip_suffix=".,;:",
+    )
+
+
+def requested_exact_reply_text(text: str) -> str | None:
+    return _first_request_match(
+        text,
+        [
+            r"\b(?:reply|respond)\s+with\s+['\"]([^'\"]+)['\"]\s+only\b",
+            r"\b(?:reply|respond)\s+with\s+(?:exactly\s+)?([A-Z0-9_.:/@+-]+)\s+only\b",
+        ],
+    )
+
+
+def requested_exact_shell_command(text: str) -> str | None:
+    lowered = str(text or "").lower()
+    if re.search(r"\bnot\s+run_shell\b", lowered) or re.search(r"\bnot\s+shell\b", lowered):
+        return None
+    patterns = [
+        r"\b(?:execute|run)\s+exactly:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
+        r"\b(?:execute|run)\s+the\s+exact\s+command:\s*(?P<command>.+?)(?:\.\s+(?:Then|Tell)\b|\n|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        command = match.group("command").strip()
+        command = command.strip("`")
+        if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
+            command = command[1:-1].strip()
+        if command:
+            return command
+    return None
 
 
 def requested_read_file_path(text: str) -> str | None:

@@ -38,10 +38,15 @@ from ollama_code.controller.request_policy import (
     request_requires_tools,
     request_targets_session_memory,
     requested_code_outline_path,
+    requested_exact_file_line,
+    requested_exact_reply_text,
+    requested_exact_shell_command,
+    requested_exact_single_line_file_write,
     requested_find_implementation_target_spec,
     requested_git_tool_path,
     requested_list_files_path,
     requested_local_search_spec,
+    requested_loose_file_create_path,
     requested_mutation_paths,
     requested_natural_read_file_path,
     requested_read_file_path,
@@ -228,6 +233,22 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         symbol_read = requested_symbol_read("Find parse_args in src/app.py.")
         self.assertIsNotNone(symbol_read)
         self.assertEqual((symbol_read.path, symbol_read.symbol), ("src/app.py", "parse_args"))
+
+    def test_exact_literal_request_parsers_are_controller_owned(self) -> None:
+        write_spec = requested_exact_single_line_file_write(
+            "Create file notes/token.txt with exactly the single line TOKEN_123 followed by a newline."
+        )
+        self.assertIsNotNone(write_spec)
+        self.assertEqual((write_spec.path, write_spec.line), ("notes/token.txt", "TOKEN_123"))
+        self.assertEqual(requested_exact_file_line("Use exactly the text 'READY' followed by a newline."), "READY")
+        self.assertEqual(requested_loose_file_create_path("Write file scratch/result.txt, then stop."), "scratch/result.txt")
+        self.assertEqual(requested_exact_reply_text("Reply with exactly READY_200 only."), "READY_200")
+        self.assertEqual(requested_exact_shell_command("Run exactly: `python -c \"print(1)\"`. Then summarize."), 'python -c "print(1)"')
+        self.assertIsNone(
+            requested_exact_shell_command(
+                "Run exact e2e commands with run_test, not run_shell: `python -c \"print('e2e OK')\"`. Then summarize."
+            )
+        )
 
 
 if __name__ == "__main__":
