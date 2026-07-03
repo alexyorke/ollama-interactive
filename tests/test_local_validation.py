@@ -125,9 +125,13 @@ class LocalValidationTests(unittest.TestCase):
         with patch.object(local_validation, "_has_module", side_effect=lambda name: name in {"pytest", "xdist"}):
             with patch.object(local_validation.os, "cpu_count", return_value=32):
                 with patch.object(local_validation, "_run", side_effect=fake_run):
-                    payload = local_validation.run_validation("smoke", repo_root=Path.cwd(), runner="auto", jobs="auto")
+                    with patch.object(local_validation, "_git_head_commit", return_value="abc123"):
+                        with patch.object(local_validation, "_git_worktree_dirty", return_value=False):
+                            payload = local_validation.run_validation("smoke", repo_root=Path.cwd(), runner="auto", jobs="auto")
 
         self.assertEqual(calls, [("smoke", "16"), ("smoke", "off")])
+        self.assertEqual(payload["git_commit"], "abc123")
+        self.assertFalse(payload["git_dirty"])
         self.assertTrue(payload["command_ok"])
         self.assertEqual(payload["commands"][0]["fallback_for"], "xdist_infrastructure_failure")
         self.assertEqual(payload["commands"][0]["original_returncode"], 3)

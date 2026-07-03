@@ -111,7 +111,32 @@ def _check_git(repo_root: Path, *, allow_dirty: bool) -> dict[str, Any]:
     return _check("git", True, f"Worktree {'dirty' if dirty else 'clean'} at {commit}.", details={"commit": commit, "dirty": dirty})
 
 
-def _check_doctor(path: Path | None, *, max_age_hours: float, now: datetime | None = None) -> dict[str, Any]:
+def _artifact_git_details(
+    payload: dict[str, Any],
+    *,
+    current_commit: str | None,
+    current_dirty: bool | None,
+) -> dict[str, Any]:
+    artifact_commit = payload.get("git_commit") if isinstance(payload.get("git_commit"), str) else None
+    artifact_dirty = payload.get("git_dirty") if isinstance(payload.get("git_dirty"), bool) else None
+    git_ok = artifact_commit == current_commit and artifact_dirty == current_dirty
+    return {
+        "git_commit": artifact_commit,
+        "git_dirty": artifact_dirty,
+        "current_commit": current_commit,
+        "current_dirty": current_dirty,
+        "git_metadata_ok": git_ok,
+    }
+
+
+def _check_doctor(
+    path: Path | None,
+    *,
+    current_commit: str | None,
+    current_dirty: bool | None,
+    max_age_hours: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     if path is None:
         return _check("doctor", True, "No doctor artifact configured; skipped.", required=False)
     payload, error = _load_json(path)
@@ -122,11 +147,25 @@ def _check_doctor(path: Path | None, *, max_age_hours: float, now: datetime | No
         details["status"] = payload.get("status")
     if error:
         return _check("doctor", False, f"Doctor artifact {error}.", details=details)
-    ok = fresh and bool(payload.get("ok", payload.get("status") in {"ok", "pass"}))
-    return _check("doctor", ok, "Doctor artifact is green." if ok else "Doctor artifact is stale or not green.", details=details)
+    assert payload is not None
+    details.update(_artifact_git_details(payload, current_commit=current_commit, current_dirty=current_dirty))
+    ok = fresh and bool(payload.get("ok", payload.get("status") in {"ok", "pass"})) and bool(details["git_metadata_ok"])
+    return _check(
+        "doctor",
+        ok,
+        "Doctor artifact is green." if ok else "Doctor artifact is stale, not green, or for a different git state.",
+        details=details,
+    )
 
 
-def _check_local_validation(path: Path, *, max_age_hours: float, now: datetime | None = None) -> dict[str, Any]:
+def _check_local_validation(
+    path: Path,
+    *,
+    current_commit: str | None,
+    current_dirty: bool | None,
+    max_age_hours: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     payload, error = _load_json(path)
     fresh, details = _fresh_artifact_details(path, max_age_hours=max_age_hours, now=now)
     details["error"] = error
@@ -143,13 +182,14 @@ def _check_local_validation(path: Path, *, max_age_hours: float, now: datetime |
             "ok": overall_ok,
         }
     )
-    ok = fresh and command_ok and overall_ok
+    details.update(_artifact_git_details(payload, current_commit=current_commit, current_dirty=current_dirty))
+    ok = fresh and command_ok and overall_ok and bool(details["git_metadata_ok"])
     if ok:
         summary = f"Local validation {payload.get('requested_tier') or 'unknown'} is green."
     elif command_ok and not overall_ok:
         summary = "Local validation commands passed, but release consistency checks failed."
     else:
-        summary = "Local validation is missing, stale, or failing."
+        summary = "Local validation is missing, stale, failing, or for a different git state."
     return _check("local_validation", ok, summary, details=details)
 
 
@@ -191,7 +231,14 @@ def _check_live_gate(
     return _check("live_model_gate", ok, summary, details=details)
 
 
-def _check_local_small(path: Path, *, max_age_hours: float, now: datetime | None = None) -> dict[str, Any]:
+def _check_local_small(
+    path: Path,
+    *,
+    current_commit: str | None,
+    current_dirty: bool | None,
+    max_age_hours: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     payload, error = _load_json(path)
     fresh, details = _fresh_artifact_details(path, max_age_hours=max_age_hours, now=now)
     details["error"] = error
@@ -203,14 +250,22 @@ def _check_local_small(path: Path, *, max_age_hours: float, now: datetime | None
     passes = int(summary_payload.get("pass") or 0)
     failures = list(payload.get("accuracy_regressions") or []) + list(payload.get("budget_failures") or []) + list(payload.get("llm_bypass_failures") or [])
     details.update({"runs": runs, "pass": passes, "failure_count": len(failures), "suite": payload.get("suite")})
-    ok = fresh and runs > 0 and passes == runs and not failures
-    return _check("local_small", ok, f"local-small passed {passes}/{runs}." if ok else "local-small is missing, stale, or not fully passing.", details=details)
+    details.update(_artifact_git_details(payload, current_commit=current_commit, current_dirty=current_dirty))
+    ok = fresh and runs > 0 and passes == runs and not failures and bool(details["git_metadata_ok"])
+    return _check(
+        "local_small",
+        ok,
+        f"local-small passed {passes}/{runs}." if ok else "local-small is missing, stale, not fully passing, or for a different git state.",
+        details=details,
+    )
 
 
 def _check_hard_cases(
     path: Path,
     *,
     required_cases: tuple[str, ...],
+    current_commit: str | None,
+    current_dirty: bool | None,
     max_age_hours: float,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -224,9 +279,11 @@ def _check_hard_cases(
     by_case = {str(row.get("case") or ""): row for row in results if isinstance(row, dict)}
     case_statuses = {case: str(by_case.get(case, {}).get("status") or "missing") for case in required_cases}
     details.update({"required_cases": list(required_cases), "case_statuses": case_statuses, "suite": payload.get("suite")})
-    ok = fresh and bool(required_cases) and all(status == "pass" for status in case_statuses.values())
+    details.update(_artifact_git_details(payload, current_commit=current_commit, current_dirty=current_dirty))
+    ok = fresh and bool(required_cases) and all(status == "pass" for status in case_statuses.values()) and bool(details["git_metadata_ok"])
     passed = sum(1 for status in case_statuses.values() if status == "pass")
-    return _check("hard_cases", ok, f"Hard cases passed {passed}/{len(required_cases)}.", details=details)
+    summary = f"Hard cases passed {passed}/{len(required_cases)}." if ok else "Hard cases are missing, stale, failing, or for a different git state."
+    return _check("hard_cases", ok, summary, details=details)
 
 
 def build_report(
@@ -255,11 +312,11 @@ def build_report(
     current_dirty = git_check["details"].get("dirty")
     checks = [
         git_check,
-        _check_doctor(doctor_json, max_age_hours=max_age_hours, now=now),
-        _check_local_validation(local_validation_json, max_age_hours=max_age_hours, now=now),
+        _check_doctor(doctor_json, current_commit=current_commit, current_dirty=current_dirty, max_age_hours=max_age_hours, now=now),
+        _check_local_validation(local_validation_json, current_commit=current_commit, current_dirty=current_dirty, max_age_hours=max_age_hours, now=now),
         _check_live_gate(live_gate_json, current_commit=current_commit, current_dirty=current_dirty, max_age_hours=max_age_hours, now=now),
-        _check_local_small(local_small_json, max_age_hours=max_age_hours, now=now),
-        _check_hard_cases(hard_cases_json, required_cases=required_hard_cases, max_age_hours=max_age_hours, now=now),
+        _check_local_small(local_small_json, current_commit=current_commit, current_dirty=current_dirty, max_age_hours=max_age_hours, now=now),
+        _check_hard_cases(hard_cases_json, required_cases=required_hard_cases, current_commit=current_commit, current_dirty=current_dirty, max_age_hours=max_age_hours, now=now),
     ]
     blocking = [check for check in checks if check["required"] and not check["ok"]]
     return {

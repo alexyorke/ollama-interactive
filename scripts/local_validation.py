@@ -587,6 +587,8 @@ def run_validation(
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root.resolve(strict=False)),
+        "git_commit": _git_head_commit(repo_root),
+        "git_dirty": _git_worktree_dirty(repo_root),
         "requested_tier": tier,
         "requested_runner": runner,
         "resolved_runner": resolved_runner,

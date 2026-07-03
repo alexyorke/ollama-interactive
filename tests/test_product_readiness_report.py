@@ -27,6 +27,8 @@ class ProductReadinessReportTests(unittest.TestCase):
                 "ok": True,
                 "status": "pass",
                 "summary": "Ollama Code doctor",
+                "git_commit": "abc123",
+                "git_dirty": False,
             },
             mtime=now,
         )
@@ -37,6 +39,8 @@ class ProductReadinessReportTests(unittest.TestCase):
                 "command_ok": True,
                 "requested_tier": "agent",
                 "resolved_runner": "pytest",
+                "git_commit": "abc123",
+                "git_dirty": False,
             },
             mtime=now,
         )
@@ -71,6 +75,8 @@ class ProductReadinessReportTests(unittest.TestCase):
             root / "scratch" / "coding-benchmark" / "local-small.json",
             {
                 "suite": "local-small",
+                "git_commit": "abc123",
+                "git_dirty": False,
                 "summary": {"runs": 8, "pass": 8},
                 "accuracy_regressions": [],
                 "budget_failures": [],
@@ -80,7 +86,12 @@ class ProductReadinessReportTests(unittest.TestCase):
         )
         hard_cases = self._write_json(
             root / "scratch" / "coding-benchmark" / "local-full.json",
-            {"suite": "local-full", "results": [{"case": "task_due_filter", "status": "pass"}]},
+            {
+                "suite": "local-full",
+                "git_commit": "abc123",
+                "git_dirty": False,
+                "results": [{"case": "task_due_filter", "status": "pass"}],
+            },
             mtime=now,
         )
         return {
@@ -151,7 +162,13 @@ class ProductReadinessReportTests(unittest.TestCase):
             self._write_green_artifacts(root, now=now)
             self._write_json(
                 root / "scratch" / "validation" / "doctor-report.json",
-                {"ok": False, "status": "fail", "summary": "model missing"},
+                {
+                    "ok": False,
+                    "status": "fail",
+                    "summary": "model missing",
+                    "git_commit": "abc123",
+                    "git_dirty": False,
+                },
                 mtime=now,
             )
 
@@ -167,7 +184,12 @@ class ProductReadinessReportTests(unittest.TestCase):
             self._write_green_artifacts(root, now=now)
             self._write_json(
                 root / "scratch" / "coding-benchmark" / "local-full.json",
-                {"suite": "local-full", "results": [{"case": "task_due_filter", "status": "fail"}]},
+                {
+                    "suite": "local-full",
+                    "git_commit": "abc123",
+                    "git_dirty": False,
+                    "results": [{"case": "task_due_filter", "status": "fail"}],
+                },
                 mtime=now,
             )
 
@@ -186,6 +208,8 @@ class ProductReadinessReportTests(unittest.TestCase):
                 root / "scratch" / "coding-benchmark" / "local-small.json",
                 {
                     "suite": "local-small",
+                    "git_commit": "abc123",
+                    "git_dirty": False,
                     "summary": {"runs": 8, "pass": 8},
                     "accuracy_regressions": [],
                     "budget_failures": [],
@@ -198,6 +222,72 @@ class ProductReadinessReportTests(unittest.TestCase):
 
         self.assertFalse(payload["ok"])
         self.assertIn("local_small", payload["blocking_checks"])
+
+    def test_stale_doctor_git_metadata_blocks_readiness(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_green_artifacts(root, now=now)
+            self._write_json(
+                root / "scratch" / "validation" / "doctor-report.json",
+                {
+                    "ok": True,
+                    "status": "pass",
+                    "summary": "Ollama Code doctor",
+                    "git_commit": "old123",
+                    "git_dirty": False,
+                },
+                mtime=now,
+            )
+
+            payload = self._build(root, now=now)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("doctor", payload["blocking_checks"])
+
+    def test_stale_local_validation_git_metadata_blocks_readiness(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_green_artifacts(root, now=now)
+            self._write_json(
+                root / "scratch" / "validation" / "local-validation-summary.json",
+                {
+                    "ok": True,
+                    "command_ok": True,
+                    "requested_tier": "agent",
+                    "resolved_runner": "pytest",
+                    "git_commit": "old123",
+                    "git_dirty": False,
+                },
+                mtime=now,
+            )
+
+            payload = self._build(root, now=now)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("local_validation", payload["blocking_checks"])
+
+    def test_stale_benchmark_git_metadata_blocks_readiness(self) -> None:
+        now = datetime(2026, 7, 3, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_green_artifacts(root, now=now)
+            self._write_json(
+                root / "scratch" / "coding-benchmark" / "local-full.json",
+                {
+                    "suite": "local-full",
+                    "git_commit": "old123",
+                    "git_dirty": False,
+                    "results": [{"case": "task_due_filter", "status": "pass"}],
+                },
+                mtime=now,
+            )
+
+            payload = self._build(root, now=now)
+
+        self.assertFalse(payload["ok"])
+        self.assertIn("hard_cases", payload["blocking_checks"])
 
 
 if __name__ == "__main__":

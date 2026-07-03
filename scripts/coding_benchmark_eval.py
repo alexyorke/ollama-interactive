@@ -2153,6 +2153,13 @@ def _git_commit(repo_root: Path) -> str:
     return result.stdout.strip() if result.returncode == 0 else "unknown"
 
 
+def _git_dirty(repo_root: Path) -> bool | None:
+    result = _run(["git", "status", "--short"], repo_root, timeout=30)
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 def write_results_payload(
     output: Path,
     *,
@@ -2168,6 +2175,7 @@ def write_results_payload(
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "git_commit": _git_commit(repo_root),
+        "git_dirty": _git_dirty(repo_root),
         "suite": suite,
         "partial": partial,
         "benchmark_classes": list(BENCHMARK_CLASSES),

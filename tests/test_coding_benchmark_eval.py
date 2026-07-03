@@ -156,6 +156,24 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
         self.assertEqual([item["case"] for item in failures], ["coding-zero"])
         self.assertIn("agent benchmark", failures[0]["llm_bypass_reason"])
 
+    def test_write_results_payload_records_git_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "results.json"
+            with patch.object(bench, "_git_commit", return_value="abc123"):
+                with patch.object(bench, "_git_dirty", return_value=False):
+                    bench.write_results_payload(
+                        output,
+                        repo_root=Path(tmp),
+                        suite="local-small",
+                        results=[{"case": "sample", "status": "pass"}],
+                    )
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["git_commit"], "abc123")
+        self.assertFalse(payload["git_dirty"])
+        self.assertEqual(payload["suite"], "local-small")
+
     def test_main_can_fail_when_coding_accuracy_uses_zero_llm_calls(self) -> None:
         case = bench.BenchmarkCase(name="only", suite="local-small", turns=("prompt",), validate=lambda ctx: "pass")
 
