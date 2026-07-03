@@ -133,3 +133,62 @@ class AgentPromptPolicyTests(AgentTestBase):
 
         self.assertIn("todo_read", selected)
         self.assertIn("todo_write", selected)
+
+    def test_primary_context_truncates_old_messages_before_recent_limit(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient([])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        current_request = "Summarize current request with TOKEN_CURRENT_END."
+        agent.messages.extend(
+            [
+                {"role": "user", "content": "old " + ("x" * 5000) + " TOKEN_OLD_END"},
+                {"role": "user", "content": current_request},
+            ]
+        )
+
+        messages = agent._primary_messages_for_model(
+            session_memory_request=False,
+            current_request=current_request,
+            tool_names={"read_file"},
+        )
+
+        old_message = next(message["content"] for message in messages if message["role"] == "user" and message["content"].startswith("old "))
+        current_message = next(message["content"] for message in messages if "TOKEN_CURRENT_END" in message["content"])
+        self.assertIn("... truncated ...", old_message)
+        self.assertNotIn("TOKEN_OLD_END", old_message)
+        self.assertEqual(current_message, current_request)
+
+    def test_primary_prompt_omits_tool_signatures_for_simple_final(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient(['{"type":"final","message":"done"}'])
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Say done.")
+
+        self.assertEqual(result.message, "done")
+        system_prompt = client.calls[0]["messages"][0]["content"]
+        self.assertNotIn("replace_symbols(path", system_prompt)
+        self.assertNotIn("run_shell(command", system_prompt)
+        self.assertNotIn("todo_write(items", system_prompt)
+        self.assertLess(len(system_prompt), len(agent.messages[0]["content"]))
+
+    def test_primary_prompt_uses_edit_tool_palette_for_mutation_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"src/app.py","content":"def f():\\n    return 1\\n"}}',
+                    '{"type":"final","message":"edited"}',
+                ]
+            )
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit src/app.py.")
+
+        self.assertEqual(result.message, "edited")
+        system_prompt = client.calls[0]["messages"][0]["content"]
+        self.assertIn("replace_symbols(path", system_prompt)
+        self.assertIn("write_file(path", system_prompt)
+        self.assertNotIn("git_commit(message", system_prompt)
