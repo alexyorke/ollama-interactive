@@ -40,11 +40,14 @@ from ollama_code.tools.synthesis import (
     foldr_argument_order_diagnostic,
     function_probe_result,
     function_probe_script,
+    insert_import_statement,
     looks_like_symbol_name,
+    merge_from_import_statement,
     normalize_python_write_content,
     normalize_python_signature_replacement,
     normalize_python_symbol_target,
     python_function_replacement_sanity_diagnostic,
+    python_import_statement_is_safe,
     python_parameter_names,
     python_parameter_sequence,
     repair_common_python_join_typo,
@@ -450,6 +453,27 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("non-empty signature", empty_diagnostic)
         self.assertEqual(wrong_name, "")
         self.assertIn("fetch_order", wrong_name_diagnostic)
+
+    def test_import_insertion_helpers_merge_existing_from_imports(self) -> None:
+        original = "from os import path\n\nprint(path)\n"
+        merged = merge_from_import_statement(original, "from os import environ, path")
+
+        self.assertEqual(merged, "from os import path, environ\n\nprint(path)\n")
+        self.assertEqual(merge_from_import_statement(merged or "", "from os import path"), merged)
+
+    def test_import_insertion_helpers_place_imports_after_header_block(self) -> None:
+        original = "#!/usr/bin/env python\n\"\"\"module docs\"\"\"\nfrom __future__ import annotations\nimport os\n\nVALUE = 1\n"
+        updated = insert_import_statement(original, "from pathlib import Path\nimport json")
+
+        self.assertEqual(
+            updated,
+            "#!/usr/bin/env python\n\"\"\"module docs\"\"\"\nfrom __future__ import annotations\nimport os\nfrom pathlib import Path\nimport json\n\nVALUE = 1\n",
+        )
+
+    def test_import_insertion_helpers_reject_executable_payloads(self) -> None:
+        self.assertTrue(python_import_statement_is_safe("import os\nfrom pathlib import Path"))
+        self.assertFalse(python_import_statement_is_safe("import os\nprint('run')"))
+        self.assertFalse(python_import_statement_is_safe("not valid python"))
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):

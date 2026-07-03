@@ -312,6 +312,82 @@ def normalize_python_signature_replacement(
     return clean, ""
 
 
+def merge_from_import_statement(original: str, statement: str) -> str | None:
+    match = re.fullmatch(r"from\s+(?P<module>[.\w]+)\s+import\s+(?P<names>.+)", statement.strip())
+    if not match:
+        return None
+    module = match.group("module")
+    requested_names = [name.strip() for name in match.group("names").split(",") if name.strip()]
+    if not requested_names:
+        return None
+    lines = original.splitlines(keepends=True)
+    existing_pattern = re.compile(rf"^(?P<prefix>\s*from\s+{re.escape(module)}\s+import\s+)(?P<names>.+?)(?P<newline>\r?\n?)$")
+    for index, line in enumerate(lines):
+        existing = existing_pattern.match(line)
+        if not existing:
+            continue
+        existing_names = [name.strip() for name in existing.group("names").split(",") if name.strip()]
+        existing_keys = {name.split(" as ", 1)[0].strip() for name in existing_names}
+        missing = [name for name in requested_names if name.split(" as ", 1)[0].strip() not in existing_keys]
+        if not missing:
+            return original
+        newline = existing.group("newline") or ("\n" if line.endswith("\n") else "")
+        lines[index] = existing.group("prefix") + ", ".join([*existing_names, *missing]) + newline
+        return "".join(lines)
+    return None
+
+
+def insert_single_import_statement(original: str, statement: str) -> str:
+    lines = original.splitlines(keepends=True)
+    insert_at = 0
+    if lines and lines[0].startswith("#!"):
+        insert_at = 1
+    try:
+        tree = ast.parse(python_parse_text(original))
+        if (
+            tree.body
+            and isinstance(tree.body[0], ast.Expr)
+            and isinstance(getattr(tree.body[0], "value", None), ast.Constant)
+            and isinstance(tree.body[0].value.value, str)
+        ):
+            insert_at = max(insert_at, int(getattr(tree.body[0], "end_lineno", 1)))
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                insert_at = max(insert_at, int(getattr(node, "end_lineno", getattr(node, "lineno", 1))))
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                insert_at = max(insert_at, int(getattr(node, "end_lineno", getattr(node, "lineno", 1))))
+            elif int(getattr(node, "lineno", 1)) > insert_at + 1:
+                break
+    except SyntaxError:
+        pass
+    if statement.strip() in {line.strip() for line in lines}:
+        return original
+    merged = merge_from_import_statement(original, statement)
+    if merged is not None:
+        return merged
+    if not statement.endswith("\n"):
+        statement += "\n"
+    return "".join(lines[:insert_at]) + statement + "".join(lines[insert_at:])
+
+
+def insert_import_statement(original: str, statement: str) -> str:
+    updated = original
+    statements = [line.strip() for line in statement.splitlines() if line.strip()]
+    if not statements:
+        return original
+    for single_statement in statements:
+        updated = insert_single_import_statement(updated, single_statement)
+    return updated
+
+
+def python_import_statement_is_safe(statement: str) -> bool:
+    try:
+        parsed_statement = ast.parse(statement)
+    except SyntaxError:
+        return False
+    return bool(parsed_statement.body) and all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in parsed_statement.body)
+
+
 def python_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     args = node.args
     names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
