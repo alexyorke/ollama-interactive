@@ -12,6 +12,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 
 - Feature-delivery obligation derivation and proof-status policy now live in controller modules instead of ad hoc `agent.py` guards.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
+- Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.
 - Focused controller tests cover feature-delivery policy directly instead of relying only on the omnibus `tests/test_agent.py`.
 
 ## Readiness Gates

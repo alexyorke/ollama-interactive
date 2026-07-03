@@ -6,6 +6,11 @@ from ollama_code.controller.repair_protocol import (
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
     repair_decision_for_tool,
+    repair_spec_broad_repair_hint,
+    repair_spec_complete_plan,
+    repair_spec_mutation_decision,
+    repair_spec_required_proof_items,
+    repair_spec_strategy_class,
 )
 
 
@@ -117,6 +122,67 @@ class RepairProtocolTests(unittest.TestCase):
         self.assertIn("tests", instruction)
         self.assertIn("docs", instruction)
         self.assertIn("direct CLI behavior proof", instruction)
+
+    def test_repair_spec_policy_selects_cli_surface_for_flag_obligations(self) -> None:
+        strategy = repair_spec_strategy_class(
+            target={"path": "task_cli.py"},
+            obligations=[
+                {
+                    "id": "flag:--due-before",
+                    "kind": "feature_token",
+                    "feature_class": "flag",
+                    "label": 'prove "--due-before"',
+                }
+            ],
+            file_repair_allowed=True,
+        )
+
+        self.assertEqual(strategy, "cli_surface_repair")
+
+    def test_repair_spec_complete_plan_and_hint_are_policy_level(self) -> None:
+        state = {
+            "path": "task_cli.py",
+            "repair_strategy": "cli_surface_repair",
+            "required_proof_items": ["prove --due-before"],
+        }
+
+        self.assertEqual(repair_spec_required_proof_items(state), ["prove --due-before"])
+        self.assertIn("parser, behavior, docs, and proof", repair_spec_complete_plan(state))
+        self.assertEqual(
+            repair_spec_broad_repair_hint(state, file_repair_allowed=True),
+            "write_file on task_cli.py so the CLI surface is repaired in one pass",
+        )
+
+    def test_repair_spec_mutation_decision_rejects_narrow_or_unrelated_retry(self) -> None:
+        state = {"path": "task_cli.py", "repair_strategy": "cli_surface_repair"}
+
+        unrelated = repair_spec_mutation_decision(
+            state,
+            proposed_tool_name="write_file",
+            proposed_paths=["other.py"],
+            repair_granularity="broad_file",
+            file_repair_allowed=True,
+        )
+        narrow = repair_spec_mutation_decision(
+            state,
+            proposed_tool_name="replace_in_file",
+            proposed_paths=["task_cli.py"],
+            repair_granularity="narrow",
+            file_repair_allowed=True,
+        )
+        broad = repair_spec_mutation_decision(
+            state,
+            proposed_tool_name="write_file",
+            proposed_paths=["task_cli.py"],
+            repair_granularity="broad_file",
+            file_repair_allowed=True,
+        )
+
+        self.assertFalse(unrelated["allowed"])
+        self.assertIn("unrelated files", unrelated["reason"])
+        self.assertFalse(narrow["allowed"])
+        self.assertIn("small speculative edit", narrow["reason"])
+        self.assertTrue(broad["allowed"])
 
 
 if __name__ == "__main__":

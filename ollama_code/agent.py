@@ -118,6 +118,11 @@ from ollama_code.controller.repair_protocol import (
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
     repair_decision_for_tool,
+    repair_spec_broad_repair_hint,
+    repair_spec_complete_plan,
+    repair_spec_mutation_decision,
+    repair_spec_required_proof_items,
+    repair_spec_strategy_class,
 )
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
 
@@ -1338,18 +1343,7 @@ class OllamaCodeAgent:
         return sorted(dict.fromkeys(fallback))
 
     def _repair_spec_required_proof_items(self, state: dict[str, Any]) -> list[str]:
-        items: list[str] = []
-        raw_items = state.get("required_proof_items")
-        if isinstance(raw_items, list):
-            items.extend(str(item).strip() for item in raw_items if str(item).strip())
-        if not items:
-            for obligation in list(state.get("unresolved_obligations") or []):
-                if not isinstance(obligation, dict):
-                    continue
-                label = str(obligation.get("label") or "").strip()
-                if label:
-                    items.append(label)
-        return list(dict.fromkeys(items))
+        return repair_spec_required_proof_items(state)
 
     def _repair_spec_strategy_class(
         self,
@@ -1358,18 +1352,11 @@ class OllamaCodeAgent:
         obligations: list[dict[str, Any]],
     ) -> str:
         path = str(target.get("path") or "").strip()
-        if any(
-            isinstance(item, dict)
-            and str(item.get("kind") or "").strip() == "feature_token"
-            and str(item.get("feature_class") or "").strip() in {"command", "flag"}
-            for item in obligations
-        ):
-            return "cli_surface_repair"
-        if str(target.get("symbol") or "").strip():
-            return "symbol_rewrite"
-        if path and self._failed_edit_recovery_allows_write_file({"path": path}):
-            return "file_repair"
-        return "cross_file_feature"
+        return repair_spec_strategy_class(
+            target=target,
+            obligations=obligations,
+            file_repair_allowed=bool(path and self._failed_edit_recovery_allows_write_file({"path": path})),
+        )
 
     def _repair_spec_behavior_regrounded(self, state: dict[str, Any]) -> bool:
         failure_event_index = int(state.get("failure_event_index", -1) or -1)
@@ -1392,20 +1379,7 @@ class OllamaCodeAgent:
         return False
 
     def _repair_spec_complete_plan(self, state: dict[str, Any]) -> str:
-        strategy = str(state.get("repair_strategy") or "").strip() or "file_repair"
-        path = str(state.get("path") or "").strip()
-        obligations = self._repair_spec_required_proof_items(state)
-        obligations_text = ", ".join(obligations[:4]) if obligations else "the unresolved feature obligations"
-        if strategy == "cli_surface_repair":
-            return (
-                f"Complete one command-surface repair in {path or 'the grounded CLI file'} so parser, behavior, docs, "
-                f"and proof land together for {obligations_text}."
-            )
-        if strategy == "symbol_rewrite":
-            return f"Complete one full-symbol repair that resolves {obligations_text} in the grounded source."
-        if strategy == "cross_file_feature":
-            return f"Complete one coordinated feature repair across the allowed files for {obligations_text}."
-        return f"Complete one broader file repair in {path or 'the grounded source file'} for {obligations_text}."
+        return repair_spec_complete_plan(state, required_proof_items=self._repair_spec_required_proof_items(state))
 
     def _repair_spec_mutation_allowed(
         self,
@@ -1414,31 +1388,20 @@ class OllamaCodeAgent:
         proposed_tool_name: str,
         proposed_arguments: dict[str, Any],
     ) -> tuple[bool, str]:
-        strategy = str(state.get("repair_strategy") or "").strip()
-        target_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
-        symbol = str(state.get("symbol") or "").strip()
         proposed_paths = [
             str(raw_path or "").strip().replace("\\", "/").lstrip("./")
             for raw_path in self._mutation_target_paths(proposed_arguments)
             if str(raw_path or "").strip()
         ]
-        if target_path and proposed_paths and any(path != target_path for path in proposed_paths):
-            return False, "Repair this grounded target before mutating unrelated files."
         repair_granularity = self._mutation_edit_granularity(name=proposed_tool_name, arguments=proposed_arguments)
-        if repair_granularity == "narrow":
-            return False, "Do not make another small speculative edit on the same failed target."
-        if strategy == "cli_surface_repair":
-            if proposed_tool_name == "write_file" and target_path and target_path in proposed_paths:
-                if self._failed_edit_recovery_allows_write_file(state):
-                    return True, ""
-            if symbol and proposed_tool_name in {"replace_symbol", "replace_symbols"}:
-                return True, ""
-            if not self._failed_edit_recovery_allows_write_file(state):
-                return False, "Use a grounded symbol-level repair here because the CLI file is too large for a safe full rewrite."
-            return False, "Use one broader direct repair on the grounded CLI surface before more validation."
-        if repair_granularity == "broad_file" and not self._failed_edit_recovery_allows_write_file(state):
-            return False, "Prefer a full-symbol replacement here; the grounded file is too large for a safe full-file rewrite fallback."
-        return True, ""
+        decision = repair_spec_mutation_decision(
+            state,
+            proposed_tool_name=proposed_tool_name,
+            proposed_paths=proposed_paths,
+            repair_granularity=repair_granularity,
+            file_repair_allowed=self._failed_edit_recovery_allows_write_file(state),
+        )
+        return bool(decision.get("allowed")), str(decision.get("reason") or "")
 
     def _repair_spec_has_followup_mutation(self, state: dict[str, Any]) -> bool:
         failure_event_index = int(state.get("failure_event_index", -1) or -1)
@@ -1539,17 +1502,10 @@ class OllamaCodeAgent:
         return bool(path and not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path))
 
     def _failed_edit_recovery_broad_repair_hint(self, state: dict[str, Any]) -> str:
-        strategy = str(state.get("repair_strategy") or "").strip()
-        if strategy == "cli_surface_repair":
-            path = str(state.get("path") or "").strip()
-            if path and self._failed_edit_recovery_allows_write_file(state):
-                return f"write_file on {path} so the CLI surface is repaired in one pass"
-            return "one grounded whole-surface CLI repair"
-        if str(state.get("symbol") or "").strip():
-            return "a full-symbol replacement"
-        if self._failed_edit_recovery_allows_write_file(state):
-            return "write_file or a full-symbol replacement"
-        return "a full-symbol replacement or another broader direct repair"
+        return repair_spec_broad_repair_hint(
+            state,
+            file_repair_allowed=self._failed_edit_recovery_allows_write_file(state),
+        )
 
     def _set_failed_edit_recovery_state(
         self,

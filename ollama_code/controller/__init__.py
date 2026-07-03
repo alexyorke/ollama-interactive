@@ -20,6 +20,11 @@ from .repair_protocol import (
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
     repair_decision_for_tool,
+    repair_spec_broad_repair_hint,
+    repair_spec_complete_plan,
+    repair_spec_mutation_decision,
+    repair_spec_required_proof_items,
+    repair_spec_strategy_class,
 )
 from .state import ControllerTurnState
 
@@ -43,6 +48,11 @@ __all__ = [
     "merge_request_obligations",
     "cli_patch_bundle_instruction",
     "repair_decision_for_tool",
+    "repair_spec_broad_repair_hint",
+    "repair_spec_complete_plan",
+    "repair_spec_mutation_decision",
+    "repair_spec_required_proof_items",
+    "repair_spec_strategy_class",
     "request_obligation_proof_status",
     "typed_cli_flag_protocol_enabled",
 ]

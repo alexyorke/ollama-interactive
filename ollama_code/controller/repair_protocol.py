@@ -315,6 +315,119 @@ def repair_decision_for_tool(
     }
 
 
+def repair_spec_required_proof_items(state: dict[str, Any]) -> list[str]:
+    items: list[str] = []
+    raw_items = state.get("required_proof_items")
+    if isinstance(raw_items, list):
+        items.extend(str(item).strip() for item in raw_items if str(item).strip())
+    if not items:
+        for obligation in list(state.get("unresolved_obligations") or []):
+            if not isinstance(obligation, dict):
+                continue
+            label = str(obligation.get("label") or "").strip()
+            if label:
+                items.append(label)
+    return list(dict.fromkeys(items))
+
+
+def repair_spec_strategy_class(
+    *,
+    target: dict[str, str],
+    obligations: list[dict[str, Any]],
+    file_repair_allowed: bool,
+) -> str:
+    if any(
+        isinstance(item, dict)
+        and str(item.get("kind") or "").strip() == "feature_token"
+        and str(item.get("feature_class") or "").strip() in {"command", "flag"}
+        for item in obligations
+    ):
+        return "cli_surface_repair"
+    if str(target.get("symbol") or "").strip():
+        return "symbol_rewrite"
+    if file_repair_allowed:
+        return "file_repair"
+    return "cross_file_feature"
+
+
+def repair_spec_complete_plan(
+    state: dict[str, Any],
+    *,
+    required_proof_items: list[str] | None = None,
+) -> str:
+    strategy = str(state.get("repair_strategy") or "").strip() or "file_repair"
+    path = str(state.get("path") or "").strip()
+    obligations = list(required_proof_items or repair_spec_required_proof_items(state))
+    obligations_text = ", ".join(obligations[:4]) if obligations else "the unresolved feature obligations"
+    if strategy == "cli_surface_repair":
+        return (
+            f"Complete one command-surface repair in {path or 'the grounded CLI file'} so parser, behavior, docs, "
+            f"and proof land together for {obligations_text}."
+        )
+    if strategy == "symbol_rewrite":
+        return f"Complete one full-symbol repair that resolves {obligations_text} in the grounded source."
+    if strategy == "cross_file_feature":
+        return f"Complete one coordinated feature repair across the allowed files for {obligations_text}."
+    return f"Complete one broader file repair in {path or 'the grounded source file'} for {obligations_text}."
+
+
+def repair_spec_broad_repair_hint(
+    state: dict[str, Any],
+    *,
+    file_repair_allowed: bool,
+) -> str:
+    strategy = str(state.get("repair_strategy") or "").strip()
+    if strategy == "cli_surface_repair":
+        path = str(state.get("path") or "").strip()
+        if path and file_repair_allowed:
+            return f"write_file on {path} so the CLI surface is repaired in one pass"
+        return "one grounded whole-surface CLI repair"
+    if str(state.get("symbol") or "").strip():
+        return "a full-symbol replacement"
+    if file_repair_allowed:
+        return "write_file or a full-symbol replacement"
+    return "a full-symbol replacement or another broader direct repair"
+
+
+def repair_spec_mutation_decision(
+    state: dict[str, Any],
+    *,
+    proposed_tool_name: str,
+    proposed_paths: list[str],
+    repair_granularity: str,
+    file_repair_allowed: bool,
+) -> dict[str, Any]:
+    strategy = str(state.get("repair_strategy") or "").strip()
+    target_path = _normalize_path(str(state.get("path") or ""))
+    symbol = str(state.get("symbol") or "").strip()
+    normalized_paths = [_normalize_path(path) for path in proposed_paths if str(path or "").strip()]
+    if target_path and normalized_paths and any(path != target_path for path in normalized_paths):
+        return {"allowed": False, "reason": "Repair this grounded target before mutating unrelated files."}
+    if repair_granularity == "narrow":
+        return {"allowed": False, "reason": "Do not make another small speculative edit on the same failed target."}
+    if strategy == "cli_surface_repair":
+        if proposed_tool_name == "write_file" and target_path and target_path in normalized_paths:
+            if file_repair_allowed:
+                return {"allowed": True, "reason": ""}
+        if symbol and proposed_tool_name in {"replace_symbol", "replace_symbols"}:
+            return {"allowed": True, "reason": ""}
+        if not file_repair_allowed:
+            return {
+                "allowed": False,
+                "reason": "Use a grounded symbol-level repair here because the CLI file is too large for a safe full rewrite.",
+            }
+        return {
+            "allowed": False,
+            "reason": "Use one broader direct repair on the grounded CLI surface before more validation.",
+        }
+    if repair_granularity == "broad_file" and not file_repair_allowed:
+        return {
+            "allowed": False,
+            "reason": "Prefer a full-symbol replacement here; the grounded file is too large for a safe full-file rewrite fallback.",
+        }
+    return {"allowed": True, "reason": ""}
+
+
 def cli_patch_bundle_instruction(state: RepairProtocolState) -> str | None:
     plan = state.patch_plan
     if plan is None or plan.strategy != "cli_patch_bundle":
@@ -347,3 +460,7 @@ def _is_narrow_cli_mutation(tool_name: str, arguments: dict[str, Any]) -> bool:
     if tool_name == "edit_intent":
         return True
     return False
+
+
+def _normalize_path(path: str) -> str:
+    return str(path or "").strip().replace("\\", "/").lstrip("./")
