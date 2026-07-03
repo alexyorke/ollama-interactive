@@ -1,5 +1,6 @@
 from .feature_delivery import (
     CliFeatureCapabilities,
+    client_allows_preemptive_mechanical_repair,
     cli_feature_capabilities,
     cli_proof_commands,
     cli_proof_command_argvs,
@@ -10,6 +11,7 @@ from .feature_delivery import (
     cli_test_additions,
     cli_test_update_plan,
     derive_request_obligations,
+    effective_repair_test_command,
     merge_request_obligations,
     mechanical_obligation_repair_failed_for,
     normalized_test_or_source_stem,
@@ -23,6 +25,7 @@ from .feature_delivery import (
     select_preemptive_repair_source,
     select_preemptive_repair_test,
     spec_guided_repair_has_actionable_spec,
+    spec_guided_repair_enabled,
     typed_cli_flag_protocol_enabled,
 )
 from .edit_policy import (
@@ -159,6 +162,7 @@ from .tool_payload_policy import normalize_payload
 
 __all__ = [
     "CliFeatureCapabilities",
+    "client_allows_preemptive_mechanical_repair",
     "ControllerTurnState",
     "FailedAttempt",
     "GroundedTarget",
@@ -277,6 +281,7 @@ __all__ = [
     "cli_test_update_plan",
     "build_repair_protocol_state",
     "derive_request_obligations",
+    "effective_repair_test_command",
     "failed_test_repair_retry_message",
     "failed_test_still_needs_repair",
     "merge_request_obligations",
@@ -291,6 +296,7 @@ __all__ = [
     "select_preemptive_repair_source",
     "select_preemptive_repair_test",
     "spec_guided_repair_has_actionable_spec",
+    "spec_guided_repair_enabled",
     "cli_patch_bundle_instruction",
     "repair_decision_for_tool",
     "repair_spec_broad_repair_hint",

@@ -2,6 +2,7 @@ import ast
 import unittest
 
 from ollama_code.controller.feature_delivery import (
+    client_allows_preemptive_mechanical_repair,
     cli_feature_capabilities,
     cli_proof_commands,
     cli_proof_command_argvs,
@@ -12,6 +13,7 @@ from ollama_code.controller.feature_delivery import (
     cli_test_additions,
     cli_test_update_plan,
     derive_request_obligations,
+    effective_repair_test_command,
     mechanical_obligation_repair_failed_for,
     normalized_test_or_source_stem,
     preemptive_repair_source_score,
@@ -24,6 +26,7 @@ from ollama_code.controller.feature_delivery import (
     select_preemptive_repair_source,
     select_preemptive_repair_test,
     spec_guided_repair_has_actionable_spec,
+    spec_guided_repair_enabled,
     typed_cli_flag_protocol_enabled,
 )
 
@@ -160,6 +163,56 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         self.assertTrue(request_likely_import_repair("Fix the import bug in this package.", source))
         self.assertFalse(request_likely_import_repair("Fix the logic bug in this package.", source))
         self.assertFalse(request_likely_import_repair("Fix the import bug in this package.", "def build():\n    return 1\n"))
+
+    def test_spec_guided_repair_enablement_policy(self) -> None:
+        self.assertTrue(spec_guided_repair_enabled(disable_spec_guided_repair=False))
+        self.assertFalse(spec_guided_repair_enabled(disable_spec_guided_repair=True))
+        self.assertTrue(
+            client_allows_preemptive_mechanical_repair(
+                disable_spec_guided_repair=False,
+                scripted_responses=None,
+            )
+        )
+        self.assertTrue(
+            client_allows_preemptive_mechanical_repair(
+                disable_spec_guided_repair=False,
+                scripted_responses=[],
+            )
+        )
+        self.assertFalse(
+            client_allows_preemptive_mechanical_repair(
+                disable_spec_guided_repair=False,
+                scripted_responses=["scripted"],
+            )
+        )
+        self.assertFalse(
+            client_allows_preemptive_mechanical_repair(
+                disable_spec_guided_repair=True,
+                scripted_responses=[],
+            )
+        )
+
+    def test_effective_repair_test_command_prefers_recovered_then_explicit_then_default(self) -> None:
+        self.assertEqual(
+            effective_repair_test_command(
+                failed_run_test_result={"recovered": True, "command": "python -m pytest tests", "original_command": "pytest"},
+                run_test_arguments={"command": "pytest -q"},
+                default_test_command="python -m unittest",
+            ),
+            "python -m pytest tests",
+        )
+        self.assertEqual(
+            effective_repair_test_command(
+                failed_run_test_result={"recovered": True, "command": "pytest", "original_command": "pytest"},
+                run_test_arguments={"command": "pytest -q"},
+                default_test_command="python -m unittest",
+            ),
+            "pytest -q",
+        )
+        self.assertEqual(
+            effective_repair_test_command(default_test_command="python -m unittest"),
+            "python -m unittest",
+        )
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:
         events = [

@@ -49,6 +49,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - CLI-surface repair source eligibility and source/test scoring now live in `ollama_code.controller.feature_delivery`; `agent.py` supplies only workspace discovery and file contents.
 - CLI-surface repair candidate selection now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only scored candidates.
 - Preemptive spec-guided repair source/test ranking and tie-breaking now live in `ollama_code.controller.feature_delivery`; `agent.py` supplies only discovered files, parsed counts, and stub counts.
+- Spec-guided repair enablement and effective repair-test command selection now live in `ollama_code.controller.feature_delivery`; `agent.py` supplies only runtime flags and defaults.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.

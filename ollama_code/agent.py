@@ -86,6 +86,7 @@ from ollama_code.agent_protocol import (
 from ollama_code.controller import (
     NavigationValidationController,
     NavigationValidationTurn,
+    client_allows_preemptive_mechanical_repair as feature_client_allows_preemptive_mechanical_repair,
     cli_proof_commands as feature_cli_proof_commands,
     cli_readme_update_plan as feature_cli_readme_update_plan,
     cli_surface_repair_candidate_score as feature_cli_surface_repair_candidate_score,
@@ -93,6 +94,7 @@ from ollama_code.controller import (
     cli_test_update_plan as feature_cli_test_update_plan,
     clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
+    effective_repair_test_command as feature_effective_repair_test_command,
     final_acknowledges_missing_path as controller_final_acknowledges_missing_path,
     final_claims_file_mutation as controller_final_claims_file_mutation,
     final_claims_path_exists as controller_final_claims_path_exists,
@@ -192,6 +194,7 @@ from ollama_code.controller import (
     select_preemptive_repair_source as feature_select_preemptive_repair_source,
     select_preemptive_repair_test as feature_select_preemptive_repair_test,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
+    spec_guided_repair_enabled as feature_spec_guided_repair_enabled,
     successful_tool_call_already_satisfied as controller_successful_tool_call_already_satisfied,
     symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
     symbol_return_update_spec as controller_symbol_return_update_spec,
@@ -9345,17 +9348,17 @@ class OllamaCodeAgent:
         return source_rel, test_rel
 
     def _client_allows_preemptive_mechanical_repair(self) -> bool:
-        if self.disable_spec_guided_repair:
-            return False
-        scripted_responses = getattr(self.client, "responses", None)
-        return not isinstance(scripted_responses, list) or not scripted_responses
+        return feature_client_allows_preemptive_mechanical_repair(
+            disable_spec_guided_repair=self.disable_spec_guided_repair,
+            scripted_responses=getattr(self.client, "responses", None),
+        )
 
     def _explicit_guard_profile_selected(self) -> bool:
         profile = active_feature_profile()
         return profile in {"contract-guards", "trajectory-guards"}
 
     def _spec_guided_repair_enabled(self) -> bool:
-        return not self.disable_spec_guided_repair
+        return feature_spec_guided_repair_enabled(disable_spec_guided_repair=self.disable_spec_guided_repair)
 
     def _effective_repair_test_command(
         self,
@@ -9363,15 +9366,11 @@ class OllamaCodeAgent:
         failed_run_test_result: dict[str, Any] | None = None,
         run_test_arguments: dict[str, Any] | None = None,
     ) -> str:
-        if isinstance(failed_run_test_result, dict) and failed_run_test_result.get("recovered") is True:
-            recovered_command = str(failed_run_test_result.get("command") or "").strip()
-            original_command = str(failed_run_test_result.get("original_command") or "").strip()
-            if recovered_command and recovered_command != original_command:
-                return recovered_command
-        raw_command = (run_test_arguments or {}).get("command")
-        if isinstance(raw_command, str) and raw_command.strip():
-            return raw_command.strip()
-        return str(self.tools.default_test_command or "").strip()
+        return feature_effective_repair_test_command(
+            failed_run_test_result=failed_run_test_result,
+            run_test_arguments=run_test_arguments,
+            default_test_command=str(self.tools.default_test_command or ""),
+        )
 
     def _repair_state_spec_guided_paths(
         self,

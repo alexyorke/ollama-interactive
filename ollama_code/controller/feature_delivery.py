@@ -144,6 +144,37 @@ def request_likely_import_repair(request_text: str, source_text: str) -> bool:
     return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
 
 
+def spec_guided_repair_enabled(*, disable_spec_guided_repair: bool) -> bool:
+    return not disable_spec_guided_repair
+
+
+def client_allows_preemptive_mechanical_repair(
+    *,
+    disable_spec_guided_repair: bool,
+    scripted_responses: object,
+) -> bool:
+    if disable_spec_guided_repair:
+        return False
+    return not isinstance(scripted_responses, list) or not scripted_responses
+
+
+def effective_repair_test_command(
+    *,
+    failed_run_test_result: dict[str, Any] | None = None,
+    run_test_arguments: dict[str, Any] | None = None,
+    default_test_command: str = "",
+) -> str:
+    if isinstance(failed_run_test_result, dict) and failed_run_test_result.get("recovered") is True:
+        recovered_command = str(failed_run_test_result.get("command") or "").strip()
+        original_command = str(failed_run_test_result.get("original_command") or "").strip()
+        if recovered_command and recovered_command != original_command:
+            return recovered_command
+    raw_command = (run_test_arguments or {}).get("command")
+    if isinstance(raw_command, str) and raw_command.strip():
+        return raw_command.strip()
+    return str(default_test_command or "").strip()
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,
