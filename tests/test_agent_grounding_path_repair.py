@@ -526,6 +526,248 @@ class AgentGroundingPathRepairTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Use the code outline for src/core.py.", feedback)
 
+    def test_context_planner_does_not_auto_outline_ambiguous_list_files_code_paths(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def app():\n    return 'app'\n", encoding="utf-8")
+        (root / "worker.py").write_text("def worker():\n    return 'worker'\n", encoding="utf-8")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=ToolExecutor(root, approval_mode="auto"), model="fake-model", debate_enabled=False)
+        successful_tool_results = [
+            {
+                "name": "list_files",
+                "arguments": {"path": "."},
+                "result": {"ok": True, "tool": "list_files", "path": ".", "output": "app.py\nworker.py\nREADME.md"},
+            }
+        ]
+
+        self.assertFalse(
+            agent._context_planner_blocks(
+                name="read_file",
+                tool_calls=[],
+                latest_run_test_failed=False,
+                successful_tool_results=successful_tool_results,
+            )
+        )
+        self.assertIsNone(agent._context_planner_probe(successful_tool_results=successful_tool_results, forbidden_tool_names=set()))
+
+    def test_context_planner_auto_outlines_recent_source_before_more_broad_reads(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"business logic","path":"src/core.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped is the only function in src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect src/core.py and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "wrapped is the only function in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["read_file", "search", "code_outline"])
+        self.assertTrue(any("Use the code outline for src/core.py." in message["content"] for message in agent.messages if message["role"] == "user"))
+
+    def test_context_planner_auto_reads_grounded_implementation_target_symbol_before_more_broad_reads(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        (root / "tests" / "test_pkg.py").write_text(
+            "import unittest\n"
+            "from src.core import wrapped\n\n"
+            "class PackageTests(unittest.TestCase):\n"
+            "    def test_wrapped(self):\n"
+            "        self.assertEqual(wrapped(), 'ok')\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":4}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":4}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect tests/test_pkg.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("find_implementation_target"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertIsNone(tools.execute_counts.get("search_symbols"))
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:5], ["read_file", "search", "find_implementation_target", "read_symbol", "read_file"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the grounded implementation target(s) src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_uses_recent_identifier_to_pick_symbol_from_grounded_implementation_target(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "src" / "core.py").write_text(
+            "def helper():\n    return 'helper'\n\n"
+            "def wrapped():\n    return 'ok'\n",
+            encoding="utf-8",
+        )
+        (root / "tests" / "test_pkg.py").write_text(
+            "import unittest\n"
+            "from src.core import helper, wrapped\n\n"
+            "class PackageTests(unittest.TestCase):\n"
+            "    def test_wrapped(self):\n"
+            "        self.assertEqual(wrapped(), 'ok')\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":5}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"tests/test_pkg.py","start":1,"end":5}}',
+                '{"type":"final","message":"wrapped is defined in src/core.py."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect tests/test_pkg.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped is defined in src/core.py.")
+        self.assertEqual(tools.execute_counts.get("find_implementation_target"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertIsNone(tools.execute_counts.get("search_symbols"))
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_file", "search", "find_implementation_target", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the grounded implementation target(s) src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_auto_reads_single_outlined_symbol_before_more_broad_reads(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"business logic","path":"src/core.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect src/core.py and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_file", "search", "code_outline", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the code outline for src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_auto_reads_single_outlined_symbol_after_narrowed_repo_search_without_source_context(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("# business logic\n\ndef wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"business logic"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"business logic"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and summarize the relevant implementation structure.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("code_outline"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["search", "code_outline", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the code outline for src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_auto_reads_symbol_match_before_more_broad_reads(self) -> None:
+        root = self._workspace_scratch()
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped","path":"src/core.py"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"src/core.py","start":1,"end":4}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect src/core.py and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        self.assertEqual(tools.execute_counts.get("code_outline"), None)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:4], ["read_file", "search", "search_symbols", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
+    def test_context_planner_auto_reads_symbol_match_without_source_context_after_repo_search(self) -> None:
+        root = self._workspace_scratch()
+        (root / "README.md").write_text("overview\n", encoding="utf-8")
+        (root / "src").mkdir()
+        (root / "src" / "core.py").write_text("def wrapped():\n    return 'ok'\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"search","arguments":{"query":"wrapped"}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"wrapped returns ok."}',
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Inspect the repo and find the wrapped implementation.")
+
+        self.assertEqual(result.message, "wrapped returns ok.")
+        self.assertEqual(tools.execute_counts.get("search_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("read_symbol"), 1)
+        tool_calls = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        self.assertEqual(tool_calls[:3], ["search", "search_symbols", "read_symbol"])
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Use the symbol-level matches for wrapped in src/core.py.", feedback)
+        self.assertIn("Use the grounded symbol wrapped in src/core.py. Continue from that narrower symbol target or answer from current evidence.", feedback)
+
     def test_pathless_mutation_grounding_probe_prefers_unique_symbol_match_among_multiple_explicit_sources(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
