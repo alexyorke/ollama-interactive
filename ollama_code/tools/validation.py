@@ -229,6 +229,43 @@ def python_typechecker_targets(
     return file_targets
 
 
+def lint_typecheck_target_plan(
+    *,
+    python_validator_files: Iterable[str],
+    python_validator_scopes: Iterable[str],
+    typechecker_configured: bool,
+    path_looks_like_test: Callable[[str], bool],
+    limit: int = 100,
+) -> dict[str, Any]:
+    file_set = {str(item).replace("\\", "/") for item in python_validator_files if str(item).strip()}
+    scope_set = {str(item).replace("\\", "/") for item in python_validator_scopes if str(item).strip()}
+    validator_targets = python_validation_targets(
+        discovered_files=file_set,
+        requested_scopes=scope_set,
+        limit=limit,
+    )
+    collapsed_scopes = collapse_validation_targets(scope_set, limit=limit)
+    typechecker_targets = python_typechecker_targets(
+        discovered_files=file_set,
+        requested_scopes=scope_set,
+        limit=limit,
+    )
+    skipped_reason = ""
+    if typechecker_targets and not typechecker_configured:
+        if "." not in collapsed_scopes:
+            typechecker_targets = []
+            skipped_reason = "No pyright/basedpyright config found for focused scope; skipped cold typechecker startup."
+        elif file_set and all(path_looks_like_test(label) for label in file_set):
+            typechecker_targets = []
+            skipped_reason = "No pyright/basedpyright config found for test-only workspace scope; skipped cold typechecker startup."
+    return {
+        "validator_targets": validator_targets,
+        "typechecker_targets": typechecker_targets,
+        "typechecker_skipped_reason": skipped_reason,
+        "collapsed_python_scopes": collapsed_scopes,
+    }
+
+
 def lint_typecheck_cache_key(
     *,
     workspace_root: Path,

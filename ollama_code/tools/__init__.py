@@ -115,6 +115,7 @@ from ollama_code.tools.validation import (
     ini_has_section,
     lint_typecheck_cache_key,
     lint_typecheck_file_analysis,
+    lint_typecheck_target_plan,
     python_typechecker_configured,
     python_typechecker_targets,
     python_validation_targets,
@@ -11162,27 +11163,16 @@ import string
                 if base_has_python:
                     python_validator_scopes.add(self.relative_label(base))
             phase_timings_ms["scan_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
-            validator_targets = self._python_validation_targets(
-                discovered_files=python_validator_files,
-                requested_scopes=python_validator_scopes,
+            target_plan = lint_typecheck_target_plan(
+                python_validator_files=python_validator_files,
+                python_validator_scopes=python_validator_scopes,
+                typechecker_configured=self._python_typechecker_configured(),
+                path_looks_like_test=lambda label: self._path_looks_like_test(Path(label)),
                 limit=100,
             )
-            collapsed_python_scopes = self._collapse_validation_targets(python_validator_scopes, limit=100)
-            typechecker_targets = self._python_typechecker_targets(
-                discovered_files=python_validator_files,
-                requested_scopes=python_validator_scopes,
-                limit=100,
-            )
-            typechecker_configured = self._python_typechecker_configured()
-            if typechecker_targets and not typechecker_configured:
-                if "." not in collapsed_python_scopes:
-                    typechecker_targets = []
-                    typechecker_skipped_reason = "No pyright/basedpyright config found for focused scope; skipped cold typechecker startup."
-                elif python_validator_files and all(self._path_looks_like_test(Path(label)) for label in python_validator_files):
-                    typechecker_targets = []
-                    typechecker_skipped_reason = (
-                        "No pyright/basedpyright config found for test-only workspace scope; skipped cold typechecker startup."
-                    )
+            validator_targets = list(target_plan["validator_targets"])
+            typechecker_targets = list(target_plan["typechecker_targets"])
+            typechecker_skipped_reason = str(target_plan["typechecker_skipped_reason"])
             ruff_path = self._which("ruff") if validator_targets else None
             typechecker_command = (
                 self._python_tool_command("basedpyright", "basedpyright", "--level", "error")

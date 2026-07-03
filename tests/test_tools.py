@@ -18,7 +18,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
-from ollama_code.tools.validation import lint_typecheck_file_analysis
+from ollama_code.tools.validation import lint_typecheck_file_analysis, lint_typecheck_target_plan
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -5510,6 +5510,30 @@ def double(value: int) -> int:
         self.assertIsNone(second["diagnostic"])
         self.assertEqual(third["diagnostic"], "changed")
         self.assertEqual(len(calls), 2)
+
+    def test_lint_typecheck_target_plan_skips_unconfigured_focused_typecheck(self) -> None:
+        plan = lint_typecheck_target_plan(
+            python_validator_files={"src/one.py", "src/two.py"},
+            python_validator_scopes={"src"},
+            typechecker_configured=False,
+            path_looks_like_test=lambda _label: False,
+        )
+
+        self.assertEqual(plan["validator_targets"], ["src/one.py", "src/two.py"])
+        self.assertEqual(plan["typechecker_targets"], [])
+        self.assertIn("focused scope", plan["typechecker_skipped_reason"])
+
+    def test_lint_typecheck_target_plan_skips_unconfigured_test_only_workspace(self) -> None:
+        plan = lint_typecheck_target_plan(
+            python_validator_files={"tests/test_sample.py"},
+            python_validator_scopes={"."},
+            typechecker_configured=False,
+            path_looks_like_test=lambda label: label.startswith("tests/"),
+        )
+
+        self.assertEqual(plan["validator_targets"], ["."])
+        self.assertEqual(plan["typechecker_targets"], [])
+        self.assertIn("test-only workspace scope", plan["typechecker_skipped_reason"])
 
     def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
         with self._temp_files_tools({"script.sh": "if true; then\n  echo ok\n"}) as (_root, tools):
