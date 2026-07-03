@@ -253,6 +253,7 @@ from ollama_code.controller.repair_protocol import (
     recovery_target_from_mutation as controller_recovery_target_from_mutation,
     recovery_target_matches as controller_recovery_target_matches,
     repair_decision_for_tool,
+    repair_protocol_event_payloads,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths as controller_repair_spec_behavior_paths,
     repair_spec_behavior_regrounded as controller_repair_spec_behavior_regrounded,
@@ -1574,26 +1575,8 @@ class OllamaCodeAgent:
         phase: str,
         round_number: int | None = None,
     ) -> None:
-        payload = state.to_event_payload()
-        self._record_event(
-            "task_state",
-            phase=phase,
-            rounds=round_number,
-            requested_deliverables=payload["requested_deliverables"],
-            grounded_targets=payload["grounded_targets"],
-            failed_attempts=payload["failed_attempts"],
-            proof_obligations=payload["proof_obligations"],
-            repair_strategy=payload["repair_strategy"],
-        )
-        self._record_event(
-            "allowed_next_actions",
-            phase=phase,
-            rounds=round_number,
-            actions=payload["allowed_next_actions"],
-            blocked_until=payload["validation_plan"]["blocked_until"],
-        )
-        if payload.get("patch_plan") is not None:
-            self._record_event("patch_plan", phase=phase, rounds=round_number, **payload["patch_plan"])
+        for event_type, payload in repair_protocol_event_payloads(state, phase=phase, round_number=round_number):
+            self._record_event(event_type, **payload)
 
     def _repair_protocol_instruction(
         self,

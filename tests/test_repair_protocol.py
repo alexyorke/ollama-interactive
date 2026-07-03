@@ -14,6 +14,7 @@ from ollama_code.controller.repair_protocol import (
     recovery_target_from_mutation,
     recovery_target_matches,
     repair_decision_for_tool,
+    repair_protocol_event_payloads,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths,
     repair_spec_behavior_regrounded,
@@ -51,6 +52,42 @@ class RepairProtocolTests(unittest.TestCase):
         decision = repair_decision_for_tool(state, tool_name="run_test", arguments={"command": "python -m unittest"})
         self.assertFalse(decision["allowed"])
         self.assertEqual(decision["action"], "validation")
+
+    def test_repair_protocol_event_payloads_include_task_allowed_and_patch_events(self) -> None:
+        obligations = [
+            {"id": "code-change", "kind": "code_change", "label": "implement the requested code change"},
+            {"id": "flag:--due-before", "kind": "feature_token", "label": 'prove the "--due-before" flag exists', "token": "--due-before", "feature_class": "flag"},
+        ]
+        state = build_repair_protocol_state(
+            obligations=obligations,
+            obligation_statuses=[],
+            successful_tool_results=[
+                {"name": "read_file", "arguments": {"path": "task_cli.py"}, "result": {"ok": True, "path": "task_cli.py"}},
+            ],
+            recovery_states=[],
+        )
+
+        events = repair_protocol_event_payloads(state, phase="pre_model", round_number=2)
+
+        self.assertEqual([name for name, _payload in events], ["task_state", "allowed_next_actions", "patch_plan"])
+        self.assertEqual(events[0][1]["phase"], "pre_model")
+        self.assertEqual(events[0][1]["rounds"], 2)
+        self.assertEqual(events[0][1]["repair_strategy"], "cli_patch_bundle")
+        self.assertIn("implementation", events[1][1]["actions"])
+        self.assertEqual(events[2][1]["strategy"], "cli_patch_bundle")
+
+    def test_repair_protocol_event_payloads_omit_patch_event_when_no_patch_plan_exists(self) -> None:
+        state = build_repair_protocol_state(
+            obligations=[{"id": "test-run", "kind": "test_run", "label": "run tests"}],
+            obligation_statuses=[],
+            successful_tool_results=[],
+            recovery_states=[],
+        )
+
+        events = repair_protocol_event_payloads(state, phase="start")
+
+        self.assertEqual([name for name, _payload in events], ["task_state", "allowed_next_actions"])
+        self.assertEqual(events[1][1]["blocked_until"], [])
 
     def test_cli_bundle_allows_source_test_and_doc_mutations_before_proof(self) -> None:
         obligations = [

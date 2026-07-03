@@ -262,6 +262,41 @@ def build_repair_protocol_state(
     )
 
 
+def repair_protocol_event_payloads(
+    state: RepairProtocolState,
+    *,
+    phase: str,
+    round_number: int | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    payload = state.to_event_payload()
+    events: list[tuple[str, dict[str, Any]]] = [
+        (
+            "task_state",
+            {
+                "phase": phase,
+                "rounds": round_number,
+                "requested_deliverables": payload["requested_deliverables"],
+                "grounded_targets": payload["grounded_targets"],
+                "failed_attempts": payload["failed_attempts"],
+                "proof_obligations": payload["proof_obligations"],
+                "repair_strategy": payload["repair_strategy"],
+            },
+        ),
+        (
+            "allowed_next_actions",
+            {
+                "phase": phase,
+                "rounds": round_number,
+                "actions": payload["allowed_next_actions"],
+                "blocked_until": payload["validation_plan"]["blocked_until"],
+            },
+        ),
+    ]
+    if payload.get("patch_plan") is not None:
+        events.append(("patch_plan", {"phase": phase, "rounds": round_number, **payload["patch_plan"]}))
+    return events
+
+
 def next_action_for_tool(tool_name: str, arguments: dict[str, Any]) -> str:
     if tool_name in {"read_file", "read_symbol", "code_outline", "search", "search_symbols", "find_implementation_target"}:
         return "grounding"
