@@ -18,7 +18,12 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
-from ollama_code.tools.validation import lint_typecheck_file_analysis, lint_typecheck_scan_paths, lint_typecheck_target_plan
+from ollama_code.tools.validation import (
+    lint_typecheck_file_analysis,
+    lint_typecheck_run_validators,
+    lint_typecheck_scan_paths,
+    lint_typecheck_target_plan,
+)
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -5561,6 +5566,86 @@ def double(value: int) -> int:
         self.assertEqual(result["python_validator_files"], {"src/app.py"})
         self.assertEqual(result["python_validator_scopes"], {"src"})
         self.assertEqual(result["shell_targets"], ["src/script.sh"])
+
+    def test_lint_typecheck_run_validators_collects_commands_and_diagnostics(self) -> None:
+        calls: list[list[str]] = []
+        timings = iter([1.0, 1.01, 2.0, 2.03, 3.0, 3.02, 4.0])
+
+        def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            calls.append(list(command))
+            return subprocess.CompletedProcess(args=command, returncode=1 if command[0] == "ruff" else 0, stdout="ruff out", stderr="")
+
+        diagnostics: list[str] = []
+        commands: list[str] = []
+        result = lint_typecheck_run_validators(
+            workspace_root=Path("."),
+            timeout=5,
+            checked=["app.py", "script.sh"],
+            diagnostics=diagnostics,
+            validator_commands=commands,
+            validator_targets=["app.py"],
+            typechecker_targets=["src"],
+            typechecker_skipped_reason="",
+            shell_targets=["script.sh"],
+            phase_timings_ms={"scan_ms": 0.0, "ruff_ms": 0.0, "typecheck_ms": 0.0, "shell_ms": 0.0},
+            ruff_path="ruff",
+            typechecker_command=["pyright", "--level", "error"],
+            bash_path="bash",
+            run_process=fake_run,
+            collect_process_output=lambda completed: str(completed.stdout),
+            collect_timeout_output=lambda _exc: "(no output)",
+            timeout_command_text=lambda raw: " ".join(raw),
+            command_to_text=lambda argv: " ".join(argv),
+            truncate_text=lambda text: text,
+            timer=lambda: next(timings),
+        )
+
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(commands, ["ruff check --no-cache app.py", "pyright --level error src", "bash -n script.sh"])
+        self.assertEqual(diagnostics, ["ruff out"])
+        self.assertEqual(calls, [["ruff", "check", "--no-cache", "app.py"], ["pyright", "--level", "error", "src"], ["bash", "-n", "script.sh"]])
+        self.assertGreater(result["phase_timings_ms"]["ruff_ms"], 0.0)
+        self.assertGreater(result["phase_timings_ms"]["typecheck_ms"], 0.0)
+        self.assertGreater(result["phase_timings_ms"]["shell_ms"], 0.0)
+
+    def test_lint_typecheck_run_validators_returns_timeout_payload(self) -> None:
+        timings = iter([1.0, 1.25, 1.5])
+
+        def timeout_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(command, 5, output="partial", stderr="")
+
+        diagnostics = ["existing"]
+        commands: list[str] = []
+        result = lint_typecheck_run_validators(
+            workspace_root=Path("."),
+            timeout=5,
+            checked=["app.py"],
+            diagnostics=diagnostics,
+            validator_commands=commands,
+            validator_targets=["app.py"],
+            typechecker_targets=[],
+            typechecker_skipped_reason="",
+            shell_targets=[],
+            phase_timings_ms={"scan_ms": 0.0, "ruff_ms": 0.0, "typecheck_ms": 0.0, "shell_ms": 0.0},
+            ruff_path="ruff",
+            typechecker_command=None,
+            bash_path=None,
+            run_process=timeout_run,
+            collect_process_output=lambda _completed: "",
+            collect_timeout_output=lambda _exc: "partial",
+            timeout_command_text=lambda raw: " ".join(raw),
+            command_to_text=lambda argv: " ".join(argv),
+            truncate_text=lambda text: text,
+            timer=lambda: next(timings),
+        )
+
+        self.assertTrue(result["timed_out"])
+        payload = result["result"]
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_class"], "timeout")
+        self.assertEqual(payload["command"], "ruff check --no-cache app.py")
+        self.assertIn("existing", payload["output"])
+        self.assertIn("partial", payload["output"])
 
     def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
         with self._temp_files_tools({"script.sh": "if true; then\n  echo ok\n"}) as (_root, tools):

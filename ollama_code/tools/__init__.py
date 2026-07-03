@@ -115,6 +115,7 @@ from ollama_code.tools.validation import (
     ini_has_section,
     lint_typecheck_cache_key,
     lint_typecheck_file_analysis,
+    lint_typecheck_run_validators,
     lint_typecheck_scan_paths,
     lint_typecheck_target_plan,
     python_typechecker_configured,
@@ -11189,40 +11190,30 @@ import string
                 result["typecheck_ms"] = 0.0
                 result["shell_ms"] = 0.0
                 return result
-            if validator_targets and ruff_path:
-                target_args = validator_targets
-                command = ["ruff", "check", "--no-cache", *target_args]
-                validator_commands.append(command_to_text(tuple(command)))
-                active_phase = "ruff_ms"
-                active_phase_started = time.perf_counter()
-                completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
-                phase_timings_ms["ruff_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
-                if completed.returncode != 0:
-                    diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
-            if typechecker_targets and typechecker_command:
-                target_args = typechecker_targets
-                command = [*typechecker_command, *target_args]
-                validator_commands.append(command_to_text(tuple(command)))
-                active_phase = "typecheck_ms"
-                active_phase_started = time.perf_counter()
-                completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
-                phase_timings_ms["typecheck_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
-                if completed.returncode != 0:
-                    diagnostics.append(self._truncate_text(self._collect_process_output(completed), limit=1200))
-            if bash:
-                for rel in shell_targets[:100]:
-                    command = [bash, "-n", rel]
-                    validator_commands.append(command_to_text(("bash", "-n", rel)))
-                    active_phase = "shell_ms"
-                    active_phase_started = time.perf_counter()
-                    completed = self._run_process(command, cwd=self.workspace_root, timeout=timeout, shell=False)
-                    phase_timings_ms["shell_ms"] = round(
-                        float(phase_timings_ms["shell_ms"]) + ((time.perf_counter() - active_phase_started) * 1000),
-                        3,
-                    )
-                    if completed.returncode != 0:
-                        output = self._collect_process_output(completed) or f"{rel}: bash -n failed"
-                        diagnostics.append(self._truncate_text(output, limit=1200))
+            runner = lint_typecheck_run_validators(
+                workspace_root=self.workspace_root,
+                timeout=timeout,
+                checked=checked,
+                diagnostics=diagnostics,
+                validator_commands=validator_commands,
+                validator_targets=validator_targets,
+                typechecker_targets=typechecker_targets,
+                typechecker_skipped_reason=typechecker_skipped_reason,
+                shell_targets=shell_targets,
+                phase_timings_ms=phase_timings_ms,
+                ruff_path=ruff_path,
+                typechecker_command=typechecker_command,
+                bash_path=bash,
+                run_process=self._run_process,
+                collect_process_output=self._collect_process_output,
+                collect_timeout_output=self._collect_timeout_output,
+                timeout_command_text=self._timeout_command_text,
+                command_to_text=command_to_text,
+                truncate_text=lambda text: self._truncate_text(text, limit=1200),
+                timer=time.perf_counter,
+            )
+            if runner.get("timed_out"):
+                return dict(runner["result"])
         except subprocess.TimeoutExpired as exc:
             phase_timings_ms[active_phase] = round(
                 float(phase_timings_ms.get(active_phase, 0.0) or 0.0) + ((time.perf_counter() - active_phase_started) * 1000),

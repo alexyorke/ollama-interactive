@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Callable, Iterable
 
 
@@ -416,3 +417,99 @@ def lint_typecheck_file_analysis(
         "analysis": dict(analysis),
     }
     return analysis
+
+
+def lint_typecheck_run_validators(
+    *,
+    workspace_root: Path,
+    timeout: int,
+    checked: list[str],
+    diagnostics: list[str],
+    validator_commands: list[str],
+    validator_targets: list[str],
+    typechecker_targets: list[str],
+    typechecker_skipped_reason: str,
+    shell_targets: list[str],
+    phase_timings_ms: dict[str, float],
+    ruff_path: str | None,
+    typechecker_command: list[str] | None,
+    bash_path: str | None,
+    run_process: Callable[..., Any],
+    collect_process_output: Callable[[Any], str],
+    collect_timeout_output: Callable[[subprocess.TimeoutExpired], str],
+    timeout_command_text: Callable[[Any], str],
+    command_to_text: Callable[[tuple[str, ...]], str],
+    truncate_text: Callable[[str], str],
+    timer: Callable[[], float],
+) -> dict[str, Any]:
+    active_phase = "scan_ms"
+    active_phase_started = timer()
+    try:
+        if validator_targets and ruff_path:
+            command = ["ruff", "check", "--no-cache", *validator_targets]
+            validator_commands.append(command_to_text(tuple(command)))
+            active_phase = "ruff_ms"
+            active_phase_started = timer()
+            completed = run_process(command, cwd=workspace_root, timeout=timeout, shell=False)
+            phase_timings_ms["ruff_ms"] = round((timer() - active_phase_started) * 1000, 3)
+            if completed.returncode != 0:
+                diagnostics.append(truncate_text(collect_process_output(completed)))
+        if typechecker_targets and typechecker_command:
+            command = [*typechecker_command, *typechecker_targets]
+            validator_commands.append(command_to_text(tuple(command)))
+            active_phase = "typecheck_ms"
+            active_phase_started = timer()
+            completed = run_process(command, cwd=workspace_root, timeout=timeout, shell=False)
+            phase_timings_ms["typecheck_ms"] = round((timer() - active_phase_started) * 1000, 3)
+            if completed.returncode != 0:
+                diagnostics.append(truncate_text(collect_process_output(completed)))
+        if bash_path:
+            for rel in shell_targets[:100]:
+                command = [bash_path, "-n", rel]
+                validator_commands.append(command_to_text(("bash", "-n", rel)))
+                active_phase = "shell_ms"
+                active_phase_started = timer()
+                completed = run_process(command, cwd=workspace_root, timeout=timeout, shell=False)
+                phase_timings_ms["shell_ms"] = round(
+                    float(phase_timings_ms["shell_ms"]) + ((timer() - active_phase_started) * 1000),
+                    3,
+                )
+                if completed.returncode != 0:
+                    output = collect_process_output(completed) or f"{rel}: bash -n failed"
+                    diagnostics.append(truncate_text(output))
+    except subprocess.TimeoutExpired as exc:
+        phase_timings_ms[active_phase] = round(
+            float(phase_timings_ms.get(active_phase, 0.0) or 0.0) + ((timer() - active_phase_started) * 1000),
+            3,
+        )
+        timeout_summary = f"Command timed out after {exc.timeout} seconds."
+        timeout_output = collect_timeout_output(exc)
+        timeout_command = timeout_command_text(exc.cmd)
+        timeout_details = f"{timeout_summary} Validator: {timeout_command}"
+        if timeout_output != "(no output)":
+            timeout_details = f"{timeout_details}\n{timeout_output}"
+        return {
+            "timed_out": True,
+            "result": {
+                "ok": False,
+                "tool": "lint_typecheck",
+                "checked": checked,
+                "diagnostics": [*diagnostics, timeout_details],
+                "validator_commands": validator_commands,
+                "validator_targets": validator_targets,
+                "typechecker_targets": typechecker_targets,
+                "typechecker_skipped_reason": typechecker_skipped_reason,
+                **phase_timings_ms,
+                "output": "\n".join([*diagnostics, timeout_details]) if diagnostics else timeout_details,
+                "summary": timeout_summary,
+                "error_class": "timeout",
+                "timed_out": True,
+                "command": timeout_command,
+            },
+        }
+    return {
+        "timed_out": False,
+        "diagnostics": diagnostics,
+        "validator_commands": validator_commands,
+        "phase_timings_ms": phase_timings_ms,
+    }
