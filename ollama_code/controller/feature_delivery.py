@@ -164,6 +164,20 @@ def mechanical_obligation_repair_failed_for(
     return False
 
 
+def cli_proof_commands(
+    *,
+    source_path: str,
+    candidate_source: str,
+    request_text: str = "",
+    python_executable: str,
+    shell_command: Callable[[list[str]], str],
+) -> list[str]:
+    return [
+        shell_command([python_executable, *argv])
+        for argv in cli_proof_command_argvs(source_path, candidate_source, request_text)
+    ]
+
+
 def _normalize_repo_path(path: str) -> str:
     return str(path or "").strip().replace("\\", "/").lstrip("./")
 

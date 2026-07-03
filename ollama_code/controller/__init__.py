@@ -1,6 +1,7 @@
 from .feature_delivery import (
     CliFeatureCapabilities,
     cli_feature_capabilities,
+    cli_proof_commands,
     cli_proof_command_argvs,
     cli_readme_additions,
     cli_test_additions,
@@ -256,6 +257,7 @@ __all__ = [
     "tool_names_in_fragment",
     "validation_preferences",
     "cli_feature_capabilities",
+    "cli_proof_commands",
     "cli_proof_command_argvs",
     "cli_readme_additions",
     "cli_test_additions",

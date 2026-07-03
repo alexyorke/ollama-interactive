@@ -87,7 +87,7 @@ from ollama_code.controller import (
     NavigationValidationController,
     NavigationValidationTurn,
     cli_feature_capabilities,
-    cli_proof_command_argvs,
+    cli_proof_commands as feature_cli_proof_commands,
     cli_readme_additions,
     cli_test_additions,
     clean_return_expression as controller_clean_return_expression,
@@ -9453,7 +9453,13 @@ class OllamaCodeAgent:
         return source_path, test_path
 
     def _candidate_cli_proof_commands(self, source_path: str, candidate_source: str, request_text: str = "") -> list[str]:
-        return [self._repair_shell_command([sys.executable, *argv]) for argv in cli_proof_command_argvs(source_path, candidate_source, request_text)]
+        return feature_cli_proof_commands(
+            source_path=source_path,
+            candidate_source=candidate_source,
+            request_text=request_text,
+            python_executable=sys.executable,
+            shell_command=self._repair_shell_command,
+        )
 
     def _mechanical_obligation_repair_failed_for(self, source_path: str, test_path: str) -> bool:
         return feature_mechanical_obligation_repair_failed_for(

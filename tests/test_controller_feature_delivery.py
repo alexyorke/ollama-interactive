@@ -3,6 +3,7 @@ import unittest
 
 from ollama_code.controller.feature_delivery import (
     cli_feature_capabilities,
+    cli_proof_commands,
     cli_proof_command_argvs,
     cli_readme_additions,
     cli_test_additions,
@@ -232,6 +233,19 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 ["task_cli.py", "list", "--priority", "high", "--due-before", "2026-07-06"],
             ],
         )
+
+    def test_cli_proof_commands_apply_python_executable_and_shell_quoting(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--due-before')\n"
+
+        commands = cli_proof_commands(
+            source_path="task cli.py",
+            candidate_source=source,
+            request_text="Add --due-before.",
+            python_executable="python.exe",
+            shell_command=lambda args: "|".join(args),
+        )
+
+        self.assertEqual(commands, ["python.exe|task cli.py|list|--due-before|2026-07-06"])
 
     def test_cli_readme_additions_skip_existing_content(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"
