@@ -12,6 +12,7 @@ from .feature_delivery import (
 )
 from .edit_policy import (
     normalize_exact_literal_tool_call,
+    normalize_file_tool_alias_call,
     normalize_snippet_symbol_edit_call,
     path_looks_like_code_file,
     shell_looks_like_file_mutation,
@@ -127,6 +128,7 @@ __all__ = [
     "path_looks_like_test_file",
     "path_looks_like_code_file",
     "normalize_exact_literal_tool_call",
+    "normalize_file_tool_alias_call",
     "normalize_snippet_symbol_edit_call",
     "shell_looks_like_file_mutation",
     "snippet_symbol_argument_looks_like_text",

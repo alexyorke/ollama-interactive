@@ -3,6 +3,7 @@ import unittest
 from ollama_code.agent_protocol import ExactFileWriteSpec
 from ollama_code.controller.edit_policy import (
     normalize_exact_literal_tool_call,
+    normalize_file_tool_alias_call,
     normalize_snippet_symbol_edit_call,
     path_looks_like_code_file,
     shell_looks_like_file_mutation,
@@ -71,6 +72,65 @@ class ControllerEditPolicyTests(unittest.TestCase):
             ("replace_symbol", {"path": "src/app.py", "symbol": "parse_args", "content": "body"}, None),
         )
         self.assertEqual(normalize_snippet_symbol_edit_call("write_file", {}), ("write_file", {}, None))
+
+    def test_file_tool_alias_normalization_for_body_and_symbol_edits(self) -> None:
+        self.assertEqual(
+            normalize_file_tool_alias_call(
+                "replace_body",
+                {"file": "src/app.py", "function": "parse_args", "body": "return args", "scope": "function"},
+            ),
+            (
+                "edit_intent",
+                {"path": "src/app.py", "intent": "replace_body", "target": "parse_args", "replacement": "return args", "scope": "function"},
+                "Normalized unsupported replace_body alias to edit_intent.",
+            ),
+        )
+        self.assertEqual(
+            normalize_file_tool_alias_call("edit_symbol", {"filename": "src/app.py", "name": "parse_args", "replacement": "def parse_args(): pass"}),
+            (
+                "edit_intent",
+                {"path": "src/app.py", "intent": "replace_symbol", "target": "parse_args", "replacement": "def parse_args(): pass"},
+                "Normalized unsupported edit_symbol alias to edit_intent.",
+            ),
+        )
+
+    def test_file_tool_alias_normalization_for_implementation_and_file_edits(self) -> None:
+        self.assertEqual(
+            normalize_file_tool_alias_call("implementation_search", {"target": "parse_args", "root": "src", "limit": "3"}),
+            (
+                "repo_index_search",
+                {"query": "parse_args", "path": "src", "limit": 3},
+                "Normalized unsupported implementation_search alias to repo_index_search.",
+            ),
+        )
+        self.assertEqual(
+            normalize_file_tool_alias_call("edit_implementation_target", {"path": "src/app.py", "target": "def parse_args(", "content": "def parse_args(): pass"}),
+            (
+                "edit_intent",
+                {"path": "src/app.py", "intent": "replace_symbol", "target": "parse_args", "replacement": "def parse_args(): pass"},
+                "Normalized unsupported edit_implementation_target alias to edit_intent.",
+            ),
+        )
+        self.assertEqual(
+            normalize_file_tool_alias_call("edit_implementation_target", {"path": "README.md", "target": "Old", "content": "New"}),
+            (
+                "edit_intent",
+                {"path": "README.md", "intent": "replace_text", "target": "Old", "replacement": "New"},
+                "Normalized unsupported edit_implementation_target alias to edit_intent.",
+            ),
+        )
+        self.assertEqual(
+            normalize_file_tool_alias_call("edit_file", {"path": "README.md", "old": "Old", "new": "New", "replace_all": True}),
+            (
+                "replace_in_file",
+                {"path": "README.md", "old": "Old", "new": "New", "replace_all": True},
+                "Normalized unsupported edit_file alias to replace_in_file.",
+            ),
+        )
+        self.assertEqual(
+            normalize_file_tool_alias_call("unknown_tool", {"path": "README.md"}),
+            ("unknown_tool", {"path": "README.md"}, None),
+        )
 
 
 if __name__ == "__main__":
