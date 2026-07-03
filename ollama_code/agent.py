@@ -253,12 +253,14 @@ from ollama_code.controller.repair_protocol import (
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths as controller_repair_spec_behavior_paths,
+    repair_spec_behavior_regrounded as controller_repair_spec_behavior_regrounded,
     repair_spec_blocks_validation_loop as controller_repair_spec_blocks_validation_loop,
     repair_spec_complete_plan,
     repair_spec_mutation_decision,
     repair_spec_retry_message,
     repair_spec_required_proof_items,
     repair_spec_strategy_class,
+    repair_spec_target_regrounded as controller_repair_spec_target_regrounded,
 )
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
 
@@ -1308,30 +1310,7 @@ class OllamaCodeAgent:
         return None
 
     def _failed_edit_recovery_regrounded(self, state: dict[str, Any]) -> bool:
-        failure_event_index = int(state.get("failure_event_index", -1) or -1)
-        target_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
-        target_symbol = str(state.get("symbol") or "").strip()
-        if not target_path:
-            return False
-        for index, event in enumerate(self.events):
-            if index <= failure_event_index or event.get("type") != "tool_result":
-                continue
-            name = str(event.get("name") or "").strip()
-            if name not in {"read_file", "read_symbol", "code_outline"}:
-                continue
-            result = event.get("result") if isinstance(event.get("result"), dict) else {}
-            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
-            if result.get("ok") is not True:
-                continue
-            event_path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
-            if event_path != target_path:
-                continue
-            if name == "read_symbol" and target_symbol:
-                event_symbol = str(result.get("symbol") or arguments.get("symbol") or "").strip()
-                if event_symbol != target_symbol:
-                    continue
-            return True
-        return False
+        return controller_repair_spec_target_regrounded(state, self.events)
 
     def _failed_edit_recovery_allows_write_file(self, state: dict[str, Any]) -> bool:
         path = str(state.get("path") or "").strip()
@@ -1387,24 +1366,11 @@ class OllamaCodeAgent:
         )
 
     def _repair_spec_behavior_regrounded(self, state: dict[str, Any]) -> bool:
-        failure_event_index = int(state.get("failure_event_index", -1) or -1)
-        behavior_paths = set(self._repair_spec_behavior_paths(state))
-        if not behavior_paths:
-            return True
-        for index, event in enumerate(self.events):
-            if index <= failure_event_index or event.get("type") != "tool_result":
-                continue
-            name = str(event.get("name") or "").strip()
-            if name not in {"read_file", "read_symbol", "code_outline"}:
-                continue
-            result = event.get("result") if isinstance(event.get("result"), dict) else {}
-            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
-            if result.get("ok") is not True:
-                continue
-            event_path = str(result.get("path") or arguments.get("path") or "").strip().replace("\\", "/").lstrip("./")
-            if event_path and event_path in behavior_paths:
-                return True
-        return False
+        return controller_repair_spec_behavior_regrounded(
+            state,
+            events=self.events,
+            behavior_paths=self._repair_spec_behavior_paths(state),
+        )
 
     def _repair_spec_complete_plan(self, state: dict[str, Any]) -> str:
         return repair_spec_complete_plan(state, required_proof_items=self._repair_spec_required_proof_items(state))

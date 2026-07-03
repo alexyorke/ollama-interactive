@@ -414,6 +414,59 @@ def recovery_target_matches(state: dict[str, Any], target: dict[str, str]) -> bo
     return not state_symbol or not target_symbol or state_symbol == target_symbol
 
 
+def repair_spec_target_regrounded(state: dict[str, Any], events: list[dict[str, Any]]) -> bool:
+    failure_event_index = int(state.get("failure_event_index", -1) or -1)
+    target_path = _normalize_path(str(state.get("path") or ""))
+    target_symbol = str(state.get("symbol") or "").strip()
+    if not target_path:
+        return False
+    for index, event in enumerate(events):
+        if index <= failure_event_index or event.get("type") != "tool_result":
+            continue
+        name = str(event.get("name") or "").strip()
+        if name not in {"read_file", "read_symbol", "code_outline"}:
+            continue
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+        if result.get("ok") is not True:
+            continue
+        event_path = _normalize_path(str(result.get("path") or arguments.get("path") or ""))
+        if event_path != target_path:
+            continue
+        if name == "read_symbol" and target_symbol:
+            event_symbol = str(result.get("symbol") or arguments.get("symbol") or "").strip()
+            if event_symbol != target_symbol:
+                continue
+        return True
+    return False
+
+
+def repair_spec_behavior_regrounded(
+    state: dict[str, Any],
+    *,
+    events: list[dict[str, Any]],
+    behavior_paths: list[str] | tuple[str, ...],
+) -> bool:
+    failure_event_index = int(state.get("failure_event_index", -1) or -1)
+    normalized_behavior_paths = {_normalize_path(str(path)) for path in behavior_paths if str(path).strip()}
+    if not normalized_behavior_paths:
+        return True
+    for index, event in enumerate(events):
+        if index <= failure_event_index or event.get("type") != "tool_result":
+            continue
+        name = str(event.get("name") or "").strip()
+        if name not in {"read_file", "read_symbol", "code_outline"}:
+            continue
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+        if result.get("ok") is not True:
+            continue
+        event_path = _normalize_path(str(result.get("path") or arguments.get("path") or ""))
+        if event_path and event_path in normalized_behavior_paths:
+            return True
+    return False
+
+
 def repair_spec_required_proof_items(state: dict[str, Any]) -> list[str]:
     items: list[str] = []
     raw_items = state.get("required_proof_items")

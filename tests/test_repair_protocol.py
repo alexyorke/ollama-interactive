@@ -14,12 +14,14 @@ from ollama_code.controller.repair_protocol import (
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths,
+    repair_spec_behavior_regrounded,
     repair_spec_blocks_validation_loop,
     repair_spec_complete_plan,
     repair_spec_mutation_decision,
     repair_spec_retry_message,
     repair_spec_required_proof_items,
     repair_spec_strategy_class,
+    repair_spec_target_regrounded,
 )
 
 
@@ -314,6 +316,42 @@ class RepairProtocolTests(unittest.TestCase):
         self.assertTrue(recovery_target_matches({"path": "task_cli.py", "symbol": ""}, {"path": "task_cli.py", "symbol": "main"}))
         self.assertTrue(recovery_target_matches({"path": "task_cli.py", "symbol": "main"}, {"path": "task_cli.py", "symbol": "main"}))
         self.assertFalse(recovery_target_matches({"path": "task_cli.py", "symbol": "main"}, {"path": "task_cli.py", "symbol": "parse"}))
+
+    def test_repair_spec_target_regrounded_requires_current_matching_tool_result(self) -> None:
+        state = {"path": "task_cli.py", "symbol": "main", "failure_event_index": 1}
+        events = [
+            {"type": "tool_result", "name": "read_symbol", "arguments": {"path": "task_cli.py", "symbol": "main"}, "result": {"ok": True}},
+            {"type": "tool_result", "name": "run_test", "result": {"ok": False}},
+            {"type": "tool_result", "name": "read_symbol", "arguments": {"path": "task_cli.py", "symbol": "parse"}, "result": {"ok": True}},
+            {"type": "tool_result", "name": "read_symbol", "arguments": {"path": ".\\task_cli.py", "symbol": "main"}, "result": {"ok": True}},
+        ]
+
+        self.assertTrue(repair_spec_target_regrounded(state, events))
+        self.assertFalse(repair_spec_target_regrounded({**state, "symbol": "missing"}, events))
+        self.assertFalse(repair_spec_target_regrounded({"path": "", "failure_event_index": 1}, events))
+
+    def test_repair_spec_behavior_regrounded_accepts_behavior_surface_after_failure(self) -> None:
+        state = {"path": "task_cli.py", "failure_event_index": 0}
+        events = [
+            {"type": "tool_result", "name": "run_test", "result": {"ok": False}},
+            {"type": "tool_result", "name": "read_file", "arguments": {"path": ".\\tests\\test_task_cli.py"}, "result": {"ok": True}},
+        ]
+
+        self.assertTrue(
+            repair_spec_behavior_regrounded(
+                state,
+                events=events,
+                behavior_paths=["tests/test_task_cli.py"],
+            )
+        )
+        self.assertFalse(
+            repair_spec_behavior_regrounded(
+                state,
+                events=events,
+                behavior_paths=["tests/test_other.py"],
+            )
+        )
+        self.assertTrue(repair_spec_behavior_regrounded(state, events=events, behavior_paths=[]))
 
     def test_failed_test_repair_policy_tracks_current_mutation_version(self) -> None:
         self.assertTrue(
