@@ -136,6 +136,75 @@ def test_spec_symbol_from_expr(expr: str, source_symbols: set[str], aliases: dic
     return ""
 
 
+def test_spec_add_raw_example(
+    examples: list[dict[str, Any]],
+    *,
+    expr: str,
+    expected: str | None = None,
+    raises: str | None = None,
+    raises_message: str | None = None,
+    line: int,
+    test_name: str | None = None,
+    source_symbols: set[str],
+    aliases: dict[str, str],
+) -> None:
+    symbol = test_spec_symbol_from_expr(expr, source_symbols, aliases)
+    if source_symbols and not symbol:
+        return
+    if expected is not None:
+        text = f"{expr} -> {expected}"
+    elif raises is not None:
+        text = f"{expr} raises {raises}"
+        if raises_message:
+            text += f"({raises_message})"
+    else:
+        return
+    item = {"symbol": symbol or "expression", "example": text, "line": line}
+    if test_name:
+        item["test_name"] = test_name
+    if item not in examples:
+        examples.append(item)
+
+
+def test_spec_add_example(
+    examples: list[dict[str, Any]],
+    *,
+    call: ast.Call,
+    expected: str | None = None,
+    raises: str | None = None,
+    raises_message: str | None = None,
+    expr_override: str | None = None,
+    line: int,
+    test_name: str | None = None,
+    source_symbols: set[str],
+    aliases: dict[str, str],
+    local_exprs: dict[str, str] | None = None,
+) -> None:
+    symbol = test_spec_call_name(call)
+    canonical = aliases.get(symbol, symbol)
+    expr = expr_override or call_expr(call, local_exprs)
+    if source_symbols and canonical not in source_symbols:
+        derived_symbol = test_spec_symbol_from_expr(expr, source_symbols, aliases)
+        if not derived_symbol:
+            return
+        canonical = derived_symbol
+    if canonical != symbol and aliases.get(symbol) == canonical and expr.startswith(symbol + "("):
+        expr = canonical + expr[len(symbol) :]
+    if expected is not None:
+        text = f"{expr} -> {expected}"
+    elif raises is not None:
+        text = f"{expr} raises {raises}"
+        if raises_message:
+            text += f"({raises_message})"
+    else:
+        return
+    item = {"symbol": canonical, "example": text, "line": line}
+    if test_name:
+        item["test_name"] = test_name
+    if item not in examples:
+        examples.append(item)
+
+
 def test_spec_iter_test_functions(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     for item in getattr(tree, "body", []):

@@ -84,8 +84,10 @@ from ollama_code.tools.synthesis import (
     select_test_spec_examples,
     split_test_example,
     test_example_probe_expressions,
+    test_spec_add_example,
     test_spec_add_cli_assertion_examples,
     test_spec_add_cli_example,
+    test_spec_add_raw_example,
     test_spec_add_text_example,
     test_spec_assigned_names,
     test_spec_assignment_expr,
@@ -4595,22 +4597,17 @@ class ToolExecutor:
         source_symbols: set[str],
         aliases: dict[str, str],
     ) -> None:
-        symbol = self._test_spec_symbol_from_expr(expr, source_symbols, aliases)
-        if source_symbols and not symbol:
-            return
-        if expected is not None:
-            text = f"{expr} -> {expected}"
-        elif raises is not None:
-            text = f"{expr} raises {raises}"
-            if raises_message:
-                text += f"({raises_message})"
-        else:
-            return
-        item = {"symbol": symbol or "expression", "example": text, "line": line}
-        if test_name:
-            item["test_name"] = test_name
-        if item not in examples:
-            examples.append(item)
+        test_spec_add_raw_example(
+            examples,
+            expr=expr,
+            expected=expected,
+            raises=raises,
+            raises_message=raises_message,
+            line=line,
+            test_name=test_name,
+            source_symbols=source_symbols,
+            aliases=aliases,
+        )
 
     def _first_behavior_call(self, statements: list[ast.stmt]) -> ast.Call | None:
         return first_behavior_call(statements)
@@ -4630,29 +4627,19 @@ class ToolExecutor:
         aliases: dict[str, str],
         local_exprs: dict[str, str] | None = None,
     ) -> None:
-        symbol = self._test_spec_call_name(call)
-        canonical = aliases.get(symbol, symbol)
-        expr = expr_override or self._call_expr(call, local_exprs)
-        if source_symbols and canonical not in source_symbols:
-            derived_symbol = self._test_spec_symbol_from_expr(expr, source_symbols, aliases)
-            if not derived_symbol:
-                return
-            canonical = derived_symbol
-        if canonical != symbol and aliases.get(symbol) == canonical and expr.startswith(symbol + "("):
-            expr = canonical + expr[len(symbol) :]
-        if expected is not None:
-            text = f"{expr} -> {expected}"
-        elif raises is not None:
-            text = f"{expr} raises {raises}"
-            if raises_message:
-                text += f"({raises_message})"
-        else:
-            return
-        item = {"symbol": canonical, "example": text, "line": line}
-        if test_name:
-            item["test_name"] = test_name
-        if item not in examples:
-            examples.append(item)
+        test_spec_add_example(
+            examples,
+            call=call,
+            expected=expected,
+            raises=raises,
+            raises_message=raises_message,
+            expr_override=expr_override,
+            line=line,
+            test_name=test_name,
+            source_symbols=source_symbols,
+            aliases=aliases,
+            local_exprs=local_exprs,
+        )
 
     def _human_test_name(self, name: str) -> str:
         return human_test_name(name)
