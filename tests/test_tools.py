@@ -27,6 +27,7 @@ from ollama_code.tools.validation import (
     lint_typecheck_target_plan,
     lint_typecheck_timeout_result,
 )
+from ollama_code.tools.synthesis import candidate_signature_gate
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -4206,6 +4207,21 @@ class ToolExecutorTests(unittest.TestCase):
             self.assertGreater(float(result["test_ms"]), 0.0)
             self.assertGreaterEqual(float(result["total_ms"]), float(result["test_ms"]))
         self.assertIn("pass", final_text)
+
+    def test_candidate_signature_gate_blocks_only_unproven_or_removed_contract_changes(self) -> None:
+        changed = ["candidate changed signature for add: def add(left, right) -> def add(left, right, extra=*)"]
+        removed = ["candidate removed public symbol add"]
+
+        unproven_change = candidate_signature_gate(changed, has_behavior_validation=False)
+        proven_change = candidate_signature_gate(changed, has_behavior_validation=True)
+        removed_change = candidate_signature_gate(removed, has_behavior_validation=True)
+
+        self.assertFalse(unproven_change["ok"])
+        self.assertEqual(unproven_change["blocking_diagnostics"], changed)
+        self.assertTrue(proven_change["ok"])
+        self.assertEqual(proven_change["signature_warnings"], changed)
+        self.assertFalse(removed_change["ok"])
+        self.assertEqual(removed_change["blocking_diagnostics"], removed)
 
     def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
         with self._temp_python_tools(

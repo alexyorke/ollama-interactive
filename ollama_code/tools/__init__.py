@@ -77,6 +77,7 @@ from ollama_code.tools.contracts import (
 from ollama_code.tools.synthesis import (
     assert_raises_expected_message,
     call_expr,
+    candidate_signature_gate,
     candidate_public_signature_map,
     candidate_signature_diagnostics,
     first_behavior_call,
@@ -9000,16 +9001,19 @@ import string
         original = source_file.read_text(encoding="utf-8", errors="replace")
         candidate_source, normalization = self._normalize_candidate_python_source(source_file, candidate_source)
         signature_diagnostics = self._candidate_signature_diagnostics(original, candidate_source)
-        removed_symbol_diagnostics = [item for item in signature_diagnostics if "removed public symbol" in item]
-        signature_warnings = [item for item in signature_diagnostics if item not in removed_symbol_diagnostics]
-        if removed_symbol_diagnostics or (signature_warnings and not (test_path or test_command)):
-            output = "\n".join((removed_symbol_diagnostics or signature_warnings)[:8])
+        signature_gate = candidate_signature_gate(
+            signature_diagnostics,
+            has_behavior_validation=bool(test_path or test_command),
+        )
+        signature_warnings = list(signature_gate["signature_warnings"])
+        if signature_gate["ok"] is not True:
+            output = "\n".join(list(signature_gate["blocking_diagnostics"])[:8])
             return {
                 "ok": False,
                 "tool": "validate_implementation_candidate",
                 "path": rel_source,
                 "stage": "signature",
-                "diagnostics": removed_symbol_diagnostics or signature_warnings,
+                "diagnostics": list(signature_gate["blocking_diagnostics"]),
                 "normalized": normalization,
                 "output": output,
                 "summary": output,

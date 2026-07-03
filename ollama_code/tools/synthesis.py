@@ -70,6 +70,24 @@ def candidate_signature_diagnostics(original: str, candidate: str) -> list[str]:
     return diagnostics
 
 
+def candidate_signature_gate(
+    signature_diagnostics: list[str],
+    *,
+    has_behavior_validation: bool,
+) -> dict[str, Any]:
+    removed_symbol_diagnostics = [item for item in signature_diagnostics if "removed public symbol" in item]
+    signature_warnings = [item for item in signature_diagnostics if item not in removed_symbol_diagnostics]
+    blocking_diagnostics = removed_symbol_diagnostics
+    if not blocking_diagnostics and signature_warnings and not has_behavior_validation:
+        blocking_diagnostics = signature_warnings
+    return {
+        "ok": not blocking_diagnostics,
+        "blocking_diagnostics": blocking_diagnostics,
+        "removed_symbol_diagnostics": removed_symbol_diagnostics,
+        "signature_warnings": signature_warnings,
+    }
+
+
 def node_expr(node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
     if local_exprs and isinstance(node, ast.Name) and node.id in local_exprs:
         return local_exprs[node.id]
