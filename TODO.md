@@ -71,6 +71,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Repair-spec validation-loop blocking, retry guidance, and failed-test repair retry policy now live in `ollama_code.controller.repair_protocol`.
 - Focused controller tests cover feature-delivery policy directly instead of relying only on the omnibus `tests/test_agent.py`.
 - `local_validation` now reports and gates focused agent test ownership so extracted behavior modules cannot depend on the legacy omnibus `tests/test_agent.py`.
+- Dead legacy failed-edit recovery helper bodies were removed from `tests/test_agent.py`; runnable coverage remains in the focused grounding and post-edit-validation modules.
 - `ToolExecutor` contract and synthesis helper policy has started moving into focused modules:
   `ollama_code/tools/contracts.py`, `ollama_code/tools/synthesis.py`, `ollama_code/tools/validation.py`, and
   `ollama_code/tools/command_validation.py`.
