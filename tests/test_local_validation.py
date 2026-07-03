@@ -234,6 +234,49 @@ class LocalValidationTests(unittest.TestCase):
             ["tests/test_cli.py", "tests/test_public_benchmark_eval.py"],
         )
 
+    def test_focused_agent_test_ownership_accepts_independent_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for module in local_validation.FOCUSED_AGENT_MODULES:
+                path = root / local_validation._module_to_path(module)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    "import unittest\n\n"
+                    "from tests.agent_test_support import AgentTestBase\n\n"
+                    "class FocusedTests(AgentTestBase):\n"
+                    "    def test_owned_behavior(self):\n"
+                    "        self.assertTrue(True)\n",
+                    encoding="utf-8",
+                )
+
+            summary = local_validation._focused_agent_test_ownership(root)
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["focused_module_count"], len(local_validation.FOCUSED_AGENT_MODULES))
+        self.assertEqual(summary["violation_count"], 0)
+        self.assertTrue(all(row["test_count"] == 1 for row in summary["modules"]))
+
+    def test_focused_agent_test_ownership_rejects_omnibus_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for index, module in enumerate(local_validation.FOCUSED_AGENT_MODULES):
+                path = root / local_validation._module_to_path(module)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                import_line = "from tests.test_agent import AgentTests\n\n" if index == 0 else "import unittest\n\n"
+                path.write_text(
+                    import_line
+                    + "class FocusedTests:\n"
+                    + "    def test_owned_behavior(self):\n"
+                    + "        assert True\n",
+                    encoding="utf-8",
+                )
+
+            summary = local_validation._focused_agent_test_ownership(root)
+
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["violation_count"], 1)
+        self.assertEqual(summary["violations"][0]["module"], local_validation.FOCUSED_AGENT_MODULES[0])
+
     def test_run_counts_unittest_module_targets(self) -> None:
         command = [sys.executable, "-m", "unittest", "tests.test_live_model_gate", "tests.test_nightly_self_improvement_report", "-q"]
 

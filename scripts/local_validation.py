@@ -42,6 +42,14 @@ AGENT_MODULES = (
     "tests.test_tools",
     "tests.test_coding_benchmark_eval",
 )
+FOCUSED_AGENT_MODULES = (
+    "tests.test_agent_grounding_path_repair",
+    "tests.test_agent_post_edit_validation",
+    "tests.test_agent_failure_compression",
+    "tests.test_agent_shell_command_preflight",
+    "tests.test_agent_typed_repair_protocol",
+    "tests.test_controller_feature_delivery",
+)
 
 MAX_AUTO_PYTEST_WORKERS = 16
 DEFAULT_COMMAND_TIMEOUT_S = 900.0
@@ -301,6 +309,50 @@ def _coverage_ok(summary: dict[str, Any]) -> bool:
     if summary.get("mode") != "pytest_target_paths":
         return True
     return bool(summary.get("full_plan_covers_all_discovered_targets"))
+
+
+def _focused_agent_test_ownership(repo_root: Path) -> dict[str, Any]:
+    forbidden_patterns = (
+        re.compile(r"^\s*from\s+tests\.test_agent\s+import\s+", re.MULTILINE),
+        re.compile(r"^\s*import\s+tests\.test_agent\b", re.MULTILINE),
+        re.compile(r"^\s*from\s+test_agent\s+import\s+", re.MULTILINE),
+        re.compile(r"^\s*import\s+test_agent\b", re.MULTILINE),
+    )
+    rows: list[dict[str, Any]] = []
+    violations: list[dict[str, Any]] = []
+    for module in FOCUSED_AGENT_MODULES:
+        relpath = _module_to_path(module)
+        path = repo_root / relpath
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            row = {"module": module, "path": relpath, "ok": False, "summary": f"unreadable: {exc}"}
+            rows.append(row)
+            violations.append(row)
+            continue
+        matched = [pattern.pattern for pattern in forbidden_patterns if pattern.search(text)]
+        row = {
+            "module": module,
+            "path": relpath,
+            "ok": not matched,
+            "forbidden_import_count": len(matched),
+            "test_count": len(re.findall(r"^\s+def\s+test_", text, flags=re.MULTILINE)),
+        }
+        rows.append(row)
+        if matched:
+            violations.append(row)
+    return {
+        "ok": not violations,
+        "focused_module_count": len(rows),
+        "violation_count": len(violations),
+        "violations": violations[:5],
+        "modules": rows,
+        "summary": (
+            "Focused agent tests own their behavior and do not import the legacy omnibus."
+            if not violations
+            else "Focused agent tests import tests.test_agent; move shared helpers to tests.agent_test_support instead."
+        ),
+    }
 
 
 def _baseline_compare_payload(
@@ -582,8 +634,9 @@ def run_validation(
         jobs=jobs,
         resolved_jobs=resolved_jobs,
     )
+    focused_agent_test_ownership = _focused_agent_test_ownership(repo_root)
     live_gate_claim_consistency = _live_gate_claim_consistency(repo_root)
-    ok = command_ok and _coverage_ok(coverage_summary)
+    ok = command_ok and _coverage_ok(coverage_summary) and bool(focused_agent_test_ownership.get("ok"))
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "repo_root": str(repo_root.resolve(strict=False)),
@@ -606,6 +659,7 @@ def run_validation(
         "elapsed_s": elapsed_s,
         "timing_summary": _timing_summary(command_rows, elapsed_s=elapsed_s),
         "coverage_summary": coverage_summary,
+        "focused_agent_test_ownership": focused_agent_test_ownership,
         "live_gate_claim_consistency": live_gate_claim_consistency,
         "baseline_compare": _baseline_compare_payload(
             repo_root,
@@ -681,6 +735,14 @@ def main(argv: list[str] | None = None) -> int:
             + f" full_plan_complete={coverage_summary.get('full_plan_covers_all_discovered_targets')}"
             + f" duplicates={coverage_summary.get('full_plan_duplicate_target_count')}"
             + f" uncovered={coverage_summary.get('full_plan_uncovered_target_count')}"
+        )
+    focused_agent_ownership = payload.get("focused_agent_test_ownership") or {}
+    if focused_agent_ownership:
+        print(
+            "[local-validation]"
+            + f" focused_agent_test_ownership_ok={focused_agent_ownership.get('ok')}"
+            + f" modules={focused_agent_ownership.get('focused_module_count')}"
+            + f" violations={focused_agent_ownership.get('violation_count')}"
         )
     claim_consistency = payload.get("live_gate_claim_consistency") or {}
     if claim_consistency:
