@@ -119,6 +119,7 @@ from ollama_code.controller.repair_protocol import (
     cli_patch_bundle_instruction,
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
+    repair_spec_behavior_paths as controller_repair_spec_behavior_paths,
     repair_spec_complete_plan,
     repair_spec_mutation_decision,
     repair_spec_required_proof_items,
@@ -1311,16 +1312,8 @@ class OllamaCodeAgent:
             return False
         return line_count <= 260
 
-    def _repair_spec_behavior_paths(self, state: dict[str, Any]) -> list[str]:
-        raw_paths = state.get("behavior_paths")
-        if isinstance(raw_paths, list):
-            normalized = [
-                str(item).strip().replace("\\", "/").lstrip("./")
-                for item in raw_paths
-                if str(item).strip()
-            ]
-            if normalized:
-                return normalized
+    def _repair_spec_behavior_test_path_candidates(self, state: dict[str, Any]) -> list[str]:
+        candidates: list[str] = []
         fallback: list[str] = []
         path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
         if path:
@@ -1331,16 +1324,14 @@ class OllamaCodeAgent:
                     for candidate in tests_root.rglob(pattern):
                         if candidate.is_file():
                             fallback.append(self.tools.relative_label(candidate))
-        for obligation in list(state.get("unresolved_obligations") or []):
-            if not isinstance(obligation, dict):
-                continue
-            if str(obligation.get("kind") or "").strip() != "docs_update":
-                continue
-            for raw_path in list(obligation.get("paths") or []):
-                normalized = str(raw_path).strip().replace("\\", "/").lstrip("./")
-                if normalized:
-                    fallback.append(normalized)
-        return sorted(dict.fromkeys(fallback))
+        candidates.extend(fallback)
+        return sorted(dict.fromkeys(candidates))
+
+    def _repair_spec_behavior_paths(self, state: dict[str, Any]) -> list[str]:
+        return controller_repair_spec_behavior_paths(
+            state,
+            test_path_candidates=self._repair_spec_behavior_test_path_candidates(state),
+        )
 
     def _repair_spec_required_proof_items(self, state: dict[str, Any]) -> list[str]:
         return repair_spec_required_proof_items(state)

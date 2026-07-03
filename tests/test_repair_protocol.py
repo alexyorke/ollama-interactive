@@ -7,6 +7,7 @@ from ollama_code.controller.repair_protocol import (
     cli_patch_bundle_instruction,
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
+    repair_spec_behavior_paths,
     repair_spec_complete_plan,
     repair_spec_mutation_decision,
     repair_spec_required_proof_items,
@@ -151,6 +152,31 @@ class RepairProtocolTests(unittest.TestCase):
         self.assertEqual(
             repair_spec_broad_repair_hint(state, file_repair_allowed=True),
             "write_file on task_cli.py so the CLI surface is repaired in one pass",
+        )
+
+    def test_repair_spec_behavior_paths_prefers_explicit_state_paths(self) -> None:
+        state = {"behavior_paths": [".\\tests\\test_task_cli.py", "./README.md", "tests/test_task_cli.py"]}
+
+        self.assertEqual(
+            repair_spec_behavior_paths(state, test_path_candidates=["tests/ignored.py"]),
+            ["tests/test_task_cli.py", "README.md"],
+        )
+
+    def test_repair_spec_behavior_paths_combines_tests_and_docs_obligations(self) -> None:
+        state = {
+            "path": "task_cli.py",
+            "unresolved_obligations": [
+                {"kind": "docs_update", "paths": ["README.md", ".\\docs\\task-cli.md"]},
+                {"kind": "test_run", "paths": ["tests/not-a-doc.py"]},
+            ],
+        }
+
+        self.assertEqual(
+            repair_spec_behavior_paths(
+                state,
+                test_path_candidates=["tests/test_task_cli.py", "tests/task_cli_test.py", "tests/test_task_cli.py"],
+            ),
+            ["README.md", "docs/task-cli.md", "tests/task_cli_test.py", "tests/test_task_cli.py"],
         )
 
     def test_repair_spec_mutation_decision_rejects_narrow_or_unrelated_retry(self) -> None:

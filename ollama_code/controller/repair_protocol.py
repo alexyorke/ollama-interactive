@@ -330,6 +330,30 @@ def repair_spec_required_proof_items(state: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+def repair_spec_behavior_paths(
+    state: dict[str, Any],
+    *,
+    test_path_candidates: list[str] | tuple[str, ...] = (),
+) -> list[str]:
+    raw_paths = state.get("behavior_paths")
+    if isinstance(raw_paths, list):
+        normalized = [_normalize_path(str(item)) for item in raw_paths if str(item).strip()]
+        if normalized:
+            return list(dict.fromkeys(normalized))
+
+    paths: list[str] = [_normalize_path(str(path)) for path in test_path_candidates if str(path).strip()]
+    for obligation in list(state.get("unresolved_obligations") or []):
+        if not isinstance(obligation, dict):
+            continue
+        if str(obligation.get("kind") or "").strip() != "docs_update":
+            continue
+        for raw_path in list(obligation.get("paths") or []):
+            normalized = _normalize_path(str(raw_path))
+            if normalized:
+                paths.append(normalized)
+    return sorted(dict.fromkeys(paths))
+
+
 def repair_spec_strategy_class(
     *,
     target: dict[str, str],
