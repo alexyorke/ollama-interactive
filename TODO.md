@@ -21,8 +21,9 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 ## Next ToolExecutor Tranche
 
 - Do not keep extracting tiny wrappers just to reduce line count.
-- Next meaningful split is validator execution, especially `lint_typecheck` subprocess/cache orchestration.
-- Treat that as a separate measured tranche because it couples cache keys, subprocess timeout behavior, Node checks, tree-sitter diagnostics, Python syntax diagnostics, and target scoping.
+- Next meaningful split is the remaining `lint_typecheck` subprocess/cache orchestration.
+- File-level lint analysis and target planning already live in `ollama_code/tools/validation.py` with direct tests.
+- Treat the remaining subprocess runner as a separate measured tranche because it couples cache hits, timeout behavior, ruff, basedpyright/pyright, bash, command rendering, and result assembly.
 - Preserve the current compatibility wrappers until the extracted validator implementation has direct focused tests.
 
 ## Readiness Gates
