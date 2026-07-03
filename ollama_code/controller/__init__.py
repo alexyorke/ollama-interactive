@@ -3,24 +3,46 @@ from .feature_delivery import (
     cli_feature_capabilities,
     cli_proof_command_argvs,
     cli_readme_additions,
+    cli_test_additions,
     derive_request_obligations,
     merge_request_obligations,
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
 from .navigation_validation import NavigationValidationController, NavigationValidationTurn
+from .repair_protocol import (
+    FailedAttempt,
+    GroundedTarget,
+    PatchPlan,
+    RepairProtocolState,
+    RequestedDeliverable,
+    ValidationPlan,
+    build_repair_protocol_state,
+    cli_patch_bundle_instruction,
+    repair_decision_for_tool,
+)
 from .state import ControllerTurnState
 
 __all__ = [
     "CliFeatureCapabilities",
     "ControllerTurnState",
+    "FailedAttempt",
+    "GroundedTarget",
     "NavigationValidationController",
     "NavigationValidationTurn",
+    "PatchPlan",
+    "RepairProtocolState",
+    "RequestedDeliverable",
+    "ValidationPlan",
     "cli_feature_capabilities",
     "cli_proof_command_argvs",
     "cli_readme_additions",
+    "cli_test_additions",
+    "build_repair_protocol_state",
     "derive_request_obligations",
     "merge_request_obligations",
+    "cli_patch_bundle_instruction",
+    "repair_decision_for_tool",
     "request_obligation_proof_status",
     "typed_cli_flag_protocol_enabled",
 ]

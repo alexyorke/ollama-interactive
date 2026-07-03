@@ -490,3 +490,59 @@ def cli_readme_additions(candidate_source: str, request_text: str, existing_read
     if caps.has_due_before and "--due-before" not in lowered:
         additions.append("- `list --due-before YYYY-MM-DD` filters tasks by due date and can be combined with `--priority`.")
     return additions
+
+
+def cli_test_additions(candidate_source: str, request_text: str, existing_test_text: str, helper_name: str) -> list[str]:
+    wants_limit_tests = "--limit" in candidate_source and "--limit" in request_text
+    wants_due_tests = "--due-before" in candidate_source and "--due-before" in request_text
+    if "--json" not in candidate_source and not wants_limit_tests and not wants_due_tests:
+        return []
+    additions: list[str] = []
+    if "--json" in candidate_source and "--json" not in existing_test_text:
+        additions.append(
+            "    def test_json_output(self) -> None:\n"
+            f"        result = {helper_name}('--json')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('\"title\"', result.stdout)\n"
+            "        self.assertIn('\"body\"', result.stdout)\n"
+            "        self.assertIn('\"tags\"', result.stdout)\n"
+            "\n"
+        )
+    if wants_limit_tests and "--limit" not in existing_test_text:
+        additions.append(
+            "    def test_limit_text_output(self) -> None:\n"
+            f"        result = {helper_name}('--tag', 'work', '--limit', '1')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('ship-cli', result.stdout)\n"
+            "        self.assertNotIn('fix-bug', result.stdout)\n"
+            "\n"
+            "    def test_limit_json_output(self) -> None:\n"
+            f"        result = {helper_name}('--tag', 'work', '--limit', '1', '--json')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('\"title\": \"ship-cli\"', result.stdout)\n"
+            "        self.assertNotIn('fix-bug', result.stdout)\n"
+            "\n"
+        )
+    if wants_due_tests and "--due-before" not in existing_test_text:
+        additions.append(
+            "    def test_due_before_filter(self) -> None:\n"
+            f"        result = {helper_name}('list', '--due-before', '2026-07-06')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+            "        self.assertIn('ship-cli:done:low:2026-07-05', result.stdout)\n"
+            "        self.assertNotIn('fix-bug', result.stdout)\n"
+            "\n"
+            "    def test_due_before_preserves_priority_filter(self) -> None:\n"
+            f"        result = {helper_name}('list', '--priority', 'high', '--due-before', '2026-07-06')\n"
+            "        self.assertEqual(result.returncode, 0)\n"
+            "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+            "        self.assertNotIn('ship-cli', result.stdout)\n"
+            "        self.assertNotIn('fix-bug', result.stdout)\n"
+            "\n"
+            "    def test_due_before_rejects_invalid_date(self) -> None:\n"
+            f"        result = {helper_name}('list', '--due-before', '2026-99-99')\n"
+            "        self.assertNotEqual(result.returncode, 0)\n"
+            "        self.assertIn('invalid', (result.stderr + result.stdout).lower())\n"
+            "\n"
+        )
+    return additions

@@ -89,6 +89,7 @@ from ollama_code.controller import (
     cli_feature_capabilities,
     cli_proof_command_argvs,
     cli_readme_additions,
+    cli_test_additions,
     derive_request_obligations as derive_feature_request_obligations,
     merge_request_obligations,
     request_obligation_proof_status as feature_obligation_proof_status,
@@ -112,7 +113,7 @@ from ollama_code.sessions import (
     transcript_message_role_supported,
     write_transcript_payload,
 )
-from ollama_code.repair_protocol import (
+from ollama_code.controller.repair_protocol import (
     RepairProtocolState,
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
@@ -10921,9 +10922,7 @@ class OllamaCodeAgent:
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> None:
-        wants_limit_tests = "--limit" in candidate_source and "--limit" in request_text
-        wants_due_tests = "--due-before" in candidate_source and "--due-before" in request_text
-        if "--json" not in candidate_source and not wants_limit_tests and not wants_due_tests:
+        if "--json" not in candidate_source and "--limit" not in candidate_source and "--due-before" not in candidate_source:
             return
         try:
             test_file = self.tools.resolve_path(test_path, allow_missing=False)
@@ -10934,54 +10933,7 @@ class OllamaCodeAgent:
         if not helper_match:
             return
         helper_name = helper_match.group("name")
-        additions: list[str] = []
-        if "--json" in candidate_source and "--json" not in test_text:
-            additions.append(
-                "    def test_json_output(self) -> None:\n"
-                f"        result = {helper_name}('--json')\n"
-                "        self.assertEqual(result.returncode, 0)\n"
-                "        self.assertIn('\"title\"', result.stdout)\n"
-                "        self.assertIn('\"body\"', result.stdout)\n"
-                "        self.assertIn('\"tags\"', result.stdout)\n"
-                "\n"
-            )
-        if wants_limit_tests and "--limit" not in test_text:
-            additions.append(
-                "    def test_limit_text_output(self) -> None:\n"
-                f"        result = {helper_name}('--tag', 'work', '--limit', '1')\n"
-                "        self.assertEqual(result.returncode, 0)\n"
-                "        self.assertIn('ship-cli', result.stdout)\n"
-                "        self.assertNotIn('fix-bug', result.stdout)\n"
-                "\n"
-                "    def test_limit_json_output(self) -> None:\n"
-                f"        result = {helper_name}('--tag', 'work', '--limit', '1', '--json')\n"
-                "        self.assertEqual(result.returncode, 0)\n"
-                "        self.assertIn('\"title\": \"ship-cli\"', result.stdout)\n"
-                "        self.assertNotIn('fix-bug', result.stdout)\n"
-                "\n"
-            )
-        if wants_due_tests and "--due-before" not in test_text:
-            additions.append(
-                "    def test_due_before_filter(self) -> None:\n"
-                f"        result = {helper_name}('list', '--due-before', '2026-07-06')\n"
-                "        self.assertEqual(result.returncode, 0)\n"
-                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
-                "        self.assertIn('ship-cli:done:low:2026-07-05', result.stdout)\n"
-                "        self.assertNotIn('fix-bug', result.stdout)\n"
-                "\n"
-                "    def test_due_before_preserves_priority_filter(self) -> None:\n"
-                f"        result = {helper_name}('list', '--priority', 'high', '--due-before', '2026-07-06')\n"
-                "        self.assertEqual(result.returncode, 0)\n"
-                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
-                "        self.assertNotIn('ship-cli', result.stdout)\n"
-                "        self.assertNotIn('fix-bug', result.stdout)\n"
-                "\n"
-                "    def test_due_before_rejects_invalid_date(self) -> None:\n"
-                f"        result = {helper_name}('list', '--due-before', '2026-99-99')\n"
-                "        self.assertNotEqual(result.returncode, 0)\n"
-                "        self.assertIn('invalid', (result.stderr + result.stdout).lower())\n"
-                "\n"
-            )
+        additions = cli_test_additions(candidate_source, request_text, test_text, helper_name)
         if not additions:
             return
         insertion = "\n" + "\n".join(additions)

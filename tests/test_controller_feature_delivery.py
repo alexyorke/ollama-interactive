@@ -4,6 +4,7 @@ from ollama_code.controller.feature_delivery import (
     cli_feature_capabilities,
     cli_proof_command_argvs,
     cli_readme_additions,
+    cli_test_additions,
     derive_request_obligations,
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
@@ -44,6 +45,21 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         additions = cli_readme_additions(source, "Update README for --due-before.", "Use --priority already.\n")
 
         self.assertEqual(additions, ["- `list --due-before YYYY-MM-DD` filters tasks by due date and can be combined with `--priority`."])
+
+    def test_cli_test_additions_create_due_before_regressions(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"
+
+        additions = cli_test_additions(source, "Add --due-before tests.", "def _run(*args: str): ...\n", "_run")
+
+        joined = "\n".join(additions)
+        self.assertIn("test_due_before_filter", joined)
+        self.assertIn("--priority", joined)
+        self.assertIn("2026-99-99", joined)
+
+    def test_cli_test_additions_skip_existing_feature_tests(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--due-before')\n"
+
+        self.assertEqual(cli_test_additions(source, "Add --due-before tests.", "--due-before already covered", "_run"), [])
 
     def test_derive_request_obligations_extracts_feature_delivery_contract(self) -> None:
         obligations = derive_request_obligations(

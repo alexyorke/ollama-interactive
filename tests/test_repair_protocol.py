@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from ollama_code.repair_protocol import (
+from ollama_code.controller.repair_protocol import (
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
     repair_decision_for_tool,
