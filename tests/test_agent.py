@@ -4817,6 +4817,45 @@ class AgentTests(AgentTestBase):
         self.assertEqual(len(guards), 2)
         self.assertTrue(all(event.get("tool") == "write_file" for event in guards))
 
+    def test_repeated_invalid_python_mutations_fail_closed_after_repair_guidance(self) -> None:
+        root = self._workspace_scratch()
+        (root / "app.py").write_text("def value() -> str:\n    return 'ok'\n", encoding="utf-8")
+        bad_content = "def value() -> str:\n    \"unterminated\n    return 'new'\n"
+        bad_call = json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": bad_content}})
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                bad_call,
+                bad_call,
+                bad_call,
+                bad_call,
+                json.dumps({"type": "final", "message": "should not be reached"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests -v")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+        with patch.object(agent, "_try_spec_guided_repair", return_value=None) as repair:
+            result = agent.handle_user("Fix app.py and run tests.")
+
+        self.assertFalse(result.completed)
+        self.assertIn("repeated Python mutation payloads", result.message)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual((root / "app.py").read_text(encoding="utf-8"), "def value() -> str:\n    return 'ok'\n")
+        self.assertGreaterEqual(repair.call_count, 1)
+        invalid_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "invalid-python-mutation-payload"
+        ]
+        compressed_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "invalid-python-mutation-loop-compressed"
+        ]
+        self.assertEqual(len(invalid_guards), 3)
+        self.assertEqual(len(compressed_guards), 1)
+
     def test_pending_repair_spec_fails_closed_without_repeated_auto_lint(self) -> None:
         root = self._workspace_scratch()
         (root / "app.py").write_text("import os\n\n\ndef value() -> str:\n    return os.name\n", encoding="utf-8")
@@ -13221,6 +13260,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_spec_guided_repair_paths_reroute_package_init_to_backing_module",
         "test_final_repair_spec_stop_attempts_spec_guided_repair",
         "test_known_syntax_error_blocks_lint_validator_until_repair",
+        "test_repeated_invalid_python_mutations_fail_closed_after_repair_guidance",
         "test_final_chance_test_success_does_not_complete_unproven_obligations",
         "test_pending_repair_spec_fails_closed_without_repeated_auto_lint",
         "test_unproven_feature_obligations_fail_before_final_verifier",

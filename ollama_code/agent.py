@@ -15126,6 +15126,24 @@ class OllamaCodeAgent:
                             if repair_result is not None:
                                 spec_guided_repair_attempted = True
                                 return repair_result
+                        if invalid_python_mutation_payload_counts[invalid_key] >= 3 and (mutation_required or code_mutation_required):
+                            self._append_assistant_payload(payload)
+                            self._record_event(
+                                "controller_guard",
+                                guard="invalid-python-mutation-loop-compressed",
+                                tool=name,
+                                diagnostic=syntax_diagnostic,
+                                rounds=round_number,
+                            )
+                            return AgentResult(
+                                message=(
+                                    "Stopped because repeated Python mutation payloads for "
+                                    f"{target_key} were syntactically invalid after repair guidance. "
+                                    f"Last diagnostic: {syntax_diagnostic}"
+                                ),
+                                rounds=round_number,
+                                completed=False,
+                            )
                         self._append_assistant_payload(payload)
                         self.messages.append(
                             {
