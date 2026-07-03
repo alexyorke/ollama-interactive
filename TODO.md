@@ -24,11 +24,12 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - `ToolExecutor.lint_typecheck` is now mostly adapter code for path resolution, local tool discovery, cache storage, and callback injection.
 - Candidate validation signature-gate policy, result shaping, workspace-copy ignore policy, and temp-workspace validation orchestration now live in `ollama_code/tools/synthesis.py` with direct tests.
 - Function-probe script generation and result shaping now live in `ollama_code/tools/synthesis.py` with direct tests.
+- Python write-content repair for generated code fences, quote prefixes, rewrite markers, common join typos, and auto-dedent now lives in `ollama_code/tools/synthesis.py` with direct tests.
 
 ## Next ToolExecutor Tranche
 
 - Do not keep extracting tiny wrappers just to reduce line count.
-- Next meaningful split is generated-code repair synthesis, or validator discovery if a measured setup gap appears.
+- Next meaningful split is the remaining generated-code replacement and symbol-repair helpers, or validator discovery if a measured setup gap appears.
 - Preserve compatibility wrappers until extracted implementations have direct focused tests.
 
 ## Readiness Gates
