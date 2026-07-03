@@ -87,6 +87,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Prompt-context truncation and prompt-palette coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Subagent delegation/configuration/model-normalization coverage now lives in `tests/test_agent_subagent.py` instead of the omnibus `tests/test_agent.py`.
 - Basic final-verification lifecycle coverage now lives in `tests/test_agent_verification.py` instead of the omnibus `tests/test_agent.py`.
+- Assumption-audit retry, fail-closed, and grounded-skip coverage now lives in `tests/test_agent_assumption_audit.py` instead of the omnibus `tests/test_agent.py`.
 - Loop-cap failure-compression coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner broad-context guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
