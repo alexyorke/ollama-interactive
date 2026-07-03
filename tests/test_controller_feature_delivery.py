@@ -14,9 +14,12 @@ from ollama_code.controller.feature_delivery import (
     cli_test_update_plan,
     derive_request_obligations,
     effective_repair_test_command,
+    edit_payload_is_stub_like_repair,
     extract_candidate_python_source,
     focused_python_repair_test_score,
+    function_body_is_stub_like_python_repair,
     mechanical_obligation_repair_failed_for,
+    mutation_payload_contains_omitted_context_marker,
     normalize_repair_strategy_payload,
     normalized_test_or_source_stem,
     package_relative_import_rewrite_source,
@@ -37,7 +40,9 @@ from ollama_code.controller.feature_delivery import (
     spec_guided_repair_candidate_models,
     spec_guided_repair_has_actionable_spec,
     spec_guided_repair_enabled,
+    text_is_stub_like_python_repair,
     typed_cli_flag_protocol_enabled,
+    validation_failure_is_stub_placeholder,
 )
 
 
@@ -185,6 +190,42 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 local_module_exists=lambda name: False,
             )
         )
+
+    def test_function_body_is_stub_like_python_repair_detects_stub_shapes(self) -> None:
+        function = ast.parse("def build():\n    pass\n").body[0]
+        self.assertIsInstance(function, ast.FunctionDef)
+        self.assertTrue(function_body_is_stub_like_python_repair(list(function.body)))  # type: ignore[union-attr]
+
+        function = ast.parse("def build():\n    return 3\n").body[0]
+        self.assertIsInstance(function, ast.FunctionDef)
+        self.assertFalse(function_body_is_stub_like_python_repair(list(function.body)))  # type: ignore[union-attr]
+
+    def test_text_and_edit_payload_stub_like_repair_policy(self) -> None:
+        self.assertTrue(text_is_stub_like_python_repair("def build():\n    raise NotImplementedError()\n"))
+        self.assertFalse(text_is_stub_like_python_repair("def build():\n    return 3\n"))
+        self.assertTrue(
+            edit_payload_is_stub_like_repair(
+                "write_file",
+                {"path": "src/example.py", "content": "def build():\n    pass\n"},
+            )
+        )
+        self.assertFalse(
+            edit_payload_is_stub_like_repair(
+                "write_file",
+                {"path": "README.md", "content": "def build():\n    pass\n"},
+            )
+        )
+
+    def test_omitted_context_and_stub_validation_failure_policy(self) -> None:
+        self.assertTrue(
+            mutation_payload_contains_omitted_context_marker(
+                "replace_in_file",
+                {"old": "x", "new": "[omitted 120 chars from prior read_file; do not copy]"},
+            )
+        )
+        self.assertFalse(mutation_payload_contains_omitted_context_marker("write_file", {"content": "normal text"}))
+        self.assertTrue(validation_failure_is_stub_placeholder("contract_check: still has stub body"))
+        self.assertFalse(validation_failure_is_stub_placeholder("contract_check: real syntax error"))
 
     def test_request_likely_import_repair_requires_import_request_and_import_source(self) -> None:
         source = "from app.models import Task\n\n\ndef build():\n    return Task()\n"

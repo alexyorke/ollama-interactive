@@ -95,6 +95,7 @@ from ollama_code.controller import (
     clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
     effective_repair_test_command as feature_effective_repair_test_command,
+    edit_payload_is_stub_like_repair as feature_edit_payload_is_stub_like_repair,
     extract_candidate_python_source as feature_extract_candidate_python_source,
     final_acknowledges_missing_path as controller_final_acknowledges_missing_path,
     final_claims_file_mutation as controller_final_claims_file_mutation,
@@ -105,8 +106,10 @@ from ollama_code.controller import (
     final_requires_verification as controller_final_requires_verification,
     focused_python_repair_test_score as feature_focused_python_repair_test_score,
     forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
+    function_body_is_stub_like_python_repair as feature_function_body_is_stub_like_python_repair,
     mechanical_obligation_repair_failed_for as feature_mechanical_obligation_repair_failed_for,
     merge_request_obligations,
+    mutation_payload_contains_omitted_context_marker as feature_mutation_payload_contains_omitted_context_marker,
     normalized_test_or_source_stem as feature_normalized_test_or_source_stem,
     normalize_edit_payload_aliases as controller_normalize_edit_payload_aliases,
     normalize_exact_literal_tool_call as controller_normalize_exact_literal_tool_call,
@@ -211,9 +214,11 @@ from ollama_code.controller import (
     signature_with_appended_parameter as controller_signature_with_appended_parameter,
     grounded_symbol_return_rewrite_spec as controller_grounded_symbol_return_rewrite_spec,
     spec_guided_repair_has_actionable_spec as feature_spec_guided_repair_has_actionable_spec,
+    text_is_stub_like_python_repair as feature_text_is_stub_like_python_repair,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
+    validation_failure_is_stub_placeholder as feature_validation_failure_is_stub_placeholder,
     workflow_config_update_operations_from_source as controller_workflow_config_update_operations_from_source,
     workflow_config_update_spec as controller_workflow_config_update_spec,
 )
@@ -3271,103 +3276,19 @@ class OllamaCodeAgent:
         return stubs
 
     def _function_body_is_stub(self, body: list[ast.stmt]) -> bool:
-        statements = [node for node in body if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))]
-        if not statements:
-            return True
-        if len(statements) != 1:
-            return False
-        node = statements[0]
-        if isinstance(node, ast.Pass):
-            return True
-        if isinstance(node, ast.Return):
-            return node.value is None or (isinstance(node.value, ast.Constant) and node.value.value is None)
-        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
-            value = node.value.value
-            return value is Ellipsis or (
-                isinstance(value, str) and re.search(r"\b(?:todo|stub|implement|your code)\b", value, flags=re.IGNORECASE) is not None
-            )
-        if isinstance(node, ast.Raise):
-            raised = node.exc
-            if isinstance(raised, ast.Call):
-                raised = raised.func
-            return isinstance(raised, ast.Name) and raised.id == "NotImplementedError"
-        return False
+        return feature_function_body_is_stub_like_python_repair(body)
 
     def _text_is_stub_like_python_repair(self, text: str) -> bool:
-        stripped = textwrap.dedent(text or "").strip()
-        if not stripped:
-            return True
-        meaningful_lines = [
-            line.strip()
-            for line in stripped.splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-        if not meaningful_lines:
-            return True
-        if all(line in {"pass", "...", "return None", "raise NotImplementedError", "raise NotImplementedError()"} for line in meaningful_lines):
-            return True
-        try:
-            tree = ast.parse(stripped)
-        except SyntaxError:
-            return False
-        functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        return bool(functions) and all(self._function_body_is_stub(list(node.body)) for node in functions)
+        return feature_text_is_stub_like_python_repair(text)
 
     def _edit_payload_is_stub_like_repair(self, name: str, arguments: dict[str, Any]) -> bool:
-        path = str(arguments.get("path") or arguments.get("file") or arguments.get("filename") or "").strip()
-        if path and not path.replace("\\", "/").endswith(".py"):
-            return False
-        values: list[str] = []
-        if name == "edit_intent":
-            value = arguments.get("replacement")
-            if isinstance(value, str):
-                values.append(value)
-        elif name == "replace_symbol":
-            value = arguments.get("content")
-            if isinstance(value, str):
-                values.append(value)
-        elif name == "replace_symbols":
-            replacements = arguments.get("replacements")
-            if isinstance(replacements, list):
-                values.extend(str(item.get("content")) for item in replacements if isinstance(item, dict) and isinstance(item.get("content"), str))
-        elif name == "write_file":
-            value = arguments.get("content")
-            if isinstance(value, str):
-                values.append(value)
-        elif name == "replace_in_file":
-            value = arguments.get("new")
-            if isinstance(value, str):
-                values.append(value)
-        return bool(values) and all(self._text_is_stub_like_python_repair(value) for value in values)
+        return feature_edit_payload_is_stub_like_repair(name, arguments)
 
     def _mutation_payload_contains_omitted_context_marker(self, name: str, arguments: dict[str, Any]) -> bool:
-        values: list[str] = []
-        if name in {"write_file", "replace_symbol"}:
-            value = arguments.get("content")
-            if isinstance(value, str):
-                values.append(value)
-        elif name == "replace_symbols":
-            replacements = arguments.get("replacements")
-            if isinstance(replacements, list):
-                values.extend(
-                    str(item.get("content"))
-                    for item in replacements
-                    if isinstance(item, dict) and isinstance(item.get("content"), str)
-                )
-        elif name == "replace_in_file":
-            for key in ("old", "new"):
-                value = arguments.get(key)
-                if isinstance(value, str):
-                    values.append(value)
-        elif name == "edit_intent":
-            value = arguments.get("replacement")
-            if isinstance(value, str):
-                values.append(value)
-        return any(re.search(r"\[omitted \d+ chars from prior [A-Za-z_]+; do not copy\]", value) for value in values)
+        return feature_mutation_payload_contains_omitted_context_marker(name, arguments)
 
     def _validation_failure_is_stub_placeholder(self, summary: str) -> bool:
-        lowered = summary.lower()
-        return "still has stub body" in lowered or "pass-style placeholder" in lowered or "stub/comment/pass-style placeholder" in lowered
+        return feature_validation_failure_is_stub_placeholder(summary)
 
     def _run_test_failure_diagnosis(self, output: str) -> str:
         if not output.strip():

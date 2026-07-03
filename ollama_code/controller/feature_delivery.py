@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 import re
+import textwrap
 from typing import Any, Callable
 
 
@@ -370,6 +371,115 @@ def package_relative_import_rewrite_source(
     if not candidate.endswith("\n"):
         candidate += "\n"
     return candidate
+
+
+def function_body_is_stub_like_python_repair(body: list[ast.stmt]) -> bool:
+    statements = [
+        node
+        for node in body
+        if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str))
+    ]
+    if not statements:
+        return True
+    if len(statements) != 1:
+        return False
+    node = statements[0]
+    if isinstance(node, ast.Pass):
+        return True
+    if isinstance(node, ast.Return):
+        return node.value is None or (isinstance(node.value, ast.Constant) and node.value.value is None)
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+        value = node.value.value
+        return value is Ellipsis or (
+            isinstance(value, str)
+            and re.search(r"\b(?:todo|stub|implement|your code)\b", value, flags=re.IGNORECASE) is not None
+        )
+    if isinstance(node, ast.Raise):
+        raised = node.exc
+        if isinstance(raised, ast.Call):
+            raised = raised.func
+        return isinstance(raised, ast.Name) and raised.id == "NotImplementedError"
+    return False
+
+
+def text_is_stub_like_python_repair(text: str) -> bool:
+    stripped = textwrap.dedent(text or "").strip()
+    if not stripped:
+        return True
+    meaningful_lines = [
+        line.strip()
+        for line in stripped.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not meaningful_lines:
+        return True
+    if all(line in {"pass", "...", "return None", "raise NotImplementedError", "raise NotImplementedError()"} for line in meaningful_lines):
+        return True
+    try:
+        tree = ast.parse(stripped)
+    except SyntaxError:
+        return False
+    functions = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    return bool(functions) and all(function_body_is_stub_like_python_repair(list(node.body)) for node in functions)
+
+
+def edit_payload_is_stub_like_repair(name: str, arguments: dict[str, Any]) -> bool:
+    path = str(arguments.get("path") or arguments.get("file") or arguments.get("filename") or "").strip()
+    if path and not path.replace("\\", "/").endswith(".py"):
+        return False
+    values: list[str] = []
+    if name == "edit_intent":
+        value = arguments.get("replacement")
+        if isinstance(value, str):
+            values.append(value)
+    elif name == "replace_symbol":
+        value = arguments.get("content")
+        if isinstance(value, str):
+            values.append(value)
+    elif name == "replace_symbols":
+        replacements = arguments.get("replacements")
+        if isinstance(replacements, list):
+            values.extend(str(item.get("content")) for item in replacements if isinstance(item, dict) and isinstance(item.get("content"), str))
+    elif name == "write_file":
+        value = arguments.get("content")
+        if isinstance(value, str):
+            values.append(value)
+    elif name == "replace_in_file":
+        value = arguments.get("new")
+        if isinstance(value, str):
+            values.append(value)
+    return bool(values) and all(text_is_stub_like_python_repair(value) for value in values)
+
+
+def mutation_payload_contains_omitted_context_marker(name: str, arguments: dict[str, Any]) -> bool:
+    values: list[str] = []
+    if name in {"write_file", "replace_symbol"}:
+        value = arguments.get("content")
+        if isinstance(value, str):
+            values.append(value)
+    elif name == "replace_symbols":
+        replacements = arguments.get("replacements")
+        if isinstance(replacements, list):
+            values.extend(
+                str(item.get("content"))
+                for item in replacements
+                if isinstance(item, dict) and isinstance(item.get("content"), str)
+            )
+    elif name == "replace_in_file":
+        for key in ("old", "new"):
+            value = arguments.get(key)
+            if isinstance(value, str):
+                values.append(value)
+    elif name == "edit_intent":
+        value = arguments.get("replacement")
+        if isinstance(value, str):
+            values.append(value)
+    return any(re.search(r"\[omitted \d+ chars from prior [A-Za-z_]+; do not copy\]", value) for value in values)
+
+
+def validation_failure_is_stub_placeholder(summary: str) -> bool:
+    lowered = summary.lower()
+    return "still has stub body" in lowered or "pass-style placeholder" in lowered or "stub/comment/pass-style placeholder" in lowered
 
 
 def mechanical_obligation_repair_failed_for(
