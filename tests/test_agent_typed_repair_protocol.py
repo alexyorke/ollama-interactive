@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 from ollama_code.agent import OllamaCodeAgent
-from tests.test_agent import CountingToolExecutor, FakeClient
+from tests.agent_test_support import CountingToolExecutor, FakeClient
 
 
 class AgentTypedRepairProtocolTests(unittest.TestCase):
