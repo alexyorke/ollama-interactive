@@ -2,6 +2,8 @@ import unittest
 
 from ollama_code.agent_protocol import ExactFileWriteSpec
 from ollama_code.controller.edit_policy import (
+    decode_accidental_escaped_newlines,
+    normalize_edit_payload_aliases,
     normalize_exact_literal_tool_call,
     normalize_file_tool_alias_call,
     normalize_snippet_symbol_edit_call,
@@ -130,6 +132,69 @@ class ControllerEditPolicyTests(unittest.TestCase):
         self.assertEqual(
             normalize_file_tool_alias_call("unknown_tool", {"path": "README.md"}),
             ("unknown_tool", {"path": "README.md"}, None),
+        )
+
+    def test_edit_payload_alias_normalization_for_replace_in_file(self) -> None:
+        self.assertEqual(decode_accidental_escaped_newlines("def f():\\n    return 1"), "def f():\n    return 1")
+        self.assertEqual(decode_accidental_escaped_newlines("plain\\ntext"), "plain\\ntext")
+        name, arguments, reason = normalize_edit_payload_aliases(
+            "replace_in_file",
+            {
+                "file": "README.md",
+                "find": "Old",
+                "replacement": "New",
+                "all": True,
+                "whole_word": True,
+            },
+        )
+        self.assertEqual(name, "replace_in_file")
+        self.assertEqual(
+            arguments,
+            {
+                "file": "README.md",
+                "find": "Old",
+                "replacement": "New",
+                "all": True,
+                "whole_word": True,
+                "path": "README.md",
+                "old": "Old",
+                "new": "New",
+                "replace_all": True,
+                "match_whole_word": True,
+            },
+        )
+        self.assertEqual(
+            reason,
+            "Normalized edit payload: normalized all to replace_all; normalized file/path alias; normalized find to old; normalized replacement to new; normalized whole_word to match_whole_word.",
+        )
+
+    def test_edit_payload_alias_normalization_for_symbols_and_non_code(self) -> None:
+        self.assertEqual(
+            normalize_edit_payload_aliases(
+                "replace_symbols",
+                {"path": "src/app.py", "replacements": [{"symbol": "parse", "content": "def parse():\\n    return 1"}]},
+            ),
+            (
+                "replace_symbols",
+                {"path": "src/app.py", "replacements": [{"symbol": "parse", "content": "def parse():\n    return 1"}]},
+                "Normalized edit payload: decoded escaped newlines in replacement content.",
+            ),
+        )
+        self.assertEqual(
+            normalize_edit_payload_aliases("replace_symbol", {"path": "src/app.py", "replacements": [{"old": "a", "new": "b", "all": True}]}),
+            (
+                "replace_in_file",
+                {"path": "src/app.py", "old": "a", "new": "b", "replace_all": True},
+                "Normalized replace_symbol replacement-list payload to replace_in_file.",
+            ),
+        )
+        self.assertEqual(
+            normalize_edit_payload_aliases("replace_symbol", {"path": "README.md", "symbol": "Old", "content": "New"}),
+            (
+                "replace_in_file",
+                {"path": "README.md", "old": "Old", "new": "New", "replace_all": False},
+                "Normalized replace_symbol text edit on a non-code file to replace_in_file.",
+            ),
         )
 
 

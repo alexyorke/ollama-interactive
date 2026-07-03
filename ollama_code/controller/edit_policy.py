@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -195,4 +196,98 @@ def normalize_file_tool_alias_call(
             {"path": path.strip(), "content": content},
             f"Normalized unsupported {name} alias to write_file.",
         )
+    return name, arguments, None
+
+
+def decode_accidental_escaped_newlines(value: str) -> str:
+    if "\n" in value or "\\n" not in value:
+        return value
+    if not re.search(r"\b(?:def|class|import|from|return|if|for|while|try|except|function|const|let|var)\b", value):
+        return value
+    return value.replace("\\r\\n", "\n").replace("\\n", "\n")
+
+
+def normalize_edit_payload_aliases(
+    name: str,
+    arguments: dict[str, Any],
+) -> tuple[str, dict[str, Any], str | None]:
+    if name not in {"write_file", "replace_symbol", "replace_symbols", "replace_in_file"}:
+        return name, arguments, None
+    updated = deepcopy(arguments)
+    changed_reasons: list[str] = []
+    if name == "replace_in_file":
+        path = updated.get("path") or updated.get("file") or updated.get("filename")
+        if isinstance(path, str) and path.strip() and "path" not in updated:
+            updated["path"] = path
+            changed_reasons.append("normalized file/path alias")
+        if "old" not in updated:
+            for alias in ("old_text", "target", "find", "search", "before", "existing", "original", "from"):
+                value = updated.get(alias)
+                if isinstance(value, str):
+                    updated["old"] = value
+                    changed_reasons.append(f"normalized {alias} to old")
+                    break
+        if "new" not in updated:
+            for alias in ("new_text", "replacement", "content", "replace_with", "after", "value", "to"):
+                value = updated.get(alias)
+                if isinstance(value, str):
+                    updated["new"] = value
+                    changed_reasons.append(f"normalized {alias} to new")
+                    break
+        if "replace_all" not in updated and "all" in updated:
+            updated["replace_all"] = bool(updated.get("all"))
+            changed_reasons.append("normalized all to replace_all")
+        if "match_whole_word" not in updated:
+            for alias in ("whole_word", "matchWholeWord"):
+                if alias in updated:
+                    updated["match_whole_word"] = bool(updated.get(alias))
+                    changed_reasons.append(f"normalized {alias} to match_whole_word")
+                    break
+    for key in ("content", "new"):
+        value = updated.get(key)
+        if isinstance(value, str):
+            decoded = decode_accidental_escaped_newlines(value)
+            if decoded != value:
+                updated[key] = decoded
+                changed_reasons.append(f"decoded escaped newlines in {key}")
+    if name == "replace_symbols":
+        replacements = updated.get("replacements")
+        if isinstance(replacements, list):
+            normalized_replacements: list[Any] = []
+            for item in replacements:
+                if not isinstance(item, dict):
+                    normalized_replacements.append(item)
+                    continue
+                normalized_item = dict(item)
+                content = normalized_item.get("content")
+                if isinstance(content, str):
+                    decoded = decode_accidental_escaped_newlines(content)
+                    if decoded != content:
+                        normalized_item["content"] = decoded
+                        changed_reasons.append("decoded escaped newlines in replacement content")
+                normalized_replacements.append(normalized_item)
+            updated["replacements"] = normalized_replacements
+    if name == "replace_symbol":
+        path = str(updated.get("path", "")).strip()
+        symbol = updated.get("symbol")
+        content = updated.get("content")
+        replacements = updated.get("replacements")
+        if path and isinstance(replacements, list) and len(replacements) == 1 and isinstance(replacements[0], dict):
+            item = replacements[0]
+            old = item.get("old")
+            new = item.get("new")
+            if isinstance(old, str) and isinstance(new, str):
+                return (
+                    "replace_in_file",
+                    {"path": path, "old": old, "new": new, "replace_all": bool(item.get("replace_all", item.get("all", False)))},
+                    "Normalized replace_symbol replacement-list payload to replace_in_file.",
+                )
+        if path and isinstance(symbol, str) and isinstance(content, str) and not path_looks_like_code_file(path):
+            return (
+                "replace_in_file",
+                {"path": path, "old": symbol, "new": content, "replace_all": False},
+                "Normalized replace_symbol text edit on a non-code file to replace_in_file.",
+            )
+    if changed_reasons:
+        return name, updated, "Normalized edit payload: " + "; ".join(sorted(set(changed_reasons))) + "."
     return name, arguments, None
