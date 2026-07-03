@@ -8,6 +8,7 @@ from ollama_code.controller.request_policy import (
     request_forbids_tests,
     request_forbids_validation,
     request_looks_like_issue_report,
+    request_needs_exact_grounding,
     request_requires_code_mutation,
     request_requires_mutation,
     request_requires_test_run,
@@ -22,6 +23,12 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         self.assertTrue(request_requires_mutation("Fix `app.py`; it returns the wrong value."))
         self.assertTrue(request_looks_like_issue_report("`app.py` fails when input is empty."))
         self.assertTrue(request_allows_mutation("Please add a stats command."))
+
+    def test_exact_grounding_policy_detects_exact_text_requests(self) -> None:
+        self.assertTrue(request_needs_exact_grounding("Read docs/spec.md and reply with the token only."))
+        self.assertTrue(request_needs_exact_grounding("What does line 12 say?"))
+        self.assertTrue(request_needs_exact_grounding("Return exactly the first line."))
+        self.assertFalse(request_needs_exact_grounding("Summarize docs/spec.md."))
 
     def test_code_mutation_policy_requires_source_or_bug_context(self) -> None:
         self.assertTrue(request_requires_code_mutation("Fix the failing tests by repairing source code."))

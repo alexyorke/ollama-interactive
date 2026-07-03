@@ -107,6 +107,7 @@ from ollama_code.controller import (
     request_forbids_validation as controller_request_forbids_validation,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
     request_looks_like_issue_report as controller_request_looks_like_issue_report,
+    request_needs_exact_grounding as controller_request_needs_exact_grounding,
     request_obligation_proof_status as feature_obligation_proof_status,
     request_requires_code_mutation as controller_request_requires_code_mutation,
     request_requires_mutation as controller_request_requires_mutation,
@@ -3928,16 +3929,7 @@ class OllamaCodeAgent:
         )
 
     def _request_needs_exact_grounding(self, text: str) -> bool:
-        lowered = text.lower()
-        patterns = [
-            r"\bexact(?:ly)?\b",
-            r"\bline\s+\d+\b",
-            r"\bfirst line\b",
-            r"\bsingle line\b",
-            r"\bwhat(?:'s| is)? .* say\b",
-            r"\btoken\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in patterns)
+        return controller_request_needs_exact_grounding(text)
 
     def _request_allows_mutation(self, text: str) -> bool:
         return controller_request_allows_mutation(text)

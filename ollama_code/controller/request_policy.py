@@ -23,6 +23,19 @@ def request_looks_like_issue_report(text: str) -> bool:
     return any(re.search(pattern, lowered) for pattern in issue_patterns)
 
 
+def request_needs_exact_grounding(text: str) -> bool:
+    lowered = text.lower()
+    patterns = [
+        r"\bexact(?:ly)?\b",
+        r"\bline\s+\d+\b",
+        r"\bfirst line\b",
+        r"\bsingle line\b",
+        r"\bwhat(?:'s| is)? .* say\b",
+        r"\btoken\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
 def request_allows_mutation(text: str) -> bool:
     lowered = text.lower()
     mutation_phrases = [
