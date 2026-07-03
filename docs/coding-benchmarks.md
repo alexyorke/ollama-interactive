@@ -64,7 +64,15 @@ python scripts/local_validation.py --tier smoke
 ```
 
 For `pytest` runs, the summary JSON includes a `coverage_summary` block that proves whether the repo-owned `smoke` plus `agent` plus `full-remaining` partition still covers the discovered test files exactly once.
-Use the `agent` tier before `local-full` when you are iterating on controller logic: it carries the focused grounding and post-edit-validation regressions that protect against README-only false success claims before you spend time on live-model runs. For typed repair protocol work, run `feature_delivery_cli_proof` and `task_due_filter` as targeted live gates; as of the first typed-protocol tranche, `feature_delivery_cli_proof` passes on `granite4.1:8b`, while `task_due_filter` is the remaining measured failure.
+Use the `agent` tier before `local-full` when you are iterating on controller logic: it carries the focused grounding and post-edit-validation regressions that protect against README-only false success claims before you spend time on live-model runs. For typed repair protocol work, run `feature_delivery_cli_proof` and `task_due_filter` as targeted live gates. `task_due_filter` is the current release hard case for CLI flag delivery and must remain green before broader controller refactors.
+
+Summarize the current release-readiness artifacts with:
+
+```bash
+python scripts/product_readiness_report.py --strict
+```
+
+The readiness report reads existing JSON artifacts; refresh the underlying validation, live-gate, and targeted benchmark outputs before using it for a release claim.
 
 Run the full local validation stack before merging larger controller changes:
 

@@ -83,7 +83,14 @@ from ollama_code.agent_protocol import (
     VERIFIED_FUNCTION_TOOL_NAMES,
     AgentResult,
 )
-from ollama_code.controller import NavigationValidationController, NavigationValidationTurn
+from ollama_code.controller import (
+    NavigationValidationController,
+    NavigationValidationTurn,
+    cli_feature_capabilities,
+    cli_proof_command_argvs,
+    cli_readme_additions,
+    typed_cli_flag_protocol_enabled,
+)
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
 from ollama_code.prompts import (
     ARTIFACT_RECONCILER_SYSTEM_PROMPT,
@@ -10415,7 +10422,10 @@ class OllamaCodeAgent:
         )
 
     def _request_uses_typed_cli_flag_protocol(self, request_text: str) -> bool:
-        return self._request_is_cli_flag_bundle(request_text)
+        return typed_cli_flag_protocol_enabled(
+            request_text=request_text,
+            request_is_cli_flag_bundle=self._request_is_cli_flag_bundle(request_text),
+        )
 
     def _try_structured_test_driven_repair(
         self,
@@ -11124,29 +11134,7 @@ class OllamaCodeAgent:
         return source_path, test_path
 
     def _candidate_cli_proof_commands(self, source_path: str, candidate_source: str, request_text: str = "") -> list[str]:
-        commands: list[str] = []
-        has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
-        has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
-        has_json_flag = "--json" in candidate_source
-        has_limit_flag = "--limit" in candidate_source and "--limit" in request_text
-        has_due_before = "--due-before" in candidate_source
-        if has_stats:
-            commands.append(self._repair_shell_command([sys.executable, source_path, "stats"]))
-        if has_priority_filter:
-            commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--priority", "high"]))
-        if has_due_before:
-            commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--due-before", "2026-07-06"]))
-            if has_priority_filter:
-                commands.append(self._repair_shell_command([sys.executable, source_path, "list", "--priority", "high", "--due-before", "2026-07-06"]))
-        if has_json_flag:
-            commands.append(self._repair_shell_command([sys.executable, source_path, "--json"]))
-            if "--tag" in candidate_source:
-                commands.append(self._repair_shell_command([sys.executable, source_path, "--tag", "work", "--json"]))
-                if has_limit_flag:
-                    commands.append(self._repair_shell_command([sys.executable, source_path, "--tag", "work", "--limit", "1", "--json"]))
-        elif has_limit_flag:
-            commands.append(self._repair_shell_command([sys.executable, source_path, "--limit", "1"]))
-        return commands
+        return [self._repair_shell_command([sys.executable, *argv]) for argv in cli_proof_command_argvs(source_path, candidate_source, request_text)]
 
     def _mechanical_obligation_repair_failed_for(self, source_path: str, test_path: str) -> bool:
         normalized_source = str(source_path or "").strip().replace("\\", "/").lstrip("./")
@@ -11174,30 +11162,15 @@ class OllamaCodeAgent:
     ) -> None:
         if not re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
             return
-        has_stats = bool(re.search(r"add_parser\(\s*['\"]stats['\"]", candidate_source))
-        has_priority_filter = "--priority" in candidate_source and bool(re.search(r"add_parser\(\s*['\"]list['\"]", candidate_source))
-        has_json_flag = "--json" in candidate_source
-        has_limit_flag = "--limit" in candidate_source and "--limit" in request_text
-        has_due_before = "--due-before" in candidate_source
-        if not has_stats and not has_priority_filter and not has_json_flag and not has_limit_flag and not has_due_before:
+        capabilities = cli_feature_capabilities(candidate_source, request_text)
+        if not capabilities.any():
             return
         try:
             readme_path = self.tools.resolve_path("README.md", allow_missing=False)
             readme_text = readme_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return
-        lowered = readme_text.lower()
-        additions: list[str] = []
-        if has_priority_filter and "--priority" not in lowered:
-            additions.append("- `list --priority high` filters tasks by priority.")
-        if has_stats and "stats" not in lowered:
-            additions.append("- `stats` prints counts by status and priority.")
-        if has_json_flag and "--json" not in lowered:
-            additions.append("- `--json` prints the selected items as JSON objects.")
-        if has_limit_flag and "--limit" not in lowered:
-            additions.append("- `--limit N` limits the selected items after filtering and works with `--json`.")
-        if has_due_before and "--due-before" not in lowered:
-            additions.append("- `list --due-before YYYY-MM-DD` filters tasks by due date and can be combined with `--priority`.")
+        additions = cli_readme_additions(candidate_source, request_text, readme_text)
         if not additions:
             if re.search(r"\b(?:readme|docs?|documentation)\b", request_text, flags=re.IGNORECASE):
                 self._execute_controller_tool(

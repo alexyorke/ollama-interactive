@@ -169,6 +169,14 @@ The JSON summary records the resolved runner, resolved worker mode, completed ti
 For `pytest` runs it also records a `coverage_summary` block proving whether the repo-owned validation plan covered the discovered test targets exactly once, with zero duplicates and zero uncovered files.
 The focused `agent` tier now includes the feature-delivery false-success and typed-repair regressions: docs-only completions must fail closed, follow-up continue runs must keep unresolved obligations alive, and CLI flag work must move through the typed patch-bundle path instead of narrow speculative edits. The live `local-full` gate also includes `task_due_filter`; it is the current measured hard case for parser changes, tests/docs, and shell proof.
 
+For release-style readiness, use the strategy in `docs/product-strategy.md` and summarize current artifacts with:
+
+```bash
+python scripts/product_readiness_report.py --strict
+```
+
+That report does not run expensive checks. It reads existing validation, live-gate, and benchmark JSON and fails if they are missing, stale, dirty, or for a different git state.
+
 Run the fuller local validation stack before merging larger controller or tooling changes:
 
 ```bash

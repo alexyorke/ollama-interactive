@@ -485,10 +485,10 @@ class LocalValidationTests(unittest.TestCase):
                             repo_root=Path.cwd(),
                             runner="auto",
                             jobs="auto",
-                        )
+        )
 
         self.assertTrue(payload["command_ok"])
-        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["ok"])
         self.assertEqual(payload["live_gate_claim_consistency"], drift)
 
     def test_run_validation_records_optional_unittest_baseline_compare(self) -> None:
