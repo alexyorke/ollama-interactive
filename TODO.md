@@ -14,6 +14,16 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.
 - Focused controller tests cover feature-delivery policy directly instead of relying only on the omnibus `tests/test_agent.py`.
+- `ToolExecutor` contract and synthesis helper policy has started moving into focused modules:
+  `ollama_code/tools/contracts.py`, `ollama_code/tools/synthesis.py`, `ollama_code/tools/validation.py`, and
+  `ollama_code/tools/command_validation.py`.
+
+## Next ToolExecutor Tranche
+
+- Do not keep extracting tiny wrappers just to reduce line count.
+- Next meaningful split is validator execution, especially `lint_typecheck` subprocess/cache orchestration.
+- Treat that as a separate measured tranche because it couples cache keys, subprocess timeout behavior, Node checks, tree-sitter diagnostics, Python syntax diagnostics, and target scoping.
+- Preserve the current compatibility wrappers until the extracted validator implementation has direct focused tests.
 
 ## Readiness Gates
 
@@ -29,4 +39,4 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - More transcript or dataset discovery.
 - Optional-tool expansion beyond the currently useful local set.
 - Token micro-optimization after deterministic probe cost is already low.
-- Broad `ToolExecutor` splitting, starting with validators or synthesis helpers, only after a measured product-readiness gap justifies it.
+- Broad `ToolExecutor` splitting beyond validator execution, contracts, and synthesis helpers unless a measured product-readiness gap justifies it.
