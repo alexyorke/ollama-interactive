@@ -88,6 +88,8 @@ from ollama_code.controller import (
     NavigationValidationTurn,
     cli_proof_commands as feature_cli_proof_commands,
     cli_readme_update_plan as feature_cli_readme_update_plan,
+    cli_surface_repair_candidate_score as feature_cli_surface_repair_candidate_score,
+    cli_surface_source_eligible as feature_cli_surface_source_eligible,
     cli_test_update_plan as feature_cli_test_update_plan,
     clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
@@ -9407,10 +9409,8 @@ class OllamaCodeAgent:
                 tree = ast.parse(source_text)
             except Exception:
                 continue
-            if len(source_text.splitlines()) > 260 or "argparse" not in source_text:
-                continue
             function_names = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
-            if "main" not in function_names:
+            if not feature_cli_surface_source_eligible(source_text=source_text, function_names=function_names):
                 continue
             related_tests = self._related_tests_for_source(rel_source)
             if not related_tests:
@@ -9436,15 +9436,15 @@ class OllamaCodeAgent:
                     test_text = self.tools.resolve_path(test_path, allow_missing=False).read_text(encoding="utf-8", errors="replace")
                 except Exception:
                     continue
-                if "subprocess" not in test_text and "_run(" not in test_text:
+                score = feature_cli_surface_repair_candidate_score(
+                    source_text=source_text,
+                    function_names=function_names,
+                    source_stem=Path(rel_source).stem,
+                    test_path=test_path,
+                    test_text=test_text,
+                )
+                if score is None:
                     continue
-                score = 10
-                if "TASKS" in source_text and {"list_tasks", "complete_task"}.issubset(function_names):
-                    score += 10
-                if "@dataclass" in source_text and "--tag" in source_text:
-                    score += 8
-                if Path(rel_source).stem.lower() in Path(test_path).name.lower():
-                    score += 10
                 candidates.append((score, rel_source, test_path))
         if not candidates:
             return None

@@ -178,6 +178,30 @@ def cli_proof_commands(
     ]
 
 
+def cli_surface_source_eligible(*, source_text: str, function_names: set[str]) -> bool:
+    return len(source_text.splitlines()) <= 260 and "argparse" in source_text and "main" in function_names
+
+
+def cli_surface_repair_candidate_score(
+    *,
+    source_text: str,
+    function_names: set[str],
+    source_stem: str,
+    test_path: str,
+    test_text: str,
+) -> int | None:
+    if "subprocess" not in test_text and "_run(" not in test_text:
+        return None
+    score = 10
+    if "TASKS" in source_text and {"list_tasks", "complete_task"}.issubset(function_names):
+        score += 10
+    if "@dataclass" in source_text and "--tag" in source_text:
+        score += 8
+    if source_stem.lower() in test_path.lower():
+        score += 10
+    return score
+
+
 def _normalize_repo_path(path: str) -> str:
     return str(path or "").strip().replace("\\", "/").lstrip("./")
 

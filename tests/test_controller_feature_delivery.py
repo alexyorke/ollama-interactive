@@ -7,6 +7,8 @@ from ollama_code.controller.feature_delivery import (
     cli_proof_command_argvs,
     cli_readme_additions,
     cli_readme_update_plan,
+    cli_surface_repair_candidate_score,
+    cli_surface_source_eligible,
     cli_test_additions,
     cli_test_update_plan,
     derive_request_obligations,
@@ -248,6 +250,46 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         )
 
         self.assertEqual(commands, ["python.exe|task cli.py|list|--due-before|2026-07-06"])
+
+    def test_cli_surface_source_eligible_requires_argparse_main_and_small_source(self) -> None:
+        self.assertTrue(
+            cli_surface_source_eligible(
+                source_text="import argparse\n\ndef main():\n    pass\n",
+                function_names={"main"},
+            )
+        )
+        self.assertFalse(cli_surface_source_eligible(source_text="def main():\n    pass\n", function_names={"main"}))
+        self.assertFalse(cli_surface_source_eligible(source_text="import argparse\n", function_names={"run"}))
+        self.assertFalse(
+            cli_surface_source_eligible(
+                source_text="\n".join("x = 1" for _ in range(261)) + "\nargparse\n",
+                function_names={"main"},
+            )
+        )
+
+    def test_cli_surface_repair_candidate_score_requires_cli_test_surface(self) -> None:
+        source = "TASKS = []\nimport argparse\nparser.add_argument('--tag')\n@dataclass\nclass Task: pass\n"
+        function_names = {"main", "list_tasks", "complete_task"}
+
+        self.assertEqual(
+            cli_surface_repair_candidate_score(
+                source_text=source,
+                function_names=function_names,
+                source_stem="task_cli",
+                test_path="tests/test_task_cli.py",
+                test_text="import subprocess\n",
+            ),
+            38,
+        )
+        self.assertIsNone(
+            cli_surface_repair_candidate_score(
+                source_text=source,
+                function_names=function_names,
+                source_stem="task_cli",
+                test_path="tests/test_task_cli.py",
+                test_text="def test_unit(): pass\n",
+            )
+        )
 
     def test_cli_readme_additions_skip_existing_content(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"
