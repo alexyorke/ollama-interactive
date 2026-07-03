@@ -30,11 +30,12 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - `change_signature` signature normalization for bare, callable, full-function, multiline, and invalid replacement inputs now lives in `ollama_code/tools/synthesis.py` with direct tests.
 - `add_import` insertion policy for from-import merging, header-aware placement, multiline requests, and executable-payload rejection now lives in `ollama_code/tools/synthesis.py` with direct tests.
 - Symbol deletion and move shaping for ambiguous-match rendering, matched-symbol text removal, and destination append formatting now lives in `ollama_code/tools/synthesis.py` with direct tests.
+- Project rename identifier validation, per-file replacement detection, already-done detection, and result shaping now lives in `ollama_code/tools/synthesis.py` with direct tests.
 
 ## Next ToolExecutor Tranche
 
 - Do not keep extracting tiny wrappers just to reduce line count.
-- Next meaningful split is remaining structured-edit execution helpers such as project rename planning/result shaping, or validator discovery if a measured setup gap appears.
+- Next meaningful split is only the remaining structured-edit/apply wrappers if a measured gap appears; otherwise prefer readiness-artifact freshness or validator discovery work over more ToolExecutor splitting.
 - Preserve compatibility wrappers until extracted implementations have direct focused tests.
 
 ## Readiness Gates

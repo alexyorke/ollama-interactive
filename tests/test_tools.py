@@ -52,6 +52,11 @@ from ollama_code.tools.synthesis import (
     python_import_statement_is_safe,
     python_parameter_names,
     python_parameter_sequence,
+    project_rename_already_done_result,
+    project_rename_identifiers_are_valid,
+    project_rename_not_found_result,
+    project_rename_success_result,
+    project_rename_text_update,
     repair_common_python_join_typo,
     render_symbol_matches,
     single_python_replacement_symbol_name,
@@ -497,6 +502,51 @@ class ToolExecutorTests(unittest.TestCase):
             append_moved_symbol_text(destination, moved),
             "import os\n\nVALUE = 1\n\ndef moved():\n        return VALUE\n",
         )
+
+    def test_project_rename_helpers_validate_and_update_text(self) -> None:
+        updated, count, already = project_rename_text_update(
+            "def total(items):\n    subtotal = total(items[1:])\n",
+            "total",
+            "cart_total",
+        )
+        unchanged, unchanged_count, unchanged_already = project_rename_text_update(
+            "def cart_total(items):\n    return sum(items)\n",
+            "total",
+            "cart_total",
+        )
+
+        self.assertTrue(project_rename_identifiers_are_valid("total", "cart_total"))
+        self.assertFalse(project_rename_identifiers_are_valid("total()", "cart_total"))
+        self.assertEqual(count, 2)
+        self.assertFalse(already)
+        self.assertIn("def cart_total", updated)
+        self.assertEqual(unchanged_count, 0)
+        self.assertTrue(unchanged_already)
+        self.assertIn("def cart_total", unchanged)
+
+    def test_project_rename_helpers_shape_results(self) -> None:
+        already = project_rename_already_done_result(
+            base_label=".",
+            old="total",
+            new="cart_total",
+            files=[f"file_{index}.py" for index in range(25)],
+        )
+        missing = project_rename_not_found_result("total")
+        success = project_rename_success_result(
+            base_label=".",
+            old="total",
+            new="cart_total",
+            count=2,
+            diff="diff text",
+        )
+
+        self.assertTrue(already["ok"])
+        self.assertEqual(already["count"], 0)
+        self.assertEqual(len(already["files"]), 20)
+        self.assertFalse(missing["ok"])
+        self.assertIn("Identifier not found", missing["summary"])
+        self.assertTrue(success["ok"])
+        self.assertEqual(success["diff"], "diff text")
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):

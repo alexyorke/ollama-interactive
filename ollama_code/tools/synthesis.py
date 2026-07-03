@@ -408,6 +408,44 @@ def append_moved_symbol_text(destination_original: str, moved_text: str) -> str:
     return destination_original.rstrip() + "\n\n" + moved_text.lstrip()
 
 
+def project_rename_identifiers_are_valid(old: str, new: str) -> bool:
+    return bool(old and new and re.match(r"^[A-Za-z_]\w*$", old) and re.match(r"^[A-Za-z_]\w*$", new))
+
+
+def project_rename_text_update(original: str, old: str, new: str) -> tuple[str, int, bool]:
+    updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
+    already_renamed = count == 0 and bool(re.search(rf"\b{re.escape(new)}\b", original))
+    return updated, count, already_renamed
+
+
+def project_rename_already_done_result(*, base_label: str, old: str, new: str, files: list[str]) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "apply_structured_edit",
+        "path": base_label,
+        "op": "rename_symbol_project",
+        "count": 0,
+        "summary": f"Identifier already renamed from {old} to {new} in {len(files)} file(s).",
+        "files": files[:20],
+    }
+
+
+def project_rename_not_found_result(old: str) -> dict[str, Any]:
+    return {"ok": False, "tool": "apply_structured_edit", "summary": f"Identifier not found: {old}"}
+
+
+def project_rename_success_result(*, base_label: str, old: str, new: str, count: int, diff: str) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "tool": "apply_structured_edit",
+        "path": base_label,
+        "op": "rename_symbol_project",
+        "count": count,
+        "summary": f"Renamed {old} to {new} in {count} file(s).",
+        "diff": diff,
+    }
+
+
 def python_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     args = node.args
     names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}

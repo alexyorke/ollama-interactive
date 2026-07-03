@@ -105,6 +105,11 @@ from ollama_code.tools.synthesis import (
     python_parameter_names,
     python_parameter_sequence,
     python_parse_text,
+    project_rename_already_done_result,
+    project_rename_identifiers_are_valid,
+    project_rename_not_found_result,
+    project_rename_success_result,
+    project_rename_text_update,
     repair_common_python_join_typo,
     render_symbol_matches,
     select_test_spec_examples,
@@ -11884,7 +11889,7 @@ import string
         return self._apply_file_update(target, original, updated, f"Change signature of {symbol} in {relative_path}?", op="change_signature")
 
     def _rename_symbol_project(self, base: Path, old: str, new: str) -> dict[str, Any]:
-        if not old or not new or not re.match(r"^[A-Za-z_]\w*$", old) or not re.match(r"^[A-Za-z_]\w*$", new):
+        if not project_rename_identifiers_are_valid(old, new):
             return {"ok": False, "tool": "apply_structured_edit", "summary": "rename_symbol_project requires valid old/new identifiers."}
         updates: list[tuple[Path, str, str]] = []
         already_renamed_files: list[str] = []
@@ -11899,42 +11904,26 @@ import string
                     known.add(resolved)
         for file_path in files:
             original = file_path.read_text(encoding="utf-8", errors="replace")
-            updated, count = re.subn(rf"\b{re.escape(old)}\b", new, original)
+            updated, count, already_renamed = project_rename_text_update(original, old, new)
             if count:
                 if file_path.suffix.lower() == ".py":
                     diagnostic = self._python_syntax_diagnostic(file_path, updated)
                     if diagnostic:
                         return {"ok": False, "tool": "apply_structured_edit", "path": self.relative_label(file_path), "syntax_ok": False, "diagnostic": diagnostic, "summary": diagnostic}
                 updates.append((file_path, original, updated))
-            elif re.search(rf"\b{re.escape(new)}\b", original):
+            elif already_renamed:
                 already_renamed_files.append(self.relative_label(file_path))
         if not updates:
             if already_renamed_files:
-                return {
-                    "ok": True,
-                    "tool": "apply_structured_edit",
-                    "path": self.relative_label(base),
-                    "op": "rename_symbol_project",
-                    "count": 0,
-                    "summary": f"Identifier already renamed from {old} to {new} in {len(already_renamed_files)} file(s).",
-                    "files": already_renamed_files[:20],
-                }
-            return {"ok": False, "tool": "apply_structured_edit", "summary": f"Identifier not found: {old}"}
+                return project_rename_already_done_result(base_label=self.relative_label(base), old=old, new=new, files=already_renamed_files)
+            return project_rename_not_found_result(old)
         preview = "\n".join(self._diff_preview(self.relative_label(path), original, updated) for path, original, updated in updates[:12])
         approved, reason = self._approve_mutation(f"Rename {old} to {new} in {len(updates)} file(s)?", preview)
         if not approved:
             return {"ok": False, "tool": "apply_structured_edit", "summary": reason}
         for path, _, updated in updates:
             path.write_text(updated, encoding="utf-8")
-        return {
-            "ok": True,
-            "tool": "apply_structured_edit",
-            "path": self.relative_label(base),
-            "op": "rename_symbol_project",
-            "count": len(updates),
-            "summary": f"Renamed {old} to {new} in {len(updates)} file(s).",
-            "diff": preview,
-        }
+        return project_rename_success_result(base_label=self.relative_label(base), old=old, new=new, count=len(updates), diff=preview)
 
     def apply_structured_edit(self, operation: dict[str, Any] | str) -> dict[str, Any]:
         payload = self._operation_payload(operation)
