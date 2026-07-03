@@ -75,6 +75,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Missing-path final-claim coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Mutation-guard coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Contract-guard coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
+- Spec-guided post-edit repair coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Loop-cap failure-compression coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner broad-context guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
