@@ -263,6 +263,31 @@ def test_spec_add_example(
         examples.append(item)
 
 
+def test_spec_source_symbols_from_text(source_text: str) -> set[str]:
+    try:
+        tree = ast.parse(python_parse_text(source_text))
+    except Exception:
+        return set()
+    return {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    }
+
+
+def test_spec_import_aliases(tree: ast.AST, source_path: str | None) -> dict[str, str]:
+    if not source_path:
+        return {}
+    module_name = source_path.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ImportFrom) or node.module != module_name:
+            continue
+        for alias in node.names:
+            aliases[alias.asname or alias.name] = alias.name
+    return aliases
+
+
 def test_spec_iter_test_functions(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
     functions: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     for item in getattr(tree, "body", []):

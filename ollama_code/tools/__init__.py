@@ -101,11 +101,13 @@ from ollama_code.tools.synthesis import (
     test_spec_cli_result_access,
     test_spec_expected_expr,
     test_spec_expr_with_history,
+    test_spec_import_aliases,
     test_spec_is_source_constructor,
     test_spec_iter_test_functions,
     test_spec_receiver_root_name,
     test_spec_receiver_root_name_from_node,
     test_spec_record_side_effect_call,
+    test_spec_source_symbols_from_text,
     test_spec_symbol_from_expr,
 )
 from ollama_code.tools.validation import (
@@ -4551,26 +4553,13 @@ class ToolExecutor:
             return set()
         try:
             target = self.resolve_path(source_path, allow_missing=False)
-            tree = ast.parse(target.read_text(encoding="utf-8", errors="replace"))
+            text = target.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return set()
-        return {
-            node.name
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        }
+        return test_spec_source_symbols_from_text(text)
 
     def _test_spec_import_aliases(self, tree: ast.AST, source_path: str | None) -> dict[str, str]:
-        if not source_path:
-            return {}
-        module_name = Path(source_path).stem
-        aliases: dict[str, str] = {}
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node.module != module_name:
-                continue
-            for alias in node.names:
-                aliases[alias.asname or alias.name] = alias.name
-        return aliases
+        return test_spec_import_aliases(tree, source_path)
 
     def _node_expr(self, node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
         return node_expr(node, local_exprs)
