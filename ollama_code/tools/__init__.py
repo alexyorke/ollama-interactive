@@ -14,7 +14,6 @@ import json
 import os
 import re
 import signal
-import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -45,6 +44,17 @@ from ollama_code.tool_dependencies import (
     resolve_tool_executable,
 )
 from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_group_help, format_tool_help
+from ollama_code.tools.command_validation import (
+    WINDOWS_DRIVE_PATH,
+    WSL_MOUNT_PATH,
+    command_family,
+    command_has_shell_chaining,
+    command_looks_like_cross_platform_path_input,
+    split_command_for_validation,
+    split_command_text,
+    token_looks_like_path,
+    validation_result,
+)
 from ollama_code.tools.validation import (
     collapse_validation_targets,
     ini_has_section,
@@ -73,8 +83,6 @@ ApprovalMode = str
 AgentRunner = Callable[[dict[str, Any]], dict[str, Any]]
 _MEMORY_FTS_CONNECTIONS: dict[str, sqlite3.Connection] = {}
 _MEMORY_VERIFIED_FUNCTION_CONNECTIONS: dict[str, sqlite3.Connection] = {}
-WINDOWS_DRIVE_PATH = re.compile(r"^(?P<drive>[A-Za-z]):(?:[\\/](?P<rest>.*))?$")
-WSL_MOUNT_PATH = re.compile(r"^/mnt/(?P<drive>[A-Za-z])(?:/(?P<rest>.*))?$")
 SHELL_SCRIPT_SUFFIXES = {".sh", ".bash"}
 CODE_FILE_SUFFIXES = {
     ".py",
@@ -14131,55 +14139,13 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return next((group for group in match.groups() if group), None)
 
     def _split_command_for_validation(self, command: str) -> tuple[list[str] | None, dict[str, Any] | None]:
-        python_inline = re.match(
-            r"^\s*(?P<exe>(?:[A-Za-z]:)?[^\s]+(?:python|python3|py)(?:\.exe)?)\s+-c\s+(?P<code>.+?)\s*$",
-            command,
-            flags=re.IGNORECASE,
-        )
-        if python_inline:
-            code = python_inline.group("code").strip()
-            if len(code) >= 2 and code[0] == code[-1] and code[0] in {"'", '"'}:
-                code = code[1:-1]
-            return [python_inline.group("exe"), "-c", code], None
-        try:
-            argv = self._split_command_text(command)
-        except ValueError as exc:
-            return None, {
-                "recognized": False,
-                "valid": False,
-                "family": "shell",
-                "reason": f"Command rejected before execution: invalid quoting ({exc}).",
-            }
-        if not argv:
-            return None, {
-                "recognized": False,
-                "valid": False,
-                "family": "shell",
-                "reason": "Command rejected before execution: empty command.",
-            }
-        return argv, None
+        return split_command_for_validation(command, os_name=os.name)
 
     def _command_looks_like_cross_platform_path_input(self, command: str) -> bool:
-        if os.name == "nt" or "\\" not in command:
-            return False
-        for token in re.findall(r'"[^"]*"|\'[^\']*\'|\S+', command):
-            stripped = token.strip().strip("'\"")
-            if not stripped:
-                continue
-            normalized = stripped.replace("\\", "/")
-            if WINDOWS_DRIVE_PATH.match(normalized) or WSL_MOUNT_PATH.match(normalized):
-                return True
-            if stripped.startswith((".\\", "..\\")):
-                return True
-            if re.search(r"[A-Za-z0-9_.-]\\[A-Za-z0-9_.-]", stripped):
-                return True
-        return False
+        return command_looks_like_cross_platform_path_input(command, os_name=os.name)
 
     def _split_command_text(self, command: str) -> list[str]:
-        posix_mode = os.name != "nt"
-        if posix_mode and self._command_looks_like_cross_platform_path_input(command):
-            return shlex.split(command, posix=False)
-        return shlex.split(command, posix=posix_mode)
+        return split_command_text(command, os_name=os.name)
 
     def _normalize_command_argv_paths(self, argv: list[str]) -> list[str]:
         normalized: list[str] = []
@@ -14203,7 +14169,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return normalized
 
     def _command_has_shell_chaining(self, command: str) -> bool:
-        return bool(re.search(r"&&|\|\||[;|<>]", command))
+        return command_has_shell_chaining(command)
 
     def _command_path_escapes(self, token: str, cwd: Path) -> bool:
         if not token or token.startswith("-"):
@@ -14225,21 +14191,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return resolved != root and root not in resolved.parents
 
     def _token_looks_like_path(self, token: str) -> bool:
-        clean = str(token or "").strip().strip("'\"")
-        if not clean:
-            return False
-        if clean in {".", ".."}:
-            return True
-        if clean.startswith(("./", "../", ".\\", "..\\")):
-            return True
-        normalized = clean.replace("\\", "/")
-        return bool(
-            clean.startswith(("/", "\\"))
-            or "/" in clean
-            or "\\" in clean
-            or WINDOWS_DRIVE_PATH.match(normalized)
-            or WSL_MOUNT_PATH.match(normalized)
-        )
+        return token_looks_like_path(token)
 
     def _validate_executable_path(self, executable: str, cwd: Path) -> str | None:
         clean = str(executable or "").strip().strip("'\"")
@@ -14261,16 +14213,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return None
 
     def _command_family(self, argv: list[str]) -> str | None:
-        executable = Path(str(argv[0]).strip().strip("'\"")).name.lower()
-        if executable.endswith(".exe"):
-            executable = executable[:-4]
-        if executable in {"git", "pytest", "ruff", "mypy", "pyright", "tsc", "npm", "pnpm", "yarn", "go", "cargo", "gradle", "gradlew", "gradlew.bat", "cmake", "ctest", "node"}:
-            return executable
-        if executable in {"python", "python3", "py"}:
-            if "-m" in argv:
-                return "python"
-            return "python_exec"
-        return None
+        return command_family(argv)
 
     def _unknown_command_error(self, argv: list[str], cwd: Path) -> str | None:
         executable = str(argv[0]).strip().strip("'\"")
@@ -14339,12 +14282,7 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return shutil.which(clean) is not None or (cwd / clean).exists() or (self.workspace_root / clean).exists()
 
     def _validation_result(self, *, family: str, valid: bool, reason: str = "", argv: list[str] | None = None) -> dict[str, Any]:
-        result: dict[str, Any] = {"recognized": True, "valid": valid, "family": family}
-        if argv is not None:
-            result["argv"] = argv
-        if reason:
-            result["reason"] = reason
-        return result
+        return validation_result(family=family, valid=valid, reason=reason, argv=argv)
 
     def _normalize_python_exec_argv(self, argv: list[str]) -> list[str]:
         if len(argv) < 3:
