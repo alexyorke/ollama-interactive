@@ -64,7 +64,9 @@ from ollama_code.tools.validation import (
     python_validation_targets,
     path_label_looks_like_test,
     python_module_label,
+    preferred_test_validator_command,
     requested_validator_file_hints,
+    run_test_needs_command_recovery,
     source_module_labels,
     targeted_unittest_command,
     test_source_match_score,
@@ -14569,27 +14571,11 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         return result
 
     def _run_test_needs_command_recovery(self, result: dict[str, Any], *, selected_command: str = "") -> bool:
-        validation = result.get("validation")
-        if isinstance(validation, dict) and validation.get("valid") is False:
-            return True
-        error_class = str(result.get("error_class") or "").strip().lower()
-        if error_class in {"command_not_found", "invalid_args", "path_missing", "cwd_missing"}:
-            return True
-        if error_class == "missing_dependency":
-            missing = str(result.get("missing_dependency") or self._missing_dependency_name(str(result.get("output") or result.get("summary") or "")) or "").strip()
-            command_text = str(selected_command or result.get("command") or "").lower()
-            if missing and re.search(rf"(?:^|\b|-m\s+){re.escape(missing.lower())}(?:\b|$)", command_text):
-                return True
-            return missing in {"pytest", "unittest", "testmon"} and missing in command_text
-        output = str(result.get("output") or result.get("summary") or "").lower()
-        return any(
-            marker in output
-            for marker in (
-                "no tests ran",
-                "ran 0 tests",
-                "collected 0 items",
-                "no tests collected",
-            )
+        missing = self._missing_dependency_name(str(result.get("output") or result.get("summary") or "")) or ""
+        return run_test_needs_command_recovery(
+            result,
+            selected_command=selected_command,
+            missing_dependency_name=missing,
         )
 
     def _preferred_test_validator_command(
@@ -14598,20 +14584,4 @@ print(json.dumps({"title": title, "body": body, **events}, ensure_ascii=True))
         *,
         exclude_commands: set[str] | None = None,
     ) -> str | None:
-        excluded = {str(item).strip() for item in (exclude_commands or set()) if str(item).strip()}
-        candidates = [
-            item
-            for item in validators.get("validators", [])
-            if (
-                isinstance(item, dict)
-                and item.get("kind") == "test"
-                and item.get("command")
-                and item.get("available") is True
-                and str(item.get("command")).strip() not in excluded
-            )
-        ]
-        preferred = [item for item in candidates if "unittest discover" in str(item.get("command", ""))]
-        selected = (preferred or candidates)[:1]
-        if not selected:
-            return None
-        return str(selected[0]["command"])
+        return preferred_test_validator_command(validators, exclude_commands=exclude_commands)
