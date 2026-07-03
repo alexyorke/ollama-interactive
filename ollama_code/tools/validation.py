@@ -1,9 +1,63 @@
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable
+
+
+def toml_tool_section(payload: dict[str, Any], name: str) -> bool:
+    tool = payload.get("tool") if isinstance(payload, dict) else None
+    return isinstance(tool, dict) and isinstance(tool.get(name), dict)
+
+
+def ini_has_section(path: Path, prefixes: tuple[str, ...]) -> bool:
+    if not path.exists():
+        return False
+    parser = configparser.ConfigParser()
+    try:
+        parser.read(path, encoding="utf-8")
+    except configparser.Error:
+        return False
+    return any(section == prefix or section.startswith(prefix + ":") for section in parser.sections() for prefix in prefixes)
+
+
+def python_typechecker_configured(workspace_root: Path, pyproject: dict[str, Any]) -> bool:
+    if (workspace_root / "pyrightconfig.json").exists() or (workspace_root / "basedpyrightconfig.json").exists():
+        return True
+    return toml_tool_section(pyproject, "pyright") or toml_tool_section(pyproject, "basedpyright")
+
+
+def requested_validator_file_hints(requested_rel: str) -> dict[str, str]:
+    hints = {
+        "workflow_file": "",
+        "yaml_file": "",
+        "shell_script": "",
+        "dockerfile": "",
+        "markdown_file": "",
+        "sql_file": "",
+        "schema_file": "",
+    }
+    if not requested_rel:
+        return hints
+    requested_suffix = Path(requested_rel).suffix.lower()
+    requested_name = Path(requested_rel).name.lower()
+    if requested_suffix in {".yml", ".yaml"}:
+        hints["yaml_file"] = requested_rel
+        if requested_rel.lower().startswith(".github/workflows/"):
+            hints["workflow_file"] = requested_rel
+    if requested_suffix in {".sh", ".bash"}:
+        hints["shell_script"] = requested_rel
+    if requested_name == "dockerfile" or requested_name.endswith(".dockerfile"):
+        hints["dockerfile"] = requested_rel
+    if requested_suffix in {".md", ".markdown"}:
+        hints["markdown_file"] = requested_rel
+    if requested_suffix == ".sql":
+        hints["sql_file"] = requested_rel
+    if requested_name.endswith(".schema.json") or requested_name.endswith(".jsonschema"):
+        hints["schema_file"] = requested_rel
+    return hints
 
 
 def collapse_validation_targets(labels: Iterable[str], *, limit: int = 100) -> list[str]:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import builtins
-import configparser
 from copy import deepcopy
 import dis
 import difflib
@@ -48,9 +47,13 @@ from ollama_code.tool_dependencies import (
 from ollama_code.tools.catalog import TOOL_DESCRIPTIONS, format_compact_tool_help, format_tool_group_help, format_tool_help
 from ollama_code.tools.validation import (
     collapse_validation_targets,
+    ini_has_section,
     lint_typecheck_cache_key,
+    python_typechecker_configured,
     python_typechecker_targets,
     python_validation_targets,
+    requested_validator_file_hints,
+    toml_tool_section,
 )
 
 try:
@@ -1473,10 +1476,8 @@ class ToolExecutor:
         )
 
     def _python_typechecker_configured(self) -> bool:
-        if (self.workspace_root / "pyrightconfig.json").exists() or (self.workspace_root / "basedpyrightconfig.json").exists():
-            return True
         pyproject = self._read_toml(self.workspace_root / "pyproject.toml")
-        return self._toml_tool_section(pyproject, "pyright") or self._toml_tool_section(pyproject, "basedpyright")
+        return python_typechecker_configured(self.workspace_root, pyproject)
 
     def _lint_typecheck_cache_key(
         self,
@@ -11346,8 +11347,7 @@ import string
             return {}
 
     def _toml_tool_section(self, payload: dict[str, Any], name: str) -> bool:
-        tool = payload.get("tool") if isinstance(payload, dict) else None
-        return isinstance(tool, dict) and isinstance(tool.get(name), dict)
+        return toml_tool_section(payload, name)
 
     def _lint_typecheck_file_analysis(self, file_path: Path, *, timeout: int) -> dict[str, Any]:
         rel = self.relative_label(file_path)
@@ -11385,14 +11385,7 @@ import string
         return analysis
 
     def _ini_has_section(self, path: Path, prefixes: tuple[str, ...]) -> bool:
-        if not path.exists():
-            return False
-        parser = configparser.ConfigParser()
-        try:
-            parser.read(path, encoding="utf-8")
-        except configparser.Error:
-            return False
-        return any(section == prefix or section.startswith(prefix + ":") for section in parser.sections() for prefix in prefixes)
+        return ini_has_section(path, prefixes)
 
     def discover_validators(self, path: str = ".", limit: int = 12) -> dict[str, Any]:
         self._check_interrupted()
@@ -11430,31 +11423,15 @@ import string
         repo_files = self._iter_repo_files(root, limit=50000)
         suffixes: set[str] = set()
         file_names: set[str] = set()
-        workflow_file = ""
-        yaml_file = ""
-        shell_script = ""
-        dockerfile = ""
-        markdown_file = ""
-        sql_file = ""
-        schema_file = ""
+        hints = requested_validator_file_hints(requested_rel)
+        workflow_file = hints["workflow_file"]
+        yaml_file = hints["yaml_file"]
+        shell_script = hints["shell_script"]
+        dockerfile = hints["dockerfile"]
+        markdown_file = hints["markdown_file"]
+        sql_file = hints["sql_file"]
+        schema_file = hints["schema_file"]
         python_tests = False
-        if requested_rel:
-            requested_suffix = Path(requested_rel).suffix.lower()
-            requested_name = Path(requested_rel).name.lower()
-            if requested_suffix in {".yml", ".yaml"}:
-                yaml_file = requested_rel
-                if requested_rel.lower().startswith(".github/workflows/"):
-                    workflow_file = requested_rel
-            if requested_suffix in SHELL_SCRIPT_SUFFIXES:
-                shell_script = requested_rel
-            if requested_name == "dockerfile" or requested_name.endswith(".dockerfile"):
-                dockerfile = requested_rel
-            if requested_suffix in {".md", ".markdown"}:
-                markdown_file = requested_rel
-            if requested_suffix == ".sql":
-                sql_file = requested_rel
-            if requested_name.endswith(".schema.json") or requested_name.endswith(".jsonschema"):
-                schema_file = requested_rel
         for file_path in repo_files:
             suffix = file_path.suffix.lower()
             name = file_path.name.lower()
