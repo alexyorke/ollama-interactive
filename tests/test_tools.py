@@ -42,6 +42,7 @@ from ollama_code.tools.synthesis import (
     function_probe_script,
     looks_like_symbol_name,
     normalize_python_write_content,
+    normalize_python_signature_replacement,
     normalize_python_symbol_target,
     python_function_replacement_sanity_diagnostic,
     python_parameter_names,
@@ -415,6 +416,40 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertTrue(plan.ok)
         self.assertEqual(plan.route, "symbol-like request routed to text replace because target/replacement is not full symbol source")
         self.assertEqual(plan.routed_tool, "replace_in_file")
+
+    def test_normalize_python_signature_replacement_accepts_bare_and_full_inputs(self) -> None:
+        bare, bare_diagnostic = normalize_python_signature_replacement(
+            symbol="Service.fetch_user",
+            signature="user_id, include_orders=False",
+            expected_name="fetch_user",
+        )
+        full, full_diagnostic = normalize_python_signature_replacement(
+            symbol="Service.fetch_user",
+            signature="def fetch_user(\n    user_id,\n    include_orders=False,\n):\n    return None\n",
+            expected_name="fetch_user",
+        )
+
+        self.assertEqual(bare, "def fetch_user(user_id, include_orders=False):")
+        self.assertEqual(bare_diagnostic, "")
+        self.assertEqual(full, "def fetch_user( user_id, include_orders=False, ):")
+        self.assertEqual(full_diagnostic, "")
+
+    def test_normalize_python_signature_replacement_reports_invalid_or_wrong_name(self) -> None:
+        empty, empty_diagnostic = normalize_python_signature_replacement(
+            symbol="fetch_user",
+            signature="",
+            expected_name="fetch_user",
+        )
+        wrong_name, wrong_name_diagnostic = normalize_python_signature_replacement(
+            symbol="fetch_user",
+            signature="def fetch_order(user_id):",
+            expected_name="fetch_user",
+        )
+
+        self.assertEqual(empty, "")
+        self.assertIn("non-empty signature", empty_diagnostic)
+        self.assertEqual(wrong_name, "")
+        self.assertIn("fetch_order", wrong_name_diagnostic)
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):

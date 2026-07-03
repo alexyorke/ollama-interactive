@@ -105,6 +105,7 @@ from ollama_code.tools.synthesis import (
     looks_like_full_symbol_source,
     looks_like_function_body_edit_intent,
     looks_like_symbol_name,
+    normalize_python_signature_replacement,
     normalize_python_symbol_target,
     single_python_replacement_symbol_name,
     split_test_example,
@@ -11899,53 +11900,11 @@ import string
     def _normalize_python_signature_replacement(
         self, *, symbol: str, signature: str, expected_name: str
     ) -> tuple[str, str]:
-        clean = textwrap.dedent(signature).strip()
-        if not clean:
-            return "", "change_signature requires a non-empty signature."
-        if "\n" in clean:
-            lines = [line.rstrip() for line in clean.splitlines()]
-            start_index = next(
-                (
-                    index
-                    for index, line in enumerate(lines)
-                    if line.lstrip().startswith(("def ", "async def "))
-                ),
-                None,
-            )
-            if start_index is not None:
-                collected: list[str] = []
-                paren_balance = 0
-                for line in lines[start_index:]:
-                    stripped = line.strip()
-                    if not stripped:
-                        continue
-                    collected.append(stripped)
-                    paren_balance += stripped.count("(") - stripped.count(")")
-                    if stripped.endswith(":") and paren_balance <= 0:
-                        break
-                clean = " ".join(collected)
-        if not clean.startswith(("def ", "async def ")):
-            name = expected_name or symbol.split(".")[-1]
-            bare_name = re.match(r"^(?P<prefix>async\s+)?(?P<name>[A-Za-z_]\w*)\s*\(", clean)
-            if bare_name:
-                prefix = "async def " if bare_name.group("prefix") else "def "
-                clean = prefix + clean
-            elif clean.startswith("("):
-                clean = f"def {name}{clean}"
-            else:
-                clean = f"def {name}({clean})"
-        if not clean.rstrip().endswith(":"):
-            clean = clean.rstrip() + ":"
-        try:
-            tree = ast.parse(f"{clean}\n    pass\n")
-        except SyntaxError as exc:
-            return "", f"Invalid Python signature: {exc.msg}."
-        candidates = [child for child in tree.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        if len(candidates) != 1:
-            return "", "change_signature requires one Python function signature."
-        if candidates[0].name != expected_name:
-            return "", f"Replacement signature defines {candidates[0].name!r}, but target symbol is {expected_name!r}."
-        return clean, ""
+        return normalize_python_signature_replacement(
+            symbol=symbol,
+            signature=signature,
+            expected_name=expected_name,
+        )
 
     def _change_python_signature(self, target: Path, symbol: str, signature: str) -> dict[str, Any]:
         relative_path = self.relative_label(target)
