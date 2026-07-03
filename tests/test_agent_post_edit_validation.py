@@ -1246,6 +1246,98 @@ class AgentPostEditValidationTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn('prove the "stats" command exists', feedback)
 
+    def test_accurate_missing_path_summary_is_allowed_for_exists_question(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me whether it exists.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertNotIn("This request requires real tool use in this turn.", feedback)
+
+    def test_false_exists_claim_is_blocked_after_missing_path_failure(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "missing.py exists."}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me whether it exists.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "path-exists-final-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("latest path lookup failed", feedback)
+        self.assertIn("do not claim the path exists", feedback)
+
+    def test_accurate_missing_path_summary_is_allowed_for_direct_read_question(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me line 1.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertNotIn("This request requires real tool use in this turn.", feedback)
+
+    def test_false_content_claim_is_blocked_after_missing_path_failure(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "missing.py"}}),
+                json.dumps({"type": "final", "message": "line 1 is hello"}),
+                json.dumps({"type": "final", "message": "missing.py does not exist in the workspace."}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
+            result = agent.handle_user("Read missing.py and tell me line 1.")
+
+        self.assertTrue(result.completed)
+        self.assertIn("does not exist", result.message.lower())
+        controller_guards = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "missing-path-content-claim"
+        ]
+        self.assertEqual(len(controller_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("latest path lookup failed", feedback)
+        self.assertIn("do not invent file contents", feedback)
+
     def test_request_obligation_code_change_requires_mutation_not_source_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -2284,4 +2376,3 @@ class AgentPostEditValidationTests(AgentTestBase):
             )
 
         self.assertEqual(agent._sticky_failed_edit_recovery[0]["path"], "task_cli.py")
-
