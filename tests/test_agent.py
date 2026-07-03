@@ -3852,6 +3852,100 @@ class AgentTests(AgentTestBase):
         self.assertIn("summarize_status", feedback)
         self.assertIn("preserve existing public API", feedback)
 
+    def test_write_file_inventing_object_model_after_failed_symbol_edit_is_rejected(self) -> None:
+        root = self._workspace_scratch()
+        original = (
+            "from __future__ import annotations\n\n"
+            "import argparse\n"
+            "import json\n"
+            "from pathlib import Path\n\n"
+            "DATA_FILE = Path(\"tasks.json\")\n\n\n"
+            "def load_tasks(path: Path = DATA_FILE) -> list[dict[str, str]]:\n"
+            "    if not path.exists():\n"
+            "        return []\n"
+            "    return json.loads(path.read_text(encoding=\"utf-8\"))\n\n\n"
+            "def save_tasks(tasks: list[dict[str, str]], path: Path = DATA_FILE) -> None:\n"
+            "    path.write_text(json.dumps(tasks), encoding=\"utf-8\")\n\n\n"
+            "def add_task(title: str, priority: str = \"normal\", path: Path = DATA_FILE) -> dict[str, str]:\n"
+            "    tasks = load_tasks(path)\n"
+            "    task = {\"title\": title, \"priority\": priority, \"status\": \"todo\"}\n"
+            "    tasks.append(task)\n"
+            "    save_tasks(tasks, path)\n"
+            "    return task\n\n\n"
+            "def list_tasks(path: Path = DATA_FILE, *, priority: str | None = None) -> list[dict[str, str]]:\n"
+            "    tasks = load_tasks(path)\n"
+            "    if priority:\n"
+            "        tasks = [task for task in tasks if task.get(\"priority\") == priority]\n"
+            "    return tasks\n\n\n"
+            "def build_parser() -> argparse.ArgumentParser:\n"
+            "    parser = argparse.ArgumentParser(description=\"Manage local tasks\")\n"
+            "    parser.add_argument(\"--priority\")\n"
+            "    return parser\n\n\n"
+            "def main(argv: list[str] | None = None) -> int:\n"
+            "    return 0\n"
+        )
+        invented_rewrite = (
+            "from __future__ import annotations\n"
+            "import argparse\n"
+            "import json\n"
+            "from datetime import datetime\n"
+            "from pathlib import Path\n\n"
+            "class TaskCLI:\n"
+            "   DATA_FILE = Path(\"tasks.json\")\n"
+            "   @classmethod\n"
+            "   def load_tasks(cls) -> list[Task]:\n"
+            "       if not cls.DATA_FILE.exists():\n"
+            "           return []\n"
+            "       raw = json.loads(cls.DATA_FILE.read_text())\n"
+            "       return [Task(**t) for t in raw]\n"
+            "   @classmethod\n"
+            "   def run_list_command(cls, args: argparse.Namespace) -> None:\n"
+            "       tasks = cls.load_tasks()\n"
+            "       for task in tasks:\n"
+            "           print(task.title)\n\n"
+            "class Task:\n"
+            "   def __init__(self, title: str, due_date: str):\n"
+            "       self.title = title\n"
+            "       self.due_date = datetime.strptime(due_date, \"%Y-%m-%d\").date()\n"
+            "if __name__ == \"__main__\":\n"
+            "   exit(TaskCLI.main())\n"
+        )
+        (root / "task_cli.py").write_text(original, encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "task_cli.py"}}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "task_cli.py",
+                            "intent": "replace_symbol",
+                            "target": "TaskCLI.list_command",
+                            "replacement": "def list_command(args):\n    pass\n",
+                        },
+                    }
+                ),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "task_cli.py", "content": invented_rewrite}}),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=4)
+
+        agent.handle_user("Add --due-before to task_cli.py without removing existing functions.")
+
+        self.assertIsNone(tools.execute_counts.get("write_file"))
+        self.assertEqual((root / "task_cli.py").read_text(encoding="utf-8"), original)
+        guard_events = [
+            event
+            for event in agent.events
+            if event.get("type") == "controller_guard" and event.get("guard") == "write-file-drops-existing-python-symbols"
+        ]
+        self.assertEqual(len(guard_events), 1)
+        self.assertIn("add_task", guard_events[0].get("dropped_symbols") or [])
+        self.assertIn("list_tasks", guard_events[0].get("dropped_symbols") or [])
+
     def test_invalid_add_function_payload_is_rejected_before_tool_execution(self) -> None:
         root = self._workspace_scratch()
         (root / "reports").mkdir()
@@ -13228,6 +13322,7 @@ EXTRACTED_GROUNDING_PATH_REPAIR_TESTS = _extract_agent_tests(
         "test_replace_body_full_function_payload_is_rejected_before_tool_execution",
         "test_write_file_with_quote_prefixed_source_is_rejected_before_execution",
         "test_write_file_dropping_existing_symbols_is_rejected_before_execution",
+        "test_write_file_inventing_object_model_after_failed_symbol_edit_is_rejected",
         "test_failed_edit_recovery_guard_requires_reground_then_broad_repair",
         "test_repair_pivot_model_timeout_fails_closed",
         "test_final_round_repeated_mutating_failure_fails_closed",

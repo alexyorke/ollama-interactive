@@ -9660,13 +9660,13 @@ import string
         all_positional = [*args.posonlyargs, *args.args]
         for index, arg in enumerate(all_positional):
             has_default = index >= defaults_start if arg in args.args else False
-            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": not has_default})
+            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": not has_default, "kind": "positional"})
         if args.vararg:
-            rows.append({"name": "*" + args.vararg.arg, "annotation": self._annotation_text(args.vararg.annotation), "required": False})
+            rows.append({"name": "*" + args.vararg.arg, "annotation": self._annotation_text(args.vararg.annotation), "required": False, "kind": "vararg"})
         for index, arg in enumerate(args.kwonlyargs):
-            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": args.kw_defaults[index] is None})
+            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": args.kw_defaults[index] is None, "kind": "kwonly"})
         if args.kwarg:
-            rows.append({"name": "**" + args.kwarg.arg, "annotation": self._annotation_text(args.kwarg.annotation), "required": False})
+            rows.append({"name": "**" + args.kwarg.arg, "annotation": self._annotation_text(args.kwarg.annotation), "required": False, "kind": "kwarg"})
         return rows
 
     def _callable_arity(self, args: ast.arguments) -> dict[str, Any]:
@@ -10467,12 +10467,31 @@ import string
             node = item.get("node")
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 diagnostics.extend(self._library_method_contract_diagnostics(item, node))
-            arity = item.get("arity", {})
-            min_args = int(arity.get("min", 0))
-            max_args = arity.get("max")
             item_args = list(item.get("args") or [])
             if item.get("kind") == "method" and item_args and str(item_args[0].get("name")) in {"self", "cls"}:
                 item_args = item_args[1:]
+            arity = item.get("arity", {})
+            positional_args = [
+                arg
+                for arg in item_args
+                if isinstance(arg, dict)
+                and str(arg.get("name") or "")
+                and str(arg.get("kind") or "positional") == "positional"
+            ]
+            required_positional_names = [
+                str(arg.get("name"))
+                for arg in positional_args
+                if bool(arg.get("required")) and str(arg.get("name") or "")
+            ]
+            required_kwonly_names = [
+                str(arg.get("name"))
+                for arg in item_args
+                if isinstance(arg, dict)
+                and str(arg.get("kind") or "") == "kwonly"
+                and bool(arg.get("required"))
+                and str(arg.get("name") or "")
+            ]
+            has_vararg = bool(arity.get("has_vararg"))
             parameter_names = {
                 str(arg.get("name"))
                 for arg in item_args
@@ -10484,9 +10503,22 @@ import string
                 if bool(caller.get("expected_exception")):
                     continue
                 arg_count = int(caller.get("args", 0))
-                keyword_count = len({str(keyword) for keyword in caller.get("keywords", []) or [] if str(keyword) in parameter_names})
+                supplied_keywords = {str(keyword) for keyword in caller.get("keywords", []) or [] if str(keyword) in parameter_names}
+                keyword_count = len(supplied_keywords)
                 supplied_count = arg_count + keyword_count
-                if supplied_count < min_args or (isinstance(max_args, int) and supplied_count > max_args):
+                provided_by_position = {
+                    str(arg.get("name"))
+                    for arg in positional_args[: max(0, min(arg_count, len(positional_args)))]
+                    if str(arg.get("name") or "")
+                }
+                missing_required = sorted(
+                    (set(required_positional_names) - provided_by_position - supplied_keywords)
+                    | (set(required_kwonly_names) - supplied_keywords)
+                )
+                too_many_positional = not has_vararg and arg_count > len(positional_args)
+                if missing_required or too_many_positional:
+                    min_args = len(required_positional_names) + len(required_kwonly_names)
+                    max_args = None if has_vararg else len(positional_args)
                     diagnostics.append(
                         f"{caller['path']}:{caller['line']} {caller['symbol']} calls {item['name']} with {supplied_count} supplied args; expected {min_args}"
                         + (f"-{max_args}" if isinstance(max_args, int) and max_args != min_args else "")
@@ -13650,7 +13682,14 @@ import string
         try:
             tree = ast.parse(self._python_parse_text(content), filename=self.relative_label(target))
         except SyntaxError:
-            return []
+            names: list[str] = []
+            seen: set[str] = set()
+            for match in re.finditer(r"(?m)^(?:async\s+def|def|class)\s+([A-Za-z_]\w*)\b", self._python_parse_text(content)):
+                name = match.group(1)
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+            return names
         names: list[str] = []
         for node in tree.body:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):

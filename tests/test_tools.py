@@ -317,6 +317,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("partial content", result["summary"])
         self.assertIn("reverse", result["summary"])
 
+    def test_write_file_rejects_invalid_partial_python_overwrite_that_drops_symbols(self) -> None:
+        with self._temp_tools() as (root, tools):
+            target = root / "task_cli.py"
+            original = (
+                "def load_tasks():\n"
+                "    return []\n\n\n"
+                "def save_tasks(tasks):\n"
+                "    return None\n\n\n"
+                "def add_task(title):\n"
+                "    return {'title': title}\n\n\n"
+                "def list_tasks():\n"
+                "    return load_tasks()\n"
+            )
+            target.write_text(original, encoding="utf-8")
+            result = tools.write_file(
+                "task_cli.py",
+                "class Task:\n"
+                "    pass\n\n\n"
+                "def load_tasks():\n"
+                "    return []\n\n"
+                "... truncated ...\n",
+            )
+            final_text = target.read_text(encoding="utf-8")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(final_text, original)
+        self.assertIn("partial content", result["summary"])
+        self.assertIn("add_task", result["summary"])
+        self.assertIn("list_tasks", result["summary"])
+
     def test_write_file_rejects_generated_cache_path(self) -> None:
         with self._temp_tools() as (_root, tools):
             result = tools.write_file("__pycache__/sample.pyc", "")
@@ -4487,6 +4517,40 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertTrue(result["ok"], result)
         self.assertNotIn("calls add_student with", result["output"])
+
+    def test_contract_check_allows_keyword_only_arguments(self) -> None:
+        with self._temp_files_tools(
+            {
+                "task_cli.py": (
+                    "from pathlib import Path\n\n"
+                    "def list_tasks(path: Path, *, priority: str | None = None):\n"
+                    "    return []\n\n"
+                    "def scenario(path: Path):\n"
+                    "    return list_tasks(path, priority='high')\n"
+                ),
+            }
+        ) as (_root, tools):
+            result = tools.contract_check(["task_cli.py"], limit=20)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("calls list_tasks with 2 supplied args", result["output"])
+
+    def test_contract_check_flags_missing_required_keyword_only_argument(self) -> None:
+        with self._temp_files_tools(
+            {
+                "task_cli.py": (
+                    "from pathlib import Path\n\n"
+                    "def list_tasks(path: Path, *, due_before: str):\n"
+                    "    return []\n\n"
+                    "def scenario(path: Path):\n"
+                    "    return list_tasks(path)\n"
+                ),
+            }
+        ) as (_root, tools):
+            result = tools.contract_check(["task_cli.py"], limit=20)
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("calls list_tasks with 1 supplied args; expected 2", result["output"])
 
     def test_contract_check_allows_exception_messages_and_bare_builtin_name_collision(self) -> None:
         with self._temp_files_tools(
