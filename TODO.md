@@ -26,11 +26,12 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Function-probe script generation and result shaping now live in `ollama_code/tools/synthesis.py` with direct tests.
 - Python write-content repair for generated code fences, quote prefixes, rewrite markers, common join typos, and auto-dedent now lives in `ollama_code/tools/synthesis.py` with direct tests.
 - Python generated-function replacement policy for parameter diagnostics, shadowed-builtin checks, critical-parameter checks, foldr argument repair, and safe canonical-signature normalization now lives in `ollama_code/tools/synthesis.py` with direct tests.
+- `edit_intent` symbol-routing policy for symbol target normalization, full-function routing, project rename routing, and text fallback now lives in `ollama_code/tools/synthesis.py` with direct tests.
 
 ## Next ToolExecutor Tranche
 
 - Do not keep extracting tiny wrappers just to reduce line count.
-- Next meaningful split is the remaining symbol-routing and structured-edit repair helpers, or validator discovery if a measured setup gap appears.
+- Next meaningful split is remaining structured-edit repair execution helpers, or validator discovery if a measured setup gap appears.
 - Preserve compatibility wrappers until extracted implementations have direct focused tests.
 
 ## Readiness Gates

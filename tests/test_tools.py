@@ -36,14 +36,18 @@ from ollama_code.tools.synthesis import (
     candidate_workspace_ignored_names,
     canonical_foldr_replacement_if_safe,
     canonical_signature_order_replacement_if_safe,
+    edit_intent_route_plan,
     foldr_argument_order_diagnostic,
     function_probe_result,
     function_probe_script,
+    looks_like_symbol_name,
     normalize_python_write_content,
+    normalize_python_symbol_target,
     python_function_replacement_sanity_diagnostic,
     python_parameter_names,
     python_parameter_sequence,
     repair_common_python_join_typo,
+    single_python_replacement_symbol_name,
     shadowed_builtin_call_diagnostic,
     strip_markdown_quote_prefixes,
     strip_python_rewrite_markers,
@@ -362,6 +366,55 @@ class ToolExecutorTests(unittest.TestCase):
 
         self.assertIn("foldr reducer arguments look reversed", diagnostic)
         self.assertIn("for item in reversed(list):", normalized)
+
+    def test_edit_intent_route_plan_helpers_classify_symbol_shapes(self) -> None:
+        self.assertTrue(looks_like_symbol_name("Service.render"))
+        self.assertFalse(looks_like_symbol_name("return total(prices)"))
+        self.assertEqual(normalize_python_symbol_target(".py", "replace_symbol", "def total(prices):"), "total")
+        self.assertEqual(single_python_replacement_symbol_name("def export_ndjson(tasks):\n    return []\n"), "export_ndjson")
+
+    def test_edit_intent_route_plan_routes_full_function_to_symbol_replace(self) -> None:
+        plan = edit_intent_route_plan(
+            relative_path="app.py",
+            path_suffix=".py",
+            intent="fix implementation",
+            target="total",
+            replacement="def total(prices):\n    return sum(prices)\n",
+            scope="file",
+        )
+
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.route, "replace symbol source")
+        self.assertEqual(plan.routed_tool, "replace_symbol")
+        self.assertIsNone(plan.operation)
+
+    def test_edit_intent_route_plan_routes_renamed_function_replacement_to_project_rename(self) -> None:
+        plan = edit_intent_route_plan(
+            relative_path="app.py",
+            path_suffix=".py",
+            intent="replace_symbol",
+            target="total",
+            replacement="def cart_total(prices):\n    return sum(prices)\n",
+            scope="file",
+        )
+
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.route, "project symbol rename from replacement source")
+        self.assertEqual(plan.operation, {"op": "rename_symbol_project", "path": ".", "old": "total", "new": "cart_total"})
+
+    def test_edit_intent_route_plan_falls_back_to_text_replace_for_bad_symbol_target(self) -> None:
+        plan = edit_intent_route_plan(
+            relative_path="pricing.py",
+            path_suffix=".py",
+            intent="replace_symbol",
+            target="return sum(prices)",
+            replacement="return 0",
+            scope="file",
+        )
+
+        self.assertTrue(plan.ok)
+        self.assertEqual(plan.route, "symbol-like request routed to text replace because target/replacement is not full symbol source")
+        self.assertEqual(plan.routed_tool, "replace_in_file")
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):

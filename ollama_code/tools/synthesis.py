@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 from copy import deepcopy
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -18,6 +19,242 @@ def human_test_name(name: str) -> str:
 
 def python_parse_text(content: str) -> str:
     return content[1:] if content.startswith("\ufeff") else content
+
+
+@dataclass(frozen=True)
+class EditIntentRoutePlan:
+    ok: bool
+    path: str
+    clean_intent: str
+    old: str
+    new: str
+    clean_scope: str
+    route: str = ""
+    routed_tool: str = ""
+    operation: dict[str, Any] | None = None
+    replace_all: bool = False
+    match_whole_word: bool = False
+    summary: str = ""
+    error_class: str | None = None
+
+
+TEXT_REPLACE_INTENTS = {
+    "replace",
+    "replace_text",
+    "text",
+    "text_replace",
+    "replace_in_file",
+    "string_replace",
+    "literal_replace",
+    "update_text",
+}
+
+ADD_SYMBOL_INTENTS = {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}
+SYMBOL_INTENTS = {"replace_symbol", "replace_function", "replace_class", "symbol"}
+RENAME_INTENTS = {"rename", "rename_symbol", "rename_symbol_project", "update_callers", "refactor_rename"}
+PROJECT_SCOPES = {"project", "repo", "repository", "all"}
+
+
+def looks_like_symbol_name(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", value.strip()))
+
+
+def looks_like_full_symbol_source(path_suffix: str, value: str) -> bool:
+    stripped = value.lstrip()
+    if path_suffix.lower() == ".py":
+        return stripped.startswith(("def ", "async def ", "class "))
+    return bool(re.match(r"(?:export\s+)?(?:async\s+)?(?:function|class)\s+\w+", stripped))
+
+
+def single_python_replacement_symbol_name(value: str) -> str:
+    try:
+        tree = ast.parse(python_parse_text(value))
+    except SyntaxError:
+        return ""
+    candidates = [
+        child.name
+        for child in tree.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    ]
+    return candidates[0] if len(candidates) == 1 else ""
+
+
+def looks_like_function_body_edit_intent(intent: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", intent.lower())
+    words = {word for word in normalized.split("_") if word}
+    return bool(words & {"body", "implementation", "function", "method", "fix", "correct", "update"})
+
+
+def normalize_python_symbol_target(path_suffix: str, intent: str, symbol: str) -> str:
+    if path_suffix.lower() != ".py" or looks_like_symbol_name(symbol):
+        return symbol
+    clean_intent = str(intent or "").strip().lower().replace("-", "_")
+    symbol_intents = {
+        "replace_body",
+        "replace_function_body",
+        "function_body",
+        "change_signature",
+        "replace_signature",
+        "signature",
+        "replace_symbol",
+        "replace_function",
+        "replace_class",
+        "symbol",
+    }
+    if clean_intent not in symbol_intents and not looks_like_function_body_edit_intent(clean_intent):
+        return symbol
+    match = re.match(r"\s*(?:async\s+def|def|class)?\s*([A-Za-z_][\w.]*)\s*(?:\(|:|$)", symbol)
+    return match.group(1) if match else symbol
+
+
+def edit_intent_route_plan(
+    *,
+    relative_path: str,
+    path_suffix: str,
+    intent: str,
+    target: str | None,
+    replacement: str | None,
+    scope: str,
+) -> EditIntentRoutePlan:
+    clean_intent = str(intent or "").strip().lower().replace("-", "_")
+    old = normalize_python_symbol_target(path_suffix, clean_intent, str(target or "").strip())
+    new = "" if replacement is None else str(replacement)
+    clean_scope = str(scope or "file").strip().lower()
+    is_python = path_suffix.lower() == ".py"
+
+    def plan(
+        route: str,
+        routed_tool: str,
+        *,
+        operation: dict[str, Any] | None = None,
+        replace_all: bool = False,
+        match_whole_word: bool = False,
+    ) -> EditIntentRoutePlan:
+        return EditIntentRoutePlan(
+            ok=True,
+            path=relative_path,
+            clean_intent=clean_intent,
+            old=old,
+            new=new,
+            clean_scope=clean_scope,
+            route=route,
+            routed_tool=routed_tool,
+            operation=operation,
+            replace_all=replace_all,
+            match_whole_word=match_whole_word,
+        )
+
+    def invalid(summary: str) -> EditIntentRoutePlan:
+        return EditIntentRoutePlan(
+            ok=False,
+            path=relative_path,
+            clean_intent=clean_intent,
+            old=old,
+            new=new,
+            clean_scope=clean_scope,
+            summary=summary,
+            error_class="invalid_args",
+        )
+
+    if not clean_intent:
+        return invalid("edit_intent requires an intent.")
+    if not old and clean_intent not in {"add_import", "add_import_if_missing", *ADD_SYMBOL_INTENTS}:
+        return invalid("edit_intent requires target for this intent.")
+    if replacement is None and clean_intent != "delete_symbol":
+        return invalid("edit_intent requires replacement for this intent.")
+
+    if clean_intent in RENAME_INTENTS and looks_like_symbol_name(old) and looks_like_symbol_name(new):
+        if clean_scope in PROJECT_SCOPES:
+            return plan(
+                "project symbol rename",
+                "apply_structured_edit",
+                operation={"op": "rename_symbol_project", "path": ".", "old": old.rsplit(".", 1)[-1], "new": new.rsplit(".", 1)[-1]},
+            )
+        return plan("identifier text rename in file", "replace_in_file", replace_all=False, match_whole_word=True)
+
+    if clean_intent in {"replace_body", "replace_function_body", "function_body"}:
+        return plan(
+            "replace Python function body",
+            "apply_structured_edit",
+            operation={"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new},
+        )
+
+    if clean_intent in {"change_signature", "replace_signature", "signature"}:
+        return plan(
+            "change Python function signature",
+            "apply_structured_edit",
+            operation={"op": "change_signature", "path": relative_path, "symbol": old, "signature": new},
+        )
+
+    if clean_intent in {"add_import", "add_import_if_missing"}:
+        statement = new.strip() or old
+        return plan(
+            "add import if missing",
+            "apply_structured_edit",
+            operation={"op": "add_import_if_missing", "path": relative_path, "statement": statement},
+        )
+
+    if clean_intent in ADD_SYMBOL_INTENTS:
+        return plan("append Python symbol source", "append_symbol")
+
+    if is_python and looks_like_symbol_name(old) and looks_like_function_body_edit_intent(clean_intent):
+        replacement_name = single_python_replacement_symbol_name(new) if looks_like_full_symbol_source(path_suffix, new) else ""
+        old_leaf = old.rsplit(".", 1)[-1]
+        if replacement_name and replacement_name != old_leaf:
+            return plan(
+                "project symbol rename from replacement source",
+                "apply_structured_edit",
+                operation={"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name},
+            )
+        if looks_like_full_symbol_source(path_suffix, new):
+            return plan("replace symbol source", "replace_symbol")
+        return plan(
+            "replace Python function body",
+            "apply_structured_edit",
+            operation={"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new},
+        )
+
+    if clean_intent in SYMBOL_INTENTS:
+        replacement_name = single_python_replacement_symbol_name(new) if is_python and looks_like_full_symbol_source(path_suffix, new) else ""
+        old_leaf = old.rsplit(".", 1)[-1]
+        new_leaf = new.rsplit(".", 1)[-1]
+        if looks_like_symbol_name(old_leaf) and looks_like_symbol_name(new_leaf):
+            if clean_scope in PROJECT_SCOPES:
+                return plan(
+                    "project symbol rename",
+                    "apply_structured_edit",
+                    operation={"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": new_leaf},
+                )
+            return plan(
+                "file symbol rename",
+                "apply_structured_edit",
+                operation={"op": "rename_symbol", "path": relative_path, "old": old_leaf, "new": new_leaf},
+            )
+        if replacement_name and replacement_name != old_leaf and looks_like_symbol_name(old_leaf):
+            return plan(
+                "project symbol rename from replacement source",
+                "apply_structured_edit",
+                operation={"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name},
+            )
+        if looks_like_symbol_name(old) and looks_like_full_symbol_source(path_suffix, new):
+            return plan("replace symbol source", "replace_symbol")
+        if is_python and looks_like_symbol_name(old):
+            return plan(
+                "replace Python function body",
+                "apply_structured_edit",
+                operation={"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new},
+            )
+        return plan("symbol-like request routed to text replace because target/replacement is not full symbol source", "replace_in_file")
+
+    if clean_intent in TEXT_REPLACE_INTENTS:
+        replace_all = clean_scope in PROJECT_SCOPES or clean_intent in {"rename", "rename_symbol", "refactor_rename"}
+        match_whole_word = looks_like_symbol_name(old) and looks_like_symbol_name(new) and "(" not in old
+        return plan("replace text in file", "replace_in_file", replace_all=replace_all, match_whole_word=match_whole_word)
+
+    return invalid(
+        f"Unknown edit_intent intent: {intent}. Use one of rename, replace_text, "
+        "replace_symbol, replace_body, change_signature, add_import, or add_function."
+    )
 
 
 def python_parameter_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:

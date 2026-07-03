@@ -86,6 +86,7 @@ from ollama_code.tools.synthesis import (
     candidate_signature_diagnostics,
     canonical_foldr_replacement_if_safe,
     canonical_signature_order_replacement_if_safe,
+    edit_intent_route_plan,
     foldr_argument_order_diagnostic,
     function_probe_result,
     function_probe_script,
@@ -101,6 +102,11 @@ from ollama_code.tools.synthesis import (
     repair_common_python_join_typo,
     select_test_spec_examples,
     shadowed_builtin_call_diagnostic,
+    looks_like_full_symbol_source,
+    looks_like_function_body_edit_intent,
+    looks_like_symbol_name,
+    normalize_python_symbol_target,
+    single_python_replacement_symbol_name,
     split_test_example,
     strip_markdown_quote_prefixes,
     strip_python_rewrite_markers,
@@ -12173,25 +12179,13 @@ import string
         return wrapped
 
     def _looks_like_symbol_name(self, value: str) -> bool:
-        return bool(re.fullmatch(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*", value.strip()))
+        return looks_like_symbol_name(value)
 
     def _looks_like_full_symbol_source(self, target: Path, value: str) -> bool:
-        stripped = value.lstrip()
-        if target.suffix.lower() == ".py":
-            return stripped.startswith(("def ", "async def ", "class "))
-        return bool(re.match(r"(?:export\s+)?(?:async\s+)?(?:function|class)\s+\w+", stripped))
+        return looks_like_full_symbol_source(target.suffix, value)
 
     def _single_python_replacement_symbol_name(self, value: str) -> str:
-        try:
-            tree = ast.parse(self._python_parse_text(value))
-        except SyntaxError:
-            return ""
-        candidates = [
-            child.name
-            for child in tree.body
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-        ]
-        return candidates[0] if len(candidates) == 1 else ""
+        return single_python_replacement_symbol_name(value)
 
     def _append_python_symbol_source(self, target: Path, relative_path: str, symbol: str, source: str) -> dict[str, Any]:
         if target.suffix.lower() != ".py":
@@ -12278,30 +12272,10 @@ import string
         }
 
     def _looks_like_function_body_edit_intent(self, intent: str) -> bool:
-        normalized = re.sub(r"[^a-z0-9_]+", "_", intent.lower())
-        words = {word for word in normalized.split("_") if word}
-        return bool(words & {"body", "implementation", "function", "method", "fix", "correct", "update"})
+        return looks_like_function_body_edit_intent(intent)
 
     def _normalize_python_symbol_target(self, target: Path, intent: str, symbol: str) -> str:
-        if target.suffix.lower() != ".py" or self._looks_like_symbol_name(symbol):
-            return symbol
-        clean_intent = str(intent or "").strip().lower().replace("-", "_")
-        symbol_intents = {
-            "replace_body",
-            "replace_function_body",
-            "function_body",
-            "change_signature",
-            "replace_signature",
-            "signature",
-            "replace_symbol",
-            "replace_function",
-            "replace_class",
-            "symbol",
-        }
-        if clean_intent not in symbol_intents and not self._looks_like_function_body_edit_intent(clean_intent):
-            return symbol
-        match = re.match(r"\s*(?:async\s+def|def|class)?\s*([A-Za-z_][\w.]*)\s*(?:\(|:|$)", symbol)
-        return match.group(1) if match else symbol
+        return normalize_python_symbol_target(target.suffix, intent, symbol)
 
     def edit_intent(
         self,
@@ -12315,134 +12289,43 @@ import string
         self._check_interrupted()
         target_path = self.resolve_path(path, allow_missing=False)
         relative_path = self.relative_label(target_path)
-        clean_intent = str(intent or "").strip().lower().replace("-", "_")
-        old = str(target or "").strip()
-        new = "" if replacement is None else str(replacement)
-        clean_scope = str(scope or "file").strip().lower()
-        old = self._normalize_python_symbol_target(target_path, clean_intent, old)
-        if not clean_intent:
-            return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires an intent."}
-        if not old and clean_intent not in {"add_import", "add_import_if_missing", "add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
-            return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires target for this intent."}
-        if replacement is None and clean_intent != "delete_symbol":
-            return {"ok": False, "tool": "edit_intent", "path": relative_path, "summary": "edit_intent requires replacement for this intent."}
-        route = ""
-        routed_tool = ""
-        operation: dict[str, Any] | None = None
-        text_replace_intents = {
-            "replace",
-            "replace_text",
-            "text",
-            "text_replace",
-            "replace_in_file",
-            "string_replace",
-            "literal_replace",
-            "update_text",
-        }
-        if clean_intent in {"rename", "rename_symbol", "rename_symbol_project", "update_callers", "refactor_rename"} and self._looks_like_symbol_name(old) and self._looks_like_symbol_name(new):
-            if clean_scope in {"project", "repo", "repository", "all"}:
-                route = "project symbol rename"
-                routed_tool = "apply_structured_edit"
-                operation = {"op": "rename_symbol_project", "path": ".", "old": old.rsplit(".", 1)[-1], "new": new.rsplit(".", 1)[-1]}
-            else:
-                route = "identifier text rename in file"
-                routed_tool = "replace_in_file"
-        elif clean_intent in {"replace_body", "replace_function_body", "function_body"}:
-            route = "replace Python function body"
-            routed_tool = "apply_structured_edit"
-            operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
-        elif clean_intent in {"change_signature", "replace_signature", "signature"}:
-            route = "change Python function signature"
-            routed_tool = "apply_structured_edit"
-            operation = {"op": "change_signature", "path": relative_path, "symbol": old, "signature": new}
-        elif clean_intent in {"add_import", "add_import_if_missing"}:
-            statement = new.strip() or old
-            route = "add import if missing"
-            routed_tool = "apply_structured_edit"
-            operation = {"op": "add_import_if_missing", "path": relative_path, "statement": statement}
-        elif clean_intent in {"add_function", "append_function", "create_function", "add_symbol", "append_symbol"}:
-            route = "append Python symbol source"
-            routed_tool = "append_symbol"
-        elif (
-            target_path.suffix.lower() == ".py"
-            and self._looks_like_symbol_name(old)
-            and self._looks_like_function_body_edit_intent(clean_intent)
-        ):
-            replacement_name = self._single_python_replacement_symbol_name(new) if self._looks_like_full_symbol_source(target_path, new) else ""
-            old_leaf = old.rsplit(".", 1)[-1]
-            if replacement_name and replacement_name != old_leaf:
-                route = "project symbol rename from replacement source"
-                routed_tool = "apply_structured_edit"
-                operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name}
-            elif self._looks_like_full_symbol_source(target_path, new):
-                route = "replace symbol source"
-                routed_tool = "replace_symbol"
-            else:
-                route = "replace Python function body"
-                routed_tool = "apply_structured_edit"
-                operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
-        elif clean_intent in {"replace_symbol", "replace_function", "replace_class", "symbol"}:
-            replacement_name = self._single_python_replacement_symbol_name(new) if target_path.suffix.lower() == ".py" and self._looks_like_full_symbol_source(target_path, new) else ""
-            old_leaf = old.rsplit(".", 1)[-1]
-            new_leaf = new.rsplit(".", 1)[-1]
-            if self._looks_like_symbol_name(old_leaf) and self._looks_like_symbol_name(new_leaf):
-                if clean_scope in {"project", "repo", "repository", "all"}:
-                    route = "project symbol rename"
-                    routed_tool = "apply_structured_edit"
-                    operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": new_leaf}
-                else:
-                    route = "file symbol rename"
-                    routed_tool = "apply_structured_edit"
-                    operation = {"op": "rename_symbol", "path": relative_path, "old": old_leaf, "new": new_leaf}
-            elif replacement_name and replacement_name != old_leaf and self._looks_like_symbol_name(old_leaf):
-                route = "project symbol rename from replacement source"
-                routed_tool = "apply_structured_edit"
-                operation = {"op": "rename_symbol_project", "path": ".", "old": old_leaf, "new": replacement_name}
-            elif self._looks_like_symbol_name(old) and self._looks_like_full_symbol_source(target_path, new):
-                route = "replace symbol source"
-                routed_tool = "replace_symbol"
-            elif target_path.suffix.lower() == ".py" and self._looks_like_symbol_name(old):
-                route = "replace Python function body"
-                routed_tool = "apply_structured_edit"
-                operation = {"op": "replace_function_body", "path": relative_path, "symbol": old, "body": new}
-            else:
-                route = "symbol-like request routed to text replace because target/replacement is not full symbol source"
-                routed_tool = "replace_in_file"
-        elif clean_intent in text_replace_intents:
-            route = "replace text in file"
-            routed_tool = "replace_in_file"
-        else:
-            return {
+        route_plan = edit_intent_route_plan(
+            relative_path=relative_path,
+            path_suffix=target_path.suffix,
+            intent=intent,
+            target=target,
+            replacement=replacement,
+            scope=scope,
+        )
+        if not route_plan.ok:
+            result = {
                 "ok": False,
                 "tool": "edit_intent",
                 "path": relative_path,
-                "summary": (
-                    f"Unknown edit_intent intent: {intent}. Use one of rename, replace_text, "
-                    "replace_symbol, replace_body, change_signature, add_import, or add_function."
-                ),
-                "error_class": "invalid_args",
+                "summary": route_plan.summary,
             }
+            if route_plan.error_class:
+                result["error_class"] = route_plan.error_class
+            return result
         if not apply:
             return {
                 "ok": True,
                 "tool": "edit_intent",
                 "path": relative_path,
-                "route": route,
-                "routed_tool": routed_tool,
-                "output": f"{route} -> {routed_tool}",
+                "route": route_plan.route,
+                "routed_tool": route_plan.routed_tool,
+                "output": f"{route_plan.route} -> {route_plan.routed_tool}",
             }
-        if operation is not None:
-            return self._wrap_routed_edit_result(routed_tool, route, self.apply_structured_edit(operation))
-        if routed_tool == "append_symbol":
-            return self._wrap_routed_edit_result(routed_tool, route, self._append_python_symbol_source(target_path, relative_path, old, new))
-        if routed_tool == "replace_symbol":
-            return self._wrap_routed_edit_result(routed_tool, route, self.replace_symbol(relative_path, old, new))
-        replace_all = clean_scope in {"project", "repo", "repository", "all"} or clean_intent in {"rename", "rename_symbol", "refactor_rename"}
-        match_whole_word = self._looks_like_symbol_name(old) and self._looks_like_symbol_name(new) and "(" not in old
+        if route_plan.operation is not None:
+            return self._wrap_routed_edit_result(route_plan.routed_tool, route_plan.route, self.apply_structured_edit(route_plan.operation))
+        if route_plan.routed_tool == "append_symbol":
+            return self._wrap_routed_edit_result(route_plan.routed_tool, route_plan.route, self._append_python_symbol_source(target_path, relative_path, route_plan.old, route_plan.new))
+        if route_plan.routed_tool == "replace_symbol":
+            return self._wrap_routed_edit_result(route_plan.routed_tool, route_plan.route, self.replace_symbol(relative_path, route_plan.old, route_plan.new))
         return self._wrap_routed_edit_result(
             "replace_in_file",
-            route,
-            self.replace_in_file(relative_path, old, new, replace_all=replace_all, match_whole_word=match_whole_word),
+            route_plan.route,
+            self.replace_in_file(relative_path, route_plan.old, route_plan.new, replace_all=route_plan.replace_all, match_whole_word=route_plan.match_whole_word),
         )
 
     def generate_tests_from_spec(
