@@ -27,6 +27,7 @@ SMOKE_MODULES = (
     "tests.test_trajectory_error_profile",
     "tests.test_trajectory_evidence_report",
     "tests.test_web_discovered_agent_dataset_analysis",
+    "tests.test_repair_protocol",
 )
 
 AGENT_MODULES = (
@@ -34,6 +35,7 @@ AGENT_MODULES = (
     "tests.test_agent_post_edit_validation",
     "tests.test_agent_failure_compression",
     "tests.test_agent_shell_command_preflight",
+    "tests.test_agent_typed_repair_protocol",
     "tests.test_tools",
     "tests.test_coding_benchmark_eval",
 )

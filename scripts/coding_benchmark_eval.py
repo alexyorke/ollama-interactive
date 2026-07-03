@@ -739,6 +739,101 @@ def validate_feature_delivery_cli_proof(ctx: BenchmarkContext) -> str:
     )
 
 
+def prepare_task_due_filter(workspace: Path) -> None:
+    _write(
+        workspace / "task_cli.py",
+        "from __future__ import annotations\n\n"
+        "import argparse\n\n"
+        "TASKS = [\n"
+        "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high', 'due': '2026-07-01'},\n"
+        "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low', 'due': '2026-07-05'},\n"
+        "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium', 'due': '2026-07-10'},\n"
+        "]\n\n"
+        "def list_tasks(priority: str | None = None) -> list[str]:\n"
+        "    tasks = TASKS if priority is None else [task for task in TASKS if task['priority'] == priority]\n"
+        "    return [f\"{task['title']}:{task['status']}:{task['priority']}:{task['due']}\" for task in tasks]\n\n"
+        "def main(argv: list[str] | None = None) -> int:\n"
+        "    parser = argparse.ArgumentParser()\n"
+        "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+        "    list_parser = subparsers.add_parser('list')\n"
+        "    list_parser.add_argument('--priority')\n"
+        "    args = parser.parse_args(argv)\n"
+        "    if args.command == 'list':\n"
+        "        print('\\n'.join(list_tasks(args.priority)))\n"
+        "        return 0\n"
+        "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+        "if __name__ == '__main__':\n"
+        "    raise SystemExit(main())\n",
+    )
+    _write(
+        workspace / "README.md",
+        "# Task CLI\n\n"
+        "Commands:\n"
+        "- `list --priority high`\n",
+    )
+    _write(
+        workspace / "tests" / "test_task_cli.py",
+        "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+        "ROOT = Path(__file__).resolve().parents[1]\n\n"
+        "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+        "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+        "class TaskCliTests(unittest.TestCase):\n"
+        "    def test_priority_filter(self) -> None:\n"
+        "        result = _run('list', '--priority', 'high')\n"
+        "        self.assertEqual(result.returncode, 0)\n"
+        "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+        "        self.assertNotIn('ship-cli', result.stdout)\n\n"
+        "if __name__ == '__main__':\n"
+        "    unittest.main()\n",
+    )
+
+
+def validate_task_due_filter(ctx: BenchmarkContext) -> str:
+    source = (ctx.workspace / "task_cli.py").read_text(encoding="utf-8")
+    readme = (ctx.workspace / "README.md").read_text(encoding="utf-8")
+    tests = (ctx.workspace / "tests" / "test_task_cli.py").read_text(encoding="utf-8")
+    due_result = _run([sys.executable, "task_cli.py", "list", "--due-before", "2026-07-06"], ctx.workspace, timeout=120)
+    combined_result = _run(
+        [sys.executable, "task_cli.py", "list", "--priority", "high", "--due-before", "2026-07-06"],
+        ctx.workspace,
+        timeout=120,
+    )
+    invalid_result = _run([sys.executable, "task_cli.py", "list", "--due-before", "2026-99-99"], ctx.workspace, timeout=120)
+    due_output = due_result.stdout
+    combined_output = combined_result.stdout
+    invalid_text = (invalid_result.stderr + invalid_result.stdout).lower()
+    implementation_changed = "--due-before" in source and ("fromisoformat" in source or "strptime" in source)
+    due_behavior_ok = (
+        due_result.returncode == 0
+        and "write-docs:todo:high:2026-07-01" in due_output
+        and "ship-cli:done:low:2026-07-05" in due_output
+        and "fix-bug" not in due_output
+    )
+    priority_preserved = (
+        combined_result.returncode == 0
+        and "write-docs:todo:high:2026-07-01" in combined_output
+        and "ship-cli" not in combined_output
+        and "fix-bug" not in combined_output
+    )
+    invalid_date_ok = invalid_result.returncode != 0 and ("invalid" in invalid_text or "date" in invalid_text)
+    readme_ok = "--due-before" in readme
+    tests_cover = "--due-before" in tests and "priority" in tests and _tool_success(ctx.session, "run_test")
+    direct_cli_proof = any(
+        "--due-before" in str(arguments.get("command", "")).lower()
+        for arguments in tool_call_args(ctx.session, "run_shell")
+    )
+    return _status_or_fail_closed(
+        ctx,
+        implementation_changed
+        and due_behavior_ok
+        and priority_preserved
+        and invalid_date_ok
+        and readme_ok
+        and tests_cover
+        and direct_cli_proof,
+    )
+
+
 def prepare_nested_package_import_fix(workspace: Path) -> None:
     _write(workspace / "src" / "pkg" / "__init__.py", "")
     _write(workspace / "src" / "pkg" / "core.py", "from helpers import label\n\ndef wrapped() -> str:\n    return label('ok')\n")
@@ -1158,6 +1253,16 @@ LOCAL_CASES: list[BenchmarkCase] = [
         test_cmd=_python_test_cmd(),
         budget_off=BenchmarkBudget(max_llm_calls=14, max_total_tokens=100_000),
         budget_on=BenchmarkBudget(max_llm_calls=18, max_total_tokens=140_000),
+    ),
+    BenchmarkCase(
+        name="task_due_filter",
+        suite="local-full",
+        turns=("Add a --due-before option to list tasks due before an ISO date, reject invalid dates with a parser error, preserve --priority filtering, update README.md and tests, run tests, and prove the CLI behavior with a shell command.",),
+        prepare=prepare_task_due_filter,
+        validate=validate_task_due_filter,
+        test_cmd=_python_test_cmd(),
+        budget_off=BenchmarkBudget(max_llm_calls=16, max_total_tokens=120_000),
+        budget_on=BenchmarkBudget(max_llm_calls=20, max_total_tokens=160_000),
     ),
     BenchmarkCase(
         name="nested_package_import_fix",

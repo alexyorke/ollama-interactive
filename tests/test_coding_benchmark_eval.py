@@ -874,6 +874,77 @@ class CodingBenchmarkEvalTests(unittest.TestCase):
 
         self.assertEqual(status, "pass")
 
+    def test_task_due_filter_validator_requires_due_behavior_docs_tests_and_shell_proof(self) -> None:
+        with self._temp_root() as workspace:
+            bench.prepare_task_due_filter(workspace)
+            (workspace / "task_cli.py").write_text(
+                "from __future__ import annotations\n\n"
+                "import argparse\nfrom datetime import date\n\n"
+                "TASKS = [\n"
+                "    {'title': 'write-docs', 'status': 'todo', 'priority': 'high', 'due': '2026-07-01'},\n"
+                "    {'title': 'ship-cli', 'status': 'done', 'priority': 'low', 'due': '2026-07-05'},\n"
+                "    {'title': 'fix-bug', 'status': 'todo', 'priority': 'medium', 'due': '2026-07-10'},\n"
+                "]\n\n"
+                "def _parse_due_before(value: str) -> date:\n"
+                "    try:\n"
+                "        return date.fromisoformat(value)\n"
+                "    except ValueError as exc:\n"
+                "        raise argparse.ArgumentTypeError('invalid ISO date') from exc\n\n"
+                "def list_tasks(priority: str | None = None, due_before: date | None = None) -> list[str]:\n"
+                "    tasks = TASKS\n"
+                "    if priority is not None:\n"
+                "        tasks = [task for task in tasks if task['priority'] == priority]\n"
+                "    if due_before is not None:\n"
+                "        tasks = [task for task in tasks if date.fromisoformat(task['due']) < due_before]\n"
+                "    return [f\"{task['title']}:{task['status']}:{task['priority']}:{task['due']}\" for task in tasks]\n\n"
+                "def main(argv: list[str] | None = None) -> int:\n"
+                "    parser = argparse.ArgumentParser()\n"
+                "    subparsers = parser.add_subparsers(dest='command', required=True)\n"
+                "    list_parser = subparsers.add_parser('list')\n"
+                "    list_parser.add_argument('--priority')\n"
+                "    list_parser.add_argument('--due-before', type=_parse_due_before)\n"
+                "    args = parser.parse_args(argv)\n"
+                "    if args.command == 'list':\n"
+                "        print('\\n'.join(list_tasks(args.priority, args.due_before)))\n"
+                "        return 0\n"
+                "    raise SystemExit(f\"unsupported command: {args.command}\")\n\n"
+                "if __name__ == '__main__':\n"
+                "    raise SystemExit(main())\n",
+                encoding="utf-8",
+            )
+            (workspace / "README.md").write_text(
+                "# Task CLI\n\nUse `list --priority high --due-before 2026-07-06`.\n",
+                encoding="utf-8",
+            )
+            (workspace / "tests" / "test_task_cli.py").write_text(
+                "import subprocess\nimport sys\nimport unittest\nfrom pathlib import Path\n\n"
+                "ROOT = Path(__file__).resolve().parents[1]\n\n"
+                "def _run(*args: str) -> subprocess.CompletedProcess[str]:\n"
+                "    return subprocess.run([sys.executable, str(ROOT / 'task_cli.py'), *args], capture_output=True, text=True, check=False)\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_due_before(self) -> None:\n"
+                "        result = _run('list', '--due-before', '2026-07-06')\n"
+                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+                "        self.assertNotIn('fix-bug', result.stdout)\n\n"
+                "    def test_priority_and_due_before(self) -> None:\n"
+                "        result = _run('list', '--priority', 'high', '--due-before', '2026-07-06')\n"
+                "        self.assertIn('write-docs:todo:high:2026-07-01', result.stdout)\n"
+                "        self.assertNotIn('ship-cli', result.stdout)\n\n"
+                "if __name__ == '__main__':\n"
+                "    unittest.main()\n",
+                encoding="utf-8",
+            )
+            session = {
+                "events": [
+                    {"type": "tool_result", "name": "run_test", "result": {"ok": True, "command": f"{sys.executable} -m unittest discover -s tests -v"}},
+                    {"type": "tool_call", "name": "run_shell", "arguments": {"command": f"{sys.executable} task_cli.py list --due-before 2026-07-06"}},
+                ]
+            }
+
+            status = bench.validate_task_due_filter(self._context(workspace, session))
+
+        self.assertEqual(status, "pass")
+
     def test_forbidden_tool_validator_rejects_read_file(self) -> None:
         with self._temp_root() as workspace:
             session = {

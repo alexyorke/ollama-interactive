@@ -102,6 +102,12 @@ from ollama_code.sessions import (
     transcript_message_role_supported,
     write_transcript_payload,
 )
+from ollama_code.repair_protocol import (
+    RepairProtocolState,
+    build_repair_protocol_state,
+    cli_patch_bundle_instruction,
+    repair_decision_for_tool,
+)
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help, format_tool_help
 
 
@@ -1607,6 +1613,71 @@ class OllamaCodeAgent:
 
     def _clear_failed_edit_recovery(self) -> None:
         self._sticky_failed_edit_recovery = []
+
+    def _current_repair_protocol_state(
+        self,
+        *,
+        request_obligations: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        required_tool_names: set[str],
+    ) -> RepairProtocolState:
+        statuses = (
+            self._request_obligation_proof_status(
+                obligations=request_obligations,
+                successful_tool_results=successful_tool_results,
+                required_tool_names=required_tool_names,
+            )
+            if request_obligations
+            else []
+        )
+        return build_repair_protocol_state(
+            obligations=request_obligations,
+            obligation_statuses=statuses,
+            successful_tool_results=successful_tool_results,
+            recovery_states=self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery),
+        )
+
+    def _emit_repair_protocol_state(
+        self,
+        state: RepairProtocolState,
+        *,
+        phase: str,
+        round_number: int | None = None,
+    ) -> None:
+        payload = state.to_event_payload()
+        self._record_event(
+            "task_state",
+            phase=phase,
+            rounds=round_number,
+            requested_deliverables=payload["requested_deliverables"],
+            grounded_targets=payload["grounded_targets"],
+            failed_attempts=payload["failed_attempts"],
+            proof_obligations=payload["proof_obligations"],
+            repair_strategy=payload["repair_strategy"],
+        )
+        self._record_event(
+            "allowed_next_actions",
+            phase=phase,
+            rounds=round_number,
+            actions=payload["allowed_next_actions"],
+            blocked_until=payload["validation_plan"]["blocked_until"],
+        )
+        if payload.get("patch_plan") is not None:
+            self._record_event("patch_plan", phase=phase, rounds=round_number, **payload["patch_plan"])
+
+    def _repair_protocol_instruction(
+        self,
+        *,
+        request_obligations: list[dict[str, Any]],
+        successful_tool_results: list[dict[str, Any]],
+        required_tool_names: set[str],
+    ) -> str | None:
+        state = self._current_repair_protocol_state(
+            request_obligations=request_obligations,
+            successful_tool_results=successful_tool_results,
+            required_tool_names=required_tool_names,
+        )
+        return cli_patch_bundle_instruction(state)
 
     def _failed_edit_recovery_retry_message(self, state: dict[str, Any], *, need_reground: bool) -> str:
         path = str(state.get("path") or "").strip()
@@ -8686,7 +8757,17 @@ class OllamaCodeAgent:
         self._record_event("tool_call", name=name, arguments=arguments, rounds=round_number)
         tool_calls_this_turn.append({"name": name, "arguments": deepcopy(arguments)})
         started = time.perf_counter()
-        result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
+        if self._request_uses_typed_cli_flag_protocol(request_text) and name in {"edit_intent", "replace_in_file"}:
+            result = {
+                "ok": False,
+                "tool": name,
+                "summary": (
+                    "Typed repair protocol rejected narrow CLI flag mutation. "
+                    "Use replace_symbol, replace_symbols, or grounded write_file for the complete command surface."
+                ),
+            }
+        else:
+            result = cached_result if cached_result is not None else self.tools.execute(name, arguments)
         duration_ms = round((time.perf_counter() - started) * 1000, 3)
         if not cache_hit:
             self._store_cached_tool_result(name, arguments, result)
@@ -10327,6 +10408,18 @@ class OllamaCodeAgent:
             return False
         return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
 
+    def _request_is_cli_flag_bundle(self, request_text: str) -> bool:
+        return bool(
+            re.search(r"--[A-Za-z0-9][A-Za-z0-9-]*", request_text)
+            and re.search(r"\b(?:cli|command|option|flag|parser|argparse)\b", request_text, flags=re.IGNORECASE)
+        )
+
+    def _request_uses_typed_cli_flag_protocol(self, request_text: str) -> bool:
+        return bool(
+            self._request_is_cli_flag_bundle(request_text)
+            and re.search(r"--due-before|\bdue-before\b|\bdue before\b|task_cli\.py", request_text, flags=re.IGNORECASE)
+        )
+
     def _try_structured_test_driven_repair(
         self,
         *,
@@ -10343,6 +10436,13 @@ class OllamaCodeAgent:
         if self._explicit_guard_profile_selected():
             return None
         if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
+            return None
+        if self._request_uses_typed_cli_flag_protocol(request_text):
+            self._record_event(
+                "spec_guided_repair",
+                phase="structured_test_driven_skipped",
+                reason="typed_protocol_owns_cli_flag_bundle",
+            )
             return None
         if not self._request_looks_like_python_test_driven_repair(
             request_text=request_text,
@@ -11204,6 +11304,16 @@ class OllamaCodeAgent:
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> AgentResult | None:
         if self._mechanical_obligation_repair_failed_for(source_path, test_path):
+            return None
+        if self._request_uses_typed_cli_flag_protocol(request_text):
+            self._record_event(
+                "spec_guided_repair",
+                phase="mechanical_repair_skipped",
+                reason="typed_protocol_owns_cli_flag_bundle",
+                source_path=source_path,
+                test_path=test_path,
+                rounds=round_number,
+            )
             return None
         for synthesis_name in (*PREEMPTIVE_SPEC_GUIDED_SYNTHESIS_TOOL_NAMES, *SPEC_GUIDED_SYNTHESIS_TOOL_NAMES):
             try:
@@ -13163,6 +13273,17 @@ class OllamaCodeAgent:
             return None
         if not any(str(item.get("kind") or "") == "feature_token" and str(item.get("feature_class") or "") in {"command", "flag"} for item in request_obligations):
             return None
+        if (
+            any(str(item.get("kind") or "") == "feature_token" and str(item.get("feature_class") or "") == "flag" for item in request_obligations)
+            and self._request_uses_typed_cli_flag_protocol(request_text)
+        ):
+            self._record_event(
+                "spec_guided_repair",
+                phase="post_context_cli_mechanical_skipped",
+                reason="typed_protocol_owns_cli_flag_bundle",
+                rounds=round_number,
+            )
+            return None
         bookmark_result = self._try_bookmark_archive_package_repair(
             request_text=request_text,
             round_number=round_number,
@@ -13227,6 +13348,13 @@ class OllamaCodeAgent:
         if not self.tools.default_test_command:
             return None
         if {"read_file", "implementation_spec", "write_file", "run_test"} & forbidden_tool_names:
+            return None
+        if self._request_uses_typed_cli_flag_protocol(request_text):
+            self._record_event(
+                "spec_guided_repair",
+                phase="preemptive_mechanical_skipped",
+                reason="typed_protocol_owns_cli_flag_bundle",
+            )
             return None
         explicit_source_paths = self._explicit_source_repair_candidates(required_mutation_paths)
         paths = None
@@ -13490,6 +13618,14 @@ class OllamaCodeAgent:
         allow_workspace_fallback: bool = False,
         forced_paths: tuple[str, str] | None = None,
     ) -> AgentResult | None:
+        if self._request_uses_typed_cli_flag_protocol(request_text):
+            self._record_event(
+                "spec_guided_repair",
+                phase="spec_guided_repair_skipped",
+                reason="typed_protocol_owns_cli_flag_bundle",
+                rounds=round_number,
+            )
+            return None
         failed_tool = str(failed_run_test_result.get("tool") or "").strip()
         paths = forced_paths or self._spec_guided_repair_paths(
             successful_tool_results,
@@ -13852,6 +13988,7 @@ class OllamaCodeAgent:
         invalid_python_mutation_payload_counts: dict[tuple[str, str], int] = {}
         omitted_mutation_payload_counts: dict[tuple[str, str], int] = {}
         omitted_write_failure_paths: set[str] = set()
+        typed_repair_protocol_prompt_key: str | None = None
         failed_mutation_obligations_pending = False
         context_only_exhausted_for_mutation = False
         repair_pivot_prompt_pending = False
@@ -13867,6 +14004,13 @@ class OllamaCodeAgent:
         last_failed_path_lookup_suggestions: list[str] = []
         last_timeout_command = ""
         last_timeout_summary = ""
+        if request_obligations:
+            initial_protocol_state = self._current_repair_protocol_state(
+                request_obligations=request_obligations,
+                successful_tool_results=successful_tool_results,
+                required_tool_names=required_tool_names,
+            )
+            self._emit_repair_protocol_state(initial_protocol_state, phase="start")
         if (
             (mutation_required or code_mutation_required)
             and not exact_request
@@ -14052,6 +14196,21 @@ class OllamaCodeAgent:
                 )
                 if deterministic_result is not None:
                     return deterministic_result
+            if request_obligations:
+                protocol_state = self._current_repair_protocol_state(
+                    request_obligations=request_obligations,
+                    successful_tool_results=successful_tool_results,
+                    required_tool_names=required_tool_names,
+                )
+                self._emit_repair_protocol_state(protocol_state, phase="pre_model", round_number=round_number)
+                if not protocol_state.failed_attempts:
+                    protocol_instruction = cli_patch_bundle_instruction(protocol_state)
+                    protocol_prompt_key = ""
+                    if protocol_instruction and protocol_state.patch_plan is not None:
+                        protocol_prompt_key = "complete" if protocol_state.patch_plan.complete else "missing"
+                    if protocol_instruction and protocol_prompt_key != typed_repair_protocol_prompt_key:
+                        self.messages.append({"role": "user", "content": protocol_instruction})
+                        typed_repair_protocol_prompt_key = protocol_prompt_key
             self.status_printer(f"thinking with {self.model} (round {round_number}/{self.max_tool_rounds})")
             old_client_timeout: int | None = None
             try:
@@ -14197,6 +14356,20 @@ class OllamaCodeAgent:
                 continue
             if response_type == "final":
                 assistant_text = str(payload.get("message", "")).strip()
+                if request_obligations:
+                    protocol_state = self._current_repair_protocol_state(
+                        request_obligations=request_obligations,
+                        successful_tool_results=successful_tool_results,
+                        required_tool_names=required_tool_names,
+                    )
+                    decision = repair_decision_for_tool(protocol_state, tool_name="final", arguments={})
+                    self._record_event(
+                        "repair_decision",
+                        tool="final",
+                        arguments={},
+                        rounds=round_number,
+                        **decision,
+                    )
                 pending_final_repair_state = None
                 for repair_state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
                     if not self._repair_spec_has_followup_mutation(repair_state):
@@ -14898,6 +15071,50 @@ class OllamaCodeAgent:
                         reason=normalization_reason,
                         rounds=round_number,
                     )
+                if request_obligations:
+                    protocol_state = self._current_repair_protocol_state(
+                        request_obligations=request_obligations,
+                        successful_tool_results=successful_tool_results,
+                        required_tool_names=required_tool_names,
+                    )
+                    decision = repair_decision_for_tool(protocol_state, tool_name=name, arguments=arguments)
+                    self._record_event(
+                        "repair_decision",
+                        tool=name,
+                        arguments=arguments,
+                        rounds=round_number,
+                        **decision,
+                    )
+                    protocol_recovery_ready = (
+                        not protocol_state.failed_attempts
+                        or any(
+                            self._repair_spec_has_followup_mutation(state)
+                            for state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery)
+                        )
+                    )
+                    if (
+                        protocol_state.repair_strategy == "cli_patch_bundle"
+                        and protocol_recovery_ready
+                        and not failed_mutation_obligations_pending
+                        and decision.get("allowed") is False
+                        and (
+                            str(decision.get("action") or "") in {"validation", "behavior_proof"}
+                            or str(decision.get("violation") or "") == "narrow_cli_mutation"
+                        )
+                    ):
+                        self._append_assistant_payload(payload)
+                        guidance = str(decision.get("reason") or "").strip()
+                        instruction = cli_patch_bundle_instruction(protocol_state)
+                        self.messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    (guidance + " " if guidance else "")
+                                    + (instruction or "Complete the implementation, tests, docs, and proof bundle before validation. Next JSON only.")
+                                ),
+                            }
+                        )
+                        continue
                 if name in forbidden_tool_names:
                     tool_error_counts[(name, self._tool_error_arg_key(name, arguments), "forbidden_tool")] = (
                         tool_error_counts.get((name, self._tool_error_arg_key(name, arguments), "forbidden_tool"), 0) + 1
@@ -16222,6 +16439,33 @@ class OllamaCodeAgent:
                         forced_next_classes=["validation", "implementation_edit", "final"],
                         rounds=round_number,
                     )
+                    if request_obligations:
+                        protocol_state = self._current_repair_protocol_state(
+                            request_obligations=request_obligations,
+                            successful_tool_results=successful_tool_results,
+                            required_tool_names=required_tool_names,
+                        )
+                        decision = repair_decision_for_tool(protocol_state, tool_name="run_test", arguments={"command": self.tools.default_test_command or ""})
+                        self._record_event(
+                            "repair_decision",
+                            tool="auto_validation",
+                            arguments={"candidate_tool": name},
+                            rounds=round_number,
+                            **decision,
+                        )
+                        if protocol_state.repair_strategy == "cli_patch_bundle" and decision.get("allowed") is False:
+                            guidance = str(decision.get("reason") or "").strip()
+                            instruction = cli_patch_bundle_instruction(protocol_state)
+                            self.messages.append(
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        (guidance + " " if guidance else "")
+                                        + (instruction or "Complete the remaining implementation, tests, docs, or proof bundle before validation. Next JSON only.")
+                                    ),
+                                }
+                            )
+                            continue
                     validation_name, validation_arguments, validation_result = self._execute_auto_validation_plan(
                         request_text=text,
                         round_number=round_number,
@@ -16499,6 +16743,20 @@ class OllamaCodeAgent:
                         last_timeout_command = str(arguments.get("command") or "").strip()
                         last_timeout_summary = str(result.get("summary") or result.get("output") or "").strip()
                     latest_tool_error_outputs[(name, self._tool_error_arg_key(name, arguments), error_class)] = str(result.get("output") or result.get("summary") or "").strip()
+                    if (
+                        name in {"replace_symbol", "replace_symbols"}
+                        and request_obligations
+                        and self._request_uses_typed_cli_flag_protocol(text)
+                        and "write_file" not in forbidden_tool_names
+                    ):
+                        mutation_paths = self._mutation_target_paths(arguments)
+                        target_path = str(mutation_paths[0]).strip().replace("\\", "/").lstrip("./") if mutation_paths else ""
+                        if target_path and self._failed_edit_recovery_allows_write_file({"path": target_path}):
+                            post_tool_feedback.append(
+                                f"Typed repair protocol: the broad symbol payload for `{target_path}` failed. "
+                                f"Re-read `{target_path}` if needed, then use write_file with the complete current CLI file so parser, "
+                                "function signature, behavior, tests, docs, and shell proof can be reconciled together. Next JSON only."
+                            )
                 real_tool_use = self._counts_as_real_tool_use(name, result) or self._failure_result_counts_for_request(text, name, result)
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
                 if real_tool_use:

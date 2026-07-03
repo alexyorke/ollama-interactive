@@ -167,7 +167,7 @@ python scripts/local_validation.py --tier smoke
 `smoke` and `agent` automatically use `pytest` with a bounded `xdist` worker count when those optional packages are installed; otherwise they fall back to serial `unittest`.
 The JSON summary records the resolved runner, resolved worker mode, completed tiers, and any tiers skipped after a failure so the local gate reflects what actually ran.
 For `pytest` runs it also records a `coverage_summary` block proving whether the repo-owned validation plan covered the discovered test targets exactly once, with zero duplicates and zero uncovered files.
-The focused `agent` tier now includes the feature-delivery false-success regressions: docs-only completions must fail closed, follow-up continue runs must keep unresolved obligations alive, and the local benchmark fixture requires proof that a requested command or flag actually exists before the task can finish.
+The focused `agent` tier now includes the feature-delivery false-success and typed-repair regressions: docs-only completions must fail closed, follow-up continue runs must keep unresolved obligations alive, and CLI flag work must move through the typed patch-bundle path instead of narrow speculative edits. The live `local-full` gate also includes `task_due_filter`; it is the current measured hard case for parser changes, tests/docs, and shell proof.
 
 Run the fuller local validation stack before merging larger controller or tooling changes:
 
