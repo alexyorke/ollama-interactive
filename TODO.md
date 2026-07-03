@@ -21,6 +21,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Tool-request parsing, forbidden-tool constraints, dynamic MCP tool names, and generic requires-tools detection now live in `ollama_code.controller.request_policy`.
 - Structured file-tool preference, session-memory detection, commit allowance, exact-output, and tool-error request predicates now live in `ollama_code.controller.request_policy`.
 - Broad-request, systems-lens, TODO-benefit, workspace-path, and clarification-risk classifiers now live in `ollama_code.controller.request_policy`.
+- Mechanical request parsers for read/list/search/test/git/outline/symbol/line targets now live in `ollama_code.controller.request_policy`.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.

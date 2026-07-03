@@ -7,6 +7,7 @@ from ollama_code.controller.request_policy import (
     request_allows_any_validation,
     request_allows_commit,
     request_allows_mutation,
+    request_asks_direct_file_contents,
     request_asks_exact_line_text,
     request_asks_if_command_works,
     request_asks_if_path_exists,
@@ -36,6 +37,18 @@ from ollama_code.controller.request_policy import (
     request_requires_test_run,
     request_requires_tools,
     request_targets_session_memory,
+    requested_code_outline_path,
+    requested_find_implementation_target_spec,
+    requested_git_tool_path,
+    requested_list_files_path,
+    requested_local_search_spec,
+    requested_mutation_paths,
+    requested_natural_read_file_path,
+    requested_read_file_path,
+    requested_run_test_command,
+    requested_search_symbols_spec,
+    requested_symbol_read,
+    requested_target_line_read,
     requested_tool_names_from_request,
     tool_names_in_fragment,
     validation_preferences,
@@ -181,6 +194,40 @@ class ControllerRequestPolicyTests(unittest.TestCase):
         self.assertTrue(request_has_clarification_risk_signal("Improve the CLI user experience."))
         self.assertTrue(request_has_clarification_risk_signal("Find bugs in this repo."))
         self.assertFalse(request_has_clarification_risk_signal("Read README.md and summarize it."))
+
+    def test_mechanical_request_parsers_extract_paths_and_commands(self) -> None:
+        self.assertEqual(requested_read_file_path("Use read_file on src/app.py."), "src/app.py")
+        self.assertEqual(requested_natural_read_file_path("What does docs/guide.md contain?"), "docs/guide.md")
+        self.assertTrue(
+            request_asks_direct_file_contents(
+                "What does docs/guide.md contain?",
+                requested_file_path="docs/guide.md",
+            )
+        )
+        self.assertFalse(
+            request_asks_direct_file_contents(
+                "Summarize what docs/guide.md contains.",
+                requested_file_path="docs/guide.md",
+            )
+        )
+        self.assertEqual(requested_mutation_paths("Update ./src/app.py and docs/guide.md.", mutation_required=True), {"src/app.py", "docs/guide.md"})
+        self.assertEqual(requested_mutation_paths("Read ./src/app.py.", mutation_required=False), set())
+        self.assertEqual(requested_git_tool_path("git diff src/app.py"), "src/app.py")
+        self.assertEqual(requested_list_files_path("list files in the repo"), ".")
+        self.assertEqual(requested_run_test_command("Use run_test to execute python -m unittest tests.test_cli and report."), "python -m unittest tests.test_cli")
+
+    def test_mechanical_request_parsers_extract_search_and_symbol_specs(self) -> None:
+        self.assertEqual(requested_local_search_spec("Search for parse_args in src."), {"query": "parse_args", "path": "src", "limit": 20})
+        self.assertIsNone(requested_local_search_spec("Search web for parse_args examples."))
+        self.assertEqual(requested_code_outline_path("Use code_outline on src/app.py."), "src/app.py")
+        self.assertEqual(requested_find_implementation_target_spec("Find implementation target for tests/test_cli.py."), {"test_path": "tests/test_cli.py"})
+        self.assertEqual(requested_search_symbols_spec("Use search_symbols to find parse_args in src/app.py."), {"query": "parse_args", "path": "src/app.py"})
+        line_read = requested_target_line_read("Read src/app.py line 12.")
+        self.assertIsNotNone(line_read)
+        self.assertEqual((line_read.path, line_read.start, line_read.end, line_read.line), ("src/app.py", 7, 17, 12))
+        symbol_read = requested_symbol_read("Find parse_args in src/app.py.")
+        self.assertIsNotNone(symbol_read)
+        self.assertEqual((symbol_read.path, symbol_read.symbol), ("src/app.py", "parse_args"))
 
 
 if __name__ == "__main__":

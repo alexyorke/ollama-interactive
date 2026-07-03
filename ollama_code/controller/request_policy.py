@@ -3,8 +3,46 @@ from __future__ import annotations
 import re
 from collections.abc import Callable
 
+from ollama_code.agent_protocol import SymbolReadSpec, TargetLineReadSpec
+
 
 ToolNamePredicate = Callable[[str], bool]
+
+
+def _strip_relative_prefix(path: str) -> str:
+    normalized = str(path or "").strip().replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _clean_match_group(match: re.Match[str], group: int | str = 1, *, default: str = "", strip_suffix: str = "") -> str:
+    try:
+        raw_value = match.group(group)
+    except IndexError:
+        raw_value = default
+    value = str(raw_value or default).strip()
+    if strip_suffix:
+        value = value.rstrip(strip_suffix)
+    return value
+
+
+def _first_request_match(
+    text: str,
+    patterns: list[str],
+    *,
+    group: int | str = 1,
+    flags: int = re.IGNORECASE,
+    strip_suffix: str = "",
+) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ""), flags=flags)
+        if not match:
+            continue
+        value = _clean_match_group(match, group, strip_suffix=strip_suffix)
+        if value:
+            return value
+    return None
 
 
 def path_looks_like_doc_target(path: str) -> bool:
@@ -300,6 +338,204 @@ def request_asks_symbol_return(text: str) -> bool:
             lowered,
         )
     )
+
+
+def requested_read_file_path(text: str) -> str | None:
+    return _first_request_match(
+        text,
+        [
+            r"\bread_file\s+on\s+(?P<path>[\w./\\:-]+)",
+            r"\bread_file\s+(?P<path>[\w./\\:-]+)",
+        ],
+        group="path",
+        strip_suffix=".,;:",
+    )
+
+
+def requested_natural_read_file_path(text: str) -> str | None:
+    return _first_request_match(
+        text,
+        [
+            r"\bwhat does\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:say|contain)\b",
+            r"\btell me what\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:says|contains)\b",
+        ],
+        group="path",
+        strip_suffix=".,;:",
+    )
+
+
+def request_asks_direct_file_contents(text: str, *, requested_file_path: str | None = None) -> bool:
+    lowered = str(text or "").lower()
+    if any(word in lowered for word in ["summarize", "summary", "explain", "why"]):
+        return False
+    return requested_file_path is not None
+
+
+def requested_mutation_paths(text: str, *, mutation_required: bool) -> set[str]:
+    if not mutation_required:
+        return set()
+    paths: set[str] = set()
+    for raw_path in re.findall(r"(?<![\w./\\-])(?:\.?[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]+\b", str(text or "")):
+        normalized = _strip_relative_prefix(raw_path.strip().strip("`'\"").rstrip(".,;:"))
+        if normalized:
+            paths.add(normalized)
+    return paths
+
+
+def requested_git_tool_path(text: str) -> str | None:
+    return _first_request_match(
+        text,
+        [
+            r"\bgit_status\s+on\s+(?P<path>[\w./\\:-]+)",
+            r"\bgit_diff\s+on\s+(?P<path>[\w./\\:-]+)",
+            r"\bgit\s+diff\s+(?P<path>[\w./\\:-]+)",
+        ],
+        group="path",
+        strip_suffix=".,;:",
+    )
+
+
+def requested_list_files_path(text: str) -> str | None:
+    lowered = str(text or "").lower().strip()
+    if lowered in {"ls", "dir", "list files", "list the files", "show files", "show the files", "list_files", "use list_files"}:
+        return "."
+    path = _first_request_match(
+        text,
+        [
+            r"\b(?:list|show)\s+(?:the\s+)?files\s+(?:in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
+            r"\b(?:use\s+)?list_files\s+(?:on|in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
+            r"\b(?:ls|dir)\s+(?P<path>[\w./\\:-]+)",
+        ],
+        group="path",
+        strip_suffix=".,;:",
+    )
+    if path:
+        return "." if path.lower() in {"the", "workspace", "repo", "repository", "project", "directory", "folder"} else path
+    if re.search(r"\b(?:list|show)\s+(?:the\s+)?files\b|\blist_files\b", lowered):
+        return "."
+    return None
+
+
+def requested_run_test_command(text: str) -> str | None:
+    patterns = [
+        r"\brun_test\s+to\s+execute\s+(?P<command>.+?)(?:\s+and\b|[.?!]\s|$)",
+        r"\buse\s+run_test\s+to\s+execute\s+(?P<command>.+?)(?:\s+and\b|[.?!]\s|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        command = match.group("command").strip().strip("` ")
+        if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
+            command = command[1:-1].strip()
+        if command:
+            return command
+    return None
+
+
+def requested_local_search_spec(text: str) -> dict[str, object] | None:
+    lowered = str(text or "").lower()
+    if "web" in lowered and not any(term in lowered for term in ["workspace", "repo", "repository", "code", "files", "project"]):
+        return None
+    patterns = [
+        r"\buse\s+search\s+to\s+find\s+(?P<query>.+?)(?:\s+and\b|[.?!]|$)",
+        r"\b(?:search|grep|rg)\s+(?:for\s+)?(?P<query>.+?)(?:\s+in\s+(?P<path>[\w./\\:-]+))?(?:\s+and\b|[,.?!]|$)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        query = match.group("query").strip().strip("`'\" ")
+        query = re.sub(r"\s+in\s+(?:the\s+)?(?:repo|repository|workspace|project)\s*$", "", query, flags=re.IGNORECASE)
+        path = _clean_match_group(match, "path", default=".", strip_suffix=".,;:")
+        if query and len(query) <= 160:
+            return {"query": query, "path": path or ".", "limit": 20}
+    return None
+
+
+def requested_code_outline_path(text: str) -> str | None:
+    path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
+    return _first_request_match(
+        text,
+        [
+            rf"\bcode_outline\b\s+(?:on|for|in)?\s*(?P<path>{path_pattern})",
+            rf"\buse\s+code_outline\s+(?:on|for|in)\s+(?P<path>{path_pattern})",
+            rf"\boutline\s+(?:the\s+)?code\s+(?:in|for)\s+(?P<path>{path_pattern})",
+        ],
+        group="path",
+        strip_suffix=".,;:",
+    )
+
+
+def requested_find_implementation_target_spec(text: str) -> dict[str, object] | None:
+    path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
+    path = _first_request_match(
+        text,
+        [
+            rf"\bfind_implementation_target\b.*?\b(?:for|on|path|test_path)\s+(?P<path>{path_pattern})",
+            rf"\b(?:identify|find|show)\s+(?:the\s+)?(?:relevant\s+|likely\s+)?implementation\s+(?:target|file|path)(?:s)?\s+(?:for|from)\s+(?P<path>{path_pattern})",
+            rf"\bwhich\s+implementation\s+(?:file|path)\s+(?:corresponds\s+to|matches|goes\s+with|for)\s+(?P<path>{path_pattern})",
+            rf"\bwhat\s+is\s+the\s+(?:relevant\s+|likely\s+)?implementation\s+(?:file|path)\s+for\s+(?P<path>{path_pattern})",
+        ],
+        group="path",
+        flags=re.IGNORECASE | re.DOTALL,
+        strip_suffix=".,;:",
+    )
+    return {"test_path": path} if path else None
+
+
+def requested_search_symbols_spec(text: str) -> dict[str, object] | None:
+    symbol_pattern = r"[A-Za-z_][\w.]*"
+    path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+|[\w./\\:-]+"
+    patterns = [
+        rf"\buse\s+search_symbols\s+to\s+(?:find|locate|search\s+for)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})",
+        rf"\bsearch_symbols\b.*?\b(?:query|symbol)\s+(?P<symbol>{symbol_pattern}).*?\b(?:path|in|on)\s+(?P<path>{path_pattern})",
+        rf"\b(?:find|locate)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})\s+using\s+search_symbols\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        symbol = _clean_match_group(match, "symbol", strip_suffix=".,;:")
+        path = _clean_match_group(match, "path", strip_suffix=".,;:")
+        if symbol and path:
+            return {"query": symbol, "path": path}
+    return None
+
+
+def requested_target_line_read(text: str) -> TargetLineReadSpec | None:
+    match = re.search(r"\bread_file\s+on\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        match = re.search(r"\bread\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    path = _clean_match_group(match, "path", strip_suffix=".,;:")
+    try:
+        line = int(match.group("line"))
+    except ValueError:
+        return None
+    if not path or line < 1:
+        return None
+    return TargetLineReadSpec(path=path, start=max(1, line - 5), end=line + 5, line=line)
+
+
+def requested_symbol_read(text: str) -> SymbolReadSpec | None:
+    symbol_pattern = r"[A-Za-z_][\w.]*"
+    path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
+    patterns = [
+        rf"\b(?:function|method|class|symbol)\s+(?P<symbol>{symbol_pattern})\s+(?:in|from)\s+(?P<path>{path_pattern})",
+        rf"\b(?:find|locate|search(?:_symbols)?(?:\s+for)?)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})",
+        rf"\bread_symbol\b.*?\b(?:on|in)\s+(?P<path>{path_pattern}).*?\bsymbol\s+(?P<symbol>{symbol_pattern})",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, str(text or ""), flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            continue
+        path = _clean_match_group(match, "path", strip_suffix=".,;:")
+        symbol = _clean_match_group(match, "symbol", strip_suffix=".,;:")
+        if path and symbol:
+            return SymbolReadSpec(path=path, symbol=symbol)
+    return None
 
 
 def request_mentions_workspace_path(text: str) -> bool:

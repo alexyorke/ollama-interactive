@@ -106,6 +106,7 @@ from ollama_code.controller import (
     request_allows_commit as controller_request_allows_commit,
     request_allows_mutation as controller_request_allows_mutation,
     request_asks_exact_line_text as controller_request_asks_exact_line_text,
+    request_asks_direct_file_contents as controller_request_asks_direct_file_contents,
     request_asks_if_command_works as controller_request_asks_if_command_works,
     request_asks_if_path_exists as controller_request_asks_if_path_exists,
     request_asks_specific_file_line as controller_request_asks_specific_file_line,
@@ -137,6 +138,18 @@ from ollama_code.controller import (
     request_requires_tools as controller_request_requires_tools,
     request_targets_session_memory as controller_request_targets_session_memory,
     requested_tool_names_from_request as controller_requested_tool_names_from_request,
+    requested_code_outline_path as controller_requested_code_outline_path,
+    requested_find_implementation_target_spec as controller_requested_find_implementation_target_spec,
+    requested_git_tool_path as controller_requested_git_tool_path,
+    requested_list_files_path as controller_requested_list_files_path,
+    requested_local_search_spec as controller_requested_local_search_spec,
+    requested_mutation_paths as controller_requested_mutation_paths,
+    requested_natural_read_file_path as controller_requested_natural_read_file_path,
+    requested_read_file_path as controller_requested_read_file_path,
+    requested_run_test_command as controller_requested_run_test_command,
+    requested_search_symbols_spec as controller_requested_search_symbols_spec,
+    requested_symbol_read as controller_requested_symbol_read,
+    requested_target_line_read as controller_requested_target_line_read,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
@@ -4117,10 +4130,10 @@ class OllamaCodeAgent:
         return controller_request_asks_specific_file_line(text)
 
     def _request_asks_direct_file_contents(self, text: str) -> bool:
-        lowered = text.lower()
-        if any(word in lowered for word in ["summarize", "summary", "explain", "why"]):
-            return False
-        return self._requested_natural_read_file_path(text) is not None
+        return controller_request_asks_direct_file_contents(
+            text,
+            requested_file_path=self._requested_natural_read_file_path(text),
+        )
 
     def _request_asks_symbol_return(self, text: str) -> bool:
         return controller_request_asks_symbol_return(text)
@@ -4178,84 +4191,22 @@ class OllamaCodeAgent:
         return None
 
     def _requested_read_file_path(self, text: str) -> str | None:
-        return self._first_request_match(
-            text,
-            [
-                r"\bread_file\s+on\s+(?P<path>[\w./\\:-]+)",
-                r"\bread_file\s+(?P<path>[\w./\\:-]+)",
-            ],
-            group="path",
-            strip_suffix=".,;:",
-        )
+        return controller_requested_read_file_path(text)
 
     def _requested_natural_read_file_path(self, text: str) -> str | None:
-        return self._first_request_match(
-            text,
-            [
-                r"\bwhat does\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:say|contain)\b",
-                r"\btell me what\s+(?P<path>[\w./\\:-]+\.[A-Za-z0-9]+)\s+(?:says|contains)\b",
-            ],
-            group="path",
-            strip_suffix=".,;:",
-        )
+        return controller_requested_natural_read_file_path(text)
 
     def _requested_mutation_paths(self, text: str) -> set[str]:
-        if not self._request_requires_mutation(text):
-            return set()
-        paths: set[str] = set()
-        for raw_path in re.findall(r"(?<![\w./\\-])(?:\.?[\w.-]+[\\/])+[\w.-]+\.[A-Za-z0-9]+\b", text):
-            normalized = self._strip_relative_prefix(raw_path.strip().strip("`'\"").rstrip(".,;:"))
-            if normalized:
-                paths.add(normalized)
-        return paths
+        return controller_requested_mutation_paths(text, mutation_required=self._request_requires_mutation(text))
 
     def _requested_git_tool_path(self, text: str) -> str | None:
-        return self._first_request_match(
-            text,
-            [
-                r"\bgit_status\s+on\s+(?P<path>[\w./\\:-]+)",
-                r"\bgit_diff\s+on\s+(?P<path>[\w./\\:-]+)",
-                r"\bgit\s+diff\s+(?P<path>[\w./\\:-]+)",
-            ],
-            group="path",
-            strip_suffix=".,;:",
-        )
+        return controller_requested_git_tool_path(text)
 
     def _requested_list_files_path(self, text: str) -> str | None:
-        lowered = text.lower().strip()
-        if lowered in {"ls", "dir", "list files", "list the files", "show files", "show the files", "list_files", "use list_files"}:
-            return "."
-        path = self._first_request_match(
-            text,
-            [
-                r"\b(?:list|show)\s+(?:the\s+)?files\s+(?:in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
-                r"\b(?:use\s+)?list_files\s+(?:on|in|under|for|from)\s+(?:the\s+)?(?P<path>[\w./\\:-]+)",
-                r"\b(?:ls|dir)\s+(?P<path>[\w./\\:-]+)",
-            ],
-            group="path",
-            strip_suffix=".,;:",
-        )
-        if path:
-            return "." if path.lower() in {"the", "workspace", "repo", "repository", "project", "directory", "folder"} else path
-        if re.search(r"\b(?:list|show)\s+(?:the\s+)?files\b|\blist_files\b", lowered):
-            return "."
-        return None
+        return controller_requested_list_files_path(text)
 
     def _requested_run_test_command(self, text: str) -> str | None:
-        patterns = [
-            r"\brun_test\s+to\s+execute\s+(?P<command>.+?)(?:\s+and\b|[.?!]\s|$)",
-            r"\buse\s+run_test\s+to\s+execute\s+(?P<command>.+?)(?:\s+and\b|[.?!]\s|$)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            if not match:
-                continue
-            command = match.group("command").strip().strip("` ")
-            if len(command) >= 2 and command[0] == command[-1] and command[0] in {"'", '"'}:
-                command = command[1:-1].strip()
-            if command:
-                return command
-        return None
+        return controller_requested_run_test_command(text)
 
     def _workspace_has_test_signal(self) -> bool:
         root = self.tools.workspace_root
@@ -4280,23 +4231,8 @@ class OllamaCodeAgent:
         return False
 
     def _requested_local_search_spec(self, text: str) -> dict[str, Any] | None:
-        lowered = text.lower()
-        if "web" in lowered and not any(term in lowered for term in ["workspace", "repo", "repository", "code", "files", "project"]):
-            return None
-        patterns = [
-            r"\buse\s+search\s+to\s+find\s+(?P<query>.+?)(?:\s+and\b|[.?!]|$)",
-            r"\b(?:search|grep|rg)\s+(?:for\s+)?(?P<query>.+?)(?:\s+in\s+(?P<path>[\w./\\:-]+))?(?:\s+and\b|[,.?!]|$)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            if not match:
-                continue
-            query = match.group("query").strip().strip("`'\" ")
-            query = re.sub(r"\s+in\s+(?:the\s+)?(?:repo|repository|workspace|project)\s*$", "", query, flags=re.IGNORECASE)
-            path = self._clean_match_group(match, "path", default=".", strip_suffix=".,;:")
-            if query and len(query) <= 160:
-                return {"query": query, "path": path or ".", "limit": 20}
-        return None
+        result = controller_requested_local_search_spec(text)
+        return dict(result) if isinstance(result, dict) else None
 
     def _requested_mechanical_tool_call(self, text: str, *, forbidden_tool_names: set[str]) -> MechanicalToolSpec | None:
         lowered = text.lower()
@@ -4380,66 +4316,18 @@ class OllamaCodeAgent:
         return None
 
     def _requested_code_outline_path(self, text: str) -> str | None:
-        path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
-        return self._first_request_match(
-            text,
-            [
-                rf"\bcode_outline\b\s+(?:on|for|in)?\s*(?P<path>{path_pattern})",
-                rf"\buse\s+code_outline\s+(?:on|for|in)\s+(?P<path>{path_pattern})",
-                rf"\boutline\s+(?:the\s+)?code\s+(?:in|for)\s+(?P<path>{path_pattern})",
-            ],
-            group="path",
-            strip_suffix=".,;:",
-        )
+        return controller_requested_code_outline_path(text)
 
     def _requested_find_implementation_target_spec(self, text: str) -> dict[str, Any] | None:
-        path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
-        path = self._first_request_match(
-            text,
-            [
-                rf"\bfind_implementation_target\b.*?\b(?:for|on|path|test_path)\s+(?P<path>{path_pattern})",
-                rf"\b(?:identify|find|show)\s+(?:the\s+)?(?:relevant\s+|likely\s+)?implementation\s+(?:target|file|path)(?:s)?\s+(?:for|from)\s+(?P<path>{path_pattern})",
-                rf"\bwhich\s+implementation\s+(?:file|path)\s+(?:corresponds\s+to|matches|goes\s+with|for)\s+(?P<path>{path_pattern})",
-                rf"\bwhat\s+is\s+the\s+(?:relevant\s+|likely\s+)?implementation\s+(?:file|path)\s+for\s+(?P<path>{path_pattern})",
-            ],
-            group="path",
-            flags=re.IGNORECASE | re.DOTALL,
-            strip_suffix=".,;:",
-        )
-        return {"test_path": path} if path else None
+        result = controller_requested_find_implementation_target_spec(text)
+        return dict(result) if isinstance(result, dict) else None
 
     def _requested_search_symbols_spec(self, text: str) -> dict[str, Any] | None:
-        symbol_pattern = r"[A-Za-z_][\w.]*"
-        path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+|[\w./\\:-]+"
-        patterns = [
-            rf"\buse\s+search_symbols\s+to\s+(?:find|locate|search\s+for)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})",
-            rf"\bsearch_symbols\b.*?\b(?:query|symbol)\s+(?P<symbol>{symbol_pattern}).*?\b(?:path|in|on)\s+(?P<path>{path_pattern})",
-            rf"\b(?:find|locate)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})\s+using\s+search_symbols\b",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            if not match:
-                continue
-            symbol = self._clean_match_group(match, "symbol", strip_suffix=".,;:")
-            path = self._clean_match_group(match, "path", strip_suffix=".,;:")
-            if symbol and path:
-                return {"query": symbol, "path": path}
-        return None
+        result = controller_requested_search_symbols_spec(text)
+        return dict(result) if isinstance(result, dict) else None
 
     def _requested_target_line_read(self, text: str) -> TargetLineReadSpec | None:
-        match = re.search(r"\bread_file\s+on\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", text, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            match = re.search(r"\bread\s+(?P<path>[\w./\\-]+).*?\bline\s+(?P<line>\d+)\b", text, flags=re.IGNORECASE | re.DOTALL)
-        if not match:
-            return None
-        path = self._clean_match_group(match, "path", strip_suffix=".,;:")
-        try:
-            line = int(match.group("line"))
-        except ValueError:
-            return None
-        if not path or line < 1:
-            return None
-        return TargetLineReadSpec(path=path, start=max(1, line - 5), end=line + 5, line=line)
+        return controller_requested_target_line_read(text)
 
     def _should_chain_run_test_after_mechanical(
         self,
@@ -4600,22 +4488,7 @@ class OllamaCodeAgent:
         return [(occurrence.fragment, occurrence.spec) for occurrence in ordered]
 
     def _requested_symbol_read(self, text: str) -> SymbolReadSpec | None:
-        symbol_pattern = r"[A-Za-z_][\w.]*"
-        path_pattern = r"[\w./\\:-]+\.[A-Za-z0-9]+"
-        patterns = [
-            rf"\b(?:function|method|class|symbol)\s+(?P<symbol>{symbol_pattern})\s+(?:in|from)\s+(?P<path>{path_pattern})",
-            rf"\b(?:find|locate|search(?:_symbols)?(?:\s+for)?)\s+(?P<symbol>{symbol_pattern})\s+in\s+(?P<path>{path_pattern})",
-            rf"\bread_symbol\b.*?\b(?:on|in)\s+(?P<path>{path_pattern}).*?\bsymbol\s+(?P<symbol>{symbol_pattern})",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
-            if not match:
-                continue
-            path = self._clean_match_group(match, "path", strip_suffix=".,;:")
-            symbol = self._clean_match_group(match, "symbol", strip_suffix=".,;:")
-            if path and symbol:
-                return SymbolReadSpec(path=path, symbol=symbol)
-        return None
+        return controller_requested_symbol_read(text)
 
     def _normalize_target_line_read_call(
         self,
