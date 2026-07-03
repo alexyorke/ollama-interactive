@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from typing import Any
 
 
@@ -129,3 +130,143 @@ def contract_signature(item: dict[str, Any]) -> str:
         args.append(text)
     returns = str(item.get("returns") or "Any")
     return f"{item.get('symbol')}({', '.join(args)})->{returns}"
+
+
+def annotation_allows_none(annotation: str) -> bool:
+    lowered = annotation.replace(" ", "").lower()
+    return lowered in {"any", "none"} or "optional[" in lowered or "|none" in lowered or "none|" in lowered
+
+
+def annotation_expected_shape(annotation: str) -> str | None:
+    lowered = annotation.replace("typing.", "").lower()
+    if lowered.startswith(("list", "sequence", "iterable")):
+        return "list"
+    if lowered.startswith("dict"):
+        return "dict"
+    if lowered.startswith("set"):
+        return "set"
+    if lowered.startswith("tuple"):
+        return "tuple"
+    if lowered in {"int", "str", "float", "bool"}:
+        return lowered
+    return None
+
+
+def return_shape_compatible(expected: str, shapes: list[str]) -> bool:
+    if not expected:
+        return True
+    if expected == "tuple":
+        return any(shape.startswith("tuple") or shape == "call:tuple" for shape in shapes)
+    if expected in {"list", "dict", "set"}:
+        return expected in shapes or f"call:{expected}" in shapes
+    if expected in {"int", "str", "float", "bool"}:
+        container_shapes = {"list", "dict", "set"}
+        if f"call:{expected}" in shapes:
+            return True
+        return not any(shape in container_shapes or shape.startswith("tuple") for shape in shapes)
+    return True
+
+
+def python_body_is_stub(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    statements = [
+        child
+        for child in node.body
+        if not (isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant) and isinstance(child.value.value, str))
+    ]
+    if not statements:
+        return True
+    if len(statements) != 1:
+        return False
+    only = statements[0]
+    if isinstance(only, ast.Pass):
+        return True
+    if isinstance(only, ast.Return):
+        return only.value is None or (isinstance(only.value, ast.Constant) and only.value.value is None)
+    if isinstance(only, ast.Expr) and isinstance(only.value, ast.Constant):
+        value = only.value.value
+        return value is Ellipsis or (
+            isinstance(value, str) and re.search(r"\b(?:todo|stub|implement|your code)\b", value, flags=re.IGNORECASE) is not None
+        )
+    if isinstance(only, ast.Raise):
+        raised = only.exc
+        if isinstance(raised, ast.Call):
+            raised = raised.func
+        return isinstance(raised, ast.Name) and raised.id == "NotImplementedError"
+    return False
+
+
+def python_assigned_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
+            names.add(child.id)
+        elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(child.name)
+        elif isinstance(child, (ast.Import, ast.ImportFrom)):
+            for alias in child.names:
+                names.add((alias.asname or alias.name).split(".", 1)[0])
+        elif isinstance(child, ast.ExceptHandler) and child.name:
+            names.add(child.name)
+    return names
+
+
+def python_loaded_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[tuple[str, int]]:
+    loaded: set[tuple[str, int]] = set()
+    root = node
+
+    class LoadVisitor(ast.NodeVisitor):
+        def visit_FunctionDef(self, child: ast.FunctionDef) -> Any:
+            if child is root:
+                self.generic_visit(child)
+            return None
+
+        def visit_AsyncFunctionDef(self, child: ast.AsyncFunctionDef) -> Any:
+            if child is root:
+                self.generic_visit(child)
+            return None
+
+        def visit_ClassDef(self, child: ast.ClassDef) -> Any:
+            return None
+
+        def visit_Lambda(self, child: ast.Lambda) -> Any:
+            return None
+
+        def visit_Name(self, child: ast.Name) -> Any:
+            if isinstance(child.ctx, ast.Load):
+                loaded.add((child.id, int(getattr(child, "lineno", getattr(root, "lineno", 1)))))
+
+    LoadVisitor().visit(node)
+    return loaded
+
+
+def python_function_param_names(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    args = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
+    names = {arg.arg for arg in args}
+    if node.args.vararg is not None:
+        names.add(node.args.vararg.arg)
+    if node.args.kwarg is not None:
+        names.add(node.args.kwarg.arg)
+    return names
+
+
+def python_placeholder_text_diagnostics(rel: str, text: str, limit: int) -> list[str]:
+    diagnostics: list[str] = []
+    for index, line in enumerate(text.splitlines(), start=1):
+        lowered = line.lower()
+        stripped = line.strip()
+        commentish = stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''")
+        patterns = [
+            (r"\bplaceholder implementation\b", "placeholder implementation text remains", True),
+            (r"\bin a real scenario\b", "speculative placeholder text remains", True),
+            (r"\bNote_(?:Interval_)?\b", "fake generated note placeholder remains", True),
+            (r"\bTODO\b|\bstub\b|\byour code\b", "TODO/stub placeholder text remains", commentish),
+        ]
+        for pattern, message, enabled in patterns:
+            if not enabled:
+                continue
+            if re.search(pattern, line, flags=re.IGNORECASE):
+                diagnostics.append(f"{rel}:{index} {message}: {lowered.strip()[:100]}")
+                break
+        if len(diagnostics) >= max(1, int(limit)):
+            break
+    return diagnostics[: max(1, int(limit))]

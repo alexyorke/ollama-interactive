@@ -56,6 +56,8 @@ from ollama_code.tools.command_validation import (
     validation_result,
 )
 from ollama_code.tools.contracts import (
+    annotation_allows_none,
+    annotation_expected_shape,
     annotation_text,
     callable_arity,
     callable_arity_without_receiver,
@@ -65,6 +67,12 @@ from ollama_code.tools.contracts import (
     dataclass_field_init_and_default,
     decorator_keyword_bool,
     decorator_leaf,
+    python_assigned_names,
+    python_body_is_stub,
+    python_function_param_names,
+    python_loaded_names,
+    python_placeholder_text_diagnostics,
+    return_shape_compatible,
 )
 from ollama_code.tools.synthesis import (
     human_test_name,
@@ -9928,36 +9936,13 @@ import string
         }
 
     def _annotation_allows_none(self, annotation: str) -> bool:
-        lowered = annotation.replace(" ", "").lower()
-        return lowered in {"any", "none"} or "optional[" in lowered or "|none" in lowered or "none|" in lowered
+        return annotation_allows_none(annotation)
 
     def _annotation_expected_shape(self, annotation: str) -> str | None:
-        lowered = annotation.replace("typing.", "").lower()
-        if lowered.startswith(("list", "sequence", "iterable")):
-            return "list"
-        if lowered.startswith("dict"):
-            return "dict"
-        if lowered.startswith("set"):
-            return "set"
-        if lowered.startswith("tuple"):
-            return "tuple"
-        if lowered in {"int", "str", "float", "bool"}:
-            return lowered
-        return None
+        return annotation_expected_shape(annotation)
 
     def _return_shape_compatible(self, expected: str, shapes: list[str]) -> bool:
-        if not expected:
-            return True
-        if expected == "tuple":
-            return any(shape.startswith("tuple") or shape == "call:tuple" for shape in shapes)
-        if expected in {"list", "dict", "set"}:
-            return expected in shapes or f"call:{expected}" in shapes
-        if expected in {"int", "str", "float", "bool"}:
-            container_shapes = {"list", "dict", "set"}
-            if f"call:{expected}" in shapes:
-                return True
-            return not any(shape in container_shapes or shape.startswith("tuple") for shape in shapes)
-        return True
+        return return_shape_compatible(expected, shapes)
 
     def _caller_return_expectation_compatible(self, expectation: str, annotation: str, shapes: list[str]) -> bool:
         annotation_shape = self._annotation_expected_shape(annotation)
@@ -10106,82 +10091,16 @@ import string
         return diagnostics
 
     def _python_body_is_stub(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
-        statements = [
-            child
-            for child in node.body
-            if not (isinstance(child, ast.Expr) and isinstance(child.value, ast.Constant) and isinstance(child.value.value, str))
-        ]
-        if not statements:
-            return True
-        if len(statements) != 1:
-            return False
-        only = statements[0]
-        if isinstance(only, ast.Pass):
-            return True
-        if isinstance(only, ast.Return):
-            return only.value is None or (isinstance(only.value, ast.Constant) and only.value.value is None)
-        if isinstance(only, ast.Expr) and isinstance(only.value, ast.Constant):
-            value = only.value.value
-            return value is Ellipsis or (
-                isinstance(value, str) and re.search(r"\b(?:todo|stub|implement|your code)\b", value, flags=re.IGNORECASE) is not None
-            )
-        if isinstance(only, ast.Raise):
-            raised = only.exc
-            if isinstance(raised, ast.Call):
-                raised = raised.func
-            return isinstance(raised, ast.Name) and raised.id == "NotImplementedError"
-        return False
+        return python_body_is_stub(node)
 
     def _python_assigned_names(self, node: ast.AST) -> set[str]:
-        names: set[str] = set()
-        for child in ast.walk(node):
-            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)):
-                names.add(child.id)
-            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                names.add(child.name)
-            elif isinstance(child, (ast.Import, ast.ImportFrom)):
-                for alias in child.names:
-                    names.add((alias.asname or alias.name).split(".", 1)[0])
-            elif isinstance(child, ast.ExceptHandler) and child.name:
-                names.add(child.name)
-        return names
+        return python_assigned_names(node)
 
     def _python_loaded_names(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[tuple[str, int]]:
-        loaded: set[tuple[str, int]] = set()
-        root = node
-
-        class LoadVisitor(ast.NodeVisitor):
-            def visit_FunctionDef(self, child: ast.FunctionDef) -> Any:
-                if child is root:
-                    self.generic_visit(child)
-                return None
-
-            def visit_AsyncFunctionDef(self, child: ast.AsyncFunctionDef) -> Any:
-                if child is root:
-                    self.generic_visit(child)
-                return None
-
-            def visit_ClassDef(self, child: ast.ClassDef) -> Any:
-                return None
-
-            def visit_Lambda(self, child: ast.Lambda) -> Any:
-                return None
-
-            def visit_Name(self, child: ast.Name) -> Any:
-                if isinstance(child.ctx, ast.Load):
-                    loaded.add((child.id, int(getattr(child, "lineno", getattr(root, "lineno", 1)))))
-
-        LoadVisitor().visit(node)
-        return loaded
+        return python_loaded_names(node)
 
     def _python_function_param_names(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-        args = list(node.args.posonlyargs) + list(node.args.args) + list(node.args.kwonlyargs)
-        names = {arg.arg for arg in args}
-        if node.args.vararg is not None:
-            names.add(node.args.vararg.arg)
-        if node.args.kwarg is not None:
-            names.add(node.args.kwarg.arg)
-        return names
+        return python_function_param_names(node)
 
     def _python_string_sequence_literal(self, node: ast.AST | None) -> list[str] | None:
         if not isinstance(node, (ast.List, ast.Tuple, ast.Set)):
@@ -10306,26 +10225,7 @@ import string
         return diagnostics[: max(1, int(limit))]
 
     def _python_placeholder_text_diagnostics(self, rel: str, text: str, limit: int) -> list[str]:
-        diagnostics: list[str] = []
-        for index, line in enumerate(text.splitlines(), start=1):
-            lowered = line.lower()
-            stripped = line.strip()
-            commentish = stripped.startswith("#") or stripped.startswith('"""') or stripped.startswith("'''")
-            patterns = [
-                (r"\bplaceholder implementation\b", "placeholder implementation text remains", True),
-                (r"\bin a real scenario\b", "speculative placeholder text remains", True),
-                (r"\bNote_(?:Interval_)?\b", "fake generated note placeholder remains", True),
-                (r"\bTODO\b|\bstub\b|\byour code\b", "TODO/stub placeholder text remains", commentish),
-            ]
-            for pattern, message, enabled in patterns:
-                if not enabled:
-                    continue
-                if re.search(pattern, line, flags=re.IGNORECASE):
-                    diagnostics.append(f"{rel}:{index} {message}: {lowered.strip()[:100]}")
-                    break
-            if len(diagnostics) >= max(1, int(limit)):
-                break
-        return diagnostics[: max(1, int(limit))]
+        return python_placeholder_text_diagnostics(rel, text, limit)
 
     def contract_check(
         self,
