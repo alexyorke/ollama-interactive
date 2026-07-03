@@ -34,6 +34,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Shell inspection routing from `run_shell` to structured read/list/search tools now lives in `ollama_code.controller.tool_call_policy`; `agent.py` supplies request, approval, and parser callbacks.
 - Head/tail shell preview parsing now lives in `ollama_code.controller.tool_call_policy`; `agent.py` only supplies file line counts for tail ranges.
 - Import-repair, project-rename, and optional-parameter bootstrap routing now live in `ollama_code.controller.tool_call_policy`; `agent.py` supplies parsed request facts and operation candidates.
+- Project function-rename operation planning and already-satisfied detection now live in `ollama_code.controller.operation_policy`; `agent.py` only delegates.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.

@@ -31,6 +31,7 @@ SMOKE_MODULES = (
     "tests.test_web_discovered_agent_dataset_analysis",
     "tests.test_controller_edit_policy",
     "tests.test_controller_final_policy",
+    "tests.test_controller_operation_policy",
     "tests.test_controller_request_policy",
     "tests.test_controller_tool_call_policy",
     "tests.test_controller_tool_payload_policy",
