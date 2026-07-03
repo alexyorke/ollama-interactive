@@ -135,6 +135,15 @@ def spec_guided_repair_has_actionable_spec(
     return small_module and (len(quick_examples) >= 4 or has_small_literal_example_repair)
 
 
+def request_likely_import_repair(request_text: str, source_text: str) -> bool:
+    lowered = request_text.lower()
+    if "import" not in lowered:
+        return False
+    if not any(token in lowered for token in ("bug", "fix", "repair", "module", "package")):
+        return False
+    return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
+
+
 def merge_request_obligations(obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()

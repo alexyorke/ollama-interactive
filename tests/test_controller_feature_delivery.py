@@ -8,6 +8,7 @@ from ollama_code.controller.feature_delivery import (
     cli_test_additions,
     derive_request_obligations,
     request_is_cli_flag_bundle,
+    request_likely_import_repair,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
     spec_guided_repair_has_actionable_spec,
@@ -140,6 +141,13 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 test_spec_call_name=call_name,
             )
         )
+
+    def test_request_likely_import_repair_requires_import_request_and_import_source(self) -> None:
+        source = "from app.models import Task\n\n\ndef build():\n    return Task()\n"
+
+        self.assertTrue(request_likely_import_repair("Fix the import bug in this package.", source))
+        self.assertFalse(request_likely_import_repair("Fix the logic bug in this package.", source))
+        self.assertFalse(request_likely_import_repair("Fix the import bug in this package.", "def build():\n    return 1\n"))
 
     def test_cli_feature_capabilities_detect_due_before_priority_and_limit(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"

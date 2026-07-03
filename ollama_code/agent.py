@@ -148,6 +148,7 @@ from ollama_code.controller import (
     request_has_clarification_risk_signal as controller_request_has_clarification_risk_signal,
     request_is_broad_or_ambiguous as controller_request_is_broad_or_ambiguous,
     request_is_continue_prompt as controller_request_is_continue_prompt,
+    request_likely_import_repair as feature_request_likely_import_repair,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
     request_looks_like_python_test_driven_repair as feature_request_looks_like_python_test_driven_repair,
     request_looks_like_issue_report as controller_request_looks_like_issue_report,
@@ -8769,12 +8770,7 @@ class OllamaCodeAgent:
         return decision
 
     def _request_likely_import_repair(self, request_text: str, source_text: str) -> bool:
-        lowered = request_text.lower()
-        if "import" not in lowered:
-            return False
-        if not any(token in lowered for token in ("bug", "fix", "repair", "module", "package")):
-            return False
-        return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
+        return feature_request_likely_import_repair(request_text, source_text)
 
     def _request_is_cli_flag_bundle(self, request_text: str) -> bool:
         return feature_request_is_cli_flag_bundle(request_text)
