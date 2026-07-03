@@ -100,6 +100,7 @@ from ollama_code.controller import (
     final_claims_timeout_success as controller_final_claims_timeout_success,
     final_requires_verification as controller_final_requires_verification,
     forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
+    mechanical_obligation_repair_failed_for as feature_mechanical_obligation_repair_failed_for,
     merge_request_obligations,
     normalize_edit_payload_aliases as controller_normalize_edit_payload_aliases,
     normalize_exact_literal_tool_call as controller_normalize_exact_literal_tool_call,
@@ -9455,18 +9456,11 @@ class OllamaCodeAgent:
         return [self._repair_shell_command([sys.executable, *argv]) for argv in cli_proof_command_argvs(source_path, candidate_source, request_text)]
 
     def _mechanical_obligation_repair_failed_for(self, source_path: str, test_path: str) -> bool:
-        normalized_source = str(source_path or "").strip().replace("\\", "/").lstrip("./")
-        normalized_test = str(test_path or "").strip().replace("\\", "/").lstrip("./")
-        for event in reversed(self.events):
-            if event.get("type") != "spec_guided_repair":
-                continue
-            if event.get("phase") != "mechanical_obligation_verification":
-                continue
-            event_source = str(event.get("source_path") or "").strip().replace("\\", "/").lstrip("./")
-            event_test = str(event.get("test_path") or "").strip().replace("\\", "/").lstrip("./")
-            if event_source == normalized_source and event_test == normalized_test and event.get("ok") is False:
-                return True
-        return False
+        return feature_mechanical_obligation_repair_failed_for(
+            source_path=source_path,
+            test_path=test_path,
+            events=self.events,
+        )
 
     def _maybe_update_cli_readme_docs(
         self,

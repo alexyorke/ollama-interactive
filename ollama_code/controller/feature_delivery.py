@@ -144,6 +144,30 @@ def request_likely_import_repair(request_text: str, source_text: str) -> bool:
     return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
 
 
+def mechanical_obligation_repair_failed_for(
+    *,
+    source_path: str,
+    test_path: str,
+    events: list[dict[str, Any]],
+) -> bool:
+    normalized_source = _normalize_repo_path(source_path)
+    normalized_test = _normalize_repo_path(test_path)
+    for event in reversed(events):
+        if event.get("type") != "spec_guided_repair":
+            continue
+        if event.get("phase") != "mechanical_obligation_verification":
+            continue
+        event_source = _normalize_repo_path(str(event.get("source_path") or ""))
+        event_test = _normalize_repo_path(str(event.get("test_path") or ""))
+        if event_source == normalized_source and event_test == normalized_test and event.get("ok") is False:
+            return True
+    return False
+
+
+def _normalize_repo_path(path: str) -> str:
+    return str(path or "").strip().replace("\\", "/").lstrip("./")
+
+
 def merge_request_obligations(obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()

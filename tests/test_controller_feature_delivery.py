@@ -7,6 +7,7 @@ from ollama_code.controller.feature_delivery import (
     cli_readme_additions,
     cli_test_additions,
     derive_request_obligations,
+    mechanical_obligation_repair_failed_for,
     request_is_cli_flag_bundle,
     request_likely_import_repair,
     request_looks_like_python_test_driven_repair,
@@ -148,6 +149,66 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         self.assertTrue(request_likely_import_repair("Fix the import bug in this package.", source))
         self.assertFalse(request_likely_import_repair("Fix the logic bug in this package.", source))
         self.assertFalse(request_likely_import_repair("Fix the import bug in this package.", "def build():\n    return 1\n"))
+
+    def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:
+        events = [
+            {
+                "type": "spec_guided_repair",
+                "phase": "mechanical_obligation_verification",
+                "source_path": "./src/task_cli.py",
+                "test_path": "tests\\test_task_cli.py",
+                "ok": False,
+            }
+        ]
+
+        self.assertTrue(
+            mechanical_obligation_repair_failed_for(
+                source_path="src/task_cli.py",
+                test_path="tests/test_task_cli.py",
+                events=events,
+            )
+        )
+
+    def test_mechanical_obligation_repair_failed_for_ignores_success_or_unrelated_events(self) -> None:
+        events = [
+            {
+                "type": "spec_guided_repair",
+                "phase": "mechanical_candidate_validation",
+                "source_path": "src/task_cli.py",
+                "test_path": "tests/test_task_cli.py",
+                "ok": False,
+            },
+            {
+                "type": "spec_guided_repair",
+                "phase": "mechanical_obligation_verification",
+                "source_path": "src/task_cli.py",
+                "test_path": "tests/test_task_cli.py",
+                "ok": True,
+            },
+        ]
+
+        self.assertFalse(
+            mechanical_obligation_repair_failed_for(
+                source_path="src/task_cli.py",
+                test_path="tests/test_task_cli.py",
+                events=events,
+            )
+        )
+        self.assertFalse(
+            mechanical_obligation_repair_failed_for(
+                source_path="src/other.py",
+                test_path="tests/test_task_cli.py",
+                events=[
+                    {
+                        "type": "spec_guided_repair",
+                        "phase": "mechanical_obligation_verification",
+                        "source_path": "src/task_cli.py",
+                        "test_path": "tests/test_task_cli.py",
+                        "ok": False,
+                    }
+                ],
+            )
+        )
 
     def test_cli_feature_capabilities_detect_due_before_priority_and_limit(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"
