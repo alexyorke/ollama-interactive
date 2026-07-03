@@ -6,6 +6,7 @@ from ollama_code.agent_protocol import TargetLineReadSpec
 from ollama_code.controller.tool_call_policy import (
     normalize_find_shell_inspection,
     normalize_run_test_call,
+    normalize_shell_test_call,
     normalize_target_line_read_call,
     normalize_unittest_file_command,
 )
@@ -87,6 +88,151 @@ class ControllerToolCallPolicyTests(unittest.TestCase):
                 "run_test",
                 {"command": "python -m unittest discover -s tests -p test_cli.py"},
                 "Normalized unittest file path command to unittest discover.",
+            ),
+        )
+
+    def test_shell_test_call_honors_explicit_tool_requests(self) -> None:
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "pytest -q", "timeout": 30},
+                approval_mode="default",
+                explicit_run_shell=True,
+                explicit_run_test=False,
+                exact_shell_command=None,
+                default_test_command="python -m unittest discover -s tests -v",
+                bare_python_test_file_command=lambda command: None,
+                shell_command_looks_like_test_run=lambda command: True,
+            ),
+            ("run_shell", {"command": "pytest -q", "timeout": 30}, None),
+        )
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "pytest -q", "cwd": "pkg"},
+                approval_mode="default",
+                explicit_run_shell=False,
+                explicit_run_test=True,
+                exact_shell_command=None,
+                default_test_command="python -m unittest discover -s tests -v",
+                bare_python_test_file_command=lambda command: None,
+                shell_command_looks_like_test_run=lambda command: True,
+            ),
+            (
+                "run_test",
+                {"command": "pytest -q", "cwd": "pkg"},
+                "Normalized run_shell to run_test because the request explicitly requires run_test.",
+            ),
+        )
+
+    def test_shell_test_call_normalizes_test_like_shell_commands(self) -> None:
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "pytest -q", "timeout": 30},
+                approval_mode="default",
+                explicit_run_shell=False,
+                explicit_run_test=False,
+                exact_shell_command=None,
+                default_test_command="python -m unittest discover -s tests -v",
+                bare_python_test_file_command=lambda command: None,
+                shell_command_looks_like_test_run=lambda command: True,
+            ),
+            (
+                "run_test",
+                {"command": "python -m unittest discover -s tests -v", "timeout": 30},
+                "Normalized shell test command to the configured run_test command.",
+            ),
+        )
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "pytest -q"},
+                approval_mode="default",
+                explicit_run_shell=False,
+                explicit_run_test=False,
+                exact_shell_command=None,
+                default_test_command=None,
+                bare_python_test_file_command=lambda command: None,
+                shell_command_looks_like_test_run=lambda command: True,
+            ),
+            ("run_test", {"command": "pytest -q"}, "Normalized shell test command to run_test with the original command."),
+        )
+
+    def test_shell_test_call_preserves_non_test_read_only_and_exact_commands(self) -> None:
+        base_kwargs = {
+            "explicit_run_shell": False,
+            "explicit_run_test": False,
+            "default_test_command": "python -m unittest discover -s tests -v",
+            "bare_python_test_file_command": lambda command: None,
+            "shell_command_looks_like_test_run": lambda command: command.startswith("pytest"),
+        }
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "pytest -q"},
+                approval_mode="read-only",
+                exact_shell_command=None,
+                **base_kwargs,
+            ),
+            ("run_shell", {"command": "pytest -q"}, None),
+        )
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "pytest -q"},
+                approval_mode="default",
+                exact_shell_command="pytest -q",
+                **base_kwargs,
+            ),
+            ("run_shell", {"command": "pytest -q"}, None),
+        )
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "python script.py"},
+                approval_mode="default",
+                exact_shell_command=None,
+                **base_kwargs,
+            ),
+            ("run_shell", {"command": "python script.py"}, None),
+        )
+
+    def test_shell_test_call_normalizes_bare_python_test_file(self) -> None:
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "tests/test_cli.py"},
+                approval_mode="default",
+                explicit_run_shell=False,
+                explicit_run_test=False,
+                exact_shell_command=None,
+                default_test_command=None,
+                bare_python_test_file_command=lambda command: "tests/test_cli.py",
+                shell_command_looks_like_test_run=lambda command: False,
+            ),
+            (
+                "run_test",
+                {"command": "python -m pytest tests/test_cli.py"},
+                "Normalized bare Python test-file shell command to run_test with pytest.",
+            ),
+        )
+        self.assertEqual(
+            normalize_shell_test_call(
+                "run_shell",
+                {"command": "tests/test_cli.py"},
+                approval_mode="default",
+                explicit_run_shell=False,
+                explicit_run_test=False,
+                exact_shell_command=None,
+                default_test_command="python -m unittest discover -s tests -v",
+                bare_python_test_file_command=lambda command: "tests/test_cli.py",
+                shell_command_looks_like_test_run=lambda command: False,
+            ),
+            (
+                "run_test",
+                {"command": "python -m unittest discover -s tests -v"},
+                "Normalized bare Python test-file shell command to the configured run_test command.",
             ),
         )
 

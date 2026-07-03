@@ -11,6 +11,8 @@ from ollama_code.agent_protocol import TargetLineReadSpec
 PathResolver = Callable[[str], Path]
 PathLabeler = Callable[[Path], str]
 UnittestCommandNormalizer = Callable[[str], str | None]
+BarePythonTestFileDetector = Callable[[str], str | None]
+ShellTestRunPredicate = Callable[[str], bool]
 
 
 def normalize_target_line_read_call(
@@ -70,6 +72,65 @@ def normalize_run_test_call(
     normalized = dict(arguments)
     normalized["command"] = default_test_command
     return "run_test", normalized, "Normalized vague run_test command to the configured test command."
+
+
+def _copy_shell_command_context(arguments: dict[str, Any], *, command: str) -> dict[str, Any]:
+    normalized: dict[str, Any] = {"command": command}
+    if "cwd" in arguments:
+        normalized["cwd"] = arguments["cwd"]
+    if "timeout" in arguments:
+        normalized["timeout"] = arguments["timeout"]
+    return normalized
+
+
+def normalize_shell_test_call(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    approval_mode: str,
+    explicit_run_shell: bool,
+    explicit_run_test: bool,
+    exact_shell_command: str | None,
+    default_test_command: str | None,
+    bare_python_test_file_command: BarePythonTestFileDetector,
+    shell_command_looks_like_test_run: ShellTestRunPredicate,
+) -> tuple[str, dict[str, Any], str | None]:
+    if name != "run_shell":
+        return name, arguments, None
+    if approval_mode == "read-only":
+        return name, arguments, None
+    command = str(arguments.get("command", "")).strip()
+    if not command:
+        return name, arguments, None
+    if explicit_run_shell:
+        return name, arguments, None
+    if explicit_run_test:
+        return (
+            "run_test",
+            _copy_shell_command_context(arguments, command=command),
+            "Normalized run_shell to run_test because the request explicitly requires run_test.",
+        )
+    bare_test_path = bare_python_test_file_command(command)
+    if bare_test_path is not None:
+        quoted_test_path = f'"{bare_test_path}"' if re.search(r"\s", bare_test_path) else bare_test_path
+        normalized = _copy_shell_command_context(arguments, command=default_test_command or f"python -m pytest {quoted_test_path}")
+        reason = (
+            "Normalized bare Python test-file shell command to the configured run_test command."
+            if default_test_command
+            else "Normalized bare Python test-file shell command to run_test with pytest."
+        )
+        return "run_test", normalized, reason
+    if not shell_command_looks_like_test_run(command):
+        return name, arguments, None
+    if exact_shell_command and command == exact_shell_command:
+        return name, arguments, None
+    normalized = _copy_shell_command_context(arguments, command=default_test_command or command)
+    reason = (
+        "Normalized shell test command to the configured run_test command."
+        if default_test_command
+        else "Normalized shell test command to run_test with the original command."
+    )
+    return "run_test", normalized, reason
 
 
 def normalize_unittest_file_command(
