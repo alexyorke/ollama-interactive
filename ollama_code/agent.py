@@ -103,10 +103,14 @@ from ollama_code.controller import (
     normalize_edit_payload_aliases as controller_normalize_edit_payload_aliases,
     normalize_exact_literal_tool_call as controller_normalize_exact_literal_tool_call,
     normalize_file_tool_alias_call as controller_normalize_file_tool_alias_call,
+    normalize_find_shell_inspection as controller_normalize_find_shell_inspection,
     normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
     normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
     normalize_payload as controller_normalize_payload,
+    normalize_run_test_call as controller_normalize_run_test_call,
     normalize_snippet_symbol_edit_call as controller_normalize_snippet_symbol_edit_call,
+    normalize_target_line_read_call as controller_normalize_target_line_read_call,
+    normalize_unittest_file_command as controller_normalize_unittest_file_command,
     path_looks_like_code_file as controller_path_looks_like_code_file,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
@@ -4198,24 +4202,7 @@ class OllamaCodeAgent:
         *,
         target_line_read: TargetLineReadSpec | None,
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name != "read_file" or target_line_read is None:
-            return name, arguments, None
-        requested_path = str(arguments.get("path", "")).strip()
-        if requested_path and requested_path.replace("\\", "/") != target_line_read.path.replace("\\", "/"):
-            return name, arguments, None
-        try:
-            current_start = int(arguments.get("start", 1))
-            current_end = int(arguments.get("end", 200))
-        except (TypeError, ValueError):
-            current_start = 1
-            current_end = 200
-        if current_start <= target_line_read.line <= current_end and (current_end - current_start) <= 40:
-            return name, arguments, None
-        return (
-            "read_file",
-            {"path": target_line_read.path, "start": target_line_read.start, "end": target_line_read.end},
-            f"Normalized read_file to the requested line {target_line_read.line} with a small surrounding range.",
-        )
+        return controller_normalize_target_line_read_call(name, arguments, target_line_read=target_line_read)
 
     def _normalize_run_test_call(
         self,
@@ -4224,29 +4211,13 @@ class OllamaCodeAgent:
         *,
         request_text: str,
     ) -> tuple[str, dict[str, Any], str | None]:
-        if name in {"test", "tests", "pytest", "unittest"} and self.tools.default_test_command:
-            normalized = dict(arguments)
-            normalized["command"] = self.tools.default_test_command
-            return "run_test", normalized, f"Normalized {name} tool alias to the configured run_test command."
-        if name != "run_test":
-            return name, arguments, None
-        command = str(arguments.get("command", "")).strip()
-        normalized_unittest = self._normalize_unittest_file_command(command)
-        if normalized_unittest:
-            normalized = dict(arguments)
-            normalized["command"] = normalized_unittest
-            return "run_test", normalized, "Normalized unittest file path command to unittest discover."
-        if not self.tools.default_test_command:
-            return name, arguments, None
-        lowered_command = command.lower()
-        lowered_request = request_text.lower()
-        vague_command = lowered_command in {"", "test", "tests", "pytest", "unittest", "python -m unittest", "python3 -m unittest"}
-        command_not_requested = bool(command) and lowered_command not in lowered_request
-        if not vague_command and not command_not_requested:
-            return name, arguments, None
-        normalized = dict(arguments)
-        normalized["command"] = self.tools.default_test_command
-        return "run_test", normalized, "Normalized vague run_test command to the configured test command."
+        return controller_normalize_run_test_call(
+            name,
+            arguments,
+            request_text=request_text,
+            default_test_command=self.tools.default_test_command,
+            normalize_unittest_file_command=self._normalize_unittest_file_command,
+        )
 
     def _request_looks_like_explicit_python_import_bug_fix(self, request_text: str) -> bool:
         if not self._request_requires_test_run(request_text):
@@ -4360,23 +4331,11 @@ class OllamaCodeAgent:
         )
 
     def _normalize_unittest_file_command(self, command: str) -> str | None:
-        match = re.match(
-            r"^(?P<prefix>(?:\"[^\"]+\"|'[^']+'|[^\s]+)\s+-m\s+unittest)\s+(?P<path>[^\s]+\.py)\s*$",
-            command.strip(),
-            flags=re.IGNORECASE,
+        return controller_normalize_unittest_file_command(
+            command,
+            resolve_path=lambda raw_path: self.tools.resolve_path(raw_path, allow_missing=False),
+            relative_label=self.tools.relative_label,
         )
-        if not match:
-            return None
-        raw_path = match.group("path").strip("\"'")
-        try:
-            target = self.tools.resolve_path(raw_path, allow_missing=False)
-        except Exception:
-            return None
-        rel = self.tools.relative_label(target).replace("\\", "/")
-        if "/tests/" not in f"/{rel}" and not target.name.startswith("test_") and not target.name.endswith("_test.py"):
-            return None
-        test_dir = self.tools.relative_label(target.parent)
-        return f"{match.group('prefix')} discover -s {test_dir} -p {target.name}"
 
     def _shell_command_looks_like_test_run(self, command: str) -> bool:
         return controller_shell_command_looks_like_test_run(command)
@@ -4574,47 +4533,7 @@ class OllamaCodeAgent:
         return {"path": path, "start": start, "end": max(start, line_count)}
 
     def _normalize_find_shell_inspection(self, argv: list[str]) -> tuple[str, dict[str, Any]] | None:
-        if len(argv) < 4 or argv[0].lower() != "find":
-            return None
-        path = argv[1]
-        if path.startswith("-"):
-            return None
-        query: str | None = None
-        target_tool = "file_search"
-        index = 2
-        while index < len(argv):
-            token = argv[index]
-            if token == "-name":
-                if index + 1 >= len(argv) or query is not None:
-                    return None
-                query = argv[index + 1]
-                index += 2
-                continue
-            if token == "-type":
-                if index + 1 >= len(argv):
-                    return None
-                raw_kind = argv[index + 1].lower()
-                if raw_kind in {"f", "file"}:
-                    target_tool = "file_search"
-                elif raw_kind in {"d", "dir", "directory"}:
-                    target_tool = "directory_search"
-                else:
-                    return None
-                index += 2
-                continue
-            return None
-        if not query or query.startswith("-"):
-            return None
-        clean_query = query.strip()
-        if target_tool == "file_search":
-            if clean_query.startswith("*") and clean_query.endswith("*") and len(clean_query) > 2:
-                clean_query = clean_query.strip("*")
-            elif clean_query.startswith("*.") and len(clean_query) > 2:
-                clean_query = clean_query[1:]
-        clean_query = clean_query.strip()
-        if not clean_query:
-            return None
-        return target_tool, {"query": clean_query, "path": path, "limit": 100}
+        return controller_normalize_find_shell_inspection(argv)
 
     def _request_explicitly_requests_tool(self, text: str, name: str) -> bool:
         return controller_request_explicitly_requests_tool(

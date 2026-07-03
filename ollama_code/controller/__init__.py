@@ -113,6 +113,12 @@ from .repair_protocol import (
     repair_spec_strategy_class,
 )
 from .state import ControllerTurnState
+from .tool_call_policy import (
+    normalize_find_shell_inspection,
+    normalize_run_test_call,
+    normalize_target_line_read_call,
+    normalize_unittest_file_command,
+)
 from .tool_payload_policy import normalize_payload
 
 __all__ = [
@@ -132,8 +138,12 @@ __all__ = [
     "normalize_exact_literal_tool_call",
     "normalize_edit_payload_aliases",
     "normalize_file_tool_alias_call",
+    "normalize_find_shell_inspection",
     "normalize_payload",
+    "normalize_run_test_call",
     "normalize_snippet_symbol_edit_call",
+    "normalize_target_line_read_call",
+    "normalize_unittest_file_command",
     "shell_looks_like_file_mutation",
     "snippet_symbol_argument_looks_like_text",
     "final_acknowledges_missing_path",

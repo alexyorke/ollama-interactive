@@ -29,6 +29,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Unsupported edit/file tool alias normalization now lives in `ollama_code.controller.edit_policy`.
 - Edit payload alias normalization and escaped-newline repair now live in `ollama_code.controller.edit_policy`.
 - Tool payload normalization for model-emitted final/tool shapes now lives in `ollama_code.controller.tool_payload_policy`; `agent.py` supplies the runtime supported-tool predicate.
+- Target-line read, run-test, unittest-file, and simple find-shell call normalization now live in `ollama_code.controller.tool_call_policy`; `agent.py` supplies filesystem and default-test-command context.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.
