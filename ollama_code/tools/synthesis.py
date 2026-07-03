@@ -88,6 +88,67 @@ def candidate_signature_gate(
     }
 
 
+def candidate_validation_failure_result(
+    *,
+    path: str,
+    stage: str,
+    summary: str,
+    timing_fields: dict[str, float],
+    diagnostics: list[str] | None = None,
+    output: str | None = None,
+    normalized: str | None = None,
+    signature_warnings: list[str] | None = None,
+    static: dict[str, Any] | None = None,
+    probes: dict[str, Any] | None = None,
+    test: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "ok": False,
+        "tool": "validate_implementation_candidate",
+        "path": path,
+        "stage": stage,
+        "summary": summary,
+        "output": output if output is not None else summary,
+        **timing_fields,
+    }
+    if diagnostics is not None:
+        result["diagnostics"] = diagnostics
+    if normalized is not None:
+        result["normalized"] = normalized
+    if signature_warnings is not None:
+        result["signature_warnings"] = signature_warnings
+    if static is not None:
+        result["static"] = static
+    if probes is not None:
+        result["probes"] = probes
+    if test is not None:
+        result["test"] = test
+    return result
+
+
+def candidate_validation_success_result(
+    *,
+    path: str,
+    candidate_source: str,
+    timing_fields: dict[str, float],
+    normalized: str | None,
+    signature_warnings: list[str],
+) -> dict[str, Any]:
+    summary = "candidate passed syntax, static sanity, example probes, and tests"
+    return {
+        "ok": True,
+        "tool": "validate_implementation_candidate",
+        "path": path,
+        "stage": "passed",
+        "candidate_source": candidate_source,
+        "normalized": normalized,
+        "signature_warnings": signature_warnings,
+        "summary": summary,
+        "output": summary,
+        **timing_fields,
+    }
+
+
 def node_expr(node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:
     if local_exprs and isinstance(node, ast.Name) and node.id in local_exprs:
         return local_exprs[node.id]

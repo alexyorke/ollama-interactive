@@ -78,6 +78,8 @@ from ollama_code.tools.synthesis import (
     assert_raises_expected_message,
     call_expr,
     candidate_signature_gate,
+    candidate_validation_failure_result,
+    candidate_validation_success_result,
     candidate_public_signature_map,
     candidate_signature_diagnostics,
     first_behavior_call,
@@ -8983,21 +8985,19 @@ import string
         source_file = self.resolve_path(source_path, allow_missing=False)
         rel_source = self.relative_label(source_file)
         if source_file.suffix.lower() != ".py":
-            return {
-                "ok": False,
-                "tool": "validate_implementation_candidate",
-                "path": rel_source,
-                "summary": "candidate validation supports Python source files only.",
-                **timing_fields(),
-            }
+            return candidate_validation_failure_result(
+                path=rel_source,
+                stage="preflight",
+                summary="candidate validation supports Python source files only.",
+                timing_fields=timing_fields(),
+            )
         if not isinstance(candidate_source, str) or not candidate_source.strip():
-            return {
-                "ok": False,
-                "tool": "validate_implementation_candidate",
-                "path": rel_source,
-                "summary": "candidate_source is empty.",
-                **timing_fields(),
-            }
+            return candidate_validation_failure_result(
+                path=rel_source,
+                stage="preflight",
+                summary="candidate_source is empty.",
+                timing_fields=timing_fields(),
+            )
         original = source_file.read_text(encoding="utf-8", errors="replace")
         candidate_source, normalization = self._normalize_candidate_python_source(source_file, candidate_source)
         signature_diagnostics = self._candidate_signature_diagnostics(original, candidate_source)
@@ -9008,30 +9008,26 @@ import string
         signature_warnings = list(signature_gate["signature_warnings"])
         if signature_gate["ok"] is not True:
             output = "\n".join(list(signature_gate["blocking_diagnostics"])[:8])
-            return {
-                "ok": False,
-                "tool": "validate_implementation_candidate",
-                "path": rel_source,
-                "stage": "signature",
-                "diagnostics": list(signature_gate["blocking_diagnostics"]),
-                "normalized": normalization,
-                "output": output,
-                "summary": output,
-                **timing_fields(),
-            }
+            return candidate_validation_failure_result(
+                path=rel_source,
+                stage="signature",
+                summary=output,
+                output=output,
+                diagnostics=list(signature_gate["blocking_diagnostics"]),
+                normalized=normalization,
+                timing_fields=timing_fields(),
+            )
         try:
             ast.parse(self._python_parse_text(candidate_source), filename=rel_source)
         except SyntaxError as exc:
             summary = f"candidate syntax error at {rel_source}:{exc.lineno or 1}: {exc.msg}"
-            return {
-                "ok": False,
-                "tool": "validate_implementation_candidate",
-                "path": rel_source,
-                "stage": "syntax",
-                "summary": summary,
-                "output": summary,
-                **timing_fields(),
-            }
+            return candidate_validation_failure_result(
+                path=rel_source,
+                stage="syntax",
+                summary=summary,
+                output=summary,
+                timing_fields=timing_fields(),
+            )
         tmp_base = self.workspace_root / ".ollama-code" / "tmp" / f"candidate-{uuid4().hex}"
         try:
             tmp_base.mkdir(parents=True, exist_ok=False)
@@ -9057,18 +9053,16 @@ import string
             phase_timings_ms["static_ms"] = round((time.perf_counter() - phase_started_at) * 1000, 3)
             if static_result.get("ok") is not True:
                 summary = str(static_result.get("output") or static_result.get("summary") or "candidate static sanity failed")
-                return {
-                    "ok": False,
-                    "tool": "validate_implementation_candidate",
-                    "path": rel_source,
-                    "stage": "static",
-                    "static": static_result,
-                    "signature_warnings": signature_warnings,
-                    "normalized": normalization,
-                    "output": summary,
-                    "summary": summary,
-                    **timing_fields(),
-                }
+                return candidate_validation_failure_result(
+                    path=rel_source,
+                    stage="static",
+                    summary=summary,
+                    output=summary,
+                    static=static_result,
+                    signature_warnings=signature_warnings,
+                    normalized=normalization,
+                    timing_fields=timing_fields(),
+                )
             probe_result: dict[str, Any] | None = None
             probe_failure_summary = ""
             if test_path:
@@ -9087,34 +9081,27 @@ import string
                 summary = str(test_result.get("output") or test_result.get("summary") or "candidate tests failed")
                 if probe_failure_summary:
                     summary = f"example probe mismatches:\n{probe_failure_summary}\n\ntest output:\n{summary}"
-                return {
-                    "ok": False,
-                    "tool": "validate_implementation_candidate",
-                    "path": rel_source,
-                    "stage": "tests",
-                    "static": static_result,
-                    "probes": probe_result,
-                    "test": test_result,
-                    "signature_warnings": signature_warnings,
-                    "normalized": normalization,
-                    "output": self._truncate_text(summary, limit=1600),
-                    "summary": self._truncate_text(summary, limit=520),
-                    **timing_fields(),
-                }
+                return candidate_validation_failure_result(
+                    path=rel_source,
+                    stage="tests",
+                    summary=self._truncate_text(summary, limit=520),
+                    output=self._truncate_text(summary, limit=1600),
+                    static=static_result,
+                    probes=probe_result,
+                    test=test_result,
+                    signature_warnings=signature_warnings,
+                    normalized=normalization,
+                    timing_fields=timing_fields(),
+                )
         finally:
             shutil.rmtree(tmp_base, ignore_errors=True)
-        return {
-            "ok": True,
-            "tool": "validate_implementation_candidate",
-            "path": rel_source,
-            "stage": "passed",
-            "candidate_source": candidate_source,
-            "normalized": normalization,
-            "signature_warnings": signature_warnings,
-            "summary": "candidate passed syntax, static sanity, example probes, and tests",
-            "output": "candidate passed syntax, static sanity, example probes, and tests",
-            **timing_fields(),
-        }
+        return candidate_validation_success_result(
+            path=rel_source,
+            candidate_source=candidate_source,
+            normalized=normalization,
+            signature_warnings=signature_warnings,
+            timing_fields=timing_fields(),
+        )
 
     def run_function_probe(
         self,

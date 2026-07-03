@@ -27,7 +27,11 @@ from ollama_code.tools.validation import (
     lint_typecheck_target_plan,
     lint_typecheck_timeout_result,
 )
-from ollama_code.tools.synthesis import candidate_signature_gate
+from ollama_code.tools.synthesis import (
+    candidate_signature_gate,
+    candidate_validation_failure_result,
+    candidate_validation_success_result,
+)
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -4222,6 +4226,42 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(proven_change["signature_warnings"], changed)
         self.assertFalse(removed_change["ok"])
         self.assertEqual(removed_change["blocking_diagnostics"], removed)
+
+    def test_candidate_validation_result_helpers_shape_stage_payloads(self) -> None:
+        timing = {"copy_ms": 1.0, "static_ms": 2.0, "probe_ms": 3.0, "test_ms": 4.0, "total_ms": 10.0}
+
+        failure = candidate_validation_failure_result(
+            path="ops.py",
+            stage="tests",
+            summary="short",
+            output="long",
+            diagnostics=["diag"],
+            normalized="normalized",
+            signature_warnings=["warn"],
+            static={"ok": True},
+            probes={"ok": False},
+            test={"ok": False},
+            timing_fields=timing,
+        )
+        success = candidate_validation_success_result(
+            path="ops.py",
+            candidate_source="def add(left, right):\n    return left + right\n",
+            normalized=None,
+            signature_warnings=[],
+            timing_fields=timing,
+        )
+
+        self.assertFalse(failure["ok"])
+        self.assertEqual(failure["tool"], "validate_implementation_candidate")
+        self.assertEqual(failure["stage"], "tests")
+        self.assertEqual(failure["summary"], "short")
+        self.assertEqual(failure["output"], "long")
+        self.assertEqual(failure["diagnostics"], ["diag"])
+        self.assertEqual(failure["signature_warnings"], ["warn"])
+        self.assertTrue(success["ok"])
+        self.assertEqual(success["stage"], "passed")
+        self.assertIn("candidate passed", success["summary"])
+        self.assertIn("def add", success["candidate_source"])
 
     def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
         with self._temp_python_tools(
