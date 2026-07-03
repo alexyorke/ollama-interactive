@@ -185,6 +185,7 @@ from ollama_code.controller import (
     requested_target_line_read as controller_requested_target_line_read,
     shell_looks_like_file_mutation as controller_shell_looks_like_file_mutation,
     shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
+    select_cli_surface_repair_candidate as feature_select_cli_surface_repair_candidate,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
     successful_tool_call_already_satisfied as controller_successful_tool_call_already_satisfied,
     symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
@@ -9446,10 +9447,7 @@ class OllamaCodeAgent:
                 if score is None:
                     continue
                 candidates.append((score, rel_source, test_path))
-        if not candidates:
-            return None
-        _score, source_path, test_path = sorted(candidates, reverse=True)[0]
-        return source_path, test_path
+        return feature_select_cli_surface_repair_candidate(candidates)
 
     def _candidate_cli_proof_commands(self, source_path: str, candidate_source: str, request_text: str = "") -> list[str]:
         return feature_cli_proof_commands(

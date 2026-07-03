@@ -17,6 +17,7 @@ from ollama_code.controller.feature_delivery import (
     request_likely_import_repair,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
+    select_cli_surface_repair_candidate,
     spec_guided_repair_has_actionable_spec,
     typed_cli_flag_protocol_enabled,
 )
@@ -289,6 +290,19 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 test_path="tests/test_task_cli.py",
                 test_text="def test_unit(): pass\n",
             )
+        )
+
+    def test_select_cli_surface_repair_candidate_uses_existing_score_tiebreak(self) -> None:
+        self.assertIsNone(select_cli_surface_repair_candidate([]))
+        self.assertEqual(
+            select_cli_surface_repair_candidate(
+                [
+                    (20, "src/a_cli.py", "tests/test_a_cli.py"),
+                    (20, "src/z_cli.py", "tests/test_z_cli.py"),
+                    (18, "src/b_cli.py", "tests/test_b_cli.py"),
+                ]
+            ),
+            ("src/z_cli.py", "tests/test_z_cli.py"),
         )
 
     def test_cli_readme_additions_skip_existing_content(self) -> None:

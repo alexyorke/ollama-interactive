@@ -16,6 +16,7 @@ from .feature_delivery import (
     request_is_cli_flag_bundle,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
+    select_cli_surface_repair_candidate,
     spec_guided_repair_has_actionable_spec,
     typed_cli_flag_protocol_enabled,
 )
@@ -278,6 +279,7 @@ __all__ = [
     "request_likely_import_repair",
     "request_is_cli_flag_bundle",
     "request_looks_like_python_test_driven_repair",
+    "select_cli_surface_repair_candidate",
     "spec_guided_repair_has_actionable_spec",
     "cli_patch_bundle_instruction",
     "repair_decision_for_tool",

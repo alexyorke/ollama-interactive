@@ -202,6 +202,13 @@ def cli_surface_repair_candidate_score(
     return score
 
 
+def select_cli_surface_repair_candidate(candidates: list[tuple[int, str, str]]) -> tuple[str, str] | None:
+    if not candidates:
+        return None
+    _score, source_path, test_path = sorted(candidates, reverse=True)[0]
+    return source_path, test_path
+
+
 def _normalize_repo_path(path: str) -> str:
     return str(path or "").strip().replace("\\", "/").lstrip("./")
 
