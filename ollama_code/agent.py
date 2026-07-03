@@ -182,6 +182,8 @@ from ollama_code.controller import (
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
+    workflow_config_update_operations_from_source as controller_workflow_config_update_operations_from_source,
+    workflow_config_update_spec as controller_workflow_config_update_spec,
 )
 from ollama_code.ollama_client import ChatResponse, OllamaClient, OllamaError
 from ollama_code.prompts import (
@@ -7820,71 +7822,19 @@ class OllamaCodeAgent:
         return False
 
     def _workflow_config_update_operations(self, request_text: str) -> list[tuple[str, dict[str, Any]]] | None:
-        lowered = request_text.lower()
-        if "pull_request" not in lowered or "workflow" not in lowered:
-            return None
-        if not re.search(r"\b(?:change|update|set)\b", lowered):
-            return None
-        path_match = re.search(r"\b(?P<path>(?:\.github|github)/workflows/[\w.-]+\.ya?ml)\b", request_text, flags=re.IGNORECASE)
-        command_match = re.search(
-            r"\b(?:command|run(?:test)?|unittest)\b(?:(?!\n\n).){0,160}?\bto\s+`(?P<command>[^`]+)`",
-            request_text,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if not path_match or not command_match:
-            return None
-        path = path_match.group("path").strip().replace("\\", "/")
-        if path.startswith("./"):
-            path = path[2:]
-        if path.lower().startswith("github/workflows/"):
-            path = "." + path
-        if not path.lower().startswith(".github/workflows/"):
-            return None
-        new_command = command_match.group("command").strip()
-        if not path or not new_command:
+        spec = controller_workflow_config_update_spec(request_text)
+        if not spec:
             return None
         try:
-            source_path = self.tools.resolve_path(path, allow_missing=False)
+            source_path = self.tools.resolve_path(spec["path"], allow_missing=False)
             source = source_path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return None
-
-        operations: list[tuple[str, dict[str, Any]]] = [("read_file", {"path": path})]
-        lines = source.splitlines()
-        if "pull_request:" not in source:
-            on_index = next((index for index, line in enumerate(lines) if line.strip() == "on:"), None)
-            if on_index is None:
-                return None
-            insert_index = len(lines)
-            for index in range(on_index + 1, len(lines)):
-                if lines[index] and not lines[index].startswith((" ", "\t")):
-                    insert_index = index
-                    break
-            old_block = "\n".join(lines[on_index:insert_index])
-            new_block = old_block.rstrip("\n") + "\n  pull_request:"
-            operations.append(("replace_in_file", {"path": path, "old": old_block, "new": new_block}))
-
-        command_line = next(
-            (
-                line
-                for line in lines
-                if "python -m unittest" in line and new_command not in line and re.search(r"\b(?:run|command)\s*:", line)
-            ),
-            None,
+        return controller_workflow_config_update_operations_from_source(
+            path=spec["path"],
+            new_command=spec["new_command"],
+            source=source,
         )
-        if command_line is None:
-            return None if len(operations) == 1 else operations
-        indent = command_line[: len(command_line) - len(command_line.lstrip())]
-        marker_match = re.match(r"(?P<prefix>\s*-\s*run:\s*|\s*run:\s*)", command_line)
-        if not marker_match:
-            return None
-        new_line = f"{indent}{marker_match.group('prefix').strip()} {new_command}"
-        if marker_match.group("prefix").lstrip().startswith("-"):
-            new_line = f"{indent}- run: {new_command}"
-        else:
-            new_line = f"{indent}run: {new_command}"
-        operations.append(("replace_in_file", {"path": path, "old": command_line, "new": new_line}))
-        return operations if len(operations) > 1 else None
 
     def _test_grounded_symbol_return_rewrite_spec(self, request_text: str) -> dict[str, str] | None:
         match = re.search(

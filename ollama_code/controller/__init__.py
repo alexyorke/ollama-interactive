@@ -32,6 +32,9 @@ from .navigation_validation import NavigationValidationController, NavigationVal
 from .operation_policy import (
     project_function_rename_already_satisfied,
     project_function_rename_operations,
+    workflow_config_update_operations,
+    workflow_config_update_operations_from_source,
+    workflow_config_update_spec,
 )
 from .request_policy import (
     forbidden_tool_names_from_request,
@@ -147,6 +150,9 @@ __all__ = [
     "path_looks_like_code_file",
     "project_function_rename_already_satisfied",
     "project_function_rename_operations",
+    "workflow_config_update_operations",
+    "workflow_config_update_operations_from_source",
+    "workflow_config_update_spec",
     "normalize_exact_literal_tool_call",
     "normalize_edit_payload_aliases",
     "normalize_file_tool_alias_call",
