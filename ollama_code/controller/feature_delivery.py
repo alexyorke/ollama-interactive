@@ -23,8 +23,19 @@ class CliFeatureCapabilities:
         )
 
 
-def typed_cli_flag_protocol_enabled(*, request_text: str, request_is_cli_flag_bundle: bool) -> bool:
-    return bool(request_is_cli_flag_bundle)
+def _request_is_cli_flag_bundle(request_text: str) -> bool:
+    return bool(
+        re.search(r"--[A-Za-z0-9][A-Za-z0-9-]*", request_text)
+        and re.search(r"\b(?:cli|command|option|flag|parser|argparse)\b", request_text, flags=re.IGNORECASE)
+    )
+
+
+def typed_cli_flag_protocol_enabled(*, request_text: str, request_is_cli_flag_bundle: bool | None = None) -> bool:
+    return bool(request_is_cli_flag_bundle if request_is_cli_flag_bundle is not None else _request_is_cli_flag_bundle(request_text))
+
+
+def request_is_cli_flag_bundle(request_text: str) -> bool:
+    return _request_is_cli_flag_bundle(request_text)
 
 
 def merge_request_obligations(obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -6,6 +6,7 @@ from ollama_code.controller.feature_delivery import (
     cli_readme_additions,
     cli_test_additions,
     derive_request_obligations,
+    request_is_cli_flag_bundle,
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
@@ -15,6 +16,13 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
     def test_typed_cli_flag_protocol_follows_detected_bundle(self) -> None:
         self.assertTrue(typed_cli_flag_protocol_enabled(request_text="add --due-before to the CLI", request_is_cli_flag_bundle=True))
         self.assertFalse(typed_cli_flag_protocol_enabled(request_text="add --due-before to the CLI", request_is_cli_flag_bundle=False))
+        self.assertTrue(typed_cli_flag_protocol_enabled(request_text="add --due-before flag to argparse"))
+
+    def test_request_is_cli_flag_bundle_requires_flag_and_cli_surface(self) -> None:
+        self.assertTrue(request_is_cli_flag_bundle("Add a --due-before option to the command parser."))
+        self.assertTrue(request_is_cli_flag_bundle("Support --priority in the CLI."))
+        self.assertFalse(request_is_cli_flag_bundle("Mention --priority in README only."))
+        self.assertFalse(request_is_cli_flag_bundle("Add a stats command without flags."))
 
     def test_cli_feature_capabilities_detect_due_before_priority_and_limit(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"

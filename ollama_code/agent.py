@@ -92,6 +92,7 @@ from ollama_code.controller import (
     cli_test_additions,
     derive_request_obligations as derive_feature_request_obligations,
     merge_request_obligations,
+    request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
     request_obligation_proof_status as feature_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
@@ -10062,10 +10063,7 @@ class OllamaCodeAgent:
         return bool(re.search(r"(?m)^\s*(?:from\s+\S+\s+import\s+|import\s+\S+)", source_text))
 
     def _request_is_cli_flag_bundle(self, request_text: str) -> bool:
-        return bool(
-            re.search(r"--[A-Za-z0-9][A-Za-z0-9-]*", request_text)
-            and re.search(r"\b(?:cli|command|option|flag|parser|argparse)\b", request_text, flags=re.IGNORECASE)
-        )
+        return feature_request_is_cli_flag_bundle(request_text)
 
     def _request_uses_typed_cli_flag_protocol(self, request_text: str) -> bool:
         return typed_cli_flag_protocol_enabled(
