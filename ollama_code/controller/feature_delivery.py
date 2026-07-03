@@ -247,6 +247,26 @@ def spec_guided_repair_candidate_models(
     return models
 
 
+def extract_candidate_python_source(text: str) -> str:
+    raw = text.strip()
+    if not raw:
+        return ""
+    fence = re.search(r"```(?:python|py)?\s*(?P<code>.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
+    if fence:
+        raw = fence.group("code").strip()
+    lines = raw.splitlines()
+    start = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(("import ", "from ", "def ", "class ", "@")):
+            start = index
+            break
+    candidate = "\n".join(lines[start:]).strip()
+    if not re.search(r"^\s*(?:def|class)\s+", candidate, flags=re.MULTILINE):
+        return ""
+    return candidate + "\n"
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,

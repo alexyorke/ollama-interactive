@@ -14,6 +14,7 @@ from ollama_code.controller.feature_delivery import (
     cli_test_update_plan,
     derive_request_obligations,
     effective_repair_test_command,
+    extract_candidate_python_source,
     focused_python_repair_test_score,
     mechanical_obligation_repair_failed_for,
     normalize_repair_strategy_payload,
@@ -328,6 +329,17 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
             ),
             ["granite", "granite"],
         )
+
+    def test_extract_candidate_python_source_handles_fences_and_prose(self) -> None:
+        self.assertEqual(
+            extract_candidate_python_source("Here is code:\n```python\nimport os\n\ndef run():\n    return os.name\n```"),
+            "import os\n\ndef run():\n    return os.name\n",
+        )
+        self.assertEqual(
+            extract_candidate_python_source("First explain.\n@dataclass\nclass Task:\n    name: str\n"),
+            "@dataclass\nclass Task:\n    name: str\n",
+        )
+        self.assertEqual(extract_candidate_python_source("just prose"), "")
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:
         events = [

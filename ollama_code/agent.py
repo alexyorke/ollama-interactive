@@ -95,6 +95,7 @@ from ollama_code.controller import (
     clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
     effective_repair_test_command as feature_effective_repair_test_command,
+    extract_candidate_python_source as feature_extract_candidate_python_source,
     final_acknowledges_missing_path as controller_final_acknowledges_missing_path,
     final_claims_file_mutation as controller_final_claims_file_mutation,
     final_claims_path_exists as controller_final_claims_path_exists,
@@ -9053,23 +9054,7 @@ class OllamaCodeAgent:
         )
 
     def _extract_candidate_python_source(self, text: str) -> str:
-        raw = text.strip()
-        if not raw:
-            return ""
-        fence = re.search(r"```(?:python|py)?\s*(?P<code>.*?)```", raw, flags=re.DOTALL | re.IGNORECASE)
-        if fence:
-            raw = fence.group("code").strip()
-        lines = raw.splitlines()
-        start = 0
-        for index, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith(("import ", "from ", "def ", "class ", "@")):
-                start = index
-                break
-        candidate = "\n".join(lines[start:]).strip()
-        if not re.search(r"^\s*(?:def|class)\s+", candidate, flags=re.MULTILINE):
-            return ""
-        return candidate + "\n"
+        return feature_extract_candidate_python_source(text)
 
     def _spec_guided_repair_messages(
         self,
