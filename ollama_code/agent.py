@@ -103,6 +103,7 @@ from ollama_code.controller import (
     forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
     mechanical_obligation_repair_failed_for as feature_mechanical_obligation_repair_failed_for,
     merge_request_obligations,
+    normalized_test_or_source_stem as feature_normalized_test_or_source_stem,
     normalize_edit_payload_aliases as controller_normalize_edit_payload_aliases,
     normalize_exact_literal_tool_call as controller_normalize_exact_literal_tool_call,
     normalize_file_tool_alias_call as controller_normalize_file_tool_alias_call,
@@ -127,6 +128,8 @@ from ollama_code.controller import (
     optional_parameter_update_spec as controller_optional_parameter_update_spec,
     project_function_rename_already_satisfied as controller_project_function_rename_already_satisfied,
     project_function_rename_operations as controller_project_function_rename_operations,
+    preemptive_repair_source_score as feature_preemptive_repair_source_score,
+    preemptive_repair_test_score as feature_preemptive_repair_test_score,
     request_allows_any_validation as controller_request_allows_any_validation,
     request_allows_commit as controller_request_allows_commit,
     request_allows_mutation as controller_request_allows_mutation,
@@ -186,6 +189,8 @@ from ollama_code.controller import (
     shell_looks_like_file_mutation as controller_shell_looks_like_file_mutation,
     shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
     select_cli_surface_repair_candidate as feature_select_cli_surface_repair_candidate,
+    select_preemptive_repair_source as feature_select_preemptive_repair_source,
+    select_preemptive_repair_test as feature_select_preemptive_repair_test,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
     successful_tool_call_already_satisfied as controller_successful_tool_call_already_satisfied,
     symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
@@ -9285,7 +9290,8 @@ class OllamaCodeAgent:
         if not sources or not tests or len(sources) > 4 or len(tests) > 6:
             return None
 
-        source_scores: list[tuple[int, int, str, Path]] = []
+        source_paths_by_rel = {self.tools.relative_label(source): source for source in sources}
+        source_scores: list[tuple[int, int, str]] = []
         for source in sources:
             try:
                 rel = self.tools.relative_label(source)
@@ -9293,52 +9299,49 @@ class OllamaCodeAgent:
                 line_count = len(source_text.splitlines())
             except Exception:
                 continue
-            if line_count > 260:
-                continue
             stubs = self._stub_targets_for_paths([rel])
-            if stubs:
-                source_scores.append((len(stubs) * 10, -line_count, rel, source))
-                continue
+            top_functions_count = 0
+            top_classes_count = 0
+            parse_ok = True
             try:
                 tree = ast.parse(source_text)
             except SyntaxError:
+                parse_ok = False
+            else:
+                top_functions_count = len([node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))])
+                top_classes_count = len([node for node in tree.body if isinstance(node, ast.ClassDef)])
+            source_score = feature_preemptive_repair_source_score(
+                line_count=line_count,
+                stub_count=len(stubs),
+                top_function_count=top_functions_count,
+                top_class_count=top_classes_count,
+                parse_ok=parse_ok,
+            )
+            if source_score is None:
                 continue
-            top_functions = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
-            top_classes = [node for node in tree.body if isinstance(node, ast.ClassDef)]
-            if len(top_functions) == 1 and not top_classes and line_count <= 80:
-                source_scores.append((1, -line_count, rel, source))
-            elif (top_functions or top_classes) and line_count <= 120:
-                source_scores.append((0, -line_count, rel, source))
-        if not source_scores:
+            score, line_score = source_score
+            source_scores.append((score, line_score, rel))
+        source_rel = feature_select_preemptive_repair_source(source_scores)
+        if source_rel is None:
             return None
-        _, _, source_rel, source_path = sorted(source_scores, reverse=True)[0]
+        source_path = source_paths_by_rel[source_rel]
 
-        def normalized_stem(path: Path) -> str:
-            stem = path.stem.lower()
-            if stem.startswith("test_"):
-                stem = stem[5:]
-            if stem.endswith("_test"):
-                stem = stem[:-5]
-            return stem
-
-        source_stem = normalized_stem(source_path)
-        test_scores: list[tuple[int, str, Path]] = []
+        source_stem = feature_normalized_test_or_source_stem(source_path.stem)
+        test_scores: list[tuple[int, str]] = []
         for test in tests:
             test_rel = self.tools.relative_label(test)
-            test_stem = normalized_stem(test)
-            score = 0
-            if test_stem == source_stem:
-                score += 20
-            elif source_stem and source_stem in test_stem:
-                score += 8
-            if test.parent == source_path.parent:
-                score += 4
-            if source_path.stem.lower() in test.name.lower():
-                score += 4
-            test_scores.append((score, test_rel, test))
-        if not test_scores:
+            score = feature_preemptive_repair_test_score(
+                source_stem=source_stem,
+                source_file_stem=source_path.stem,
+                source_parent=source_path.parent.as_posix(),
+                test_stem=feature_normalized_test_or_source_stem(test.stem),
+                test_name=test.name,
+                test_parent=test.parent.as_posix(),
+            )
+            test_scores.append((score, test_rel))
+        test_rel = feature_select_preemptive_repair_test(test_scores)
+        if test_rel is None:
             return None
-        _, test_rel, _ = sorted(test_scores, reverse=True)[0]
         return source_rel, test_rel
 
     def _client_allows_preemptive_mechanical_repair(self) -> bool:

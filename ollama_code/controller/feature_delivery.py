@@ -209,6 +209,75 @@ def select_cli_surface_repair_candidate(candidates: list[tuple[int, str, str]]) 
     return source_path, test_path
 
 
+def preemptive_repair_source_score(
+    *,
+    line_count: int,
+    stub_count: int,
+    top_function_count: int,
+    top_class_count: int,
+    parse_ok: bool = True,
+) -> tuple[int, int] | None:
+    if line_count > 260:
+        return None
+    if stub_count:
+        return (stub_count * 10, -line_count)
+    if not parse_ok:
+        return None
+    if top_function_count == 1 and top_class_count == 0 and line_count <= 80:
+        return (1, -line_count)
+    if (top_function_count or top_class_count) and line_count <= 120:
+        return (0, -line_count)
+    return None
+
+
+def normalized_test_or_source_stem(name: str) -> str:
+    stem = str(name or "").strip().lower()
+    if "." in stem:
+        stem = stem.rsplit(".", 1)[0]
+    if stem.startswith("test_"):
+        stem = stem[5:]
+    if stem.endswith("_test"):
+        stem = stem[:-5]
+    return stem
+
+
+def preemptive_repair_test_score(
+    *,
+    source_stem: str,
+    source_file_stem: str,
+    source_parent: str,
+    test_stem: str,
+    test_name: str,
+    test_parent: str,
+) -> int:
+    score = 0
+    normalized_source_stem = normalized_test_or_source_stem(source_stem)
+    normalized_test_stem = normalized_test_or_source_stem(test_stem)
+    if normalized_test_stem == normalized_source_stem:
+        score += 20
+    elif normalized_source_stem and normalized_source_stem in normalized_test_stem:
+        score += 8
+    if str(test_parent) == str(source_parent):
+        score += 4
+    if str(source_file_stem).lower() in str(test_name).lower():
+        score += 4
+    return score
+
+
+def select_preemptive_repair_source(candidates: list[tuple[int, int, str]]) -> str | None:
+    if not candidates:
+        return None
+    _score, _line_count, source_rel = sorted(candidates, reverse=True)[0]
+    return source_rel
+
+
+def select_preemptive_repair_test(candidates: list[tuple[int, str]]) -> str | None:
+    if not candidates:
+        return None
+    _score, test_rel = sorted(candidates, reverse=True)[0]
+    return test_rel
+
+
 def _normalize_repo_path(path: str) -> str:
     return str(path or "").strip().replace("\\", "/").lstrip("./")
 

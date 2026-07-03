@@ -13,11 +13,16 @@ from ollama_code.controller.feature_delivery import (
     cli_test_update_plan,
     derive_request_obligations,
     mechanical_obligation_repair_failed_for,
+    normalized_test_or_source_stem,
+    preemptive_repair_source_score,
+    preemptive_repair_test_score,
     request_is_cli_flag_bundle,
     request_likely_import_repair,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
     select_cli_surface_repair_candidate,
+    select_preemptive_repair_source,
+    select_preemptive_repair_test,
     spec_guided_repair_has_actionable_spec,
     typed_cli_flag_protocol_enabled,
 )
@@ -304,6 +309,63 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
             ),
             ("src/z_cli.py", "tests/test_z_cli.py"),
         )
+
+    def test_preemptive_repair_source_score_preserves_existing_ranking(self) -> None:
+        self.assertEqual(
+            preemptive_repair_source_score(
+                line_count=200,
+                stub_count=2,
+                top_function_count=0,
+                top_class_count=0,
+                parse_ok=False,
+            ),
+            (20, -200),
+        )
+        self.assertEqual(
+            preemptive_repair_source_score(
+                line_count=70,
+                stub_count=0,
+                top_function_count=1,
+                top_class_count=0,
+            ),
+            (1, -70),
+        )
+        self.assertEqual(
+            preemptive_repair_source_score(
+                line_count=100,
+                stub_count=0,
+                top_function_count=0,
+                top_class_count=1,
+            ),
+            (0, -100),
+        )
+        self.assertIsNone(
+            preemptive_repair_source_score(
+                line_count=261,
+                stub_count=1,
+                top_function_count=0,
+                top_class_count=0,
+            )
+        )
+
+    def test_preemptive_repair_test_score_and_selection_preserve_tiebreaks(self) -> None:
+        self.assertEqual(normalized_test_or_source_stem("test_task_cli.py"), "task_cli")
+        self.assertEqual(normalized_test_or_source_stem("task_cli_test.py"), "task_cli")
+        self.assertEqual(
+            preemptive_repair_test_score(
+                source_stem="task_cli",
+                source_file_stem="task_cli",
+                source_parent="src",
+                test_stem="task_cli",
+                test_name="test_task_cli.py",
+                test_parent="src",
+            ),
+            28,
+        )
+        self.assertEqual(select_preemptive_repair_source([(1, -20, "src/a.py"), (1, -10, "src/b.py")]), "src/b.py")
+        self.assertEqual(select_preemptive_repair_test([(20, "tests/test_a.py"), (20, "tests/test_z.py")]), "tests/test_z.py")
+        self.assertIsNone(select_preemptive_repair_source([]))
+        self.assertIsNone(select_preemptive_repair_test([]))
 
     def test_cli_readme_additions_skip_existing_content(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"
