@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from contextlib import contextmanager
 import gc
 import os
@@ -33,12 +34,20 @@ from ollama_code.tools.synthesis import (
     candidate_validation_run_in_temp_workspace,
     candidate_validation_success_result,
     candidate_workspace_ignored_names,
+    canonical_foldr_replacement_if_safe,
+    canonical_signature_order_replacement_if_safe,
+    foldr_argument_order_diagnostic,
     function_probe_result,
     function_probe_script,
     normalize_python_write_content,
+    python_function_replacement_sanity_diagnostic,
+    python_parameter_names,
+    python_parameter_sequence,
     repair_common_python_join_typo,
+    shadowed_builtin_call_diagnostic,
     strip_markdown_quote_prefixes,
     strip_python_rewrite_markers,
+    unused_critical_parameter_diagnostic,
 )
 
 
@@ -309,6 +318,50 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(joined, 'def f(items):\n    return " ".join(items)\n')
         self.assertEqual(dedented, "def f():\n    return 1\n")
         self.assertIn("Auto-dedented", dedented_reason or "")
+
+    def test_python_replacement_policy_helpers_report_sanity_diagnostics(self) -> None:
+        node = ast.parse("def foldr(function, list, initial):\n    return initial\n").body[0]
+        self.assertIsInstance(node, ast.FunctionDef)
+
+        self.assertEqual(python_parameter_names(node), {"function", "list", "initial"})
+        self.assertEqual(python_parameter_sequence(node), ["function", "list", "initial"])
+        self.assertIn("shadows the Python builtin", shadowed_builtin_call_diagnostic(node, "return list(items)"))
+        self.assertIn("initial", unused_critical_parameter_diagnostic(node, "return list"))
+        self.assertIn("foldr reducer arguments look reversed", foldr_argument_order_diagnostic(node, "return function(list[0], foldr(function, list[1:], initial))"))
+        self.assertIn(
+            "Replacement changes signature",
+            python_function_replacement_sanity_diagnostic(
+                node,
+                "def foldr(function, initial, list):\n    return initial\n",
+            ),
+        )
+
+    def test_python_replacement_policy_helpers_canonicalize_safe_signature_repairs(self) -> None:
+        node = ast.parse("def append(values, item):\n    return values + [item]\n").body[0]
+        self.assertIsInstance(node, ast.FunctionDef)
+
+        diagnostic = python_function_replacement_sanity_diagnostic(
+            node,
+            "def append(list, function):\n    return list + [function]\n",
+        )
+        normalized = canonical_signature_order_replacement_if_safe(
+            node,
+            "def append(list, function):\n    return list + [function]\n",
+            diagnostic,
+        )
+
+        self.assertIn("Replacement changes signature", diagnostic)
+        self.assertEqual(normalized, "def append(values, item):\n    return values + [item]\n")
+
+    def test_python_replacement_policy_helpers_emit_safe_foldr_repair(self) -> None:
+        node = ast.parse("def foldr(function, list, initial):\n    return initial\n").body[0]
+        self.assertIsInstance(node, ast.FunctionDef)
+
+        diagnostic = foldr_argument_order_diagnostic(node, "return function(list[0], foldr(function, list[1:], initial))")
+        normalized = canonical_foldr_replacement_if_safe(node, diagnostic)
+
+        self.assertIn("foldr reducer arguments look reversed", diagnostic)
+        self.assertIn("for item in reversed(list):", normalized)
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):

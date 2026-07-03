@@ -84,6 +84,9 @@ from ollama_code.tools.synthesis import (
     candidate_workspace_ignored_names,
     candidate_public_signature_map,
     candidate_signature_diagnostics,
+    canonical_foldr_replacement_if_safe,
+    canonical_signature_order_replacement_if_safe,
+    foldr_argument_order_diagnostic,
     function_probe_result,
     function_probe_script,
     first_behavior_call,
@@ -91,9 +94,13 @@ from ollama_code.tools.synthesis import (
     method_name,
     node_expr,
     normalize_python_write_content,
+    python_function_replacement_sanity_diagnostic,
+    python_parameter_names,
+    python_parameter_sequence,
     python_parse_text,
     repair_common_python_join_typo,
     select_test_spec_examples,
+    shadowed_builtin_call_diagnostic,
     split_test_example,
     strip_markdown_quote_prefixes,
     strip_python_rewrite_markers,
@@ -120,6 +127,7 @@ from ollama_code.tools.synthesis import (
     test_spec_record_side_effect_call,
     test_spec_source_symbols_from_text,
     test_spec_symbol_from_expr,
+    unused_critical_parameter_diagnostic,
 )
 from ollama_code.tools.validation import (
     collapse_validation_targets,
@@ -11769,262 +11777,37 @@ import string
         return normalized
 
     def _python_parameter_names(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
-        args = node.args
-        names = {arg.arg for arg in [*args.posonlyargs, *args.args, *args.kwonlyargs]}
-        if args.vararg:
-            names.add(args.vararg.arg)
-        if args.kwarg:
-            names.add(args.kwarg.arg)
-        return names
+        return python_parameter_names(node)
 
     def _python_parameter_sequence(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> list[str]:
-        args = node.args
-        names = [arg.arg for arg in [*args.posonlyargs, *args.args]]
-        if args.vararg:
-            names.append("*" + args.vararg.arg)
-        names.extend(arg.arg for arg in args.kwonlyargs)
-        if args.kwarg:
-            names.append("**" + args.kwarg.arg)
-        return names
+        return python_parameter_sequence(node)
 
     def _shadowed_builtin_call_diagnostic(self, node: ast.FunctionDef | ast.AsyncFunctionDef, body: str) -> str:
-        shadowable = {"list", "dict", "set", "tuple", "str", "int", "float", "bool", "sum", "map", "filter", "len", "min", "max"}
-        shadowed = self._python_parameter_names(node) & shadowable
-        if not shadowed:
-            return ""
-        indented = "\n".join("    " + line if line.strip() else "" for line in (body.splitlines() or ["pass"]))
-        source = f"def __candidate__():\n{indented}\n"
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            return ""
-        for call in (child for child in ast.walk(tree) if isinstance(child, ast.Call)):
-            if isinstance(call.func, ast.Name) and call.func.id in shadowed:
-                return f"Replacement calls parameter {call.func.id!r} as a function; it shadows the Python builtin. Use a comprehension, rename the local parameter in a full function replacement, or call builtins.{call.func.id} explicitly."
-        return ""
+        return shadowed_builtin_call_diagnostic(node, body)
 
     def _unused_critical_parameter_diagnostic(self, node: ast.FunctionDef | ast.AsyncFunctionDef, body: str) -> str:
-        critical = self._python_parameter_names(node) & {"initial", "default", "accumulator"}
-        if not critical:
-            return ""
-        indented = "\n".join("    " + line if line.strip() else "" for line in (body.splitlines() or ["pass"]))
-        try:
-            tree = ast.parse(f"def __candidate__():\n{indented}\n")
-        except SyntaxError:
-            return ""
-        used = {child.id for child in ast.walk(tree) if isinstance(child, ast.Name)}
-        missing = sorted(critical - used)
-        if not missing:
-            return ""
-        return "Replacement does not use required accumulator/default parameter(s): " + ", ".join(missing) + ". Include them in the implementation or replace the full function with a justified signature change."
+        return unused_critical_parameter_diagnostic(node, body)
 
     def _foldr_argument_order_diagnostic(self, node: ast.FunctionDef | ast.AsyncFunctionDef, body: str) -> str:
-        if node.name.lower() != "foldr":
-            return ""
-        indented = "\n".join("    " + line if line.strip() else "" for line in (body.splitlines() or ["pass"]))
-        try:
-            tree = ast.parse(f"def __candidate__():\n{indented}\n")
-        except SyntaxError:
-            return ""
-        for call in (child for child in ast.walk(tree) if isinstance(child, ast.Call)):
-            if not isinstance(call.func, ast.Name) or call.func.id != "function" or len(call.args) < 2:
-                continue
-            first = ast.unparse(call.args[0]) if hasattr(ast, "unparse") else ""
-            second = ast.unparse(call.args[1]) if hasattr(ast, "unparse") else ""
-            if first in {"item", "el", "element"} and second in {"result", "acc", "accumulator"}:
-                return "foldr reducer arguments look reversed. While traversing from the right, call the reducer with accumulator/result first and current element second."
-            if first in {"item", "el", "element", "current"} and re.search(r"\b(?:foldr|folder|helper|recurse)\s*\(", second):
-                return "foldr reducer arguments look reversed. While traversing from the right, call the reducer with accumulator/result first and current element second, e.g. function(foldr(function, rest, initial), current)."
-            if (
-                re.fullmatch(r"(?:list|items|values|seq|sequence)\s*\[\s*0\s*\]", first)
-                and re.search(r"\bfoldr\s*\(", second)
-            ):
-                return "foldr reducer arguments look reversed. While traversing from the right, call the reducer with accumulator/result first and current element second, e.g. function(foldr(function, rest, initial), current)."
-        return ""
+        return foldr_argument_order_diagnostic(node, body)
 
     def _python_function_replacement_sanity_diagnostic(self, target: Path, symbol: str, replacement: str) -> str:
         node = self._python_function_node(target, symbol)
         if node is None:
             return ""
-        try:
-            tree = ast.parse(self._python_parse_text(replacement))
-        except SyntaxError:
-            return ""
-        candidates = [child for child in tree.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        if len(candidates) != 1:
-            return ""
-        candidate = candidates[0]
-        if candidate.name != node.name:
-            return f"Replacement defines {candidate.name!r}, but target symbol is {node.name!r}. Use rename/change_signature for intentional API changes."
-        existing_params = self._python_parameter_sequence(node)
-        replacement_params = self._python_parameter_sequence(candidate)
-        if replacement_params != existing_params:
-            return (
-                f"Replacement changes signature for {node.name} from ({', '.join(existing_params)}) "
-                f"to ({', '.join(replacement_params)}). Use change_signature for intentional API changes; otherwise keep the existing parameter order."
-            )
-        if candidate.body:
-            lines = replacement.splitlines()
-            start = int(getattr(candidate.body[0], "lineno", 1))
-            end = int(getattr(candidate.body[-1], "end_lineno", getattr(candidate.body[-1], "lineno", start)))
-            body = textwrap.dedent("\n".join(lines[start - 1 : end]))
-        else:
-            body = ""
-        return (
-            self._shadowed_builtin_call_diagnostic(node, body)
-            or self._unused_critical_parameter_diagnostic(node, body)
-            or self._foldr_argument_order_diagnostic(node, body)
-        )
+        return python_function_replacement_sanity_diagnostic(node, replacement)
 
     def _canonical_signature_order_replacement_if_safe(self, target: Path, symbol: str, replacement: str, diagnostic: str) -> str:
-        if "Replacement changes signature" not in diagnostic:
-            return ""
         node = self._python_function_node(target, symbol)
         if node is None:
             return ""
-        try:
-            tree = ast.parse(self._python_parse_text(replacement))
-        except SyntaxError:
-            return ""
-        candidates = [child for child in tree.body if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))]
-        if len(candidates) != 1:
-            return ""
-        candidate = candidates[0]
-        if candidate.name != node.name:
-            return ""
-        existing_params = self._python_parameter_sequence(node)
-        replacement_params = self._python_parameter_sequence(candidate)
-        existing_names = [entry for entry in existing_params if not entry.startswith("*")]
-        replacement_names = [entry for entry in replacement_params if not entry.startswith("*")]
-
-        if not existing_names or not replacement_names:
-            return ""
-        if len(existing_names) != len(replacement_names):
-            return ""
-
-        # Reorder-only correction for same-name permutations.
-        if sorted(existing_names) == sorted(replacement_names):
-            if (
-                replacement_names == existing_names
-                or node.args.defaults
-                or candidate.args.defaults
-                or node.args.kw_defaults
-                or candidate.args.kw_defaults
-                or node.args.vararg
-                or candidate.args.vararg
-                or node.args.kwarg
-                or candidate.args.kwarg
-                or node.args.kwonlyargs
-                or candidate.args.kwonlyargs
-            ):
-                return ""
-            lines = replacement.splitlines()
-            header_index = int(getattr(candidate, "lineno", 1)) - 1
-            if header_index < 0 or header_index >= len(lines):
-                return ""
-            header = lines[header_index]
-            match = re.match(rf"^(\s*(?:async\s+)?def\s+{re.escape(candidate.name)}\s*)\([^)]*\)(\s*(?:->\s*[^:]+)?\s*:\s*)$", header)
-            if not match:
-                return ""
-            lines[header_index] = f"{match.group(1)}({', '.join(existing_names)}){match.group(2)}"
-            return "\n".join(lines) + ("\n" if replacement.endswith(("\n", "\r")) else "")
-
-        # Name-only correction for same arity, same parameter shape.
-        if (
-            len(existing_params) != len(replacement_params)
-            or node.args.defaults
-            or candidate.args.defaults
-            or node.args.kw_defaults
-            or candidate.args.kw_defaults
-            or node.args.vararg
-            or candidate.args.vararg
-            or node.args.kwarg
-            or candidate.args.kwarg
-            or node.args.kwonlyargs
-            or candidate.args.kwonlyargs
-            or any(name.startswith("*") for name in existing_params + replacement_params)
-        ):
-            return ""
-
-        # Avoid rewriting when a candidate parameter name is rebound in function body.
-        for child in ast.walk(candidate):
-            if isinstance(child, ast.Name) and isinstance(child.ctx, (ast.Store, ast.Del)) and child.id in replacement_names:
-                return ""
-
-        class _CanonicalBodyRenamer(ast.NodeTransformer):
-            def __init__(self, mapping: dict[str, str]):
-                self._mapping = mapping
-                self._depth = 0
-
-            def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
-                if self._depth == 0:
-                    self._depth = 1
-                    node.body = [self.visit(child) for child in node.body]
-                    self._depth = 0
-                    return node
-                return node
-
-            def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AsyncFunctionDef:
-                if self._depth == 0:
-                    self._depth = 1
-                    node.body = [self.visit(child) for child in node.body]
-                    self._depth = 0
-                    return node
-                return node
-
-            def visit_ClassDef(self, node: ast.ClassDef) -> ast.ClassDef:
-                return node
-
-            def visit_Lambda(self, node: ast.Lambda) -> ast.Lambda:
-                return node
-
-            def visit_Name(self, node: ast.Name) -> ast.Name:
-                if self._depth == 1 and isinstance(node.ctx, ast.Load):
-                    mapped = self._mapping.get(node.id)
-                    if mapped is not None:
-                        node = ast.copy_location(ast.Name(id=mapped, ctx=node.ctx), node)
-                return node
-
-        mapping = {replacement_name: existing_name for replacement_name, existing_name in zip(replacement_names, existing_names)}
-        candidate_rebuilt = deepcopy(candidate)
-        posonly_count = len(candidate.args.posonlyargs)
-
-        # Keep the argument shape and defaults; only normalize parameter identifiers.
-        for index, param_name in enumerate(existing_names):
-            if index < posonly_count:
-                if index >= len(candidate_rebuilt.args.posonlyargs):
-                    return ""
-                candidate_rebuilt.args.posonlyargs[index].arg = param_name
-            else:
-                arg_index = index - posonly_count
-                if arg_index >= len(candidate_rebuilt.args.args):
-                    return ""
-                candidate_rebuilt.args.args[arg_index].arg = param_name
-
-        candidate_rebuilt = _CanonicalBodyRenamer(mapping).visit(candidate_rebuilt)
-        ast.fix_missing_locations(candidate_rebuilt)
-        try:
-            normalized = ast.unparse(candidate_rebuilt)
-        except (SyntaxError, ValueError):
-            return ""
-        return normalized + "\n"
+        return canonical_signature_order_replacement_if_safe(node, replacement, diagnostic)
 
     def _canonical_foldr_replacement_if_safe(self, target: Path, symbol: str, diagnostic: str) -> str:
-        if "foldr reducer arguments look reversed" not in diagnostic:
-            return ""
         node = self._python_function_node(target, symbol)
-        if node is None or node.name.lower() != "foldr":
+        if node is None:
             return ""
-        params = self._python_parameter_sequence(node)
-        if params != ["function", "list", "initial"]:
-            return ""
-        return (
-            "def foldr(function, list, initial):\n"
-            "    accumulator = initial\n"
-            "    for item in reversed(list):\n"
-            "        accumulator = function(accumulator, item)\n"
-            "    return accumulator\n"
-        )
+        return canonical_foldr_replacement_if_safe(node, diagnostic)
 
     def _replace_python_function_body(self, target: Path, symbol: str, body: str) -> dict[str, Any]:
         relative_path = self.relative_label(target)
