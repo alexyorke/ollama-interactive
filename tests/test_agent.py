@@ -820,18 +820,7 @@ class AgentTests(AgentTestBase):
 
     # Focused package-repair feature-delivery coverage lives in test_agent_post_edit_validation.py.
 
-    def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
-        root = self._workspace_scratch()
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
-
-        delta = agent._failure_delta_summary(
-            "FAILED test_ops.py::test_value | AssertionError: expected 1 got 0",
-            "FAILED test_ops.py::test_value | AssertionError: expected 1 got 2",
-        )
-
-        self.assertIn("expected 1 got 2", delta)
-        self.assertNotIn("expected 1 got 0", delta)
+    # Focused failure-delta coverage lives in test_agent_failure_compression.py.
 
     def test_agent_context_pack_profile_preloads_context(self) -> None:
         root = self._workspace_scratch()

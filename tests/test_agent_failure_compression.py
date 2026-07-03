@@ -8,10 +8,24 @@ from unittest.mock import patch
 
 from ollama_code.agent import OllamaCodeAgent
 from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
+from ollama_code.tools import ToolExecutor
 from tests.agent_test_support import AgentTestBase, CountingToolExecutor, FakeClient
 
 
 class AgentFailureCompressionTests(AgentTestBase):
+    def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
+
+        delta = agent._failure_delta_summary(
+            "FAILED test_ops.py::test_value | AssertionError: expected 1 got 0",
+            "FAILED test_ops.py::test_value | AssertionError: expected 1 got 2",
+        )
+
+        self.assertIn("expected 1 got 2", delta)
+        self.assertNotIn("expected 1 got 0", delta)
+
     def test_trajectory_loop_cap_blocks_fourth_context_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
