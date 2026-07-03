@@ -90,9 +90,13 @@ from ollama_code.tools.synthesis import (
     human_test_name,
     method_name,
     node_expr,
+    normalize_python_write_content,
     python_parse_text,
+    repair_common_python_join_typo,
     select_test_spec_examples,
     split_test_example,
+    strip_markdown_quote_prefixes,
+    strip_python_rewrite_markers,
     test_example_probe_expressions,
     test_spec_add_example,
     test_spec_add_cli_assertion_examples,
@@ -12897,67 +12901,20 @@ import string
         return bool(re.search(r"\[omitted \d+ chars from prior [A-Za-z_]+; do not copy\]", content))
 
     def _normalize_python_write_content(self, target: Path, content: str) -> tuple[str, str | None]:
-        if target.suffix.lower() != ".py":
-            return content, None
-        if self._python_syntax_diagnostic(target, content) is None:
-            return content, None
-        candidates: list[tuple[str, str]] = []
-        fenced_match = re.match(r"^\s*```(?:python|py)?\s*\n(?P<body>.*?)(?:\n)?```\s*$", content, flags=re.DOTALL | re.IGNORECASE)
-        if fenced_match:
-            candidates.append((fenced_match.group("body"), "Stripped markdown code fence from Python file content before write."))
-        rewrite_marker_stripped = self._strip_python_rewrite_markers(content)
-        if rewrite_marker_stripped != content:
-            candidates.append((rewrite_marker_stripped, "Stripped rewrite markers from Python file content before write."))
-        quote_stripped = self._strip_markdown_quote_prefixes(content)
-        if quote_stripped != content:
-            candidates.append((quote_stripped, "Stripped markdown quote prefixes from Python file content before write."))
-        if fenced_match:
-            fenced_quote_stripped = self._strip_markdown_quote_prefixes(fenced_match.group("body"))
-            if fenced_quote_stripped != fenced_match.group("body"):
-                candidates.append((fenced_quote_stripped, "Stripped markdown code fence and quote prefixes from Python file content before write."))
-        join_repaired = self._repair_common_python_join_typo(content)
-        if join_repaired != content:
-            candidates.append((join_repaired, "Repaired common Python join string typo before write."))
-        for candidate, reason in list(candidates):
-            if self._python_syntax_diagnostic(target, candidate) is None:
-                return candidate, reason
-        bases = [(content, "Auto-dedented Python file content before write."), *candidates]
-        for candidate, reason in bases:
-            dedented = textwrap.dedent(candidate)
-            if dedented == candidate:
-                continue
-            if self._python_syntax_diagnostic(target, dedented) is None:
-                if reason.startswith("Auto-dedented"):
-                    return dedented, reason
-                return dedented, reason[:-1] + " and auto-dedented it."
-        return content, None
+        return normalize_python_write_content(
+            content,
+            is_python=target.suffix.lower() == ".py",
+            syntax_ok=lambda candidate: self._python_syntax_diagnostic(target, candidate) is None,
+        )
 
     def _repair_common_python_join_typo(self, content: str) -> str:
-        return re.sub(r"(?m)^(\s*return\s+)['\"]\.join\(", r'\1" ".join(', content)
+        return repair_common_python_join_typo(content)
 
     def _strip_python_rewrite_markers(self, content: str) -> str:
-        lines = content.splitlines()
-        if len(lines) < 3:
-            return content
-        first = lines[0].strip().lower()
-        last = lines[-1].strip().lower()
-        begin_rewrite = bool(re.fullmatch(r"[>=#/\-\s]*begin (?:rewrite|file|source|replacement)[<\-=#/\s]*", first))
-        end_rewrite = bool(re.fullmatch(r"[>=#/\-\s]*end (?:rewrite|file|source|replacement)[<\-=#/\s]*", last))
-        if begin_rewrite and end_rewrite:
-            trailing_newline = "\n" if content.endswith(("\n", "\r\n")) else ""
-            return "\n".join(lines[1:-1]) + trailing_newline
-        return content
+        return strip_python_rewrite_markers(content)
 
     def _strip_markdown_quote_prefixes(self, content: str) -> str:
-        lines = content.splitlines(keepends=True)
-        if not lines:
-            return content
-        prefixed = sum(1 for line in lines if re.match(r"^\s*>\s?", line))
-        non_empty = sum(1 for line in lines if line.strip())
-        first_non_empty = next((line for line in lines if line.strip()), "")
-        if non_empty == 0 or (prefixed < max(1, non_empty // 2) and not re.match(r"^\s*>\s?", first_non_empty)):
-            return content
-        return "".join(re.sub(r"^\s*>\s?", "", line, count=1) for line in lines)
+        return strip_markdown_quote_prefixes(content)
 
     def _python_syntax_diagnostic(self, target: Path, content: str) -> str | None:
         if target.suffix.lower() != ".py":

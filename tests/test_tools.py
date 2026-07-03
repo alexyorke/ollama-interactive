@@ -35,6 +35,10 @@ from ollama_code.tools.synthesis import (
     candidate_workspace_ignored_names,
     function_probe_result,
     function_probe_script,
+    normalize_python_write_content,
+    repair_common_python_join_typo,
+    strip_markdown_quote_prefixes,
+    strip_python_rewrite_markers,
 )
 
 
@@ -275,6 +279,36 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertIn("Python syntax error", result["summary"])
         self.assertIn("bad.py:2", result["diagnostic"])
         self.assertEqual(final_text, "def f():\nreturn 1\n")
+
+    def test_python_write_normalization_helpers_repair_common_wrappers(self) -> None:
+        def syntax_ok(text: str) -> bool:
+            try:
+                compile(text, "candidate.py", "exec")
+                return True
+            except SyntaxError:
+                return False
+
+        fenced, fenced_reason = normalize_python_write_content(
+            "```python\ndef f():\n    return 1\n```",
+            is_python=True,
+            syntax_ok=syntax_ok,
+        )
+        quoted = strip_markdown_quote_prefixes("> def f():\n>     return 1\n")
+        marked = strip_python_rewrite_markers("BEGIN REWRITE\ndef f():\n    return 1\nEND REWRITE\n")
+        joined = repair_common_python_join_typo("def f(items):\n    return '.join(items)\n")
+        dedented, dedented_reason = normalize_python_write_content(
+            "    def f():\n        return 1\n",
+            is_python=True,
+            syntax_ok=syntax_ok,
+        )
+
+        self.assertEqual(fenced, "def f():\n    return 1")
+        self.assertIn("code fence", fenced_reason or "")
+        self.assertEqual(quoted, "def f():\n    return 1\n")
+        self.assertEqual(marked, "def f():\n    return 1\n")
+        self.assertEqual(joined, 'def f(items):\n    return " ".join(items)\n')
+        self.assertEqual(dedented, "def f():\n    return 1\n")
+        self.assertIn("Auto-dedented", dedented_reason or "")
 
     def test_write_file_auto_dedents_globally_indented_python(self) -> None:
         with self._temp_tools() as (root, tools):
