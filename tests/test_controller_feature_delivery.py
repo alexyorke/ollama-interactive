@@ -8,6 +8,7 @@ from ollama_code.controller.feature_delivery import (
     cli_readme_additions,
     cli_readme_update_plan,
     cli_test_additions,
+    cli_test_update_plan,
     derive_request_obligations,
     mechanical_obligation_repair_failed_for,
     request_is_cli_flag_bundle,
@@ -306,6 +307,38 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         source = "parser.add_parser('list')\nlist_parser.add_argument('--due-before')\n"
 
         self.assertEqual(cli_test_additions(source, "Add --due-before tests.", "--due-before already covered", "_run"), [])
+
+    def test_cli_test_update_plan_skips_when_no_feature_or_helper(self) -> None:
+        self.assertEqual(
+            cli_test_update_plan(
+                candidate_source="def main(): pass\n",
+                request_text="Add tests.",
+                existing_test_text="def _run(*args: str): ...\n",
+            ),
+            {"action": "skip"},
+        )
+        self.assertEqual(
+            cli_test_update_plan(
+                candidate_source="parser.add_argument('--due-before')\n",
+                request_text="Add --due-before tests.",
+                existing_test_text="class Tests: pass\n",
+            ),
+            {"action": "skip"},
+        )
+
+    def test_cli_test_update_plan_writes_missing_due_before_tests(self) -> None:
+        source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"
+        existing = "def _run(*args: str): ...\n\nif __name__ == '__main__':\n    pass\n"
+
+        plan = cli_test_update_plan(
+            candidate_source=source,
+            request_text="Add --due-before tests.",
+            existing_test_text=existing,
+        )
+
+        self.assertEqual(plan["action"], "write")
+        self.assertIn("test_due_before_filter", plan["content"])
+        self.assertIn("\n\nif __name__ == '__main__':", plan["content"])
 
     def test_derive_request_obligations_extracts_feature_delivery_contract(self) -> None:
         obligations = derive_request_obligations(

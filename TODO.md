@@ -45,6 +45,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Mechanical obligation repair failure detection now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only recorded events.
 - CLI proof command planning now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only the Python executable and shell quoting function.
 - CLI README update planning now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only README I/O and tool execution.
+- CLI test update planning now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only test-file I/O and tool execution.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.

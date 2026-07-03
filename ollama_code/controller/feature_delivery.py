@@ -720,3 +720,26 @@ def cli_test_additions(candidate_source: str, request_text: str, existing_test_t
             "\n"
         )
     return additions
+
+
+def cli_test_update_plan(
+    *,
+    candidate_source: str,
+    request_text: str,
+    existing_test_text: str,
+) -> dict[str, str]:
+    if "--json" not in candidate_source and "--limit" not in candidate_source and "--due-before" not in candidate_source:
+        return {"action": "skip"}
+    helper_match = re.search(r"(?m)^def\s+(?P<name>[_A-Za-z]\w*)\(\*args:\s*str\)", existing_test_text)
+    if not helper_match:
+        return {"action": "skip"}
+    additions = cli_test_additions(candidate_source, request_text, existing_test_text, helper_match.group("name"))
+    if not additions:
+        return {"action": "skip"}
+    insertion = "\n" + "\n".join(additions)
+    marker = "\n\nif __name__ == '__main__':"
+    if marker in existing_test_text:
+        content = existing_test_text.replace(marker, insertion + marker, 1)
+    else:
+        content = existing_test_text.rstrip() + insertion
+    return {"action": "write", "content": content}

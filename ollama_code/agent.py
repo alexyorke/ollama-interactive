@@ -88,7 +88,7 @@ from ollama_code.controller import (
     NavigationValidationTurn,
     cli_proof_commands as feature_cli_proof_commands,
     cli_readme_update_plan as feature_cli_readme_update_plan,
-    cli_test_additions,
+    cli_test_update_plan as feature_cli_test_update_plan,
     clean_return_expression as controller_clean_return_expression,
     derive_request_obligations as derive_feature_request_obligations,
     final_acknowledges_missing_path as controller_final_acknowledges_missing_path,
@@ -9524,29 +9524,21 @@ class OllamaCodeAgent:
         satisfied_tool_names: set[str],
         tool_calls_this_turn: list[dict[str, Any]],
     ) -> None:
-        if "--json" not in candidate_source and "--limit" not in candidate_source and "--due-before" not in candidate_source:
-            return
         try:
             test_file = self.tools.resolve_path(test_path, allow_missing=False)
             test_text = test_file.read_text(encoding="utf-8", errors="replace")
         except Exception:
             return
-        helper_match = re.search(r"(?m)^def\s+(?P<name>[_A-Za-z]\w*)\(\*args:\s*str\)", test_text)
-        if not helper_match:
+        plan = feature_cli_test_update_plan(
+            candidate_source=candidate_source,
+            request_text=request_text,
+            existing_test_text=test_text,
+        )
+        if str(plan.get("action") or "").strip() != "write" or not isinstance(plan.get("content"), str):
             return
-        helper_name = helper_match.group("name")
-        additions = cli_test_additions(candidate_source, request_text, test_text, helper_name)
-        if not additions:
-            return
-        insertion = "\n" + "\n".join(additions)
-        marker = "\n\nif __name__ == '__main__':"
-        if marker in test_text:
-            content = test_text.replace(marker, insertion + marker, 1)
-        else:
-            content = test_text.rstrip() + insertion
         self._execute_controller_tool(
             name="write_file",
-            arguments={"path": test_path, "content": content},
+            arguments={"path": test_path, "content": plan["content"]},
             request_text=request_text,
             round_number=round_number,
             successful_tool_results=successful_tool_results,
