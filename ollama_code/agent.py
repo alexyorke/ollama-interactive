@@ -1506,6 +1506,20 @@ class OllamaCodeAgent:
         name = str(mutation.get("name") or "").strip()
         arguments = mutation.get("arguments") if isinstance(mutation.get("arguments"), dict) else {}
         result = mutation.get("result") if isinstance(mutation.get("result"), dict) else {}
+        explicit_paths = [
+            str(path or "").strip().replace("\\", "/").lstrip("./")
+            for path in self._mutation_target_paths(arguments)
+            if str(path or "").strip()
+        ]
+        result_path = str(result.get("path") or "").strip().replace("\\", "/").lstrip("./")
+        if result_path:
+            explicit_paths.append(result_path)
+        explicit_paths = list(dict.fromkeys(explicit_paths))
+        if explicit_paths:
+            return any(
+                path and not self._path_looks_like_doc_target(path) and not self._path_looks_like_test_file(path)
+                for path in explicit_paths
+            )
         target = self._recovery_target_from_mutation(
             name=name,
             arguments=arguments,
@@ -13736,6 +13750,7 @@ class OllamaCodeAgent:
         latest_tool_error_outputs: dict[tuple[str, str, str], str] = {}
         mutating_failure_counts: dict[tuple[str, str], int] = {}
         invalid_python_mutation_payload_counts: dict[tuple[str, str], int] = {}
+        failed_mutation_obligations_pending = False
         context_only_exhausted_for_mutation = False
         repair_pivot_prompt_pending = False
         last_repair_pivot_message = ""
@@ -14388,6 +14403,7 @@ class OllamaCodeAgent:
                 if (
                     self._post_edit_validation_enabled()
                     and mutation_verified_this_turn
+                    and (not failed_mutation_obligations_pending or last_successful_source_mutation is not None)
                     and last_successful_validation_version != mutation_version
                     and self._request_allows_any_validation(text)
                 ):
@@ -14891,6 +14907,11 @@ class OllamaCodeAgent:
                                 "content": "write_file content must be the exact file contents, without BEGIN/END EDITED CONTENT markers or transcript delimiters. Re-read the target file, then send clean source text only. Next JSON only.",
                             }
                         )
+                        if self._mutation_record_targets_source(
+                            {"name": name, "arguments": deepcopy(arguments), "result": {"ok": False}},
+                            successful_tool_results,
+                        ):
+                            failed_mutation_obligations_pending = True
                         continue
                     nonblank_lines = [line for line in content_text.splitlines() if line.strip()]
                     quote_prefixed_lines = [line for line in nonblank_lines if re.match(r"^\s*>\s?", line)]
@@ -14907,6 +14928,11 @@ class OllamaCodeAgent:
                                 "content": "write_file content must be clean file text, not Markdown blockquote or transcript text. Remove every leading `>` quote marker, re-read the target if needed, then send exact file contents only. Next JSON only.",
                             }
                         )
+                        if self._mutation_record_targets_source(
+                            {"name": name, "arguments": deepcopy(arguments), "result": {"ok": False}},
+                            successful_tool_results,
+                        ):
+                            failed_mutation_obligations_pending = True
                         continue
                     dropped_path, dropped_symbols = self._write_file_dropped_python_symbols(arguments)
                     if dropped_path and dropped_symbols:
@@ -14931,6 +14957,7 @@ class OllamaCodeAgent:
                                 ),
                             }
                         )
+                        failed_mutation_obligations_pending = True
                         continue
                 if name in MUTATING_TOOL_NAMES:
                     missing_path, suggestions = self._missing_mutation_target_suggestions(arguments)
@@ -15905,6 +15932,50 @@ class OllamaCodeAgent:
                         }
                     )
                     continue
+                if (
+                    failed_mutation_obligations_pending
+                    and name in (set(VALIDATION_TOOL_NAMES) | {"run_shell", "lint_typecheck", "contract_check", "run_function_probe"})
+                    and last_successful_source_mutation is None
+                ):
+                    obligation_statuses = (
+                        self._request_obligation_proof_status(
+                            obligations=request_obligations,
+                            successful_tool_results=successful_tool_results,
+                            required_tool_names=required_tool_names,
+                        )
+                        if request_obligations
+                        else []
+                    )
+                    unresolved_obligations = [
+                        item
+                        for item in obligation_statuses
+                        if str(item.get("status") or "").strip() != "proven"
+                    ]
+                    labels = [
+                        str(item.get("label") or item.get("id") or "").strip()
+                        for item in unresolved_obligations[:4]
+                        if str(item.get("label") or item.get("id") or "").strip()
+                    ]
+                    self._append_assistant_payload(payload)
+                    self._record_event(
+                        "controller_guard",
+                        guard="failed-mutation-obligations-before-validation",
+                        candidate_tool=name,
+                        unresolved_obligations=unresolved_obligations,
+                        rounds=round_number,
+                    )
+                    detail = "; ".join(labels) if labels else "requested code/test/docs/proof deliverables"
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Do not run validation or proof commands after failed edits while requested deliverables remain unimplemented: "
+                                + detail
+                                + ". Re-read the target if needed and make a successful source or test mutation first. Next JSON only."
+                            ),
+                        }
+                    )
+                    continue
                 pending_repair_without_followup = self._pending_repair_spec_without_followup()
                 repair_pending_before_validation = pending_repair_state is not None or pending_repair_without_followup is not None or (
                     self._mutation_record_targets_source(last_successful_source_mutation or last_successful_mutation, successful_tool_results)
@@ -16185,6 +16256,14 @@ class OllamaCodeAgent:
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
+                    if (
+                        name in MUTATING_TOOL_NAMES
+                        and self._mutation_record_targets_source(
+                            {"name": name, "arguments": deepcopy(arguments), "result": deepcopy(result)},
+                            successful_tool_results,
+                        )
+                    ):
+                        failed_mutation_obligations_pending = True
                     if name in RETRY_PRONE_MUTATING_TOOL_NAMES and (mutation_required or code_mutation_required):
                         failed_test_context_reads = 0
                         failed_test_mutation_version = mutation_version
@@ -16218,7 +16297,7 @@ class OllamaCodeAgent:
                 tool_used_this_turn = tool_used_this_turn or real_tool_use
                 if real_tool_use:
                     satisfied_tool_names.add(name)
-                    if name in MUTATING_TOOL_NAMES:
+                    if name in MUTATING_TOOL_NAMES and result.get("ok") is True:
                         mutation_verified_this_turn = True
                         mutation_version += 1
                         last_successful_mutation = {
@@ -16228,6 +16307,7 @@ class OllamaCodeAgent:
                         }
                         if self._mutation_record_targets_source(last_successful_mutation, successful_tool_results):
                             last_successful_source_mutation = deepcopy(last_successful_mutation)
+                            failed_mutation_obligations_pending = False
                         last_failed_run_test_diagnosis_key = None
                         failed_test_context_reads = 0
                         failed_test_mutation_version = None
@@ -16724,6 +16804,7 @@ class OllamaCodeAgent:
                     round_number == self.max_tool_rounds
                     and test_run_required
                     and mutation_verified_this_turn
+                    and (not failed_mutation_obligations_pending or last_successful_source_mutation is not None)
                     and self.tools.default_test_command
                     and last_successful_run_test_version != mutation_version
                     and not unresolved_syntax_diagnostics
@@ -16879,6 +16960,7 @@ class OllamaCodeAgent:
         if (
             self._post_edit_validation_enabled()
             and mutation_verified_this_turn
+            and (not failed_mutation_obligations_pending or last_successful_source_mutation is not None)
             and last_successful_validation_version != mutation_version
             and self._request_allows_any_validation(text)
         ):

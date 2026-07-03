@@ -7849,6 +7849,65 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Do not rerun validators until you make the broader repair", feedback)
 
+    def test_failed_mutation_obligations_block_validation_before_repair(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "task_cli.py").write_text(
+                "def list_tasks(priority=None):\n"
+                "    return []\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_task_cli.py").write_text(
+                "import unittest\n\n"
+                "class TaskCliTests(unittest.TestCase):\n"
+                "    def test_placeholder(self):\n"
+                "        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"task_cli.py"}}',
+                    '{"type":"tool","name":"edit_intent","arguments":{"intent":"replace_body","path":"task_cli.py","target":"list_tasks"}}',
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "write_file",
+                            "arguments": {
+                                "path": "task_cli.py",
+                                "content": "> def list_tasks(priority=None):\n>     return []\n> \n> def due_before():\n>     return None\n",
+                            },
+                        }
+                    ),
+                    '{"type":"tool","name":"write_file","arguments":{"path":"README.md","content":"Use --due-before.\\n"}}',
+                    '{"type":"tool","name":"run_test","arguments":{"command":"python -m unittest discover -s tests -v"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            (root / "README.md").write_text("Task CLI\n", encoding="utf-8")
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command="python -m unittest discover -s tests -v")
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                disable_spec_guided_repair=True,
+                max_tool_rounds=5,
+            )
+
+            result = agent.handle_user(
+                "Add a --due-before option to task_cli.py, update tests and README, run tests, and prove it with a shell command."
+            )
+
+        self.assertFalse(result.completed)
+        self.assertIsNone(tools.execute_counts.get("run_test"))
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        guard_names = [event.get("guard") for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertIn("failed-mutation-obligations-before-validation", guard_names)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Do not run validation or proof commands after failed edits", feedback)
+        self.assertIn("make a successful source or test mutation first", feedback)
+
     def test_failed_edit_recovery_only_counts_allowed_broad_repair_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -13380,6 +13439,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_failed_edit_recovery_state_persists_across_continue_requests",
         "test_failed_edit_recovery_blocks_validation_only_loop_before_repair",
         "test_failed_edit_recovery_blocks_auto_validation_loop_after_failed_test",
+        "test_failed_mutation_obligations_block_validation_before_repair",
         "test_failed_edit_recovery_only_counts_allowed_broad_repair_mutation",
         "test_failed_edit_recovery_blocks_validation_when_multiple_repair_specs_exist",
         "test_failed_edit_recovery_rejects_final_before_followup_repair",
