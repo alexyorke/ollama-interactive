@@ -117,11 +117,15 @@ from ollama_code.controller.repair_protocol import (
     RepairProtocolState,
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
+    failed_test_repair_retry_message as controller_failed_test_repair_retry_message,
+    failed_test_still_needs_repair as controller_failed_test_still_needs_repair,
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths as controller_repair_spec_behavior_paths,
+    repair_spec_blocks_validation_loop as controller_repair_spec_blocks_validation_loop,
     repair_spec_complete_plan,
     repair_spec_mutation_decision,
+    repair_spec_retry_message,
     repair_spec_required_proof_items,
     repair_spec_strategy_class,
 )
@@ -1432,9 +1436,10 @@ class OllamaCodeAgent:
         return False
 
     def _repair_spec_blocks_validation_loop(self, state: dict[str, Any], tool_name: str) -> bool:
-        if tool_name not in {"select_tests", "run_test", "lint_typecheck", "contract_check", "run_function_probe"}:
-            return False
-        return not self._repair_spec_has_followup_mutation(state)
+        return controller_repair_spec_blocks_validation_loop(
+            tool_name=tool_name,
+            has_followup_mutation=self._repair_spec_has_followup_mutation(state),
+        )
 
     def _pending_repair_spec_without_followup(self) -> dict[str, Any] | None:
         for state in self._merge_failed_edit_recovery(self._sticky_failed_edit_recovery):
@@ -1444,18 +1449,22 @@ class OllamaCodeAgent:
 
     def _repair_spec_validation_retry_message(self, state: dict[str, Any]) -> str:
         return (
-            self._failed_edit_recovery_retry_message(state, need_reground=not self._failed_edit_recovery_regrounded(state))
+            self._failed_edit_recovery_retry_message(
+                state,
+                need_reground=not self._failed_edit_recovery_regrounded(state),
+            )
             + " Do not rerun validators until you make the broader repair."
         )
 
     def _failed_test_still_needs_repair(self, *, latest_run_test_failed: bool, failed_test_mutation_version: int | None, mutation_version: int) -> bool:
-        return latest_run_test_failed and failed_test_mutation_version == mutation_version
+        return controller_failed_test_still_needs_repair(
+            latest_run_test_failed=latest_run_test_failed,
+            failed_test_mutation_version=failed_test_mutation_version,
+            mutation_version=mutation_version,
+        )
 
     def _failed_test_repair_retry_message(self, summary: str) -> str:
-        message = "The latest run_test failed after the current edit. Repair the implementation before rerunning validators or finishing."
-        if summary:
-            message += " Evidence: " + self._truncate_text(summary, limit=420)
-        return message
+        return controller_failed_test_repair_retry_message(summary)
 
     def _mutation_record_targets_source(
         self,
@@ -1628,41 +1637,15 @@ class OllamaCodeAgent:
         return cli_patch_bundle_instruction(state)
 
     def _failed_edit_recovery_retry_message(self, state: dict[str, Any], *, need_reground: bool) -> str:
-        path = str(state.get("path") or "").strip()
-        symbol = str(state.get("symbol") or "").strip()
-        diagnostic = str(state.get("diagnostic") or "").strip()
-        validation_name = str(state.get("validation_name") or "").strip() or "validation"
         behavior_paths = self._repair_spec_behavior_paths(state)
-        need_behavior_reground = not self._repair_spec_behavior_regrounded(state)
-        if symbol:
-            target_label = f"{symbol} in {path}"
-            reground_step = f"Re-ground {target_label} from current source with read_symbol before another mutation."
-        else:
-            target_label = path or "the current source target"
-            reground_tool = "read_file"
-            reground_step = f"Re-ground {target_label} from current source with {reground_tool} before another mutation."
-        behavior_step = ""
-        if behavior_paths:
-            behavior_targets = ", ".join(behavior_paths[:3])
-            behavior_step = f" Re-read the failing behavior surface with read_file on {behavior_targets} before repairing."
-        repair_step = (
-            " Then make one broader repair with "
-            + self._failed_edit_recovery_broad_repair_hint(state)
-            + ", rerun proof-producing validation, and only then finish."
+        return repair_spec_retry_message(
+            state,
+            need_reground=need_reground,
+            need_behavior_reground=not self._repair_spec_behavior_regrounded(state),
+            behavior_paths=behavior_paths,
+            broad_repair_hint=self._failed_edit_recovery_broad_repair_hint(state),
+            complete_plan=self._repair_spec_complete_plan(state),
         )
-        if need_reground:
-            message = f"Validation already failed after a prior edit on {target_label}. {reground_step}"
-        else:
-            message = (
-                f"Validation already failed after a prior edit on {target_label}. "
-                + "Do not make another small speculative edit on the same target."
-            )
-        if need_behavior_reground and behavior_step:
-            message += behavior_step
-        message += " " + self._repair_spec_complete_plan(state) + repair_step
-        if diagnostic:
-            message += f" Last {validation_name}: {diagnostic}"
-        return message
 
     def _derive_request_obligations(
         self,

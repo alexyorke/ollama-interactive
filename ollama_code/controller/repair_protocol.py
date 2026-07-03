@@ -6,6 +6,7 @@ from typing import Any
 
 MUTATION_ACTIONS = {"implementation", "tests", "docs"}
 PROOF_ACTIONS = {"validation", "behavior_proof", "final"}
+VALIDATION_LOOP_TOOL_NAMES = {"select_tests", "run_test", "lint_typecheck", "contract_check", "run_function_probe"}
 
 
 @dataclass(frozen=True)
@@ -452,6 +453,73 @@ def repair_spec_mutation_decision(
     return {"allowed": True, "reason": ""}
 
 
+def repair_spec_blocks_validation_loop(*, tool_name: str, has_followup_mutation: bool) -> bool:
+    if tool_name not in VALIDATION_LOOP_TOOL_NAMES:
+        return False
+    return not has_followup_mutation
+
+
+def repair_spec_retry_message(
+    state: dict[str, Any],
+    *,
+    need_reground: bool,
+    need_behavior_reground: bool,
+    behavior_paths: list[str] | tuple[str, ...],
+    broad_repair_hint: str,
+    complete_plan: str,
+) -> str:
+    path = str(state.get("path") or "").strip()
+    symbol = str(state.get("symbol") or "").strip()
+    diagnostic = str(state.get("diagnostic") or "").strip()
+    validation_name = str(state.get("validation_name") or "").strip() or "validation"
+    if symbol:
+        target_label = f"{symbol} in {path}"
+        reground_step = f"Re-ground {target_label} from current source with read_symbol before another mutation."
+    else:
+        target_label = path or "the current source target"
+        reground_step = f"Re-ground {target_label} from current source with read_file before another mutation."
+    behavior_step = ""
+    if behavior_paths:
+        behavior_targets = ", ".join(str(path).strip() for path in behavior_paths[:3] if str(path).strip())
+        if behavior_targets:
+            behavior_step = f" Re-read the failing behavior surface with read_file on {behavior_targets} before repairing."
+    repair_step = (
+        " Then make one broader repair with "
+        + broad_repair_hint
+        + ", rerun proof-producing validation, and only then finish."
+    )
+    if need_reground:
+        message = f"Validation already failed after a prior edit on {target_label}. {reground_step}"
+    else:
+        message = (
+            f"Validation already failed after a prior edit on {target_label}. "
+            + "Do not make another small speculative edit on the same target."
+        )
+    if need_behavior_reground and behavior_step:
+        message += behavior_step
+    message += " " + complete_plan + repair_step
+    if diagnostic:
+        message += f" Last {validation_name}: {diagnostic}"
+    return message
+
+
+def failed_test_still_needs_repair(
+    *,
+    latest_run_test_failed: bool,
+    failed_test_mutation_version: int | None,
+    mutation_version: int,
+) -> bool:
+    return latest_run_test_failed and failed_test_mutation_version == mutation_version
+
+
+def failed_test_repair_retry_message(summary: str, *, limit: int = 420) -> str:
+    message = "The latest run_test failed after the current edit. Repair the implementation before rerunning validators or finishing."
+    diagnostic = _truncate_text(str(summary or ""), limit=limit).strip()
+    if diagnostic:
+        message += " Evidence: " + diagnostic
+    return message
+
+
 def cli_patch_bundle_instruction(state: RepairProtocolState) -> str | None:
     plan = state.patch_plan
     if plan is None or plan.strategy != "cli_patch_bundle":
@@ -488,3 +556,9 @@ def _is_narrow_cli_mutation(tool_name: str, arguments: dict[str, Any]) -> bool:
 
 def _normalize_path(path: str) -> str:
     return str(path or "").strip().replace("\\", "/").lstrip("./")
+
+
+def _truncate_text(text: str, *, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."

@@ -5,11 +5,15 @@ import unittest
 from ollama_code.controller.repair_protocol import (
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
+    failed_test_repair_retry_message,
+    failed_test_still_needs_repair,
     repair_decision_for_tool,
     repair_spec_broad_repair_hint,
     repair_spec_behavior_paths,
+    repair_spec_blocks_validation_loop,
     repair_spec_complete_plan,
     repair_spec_mutation_decision,
+    repair_spec_retry_message,
     repair_spec_required_proof_items,
     repair_spec_strategy_class,
 )
@@ -209,6 +213,51 @@ class RepairProtocolTests(unittest.TestCase):
         self.assertFalse(narrow["allowed"])
         self.assertIn("small speculative edit", narrow["reason"])
         self.assertTrue(broad["allowed"])
+
+    def test_repair_spec_blocks_validation_loop_until_followup_mutation(self) -> None:
+        self.assertTrue(repair_spec_blocks_validation_loop(tool_name="run_test", has_followup_mutation=False))
+        self.assertFalse(repair_spec_blocks_validation_loop(tool_name="run_test", has_followup_mutation=True))
+        self.assertFalse(repair_spec_blocks_validation_loop(tool_name="read_file", has_followup_mutation=False))
+
+    def test_repair_spec_retry_message_is_policy_level(self) -> None:
+        message = repair_spec_retry_message(
+            {
+                "path": "task_cli.py",
+                "symbol": "main",
+                "validation_name": "run_test",
+                "diagnostic": "expected --due-before output",
+            },
+            need_reground=False,
+            need_behavior_reground=True,
+            behavior_paths=["tests/test_task_cli.py"],
+            broad_repair_hint="a full-symbol replacement",
+            complete_plan="Complete one full-symbol repair.",
+        )
+
+        self.assertIn("Do not make another small speculative edit", message)
+        self.assertIn("read_file on tests/test_task_cli.py", message)
+        self.assertIn("a full-symbol replacement", message)
+        self.assertIn("Last run_test: expected --due-before output", message)
+
+    def test_failed_test_repair_policy_tracks_current_mutation_version(self) -> None:
+        self.assertTrue(
+            failed_test_still_needs_repair(
+                latest_run_test_failed=True,
+                failed_test_mutation_version=3,
+                mutation_version=3,
+            )
+        )
+        self.assertFalse(
+            failed_test_still_needs_repair(
+                latest_run_test_failed=True,
+                failed_test_mutation_version=2,
+                mutation_version=3,
+            )
+        )
+        self.assertIn(
+            "Repair the implementation before rerunning validators",
+            failed_test_repair_retry_message("test_due_before failed"),
+        )
 
 
 if __name__ == "__main__":
