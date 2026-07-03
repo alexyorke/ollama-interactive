@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from ollama_code.controller.repair_protocol import (
+    build_failed_edit_recovery_state,
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
     failed_test_repair_retry_message,
@@ -352,6 +353,35 @@ class RepairProtocolTests(unittest.TestCase):
             )
         )
         self.assertTrue(repair_spec_behavior_regrounded(state, events=events, behavior_paths=[]))
+
+    def test_build_failed_edit_recovery_state_shapes_repair_spec(self) -> None:
+        state = build_failed_edit_recovery_state(
+            target={"target_id": "path:task_cli.py", "kind": "path", "path": "task_cli.py", "symbol": ""},
+            tool_name="edit_intent",
+            tool_granularity="narrow",
+            validation_name="run_test",
+            diagnostic="x" * 600,
+            failure_event_index=7,
+            repair_strategy="cli_surface_repair",
+            allowed_files=["task_cli.py", ""],
+            forbidden_files=["other.py"],
+            unresolved_obligations=[
+                {"id": "flag:--due-before", "label": "prove --due-before"},
+                {"id": "code-change", "label": ""},
+            ],
+            behavior_paths=["tests/test_task_cli.py"],
+        )
+
+        self.assertEqual(state["target_id"], "path:task_cli.py")
+        self.assertEqual(state["last_mutating_tool_family"], "edit_intent")
+        self.assertEqual(state["failing_validators"], ["run_test"])
+        self.assertEqual(state["failure_event_index"], 7)
+        self.assertEqual(state["allowed_files"], ["task_cli.py"])
+        self.assertEqual(state["forbidden_files"], ["other.py"])
+        self.assertEqual(state["required_proof_items"], ["prove --due-before"])
+        self.assertEqual(state["behavior_paths"], ["tests/test_task_cli.py"])
+        self.assertLessEqual(len(state["diagnostic"]), 520)
+        self.assertLessEqual(len(state["diagnostic_excerpt"]), 240)
 
     def test_failed_test_repair_policy_tracks_current_mutation_version(self) -> None:
         self.assertTrue(

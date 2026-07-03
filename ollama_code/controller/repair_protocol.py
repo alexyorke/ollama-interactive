@@ -467,6 +467,43 @@ def repair_spec_behavior_regrounded(
     return False
 
 
+def build_failed_edit_recovery_state(
+    *,
+    target: dict[str, str],
+    tool_name: str,
+    tool_granularity: str,
+    validation_name: str,
+    diagnostic: str,
+    failure_event_index: int,
+    repair_strategy: str,
+    allowed_files: list[str],
+    forbidden_files: list[str],
+    unresolved_obligations: list[dict[str, Any]],
+    behavior_paths: list[str],
+) -> dict[str, Any]:
+    return {
+        **target,
+        "tool_name": tool_name,
+        "last_mutating_tool_family": tool_name,
+        "tool_granularity": tool_granularity,
+        "validation_name": validation_name,
+        "failing_validators": [validation_name],
+        "diagnostic": _truncate_text(diagnostic.strip(), limit=520),
+        "diagnostic_excerpt": _truncate_text(diagnostic.strip(), limit=240),
+        "failure_event_index": failure_event_index,
+        "repair_strategy": repair_strategy,
+        "allowed_files": [path for path in allowed_files if path],
+        "forbidden_files": forbidden_files,
+        "unresolved_obligations": unresolved_obligations,
+        "required_proof_items": [
+            str(item.get("label") or "").strip()
+            for item in unresolved_obligations
+            if str(item.get("label") or "").strip()
+        ],
+        "behavior_paths": behavior_paths,
+    }
+
+
 def repair_spec_required_proof_items(state: dict[str, Any]) -> list[str]:
     items: list[str] = []
     raw_items = state.get("required_proof_items")

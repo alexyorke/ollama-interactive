@@ -242,6 +242,7 @@ from ollama_code.sessions import (
 )
 from ollama_code.controller.repair_protocol import (
     RepairProtocolState,
+    build_failed_edit_recovery_state,
     build_repair_protocol_state,
     cli_patch_bundle_instruction,
     failed_test_repair_retry_message as controller_failed_test_repair_retry_message,
@@ -1542,27 +1543,19 @@ class OllamaCodeAgent:
             for path in self._mutated_paths_from_successful_results(successful_tool_results)
             if path not in allowed_files and not self._path_looks_like_doc_target(path)
         )
-        state = {
-            **target,
-            "tool_name": name,
-            "last_mutating_tool_family": name,
-            "tool_granularity": self._mutation_edit_granularity(name=name, arguments=arguments),
-            "validation_name": validation_name,
-            "failing_validators": [validation_name],
-            "diagnostic": self._truncate_text(diagnostic.strip(), limit=520),
-            "diagnostic_excerpt": self._truncate_text(diagnostic.strip(), limit=240),
-            "failure_event_index": len(self.events),
-            "repair_strategy": strategy,
-            "allowed_files": [path for path in allowed_files if path],
-            "forbidden_files": forbidden_files,
-            "unresolved_obligations": unresolved_obligations,
-            "required_proof_items": [
-                str(item.get("label") or "").strip()
-                for item in unresolved_obligations
-                if str(item.get("label") or "").strip()
-            ],
-            "behavior_paths": self._repair_spec_behavior_paths({"path": str(target.get("path") or "").strip(), "unresolved_obligations": unresolved_obligations}),
-        }
+        state = build_failed_edit_recovery_state(
+            target=target,
+            tool_name=name,
+            tool_granularity=self._mutation_edit_granularity(name=name, arguments=arguments),
+            validation_name=validation_name,
+            diagnostic=diagnostic,
+            failure_event_index=len(self.events),
+            repair_strategy=strategy,
+            allowed_files=allowed_files,
+            forbidden_files=forbidden_files,
+            unresolved_obligations=unresolved_obligations,
+            behavior_paths=self._repair_spec_behavior_paths({"path": str(target.get("path") or "").strip(), "unresolved_obligations": unresolved_obligations}),
+        )
         self._sticky_failed_edit_recovery = self._merge_failed_edit_recovery([state, *self._sticky_failed_edit_recovery])
         self._record_event("repair_spec", **state)
         self._record_event("failed_edit_recovery", **state)
