@@ -80,6 +80,7 @@ from ollama_code.tools.synthesis import (
     candidate_signature_gate,
     candidate_validation_failure_result,
     candidate_validation_success_result,
+    candidate_workspace_ignored_names,
     candidate_public_signature_map,
     candidate_signature_diagnostics,
     first_behavior_call,
@@ -8944,17 +8945,7 @@ import string
 
     def _copy_workspace_for_candidate(self, destination: Path) -> None:
         def ignore(_directory: str, names: list[str]) -> set[str]:
-            skipped = {
-                ".git",
-                ".meta",
-                ".ollama-code",
-                "__pycache__",
-                ".pytest_cache",
-                ".ruff_cache",
-                "scratch",
-                "verify_scratch",
-            }
-            return {name for name in names if name in skipped or self._generated_dir_name(name)}
+            return candidate_workspace_ignored_names(names, generated_dir_name=self._generated_dir_name)
 
         shutil.copytree(self.workspace_root, destination, ignore=ignore)
 

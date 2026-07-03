@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
-from typing import Any
+from typing import Any, Callable
 
 
 def human_test_name(name: str) -> str:
@@ -147,6 +147,24 @@ def candidate_validation_success_result(
         "output": summary,
         **timing_fields,
     }
+
+
+def candidate_workspace_ignored_names(
+    names: list[str],
+    *,
+    generated_dir_name: Callable[[str], bool],
+) -> set[str]:
+    skipped = {
+        ".git",
+        ".meta",
+        ".ollama-code",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        "scratch",
+        "verify_scratch",
+    }
+    return {name for name in names if name in skipped or generated_dir_name(name)}
 
 
 def node_expr(node: ast.AST, local_exprs: dict[str, str] | None = None) -> str:

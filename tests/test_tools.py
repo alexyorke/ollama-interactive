@@ -31,6 +31,7 @@ from ollama_code.tools.synthesis import (
     candidate_signature_gate,
     candidate_validation_failure_result,
     candidate_validation_success_result,
+    candidate_workspace_ignored_names,
 )
 
 
@@ -4262,6 +4263,14 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(success["stage"], "passed")
         self.assertIn("candidate passed", success["summary"])
         self.assertIn("def add", success["candidate_source"])
+
+    def test_candidate_workspace_ignored_names_skips_runtime_and_generated_dirs(self) -> None:
+        ignored = candidate_workspace_ignored_names(
+            [".git", ".ollama-code", "__pycache__", "scratch", "src", "generated-123"],
+            generated_dir_name=lambda name: name.startswith("generated-"),
+        )
+
+        self.assertEqual(ignored, {".git", ".ollama-code", "__pycache__", "scratch", "generated-123"})
 
     def test_validate_implementation_candidate_applies_safe_foldr_normalization(self) -> None:
         with self._temp_python_tools(
