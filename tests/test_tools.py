@@ -18,7 +18,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
-from ollama_code.tools.validation import lint_typecheck_file_analysis, lint_typecheck_target_plan
+from ollama_code.tools.validation import lint_typecheck_file_analysis, lint_typecheck_scan_paths, lint_typecheck_target_plan
 
 
 class ToolExecutorTests(unittest.TestCase):
@@ -5534,6 +5534,33 @@ def double(value: int) -> int:
         self.assertEqual(plan["validator_targets"], ["."])
         self.assertEqual(plan["typechecker_targets"], [])
         self.assertIn("test-only workspace scope", plan["typechecker_skipped_reason"])
+
+    def test_lint_typecheck_scan_paths_collects_targets_and_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            src = root / "src"
+            src.mkdir()
+            app = src / "app.py"
+            script = src / "script.sh"
+            config = src / "config.json"
+            for path in (app, script, config):
+                path.write_text("x\n", encoding="utf-8")
+
+            files = [app, script, config, script]
+            result = lint_typecheck_scan_paths(
+                raw_paths=["src"],
+                resolve_path=lambda raw: root / raw,
+                iter_code_files=lambda _base: files,
+                relative_label=lambda path: path.relative_to(root).as_posix(),
+                file_analysis=lambda path: {"diagnostic": "bad json"} if path == config else {"diagnostic": None},
+                shell_script_suffixes={".sh"},
+            )
+
+        self.assertEqual(result["checked"], ["src/app.py", "src/script.sh", "src/config.json", "src/script.sh"])
+        self.assertEqual(result["diagnostics"], ["bad json"])
+        self.assertEqual(result["python_validator_files"], {"src/app.py"})
+        self.assertEqual(result["python_validator_scopes"], {"src"})
+        self.assertEqual(result["shell_targets"], ["src/script.sh"])
 
     def test_lint_typecheck_runs_bash_n_for_shell_scripts(self) -> None:
         with self._temp_files_tools({"script.sh": "if true; then\n  echo ok\n"}) as (_root, tools):

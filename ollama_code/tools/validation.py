@@ -266,6 +266,58 @@ def lint_typecheck_target_plan(
     }
 
 
+def lint_typecheck_scan_paths(
+    *,
+    raw_paths: Iterable[str],
+    resolve_path: Callable[[str], Path],
+    iter_code_files: Callable[[Path], Iterable[Path]],
+    relative_label: Callable[[Path], str],
+    file_analysis: Callable[[Path], dict[str, Any]],
+    shell_script_suffixes: set[str],
+    checked: list[str] | None = None,
+    diagnostics: list[str] | None = None,
+    python_validator_files: set[str] | None = None,
+    python_validator_scopes: set[str] | None = None,
+    shell_targets: list[str] | None = None,
+) -> dict[str, Any]:
+    checked = checked if checked is not None else []
+    diagnostics = diagnostics if diagnostics is not None else []
+    python_validator_files = python_validator_files if python_validator_files is not None else set()
+    python_validator_scopes = python_validator_scopes if python_validator_scopes is not None else set()
+    shell_targets = shell_targets if shell_targets is not None else []
+    seen_shell_targets: set[str] = set(shell_targets)
+    for raw_path in raw_paths:
+        base = resolve_path(str(raw_path))
+        files = iter_code_files(base)
+        base_has_python = False
+        for file_path in files:
+            rel = relative_label(file_path)
+            checked.append(rel)
+            analysis = file_analysis(file_path)
+            suffix = file_path.suffix.lower()
+            diagnostic = analysis.get("diagnostic")
+            if suffix == ".py":
+                base_has_python = True
+                python_validator_files.add(rel)
+                if diagnostic:
+                    diagnostics.append(str(diagnostic))
+            elif suffix in shell_script_suffixes:
+                if rel not in seen_shell_targets:
+                    shell_targets.append(rel)
+                    seen_shell_targets.add(rel)
+            elif diagnostic:
+                diagnostics.append(str(diagnostic))
+        if base_has_python:
+            python_validator_scopes.add(relative_label(base))
+    return {
+        "checked": checked,
+        "diagnostics": diagnostics,
+        "python_validator_files": python_validator_files,
+        "python_validator_scopes": python_validator_scopes,
+        "shell_targets": shell_targets,
+    }
+
+
 def lint_typecheck_cache_key(
     *,
     workspace_root: Path,

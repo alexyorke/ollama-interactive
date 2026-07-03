@@ -115,6 +115,7 @@ from ollama_code.tools.validation import (
     ini_has_section,
     lint_typecheck_cache_key,
     lint_typecheck_file_analysis,
+    lint_typecheck_scan_paths,
     lint_typecheck_target_plan,
     python_typechecker_configured,
     python_typechecker_targets,
@@ -11130,7 +11131,6 @@ import string
         python_validator_files: set[str] = set()
         python_validator_scopes: set[str] = set()
         shell_targets: list[str] = []
-        seen_shell_targets: set[str] = set()
         validator_commands: list[str] = []
         validator_targets: list[str] = []
         typechecker_targets: list[str] = []
@@ -11139,29 +11139,19 @@ import string
         active_phase = "scan_ms"
         active_phase_started = time.perf_counter()
         try:
-            for raw_path in raw_paths:
-                base = self.resolve_path(str(raw_path), allow_missing=False)
-                files = self._iter_code_files(base, limit=50000)
-                base_has_python = False
-                for file_path in files:
-                    rel = self.relative_label(file_path)
-                    checked.append(rel)
-                    analysis = self._lint_typecheck_file_analysis(file_path, timeout=timeout)
-                    suffix = file_path.suffix.lower()
-                    diagnostic = analysis.get("diagnostic")
-                    if suffix == ".py":
-                        base_has_python = True
-                        python_validator_files.add(rel)
-                        if diagnostic:
-                            diagnostics.append(str(diagnostic))
-                    elif file_path.suffix.lower() in SHELL_SCRIPT_SUFFIXES:
-                        if rel not in seen_shell_targets:
-                            shell_targets.append(rel)
-                            seen_shell_targets.add(rel)
-                    elif diagnostic:
-                        diagnostics.append(str(diagnostic))
-                if base_has_python:
-                    python_validator_scopes.add(self.relative_label(base))
+            lint_typecheck_scan_paths(
+                raw_paths=[str(item) for item in raw_paths],
+                resolve_path=lambda raw_path: self.resolve_path(raw_path, allow_missing=False),
+                iter_code_files=lambda base: self._iter_code_files(base, limit=50000),
+                relative_label=self.relative_label,
+                file_analysis=lambda file_path: self._lint_typecheck_file_analysis(file_path, timeout=timeout),
+                shell_script_suffixes=SHELL_SCRIPT_SUFFIXES,
+                checked=checked,
+                diagnostics=diagnostics,
+                python_validator_files=python_validator_files,
+                python_validator_scopes=python_validator_scopes,
+                shell_targets=shell_targets,
+            )
             phase_timings_ms["scan_ms"] = round((time.perf_counter() - active_phase_started) * 1000, 3)
             target_plan = lint_typecheck_target_plan(
                 python_validator_files=python_validator_files,
