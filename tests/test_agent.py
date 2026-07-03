@@ -808,57 +808,7 @@ class AgentTests(AgentTestBase):
     # Focused missing-path final-claim coverage lives in test_agent_post_edit_validation.py.
 
 
-    def test_contract_guards_run_contract_check_before_targeted_tests(self) -> None:
-        root = self._workspace_scratch()
-        (root / "src").mkdir()
-        (root / "tests").mkdir()
-        (root / "src" / "pricing.py").write_text("def cart_total(prices: list[int]) -> int:\n    return 0\n", encoding="utf-8")
-        (root / "tests" / "test_pricing.py").write_text(
-            "import unittest\n"
-            "from src.pricing import cart_total\n\n"
-            "class PricingTests(unittest.TestCase):\n"
-            "    def test_cart_total(self):\n"
-            "        self.assertEqual(cart_total([2, 3]), 5)\n",
-            encoding="utf-8",
-        )
-        client = FakeClient(
-            [
-                '{"type":"tool","name":"read_file","arguments":{"path":"src/pricing.py"}}',
-                '{"type":"tool","name":"replace_in_file","arguments":{"path":"src/pricing.py","old":"return 0","new":"return sum(prices)"}}',
-                '{"type":"final","message":"Updated src/pricing.py and tests passed."}',
-            ]
-        )
-        tools = ToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover -s tests")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
-
-        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "contract-guards"}):
-            result = agent.handle_user("Fix src/pricing.py and run tests.")
-
-        self.assertTrue(result.completed)
-        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
-        self.assertIn("contract_check", tool_names)
-        self.assertIn("select_tests", tool_names)
-        self.assertLess(tool_names.index("contract_check"), tool_names.index("select_tests"))
-
-    def test_contract_guards_fail_closed_on_contract_mismatch(self) -> None:
-        root = self._workspace_scratch()
-        (root / "app.py").write_text("def value() -> int:\n    return 1\n", encoding="utf-8")
-        client = FakeClient(
-            [
-                '{"type":"tool","name":"read_file","arguments":{"path":"app.py"}}',
-                '{"type":"tool","name":"replace_symbol","arguments":{"path":"app.py","symbol":"value","content":"def value() -> int:\\n    pass\\n"}}',
-                '{"type":"final","message":"Updated app.py."}',
-            ]
-        )
-        tools = ToolExecutor(root, approval_mode="auto")
-        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
-
-        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "contract-guards"}):
-            result = agent.handle_user("Fix app.py.")
-
-        self.assertFalse(result.completed)
-        self.assertIn("post-edit validation failed", result.message)
-        self.assertIn("may return None", result.message)
+    # Focused contract-guard coverage lives in test_agent_post_edit_validation.py.
 
 
 
