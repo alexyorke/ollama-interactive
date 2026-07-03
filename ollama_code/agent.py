@@ -182,9 +182,11 @@ from ollama_code.controller import (
     shell_looks_like_file_mutation as controller_shell_looks_like_file_mutation,
     shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
+    successful_tool_call_already_satisfied as controller_successful_tool_call_already_satisfied,
     symbol_return_update_operations_from_source as controller_symbol_return_update_operations_from_source,
     symbol_return_update_spec as controller_symbol_return_update_spec,
     signature_with_appended_parameter as controller_signature_with_appended_parameter,
+    grounded_symbol_return_rewrite_spec as controller_grounded_symbol_return_rewrite_spec,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
@@ -7815,17 +7817,11 @@ class OllamaCodeAgent:
         arguments: dict[str, Any],
         successful_tool_results: list[dict[str, Any]],
     ) -> bool:
-        expected = json.dumps(arguments, sort_keys=True, ensure_ascii=True)
-        for item in reversed(successful_tool_results):
-            if str(item.get("name") or "").strip() != name:
-                continue
-            item_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
-            if json.dumps(item_arguments, sort_keys=True, ensure_ascii=True) != expected:
-                continue
-            result = item.get("result") if isinstance(item.get("result"), dict) else {}
-            if result.get("ok") is True:
-                return True
-        return False
+        return controller_successful_tool_call_already_satisfied(
+            name=name,
+            arguments=arguments,
+            successful_tool_results=successful_tool_results,
+        )
 
     def _workflow_config_update_operations(self, request_text: str) -> list[tuple[str, dict[str, Any]]] | None:
         spec = controller_workflow_config_update_spec(request_text)
@@ -7843,27 +7839,10 @@ class OllamaCodeAgent:
         )
 
     def _test_grounded_symbol_return_rewrite_spec(self, request_text: str) -> dict[str, str] | None:
-        match = re.search(
-            r"\b(?P<test>[\w./-]+\.py)\b(?:(?!\n\n).){0,260}?\b(?:change|changing|update|updating)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
+        return controller_grounded_symbol_return_rewrite_spec(
             request_text,
-            flags=re.IGNORECASE | re.DOTALL,
+            path_looks_like_test_file=self._path_looks_like_test_file,
         )
-        if not match:
-            return None
-        test_path = self._clean_match_group(match, "test", strip_suffix=".,;:")
-        if not self._path_looks_like_test_file(test_path):
-            return None
-        symbol = match.group("symbol").strip()
-        new_expr = self._clean_return_expression(match.group("new"))
-        old_expr = self._clean_return_expression(match.group("old"))
-        if not test_path or not symbol or not new_expr or not old_expr:
-            return None
-        return {
-            "test_path": test_path,
-            "symbol": symbol,
-            "new_expr": new_expr,
-            "old_expr": old_expr,
-        }
 
     def _symbol_return_update_operations_for_target(
         self,

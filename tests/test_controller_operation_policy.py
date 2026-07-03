@@ -8,8 +8,10 @@ from ollama_code.controller.operation_policy import (
     project_function_rename_already_satisfied,
     project_function_rename_operations,
     signature_with_appended_parameter,
+    successful_tool_call_already_satisfied,
     symbol_return_update_operations_from_source,
     symbol_return_update_spec,
+    grounded_symbol_return_rewrite_spec,
     workflow_config_update_operations,
     workflow_config_update_operations_from_source,
     workflow_config_update_spec,
@@ -32,6 +34,27 @@ class ControllerOperationPolicyTests(unittest.TestCase):
             {"path": "src/app.ts", "symbol": "compute", "new_expr": "2", "old_expr": "1"},
         )
         self.assertIsNone(symbol_return_update_spec("Update src/app.py without return details."))
+
+    def test_test_grounded_symbol_return_rewrite_spec_uses_test_path_predicate(self) -> None:
+        is_test_path = lambda path: path.startswith("tests/") or path.endswith("_test.py")
+        self.assertEqual(
+            grounded_symbol_return_rewrite_spec(
+                "In tests/test_app.py change parse() so it returns `new_value` instead of `old_value`; then run tests.",
+                path_looks_like_test_file=is_test_path,
+            ),
+            {
+                "test_path": "tests/test_app.py",
+                "symbol": "parse",
+                "new_expr": "new_value",
+                "old_expr": "old_value",
+            },
+        )
+        self.assertIsNone(
+            grounded_symbol_return_rewrite_spec(
+                "In src/app.py change parse() so it returns new_value instead of old_value.",
+                path_looks_like_test_file=is_test_path,
+            )
+        )
 
     def test_symbol_return_update_operations_replaces_matching_return(self) -> None:
         source = "def parse():\n    return old_value\n"
@@ -89,6 +112,41 @@ class ControllerOperationPolicyTests(unittest.TestCase):
                 source=source,
                 requested_tool_names=set(),
                 required_tool_names=set(),
+            )
+        )
+
+    def test_successful_tool_call_already_satisfied_requires_exact_successful_arguments(self) -> None:
+        results = [
+            {
+                "name": "replace_in_file",
+                "arguments": {"path": "src/app.py", "old": "A", "new": "B"},
+                "result": {"ok": False},
+            },
+            {
+                "name": "replace_in_file",
+                "arguments": {"new": "B", "old": "A", "path": "src/app.py"},
+                "result": {"ok": True},
+            },
+        ]
+        self.assertTrue(
+            successful_tool_call_already_satisfied(
+                name="replace_in_file",
+                arguments={"path": "src/app.py", "old": "A", "new": "B"},
+                successful_tool_results=results,
+            )
+        )
+        self.assertFalse(
+            successful_tool_call_already_satisfied(
+                name="replace_in_file",
+                arguments={"path": "src/app.py", "old": "A", "new": "C"},
+                successful_tool_results=results,
+            )
+        )
+        self.assertFalse(
+            successful_tool_call_already_satisfied(
+                name="write_file",
+                arguments={"path": "src/app.py", "old": "A", "new": "B"},
+                successful_tool_results=results,
             )
         )
 

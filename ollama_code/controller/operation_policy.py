@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import ast
+import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 
 ToolOperation = tuple[str, dict[str, Any]]
+PathPredicate = Callable[[str], bool]
 
 
 def workflow_config_update_spec(request_text: str) -> dict[str, str] | None:
@@ -105,6 +108,34 @@ def symbol_return_update_spec(request_text: str) -> dict[str, str] | None:
     return {"path": path, "symbol": symbol, "new_expr": new_expr, "old_expr": old_expr}
 
 
+def grounded_symbol_return_rewrite_spec(
+    request_text: str,
+    *,
+    path_looks_like_test_file: PathPredicate,
+) -> dict[str, str] | None:
+    match = re.search(
+        r"\b(?P<test>[\w./-]+\.py)\b(?:(?!\n\n).){0,260}?\b(?:change|changing|update|updating)\s+(?P<symbol>[A-Za-z_]\w*)\s*\([^)]*\)\s+so\s+it\s+returns\s+(?P<new>.+?)\s+instead\s+of\s+(?P<old>.+?)(?:[.?!]|$)",
+        request_text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    test_path = str(match.group("test") or "").strip().rstrip(".,;:")
+    if not path_looks_like_test_file(test_path):
+        return None
+    symbol = match.group("symbol").strip()
+    new_expr = clean_return_expression(match.group("new"))
+    old_expr = clean_return_expression(match.group("old"))
+    if not test_path or not symbol or not new_expr or not old_expr:
+        return None
+    return {
+        "test_path": test_path,
+        "symbol": symbol,
+        "new_expr": new_expr,
+        "old_expr": old_expr,
+    }
+
+
 def symbol_return_update_operations_from_source(
     *,
     path: str,
@@ -138,6 +169,25 @@ def symbol_return_update_operations_from_source(
         operations.append(("read_symbol", {"path": path, "symbol": symbol, "include_context": 0}))
     operations.append(("replace_in_file", {"path": path, "old": old_line, "new": new_line}))
     return operations
+
+
+def successful_tool_call_already_satisfied(
+    *,
+    name: str,
+    arguments: dict[str, Any],
+    successful_tool_results: list[dict[str, Any]],
+) -> bool:
+    expected = json.dumps(arguments, sort_keys=True, ensure_ascii=True)
+    for item in reversed(successful_tool_results):
+        if str(item.get("name") or "").strip() != name:
+            continue
+        item_arguments = item.get("arguments") if isinstance(item.get("arguments"), dict) else {}
+        if json.dumps(item_arguments, sort_keys=True, ensure_ascii=True) != expected:
+            continue
+        result = item.get("result") if isinstance(item.get("result"), dict) else {}
+        if result.get("ok") is True:
+            return True
+    return False
 
 
 def optional_parameter_update_spec(request_text: str) -> dict[str, str] | None:
