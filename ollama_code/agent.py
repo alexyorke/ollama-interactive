@@ -258,6 +258,7 @@ from ollama_code.controller.repair_protocol import (
     repair_spec_behavior_regrounded as controller_repair_spec_behavior_regrounded,
     repair_spec_blocks_validation_loop as controller_repair_spec_blocks_validation_loop,
     repair_spec_complete_plan,
+    repair_spec_has_followup_mutation as controller_repair_spec_has_followup_mutation,
     repair_spec_mutation_decision,
     repair_spec_retry_message,
     repair_spec_required_proof_items,
@@ -1400,41 +1401,22 @@ class OllamaCodeAgent:
         return bool(decision.get("allowed")), str(decision.get("reason") or "")
 
     def _repair_spec_has_followup_mutation(self, state: dict[str, Any]) -> bool:
-        failure_event_index = int(state.get("failure_event_index", -1) or -1)
-        target_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
-        target_symbol = str(state.get("symbol") or "").strip()
-        for index, event in enumerate(self.events):
-            if index <= failure_event_index or event.get("type") != "tool_result":
-                continue
-            name = str(event.get("name") or "").strip()
-            if name not in MUTATING_TOOL_NAMES:
-                continue
-            result = event.get("result") if isinstance(event.get("result"), dict) else {}
-            arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
-            if result.get("ok") is not True:
-                continue
-            allowed, _reason = self._repair_spec_mutation_allowed(
-                state,
-                proposed_tool_name=name,
+        return controller_repair_spec_has_followup_mutation(
+            state,
+            events=self.events,
+            mutating_tool_names=set(MUTATING_TOOL_NAMES),
+            mutation_allowed=lambda repair_state, tool_name, arguments: self._repair_spec_mutation_allowed(
+                repair_state,
+                proposed_tool_name=tool_name,
                 proposed_arguments=arguments,
-            )
-            if not allowed:
-                continue
-            target = self._recovery_target_from_mutation(
-                name=name,
+            )[0],
+            recovery_target_from_event=lambda tool_name, arguments, result: self._recovery_target_from_mutation(
+                name=tool_name,
                 arguments=arguments,
                 successful_tool_results=[],
                 result=result,
-            )
-            if target is None:
-                continue
-            if self._recovery_target_matches(state, target):
-                return True
-            event_path = str(target.get("path") or "").strip().replace("\\", "/").lstrip("./")
-            event_symbol = str(target.get("symbol") or "").strip()
-            if target_path and event_path == target_path and (not target_symbol or not event_symbol or target_symbol == event_symbol):
-                return True
-        return False
+            ),
+        )
 
     def _repair_spec_blocks_validation_loop(self, state: dict[str, Any], tool_name: str) -> bool:
         return controller_repair_spec_blocks_validation_loop(

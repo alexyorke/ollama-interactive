@@ -19,6 +19,7 @@ from ollama_code.controller.repair_protocol import (
     repair_spec_behavior_regrounded,
     repair_spec_blocks_validation_loop,
     repair_spec_complete_plan,
+    repair_spec_has_followup_mutation,
     repair_spec_mutation_decision,
     repair_spec_retry_message,
     repair_spec_required_proof_items,
@@ -423,6 +424,52 @@ class RepairProtocolTests(unittest.TestCase):
                 fallback_target={"path": "tests/test_task_cli.py"},
                 path_looks_like_doc_target=is_doc,
                 path_looks_like_test_file=is_test,
+            )
+        )
+
+    def test_repair_spec_has_followup_mutation_requires_allowed_matching_mutation(self) -> None:
+        state = {"path": "task_cli.py", "repair_strategy": "file_repair", "failure_event_index": 1}
+        events = [
+            {"type": "tool_result", "name": "write_file", "arguments": {"path": "task_cli.py"}, "result": {"ok": True, "path": "task_cli.py"}},
+            {"type": "tool_result", "name": "run_test", "result": {"ok": False}},
+            {"type": "tool_result", "name": "replace_in_file", "arguments": {"path": "task_cli.py"}, "result": {"ok": True, "path": "task_cli.py"}},
+            {"type": "tool_result", "name": "write_file", "arguments": {"path": "task_cli.py"}, "result": {"ok": True, "path": "task_cli.py"}},
+        ]
+
+        self.assertTrue(
+            repair_spec_has_followup_mutation(
+                state,
+                events=events,
+                mutating_tool_names={"write_file", "replace_in_file"},
+                mutation_allowed=lambda _state, tool_name, _arguments: tool_name == "write_file",
+                recovery_target_from_event=lambda _tool_name, arguments, result: {
+                    "target_id": "path:" + str(result.get("path") or arguments.get("path")).lower(),
+                    "kind": "path",
+                    "path": str(result.get("path") or arguments.get("path")),
+                    "symbol": "",
+                },
+            )
+        )
+
+    def test_repair_spec_has_followup_mutation_rejects_unmatched_or_unallowed_events(self) -> None:
+        state = {"path": "task_cli.py", "symbol": "main", "failure_event_index": 0}
+        events = [
+            {"type": "tool_result", "name": "replace_symbol", "arguments": {"path": "task_cli.py", "symbol": "parse"}, "result": {"ok": True, "path": "task_cli.py", "symbol": "parse"}},
+            {"type": "tool_result", "name": "write_file", "arguments": {"path": "other.py"}, "result": {"ok": True, "path": "other.py"}},
+        ]
+
+        self.assertFalse(
+            repair_spec_has_followup_mutation(
+                state,
+                events=events,
+                mutating_tool_names={"write_file", "replace_symbol"},
+                mutation_allowed=lambda _state, _tool_name, _arguments: True,
+                recovery_target_from_event=lambda _tool_name, _arguments, result: {
+                    "target_id": "",
+                    "kind": "symbol" if result.get("symbol") else "path",
+                    "path": str(result.get("path") or ""),
+                    "symbol": str(result.get("symbol") or ""),
+                },
             )
         )
 

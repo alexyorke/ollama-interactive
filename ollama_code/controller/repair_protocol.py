@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 
 MUTATION_ACTIONS = {"implementation", "tests", "docs"}
@@ -520,6 +520,41 @@ def mutation_record_targets_source(
     target = fallback_target if isinstance(fallback_target, dict) else {}
     path = _normalize_path(str(target.get("path") or ""))
     return bool(path and not path_looks_like_doc_target(path) and not path_looks_like_test_file(path))
+
+
+def repair_spec_has_followup_mutation(
+    state: dict[str, Any],
+    *,
+    events: list[dict[str, Any]],
+    mutating_tool_names: set[str],
+    mutation_allowed: Callable[[dict[str, Any], str, dict[str, Any]], bool],
+    recovery_target_from_event: Callable[[str, dict[str, Any], dict[str, Any]], dict[str, str] | None],
+) -> bool:
+    failure_event_index = int(state.get("failure_event_index", -1) or -1)
+    target_path = _normalize_path(str(state.get("path") or ""))
+    target_symbol = str(state.get("symbol") or "").strip()
+    for index, event in enumerate(events):
+        if index <= failure_event_index or event.get("type") != "tool_result":
+            continue
+        name = str(event.get("name") or "").strip()
+        if name not in mutating_tool_names:
+            continue
+        result = event.get("result") if isinstance(event.get("result"), dict) else {}
+        arguments = event.get("arguments") if isinstance(event.get("arguments"), dict) else {}
+        if result.get("ok") is not True:
+            continue
+        if not mutation_allowed(state, name, arguments):
+            continue
+        target = recovery_target_from_event(name, arguments, result)
+        if target is None:
+            continue
+        if recovery_target_matches(state, target):
+            return True
+        event_path = _normalize_path(str(target.get("path") or ""))
+        event_symbol = str(target.get("symbol") or "").strip()
+        if target_path and event_path == target_path and (not target_symbol or not event_symbol or target_symbol == event_symbol):
+            return True
+    return False
 
 
 def repair_spec_required_proof_items(state: dict[str, Any]) -> list[str]:
