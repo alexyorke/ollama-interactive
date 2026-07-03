@@ -55,6 +55,17 @@ from ollama_code.tools.command_validation import (
     token_looks_like_path,
     validation_result,
 )
+from ollama_code.tools.contracts import (
+    annotation_text,
+    callable_arity,
+    callable_arity_without_receiver,
+    contract_args,
+    contract_signature,
+    dataclass_contract_args,
+    dataclass_field_init_and_default,
+    decorator_keyword_bool,
+    decorator_leaf,
+)
 from ollama_code.tools.synthesis import (
     human_test_name,
     select_test_spec_examples,
@@ -9475,12 +9486,7 @@ import string
         }
 
     def _annotation_text(self, node: ast.AST | None) -> str:
-        if node is None:
-            return "Any"
-        try:
-            return ast.unparse(node)[:120]
-        except Exception:
-            return "Any"
+        return annotation_text(node)
 
     def _python_function_contracts(self, base: Path, limit: int = 500) -> dict[str, Any]:
         definitions: dict[str, dict[str, Any]] = {}
@@ -9640,91 +9646,25 @@ import string
         }
 
     def _contract_args(self, args: ast.arguments) -> list[dict[str, Any]]:
-        defaults_start = len(args.args) - len(args.defaults)
-        rows: list[dict[str, Any]] = []
-        all_positional = [*args.posonlyargs, *args.args]
-        for index, arg in enumerate(all_positional):
-            has_default = index >= defaults_start if arg in args.args else False
-            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": not has_default, "kind": "positional"})
-        if args.vararg:
-            rows.append({"name": "*" + args.vararg.arg, "annotation": self._annotation_text(args.vararg.annotation), "required": False, "kind": "vararg"})
-        for index, arg in enumerate(args.kwonlyargs):
-            rows.append({"name": arg.arg, "annotation": self._annotation_text(arg.annotation), "required": args.kw_defaults[index] is None, "kind": "kwonly"})
-        if args.kwarg:
-            rows.append({"name": "**" + args.kwarg.arg, "annotation": self._annotation_text(args.kwarg.annotation), "required": False, "kind": "kwarg"})
-        return rows
+        return contract_args(args)
 
     def _callable_arity(self, args: ast.arguments) -> dict[str, Any]:
-        positional = [*args.posonlyargs, *args.args]
-        required_positional = len(positional) - len(args.defaults)
-        required_kwonly = sum(1 for default in args.kw_defaults if default is None)
-        return {
-            "min": required_positional + required_kwonly,
-            "max": None if args.vararg else len(positional),
-            "has_vararg": args.vararg is not None,
-            "has_kwarg": args.kwarg is not None,
-        }
+        return callable_arity(args)
 
     def _callable_arity_without_receiver(self, args: ast.arguments) -> dict[str, Any]:
-        arity = self._callable_arity(args)
-        positional = [*args.posonlyargs, *args.args]
-        if positional and positional[0].arg in {"self", "cls"}:
-            arity["min"] = max(0, int(arity.get("min", 0)) - 1)
-            if isinstance(arity.get("max"), int):
-                arity["max"] = max(0, int(arity["max"]) - 1)
-        return arity
+        return callable_arity_without_receiver(args)
 
     def _decorator_leaf(self, decorator: ast.AST) -> str:
-        target = decorator.func if isinstance(decorator, ast.Call) else decorator
-        if isinstance(target, ast.Name):
-            return target.id
-        if isinstance(target, ast.Attribute):
-            return target.attr
-        return ""
+        return decorator_leaf(decorator)
 
     def _decorator_keyword_bool(self, decorator: ast.AST, name: str, default: bool) -> bool:
-        if not isinstance(decorator, ast.Call):
-            return default
-        for keyword in decorator.keywords:
-            if keyword.arg == name and isinstance(keyword.value, ast.Constant) and isinstance(keyword.value.value, bool):
-                return bool(keyword.value.value)
-        return default
+        return decorator_keyword_bool(decorator, name, default)
 
     def _dataclass_contract_args(self, node: ast.ClassDef) -> list[dict[str, Any]] | None:
-        dataclass_decorator = next((decorator for decorator in node.decorator_list if self._decorator_leaf(decorator) == "dataclass"), None)
-        if dataclass_decorator is None:
-            return None
-        if not self._decorator_keyword_bool(dataclass_decorator, "init", True):
-            return []
-
-        rows: list[dict[str, Any]] = []
-        for child in node.body:
-            if not isinstance(child, ast.AnnAssign) or not isinstance(child.target, ast.Name):
-                continue
-            name = child.target.id
-            annotation = self._annotation_text(child.annotation)
-            annotation_leaf = annotation.split(".")[-1]
-            if annotation_leaf.startswith("ClassVar") or annotation_leaf == "KW_ONLY":
-                continue
-            init, has_default = self._dataclass_field_init_and_default(child.value)
-            if not init:
-                continue
-            rows.append({"name": name, "annotation": annotation, "required": not has_default})
-        return rows
+        return dataclass_contract_args(node)
 
     def _dataclass_field_init_and_default(self, value: ast.AST | None) -> tuple[bool, bool]:
-        if value is None:
-            return True, False
-        if not isinstance(value, ast.Call) or self._call_name(value.func) != "field":
-            return True, True
-        init = True
-        has_default = False
-        for keyword in value.keywords:
-            if keyword.arg == "init" and isinstance(keyword.value, ast.Constant) and keyword.value.value is False:
-                init = False
-            elif keyword.arg in {"default", "default_factory"}:
-                has_default = True
-        return init, has_default
+        return dataclass_field_init_and_default(value)
 
     def _call_name(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name):
@@ -9947,19 +9887,7 @@ import string
         return "pure_hint"
 
     def _contract_signature(self, item: dict[str, Any]) -> str:
-        args = []
-        for arg in item.get("args", []):
-            if not isinstance(arg, dict):
-                continue
-            text = str(arg.get("name", ""))
-            annotation = str(arg.get("annotation", "Any"))
-            if annotation and annotation != "Any":
-                text += f": {annotation}"
-            if not arg.get("required", True):
-                text += "=?"
-            args.append(text)
-        returns = str(item.get("returns") or "Any")
-        return f"{item.get('symbol')}({', '.join(args)})->{returns}"
+        return contract_signature(item)
 
     def contract_graph(self, path: str = ".", symbol: str | None = None, limit: int = 40) -> dict[str, Any]:
         self._check_interrupted()
