@@ -6468,6 +6468,97 @@ class AgentTests(AgentTestBase):
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual([event["name"] for event in tool_calls], ["read_file"])
 
+    def test_failed_tool_prunes_accepted_assumption_audit_context(self) -> None:
+        root = self._workspace_scratch()
+        original = "def existing():\n    return 'old'\n"
+        updated = "def existing():\n    return 'new'\n"
+        (root / "sample.py").write_text(original, encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "sample.py"}}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "sample.py",
+                            "intent": "add_function",
+                            "target": "existing",
+                            "replacement": updated,
+                        },
+                    }
+                ),
+                json.dumps({"type": "tool", "name": "git_status", "arguments": {}}),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=4)
+
+        agent.handle_user("Update sample.py.")
+
+        audit_payloads = [
+            json.loads(call["messages"][1]["content"])
+            for call in client.calls
+            if str(call["messages"][0]["content"]).startswith("You are a tool-step assumption auditor")
+        ]
+        self.assertGreaterEqual(len(audit_payloads), 2)
+        self.assertEqual(audit_payloads[0]["proposed_tool"]["name"], "edit_intent")
+        self.assertEqual(audit_payloads[1]["proposed_tool"]["name"], "git_status")
+        self.assertEqual(audit_payloads[1]["accepted_assumption_audits"], [])
+
+    def test_grounded_write_file_skips_audit_after_other_tool_forbidden(self) -> None:
+        root = self._workspace_scratch()
+        original = "def existing():\n    return 'old'\n"
+        updated = "def existing():\n    return 'new'\n"
+        (root / "sample.py").write_text(original, encoding="utf-8")
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "sample.py"}}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "sample.py",
+                            "intent": "add_function",
+                            "target": "existing",
+                            "replacement": updated,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "sample.py",
+                            "intent": "replace_function_body",
+                            "target": "existing",
+                            "replacement": "    return 'new'\n",
+                        },
+                    }
+                ),
+                json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "sample.py", "content": updated}}),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=5)
+
+        agent.handle_user("Update sample.py.")
+
+        audit_payloads = [
+            json.loads(call["messages"][1]["content"])
+            for call in client.calls
+            if str(call["messages"][0]["content"]).startswith("You are a tool-step assumption auditor")
+        ]
+        audited_tools = [payload["proposed_tool"]["name"] for payload in audit_payloads]
+        self.assertIn("edit_intent", audited_tools)
+        self.assertNotIn("write_file", audited_tools)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual((root / "sample.py").read_text(encoding="utf-8"), updated)
+
     def test_agent_fails_closed_after_assumption_audit_retry_cap(self) -> None:
         root = self._workspace_scratch()
         client = FakeClient(
@@ -7907,6 +7998,75 @@ class AgentTests(AgentTestBase):
         feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
         self.assertIn("Do not run validation or proof commands after failed edits", feedback)
         self.assertIn("make a successful source or test mutation first", feedback)
+
+    def test_repeated_edit_intent_failure_allows_replace_symbol_repair(self) -> None:
+        root = self._workspace_scratch()
+        source = (
+            "def list_tasks(path, *, priority=None):\n"
+            "    tasks = []\n"
+            "    if priority:\n"
+            "        tasks = [task for task in tasks if task.get('priority') == priority]\n"
+            "    return tasks\n"
+        )
+        (root / "task_cli.py").write_text(source, encoding="utf-8")
+        replacement = (
+            "def list_tasks(path, *, priority=None):\n"
+            "    tasks = []\n"
+            "    due_before = '2026-07-31'\n"
+            "    if priority:\n"
+            "        tasks = [task for task in tasks if task.get('priority') == priority]\n"
+            "    if due_before:\n"
+            "        tasks = [task for task in tasks if task.get('due') and task.get('due') <= due_before]\n"
+            "    return tasks\n"
+        )
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "task_cli.py"}}),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "task_cli.py",
+                            "intent": "add_function",
+                            "target": "list_tasks",
+                            "replacement": replacement,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "edit_intent",
+                        "arguments": {
+                            "path": "task_cli.py",
+                            "intent": "replace_symbol",
+                            "target": "list_tasks",
+                            "replacement": replacement,
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "tool",
+                        "name": "replace_symbol",
+                        "arguments": {"path": "task_cli.py", "symbol": "list_tasks", "content": replacement},
+                    }
+                ),
+                json.dumps({"type": "final", "message": "stopped"}),
+            ]
+        )
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
+
+        agent.handle_user("Add due_before support to list_tasks in task_cli.py.")
+
+        self.assertEqual(tools.execute_counts.get("replace_symbol"), 1)
+        updated = (root / "task_cli.py").read_text(encoding="utf-8")
+        self.assertIn("due_before = '2026-07-31'", updated)
+        self.assertIn("task.get('due') <= due_before", updated)
+        guard_names = [event.get("guard") for event in agent.events if event.get("type") == "controller_guard"]
+        self.assertIn("repeated-mutating-failure-pivot", guard_names)
 
     def test_failed_edit_recovery_only_counts_allowed_broad_repair_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -13440,6 +13600,7 @@ EXTRACTED_POST_EDIT_VALIDATION_TESTS = _extract_agent_tests(
         "test_failed_edit_recovery_blocks_validation_only_loop_before_repair",
         "test_failed_edit_recovery_blocks_auto_validation_loop_after_failed_test",
         "test_failed_mutation_obligations_block_validation_before_repair",
+        "test_repeated_edit_intent_failure_allows_replace_symbol_repair",
         "test_failed_edit_recovery_only_counts_allowed_broad_repair_mutation",
         "test_failed_edit_recovery_blocks_validation_when_multiple_repair_specs_exist",
         "test_failed_edit_recovery_rejects_final_before_followup_repair",

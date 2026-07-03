@@ -5661,6 +5661,20 @@ class OllamaCodeAgent:
         arguments: dict[str, Any],
         successful_tool_results: list[dict[str, Any]],
     ) -> bool:
+        if name == "write_file":
+            path = str(arguments.get("path", "")).strip().replace("\\", "/").lstrip("./")
+            if not path:
+                return False
+            for item in reversed(successful_tool_results):
+                if item.get("name") not in {"read_file", "read_symbol", "code_outline"}:
+                    continue
+                result = item.get("result") if isinstance(item.get("result"), dict) else {}
+                if result.get("ok") is not True:
+                    continue
+                result_path = str(result.get("path") or item.get("arguments", {}).get("path") or "").strip().replace("\\", "/").lstrip("./")
+                if result_path == path:
+                    return True
+            return False
         if name != "replace_in_file":
             return False
         path = str(arguments.get("path", "")).strip().replace("\\", "/")
@@ -5699,6 +5713,8 @@ class OllamaCodeAgent:
             successful_tool_results=successful_tool_results,
         ):
             return False
+        if name == "write_file" and name not in forbidden_tool_names:
+            return False
         if failed_tool_this_turn:
             if name in CONTEXT_GATHERING_TOOL_NAMES:
                 return False
@@ -5711,7 +5727,15 @@ class OllamaCodeAgent:
             ):
                 return False
             return True
-        if name in MUTATING_TOOL_NAMES or name == "run_shell":
+        if name in MUTATING_TOOL_NAMES:
+            if name not in forbidden_tool_names and self._tool_call_grounded_by_successful_evidence(
+                name=name,
+                arguments=arguments,
+                successful_tool_results=successful_tool_results,
+            ):
+                return False
+            return True
+        if name == "run_shell":
             return True
         if name == "run_agent":
             if forbidden_tool_names:
@@ -7602,7 +7626,7 @@ class OllamaCodeAgent:
     def _mutating_failure_key(self, name: str, arguments: dict[str, Any]) -> tuple[str, str]:
         path = str(arguments.get("path") or arguments.get("cwd") or "").strip().replace("\\", "/").lstrip("./")
         if path:
-            return ("path", path.lower())
+            return (name, path.lower())
         return ("tool", name)
 
     def _repeated_mutating_failure_escape_message(
@@ -15686,7 +15710,10 @@ class OllamaCodeAgent:
                         forced_next_classes=["read", "implementation_edit", "validation"],
                         rounds=round_number,
                     )
-                    forbidden_tool_names.update({"edit_intent", "replace_in_file", "replace_symbol", "replace_symbols", "apply_structured_edit"})
+                    if name == "edit_intent":
+                        forbidden_tool_names.add("edit_intent")
+                    elif name in {"replace_symbol", "replace_symbols", "replace_in_file", "apply_structured_edit"}:
+                        forbidden_tool_names.add(name)
                     required_tool_names.difference_update(forbidden_tool_names)
                     last_repair_pivot_message = self._repeated_mutating_failure_escape_message(
                         name=name,
@@ -16256,6 +16283,11 @@ class OllamaCodeAgent:
                 evidence_id = self._next_evidence_id() if feature_enabled("evidence-handles") else None
                 if result.get("ok") is not True:
                     failed_tool_this_turn = True
+                    accepted_assumption_audits = [
+                        audit
+                        for audit in accepted_assumption_audits
+                        if str(audit.get("tool") or "").strip() != name
+                    ]
                     if (
                         name in MUTATING_TOOL_NAMES
                         and self._mutation_record_targets_source(
