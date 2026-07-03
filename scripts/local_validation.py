@@ -39,6 +39,7 @@ SMOKE_MODULES = (
 )
 
 AGENT_MODULES = (
+    "tests.test_agent_prompt_policy",
     "tests.test_agent_grounding_path_repair",
     "tests.test_agent_post_edit_validation",
     "tests.test_agent_failure_compression",
@@ -49,6 +50,7 @@ AGENT_MODULES = (
     "tests.test_coding_benchmark_eval",
 )
 FOCUSED_AGENT_MODULES = (
+    "tests.test_agent_prompt_policy",
     "tests.test_agent_grounding_path_repair",
     "tests.test_agent_post_edit_validation",
     "tests.test_agent_failure_compression",
