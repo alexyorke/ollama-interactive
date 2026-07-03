@@ -100,6 +100,8 @@ from ollama_code.controller import (
     final_requires_verification as controller_final_requires_verification,
     forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
     merge_request_obligations,
+    normalize_find_exec_grep_shell_command as controller_normalize_find_exec_grep_shell_command,
+    normalize_grep_shell_inspection as controller_normalize_grep_shell_inspection,
     path_looks_like_doc_target as controller_path_looks_like_doc_target,
     path_looks_like_test_file as controller_path_looks_like_test_file,
     request_allows_any_validation as controller_request_allows_any_validation,
@@ -145,6 +147,7 @@ from ollama_code.controller import (
     requested_exact_reply_text as controller_requested_exact_reply_text,
     requested_exact_shell_command as controller_requested_exact_shell_command,
     requested_exact_single_line_file_write as controller_requested_exact_single_line_file_write,
+    requested_git_diff_mode as controller_requested_git_diff_mode,
     requested_list_files_path as controller_requested_list_files_path,
     requested_local_search_spec as controller_requested_local_search_spec,
     requested_loose_file_create_path as controller_requested_loose_file_create_path,
@@ -155,6 +158,7 @@ from ollama_code.controller import (
     requested_search_symbols_spec as controller_requested_search_symbols_spec,
     requested_symbol_read as controller_requested_symbol_read,
     requested_target_line_read as controller_requested_target_line_read,
+    shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
     typed_cli_flag_protocol_enabled,
     tool_names_in_fragment as controller_tool_names_in_fragment,
     validation_preferences as controller_validation_preferences,
@@ -4635,20 +4639,7 @@ class OllamaCodeAgent:
         return f"{match.group('prefix')} discover -s {test_dir} -p {target.name}"
 
     def _shell_command_looks_like_test_run(self, command: str) -> bool:
-        lowered = command.lower()
-        test_patterns = [
-            r"\bpytest\b",
-            r"\bunittest\b",
-            r"\bpython(?:3|\.exe)?\s+-m\s+unittest\b",
-            r"\bgo\s+test\b",
-            r"\bcargo\s+test\b",
-            r"\bnpm\s+(?:run\s+)?test\b",
-            r"\bpnpm\s+(?:run\s+)?test\b",
-            r"\byarn\s+test\b",
-            r"\bmvn\s+test\b",
-            r"\bgradle\s+test\b",
-        ]
-        return any(re.search(pattern, lowered) for pattern in test_patterns)
+        return controller_shell_command_looks_like_test_run(command)
 
     def _bare_python_test_file_command(self, command: str) -> str | None:
         try:
@@ -4789,55 +4780,12 @@ class OllamaCodeAgent:
         return name, arguments, None
 
     def _normalize_grep_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
-        if len(argv) < 3 or len(argv) > 5 or not argv:
-            return None
-        if argv[0].lower() not in {"grep", "rg", "ripgrep"}:
-            return None
-        index = 1
-        allowed_flags = {"-n", "--line-number", "-r", "-R", "--recursive"}
-        while index < len(argv) and argv[index].startswith("-"):
-            if argv[index] not in allowed_flags:
-                return None
-            index += 1
-        if len(argv) - index != 2:
-            return None
-        query, path = argv[index], argv[index + 1]
-        if query.startswith("-") or path.startswith("-"):
-            return None
-        return {"query": query, "path": path}
+        result = controller_normalize_grep_shell_inspection(argv)
+        return dict(result) if isinstance(result, dict) else None
 
     def _normalize_find_exec_grep_shell_command(self, command: str) -> dict[str, Any] | None:
-        command = re.sub(r"(?i)^find\.(?=\s)", "find .", command.strip(), count=1)
-        if not command.lower().startswith("find "):
-            return None
-        if re.search(r"[|&<>`$\r\n]", command):
-            return None
-        try:
-            argv = shlex.split(command, posix=True)
-        except ValueError:
-            return None
-        if len(argv) not in {10, 12}:
-            return None
-        if argv[0].lower() != "find" or argv[2] != "-name":
-            return None
-        path = argv[1]
-        file_glob = argv[3]
-        index = 4
-        if len(argv) == 12:
-            if argv[index] != "-type" or argv[index + 1].lower() not in {"f", "file"}:
-                return None
-            index += 2
-        if argv[index : index + 2] != ["-exec", "grep"]:
-            return None
-        grep_flag = argv[index + 2]
-        if grep_flag not in {"-l", "-H"}:
-            return None
-        query = argv[index + 3]
-        if argv[index + 4] != "{}" or argv[index + 5] != ";":
-            return None
-        if path.startswith("-") or file_glob.startswith("-") or query.startswith("-"):
-            return None
-        return {"query": query, "path": path, "file_glob": file_glob}
+        result = controller_normalize_find_exec_grep_shell_command(command)
+        return dict(result) if isinstance(result, dict) else None
 
     def _normalize_head_tail_shell_inspection(self, argv: list[str]) -> dict[str, Any] | None:
         if not argv:
@@ -8807,14 +8755,7 @@ class OllamaCodeAgent:
         return controller_final_claims_test_success(message)
 
     def _requested_git_diff_mode(self, text: str) -> str | None:
-        lowered = text.lower()
-        if "git_diff" not in lowered and "git diff" not in lowered:
-            return None
-        if any(phrase in lowered for phrase in ["working tree", "working-tree", "unstaged", "uncached", "cached false", "cached=false"]):
-            return "working-tree"
-        if any(phrase in lowered for phrase in ["staged", "cached true", "cached=true", "index diff"]):
-            return "staged"
-        return None
+        return controller_requested_git_diff_mode(text)
 
     def _request_mentions_workspace_path(self, text: str) -> bool:
         return controller_request_mentions_workspace_path(text)

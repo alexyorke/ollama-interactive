@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Callable
 
 from ollama_code.agent_protocol import ExactFileWriteSpec, SymbolReadSpec, TargetLineReadSpec
@@ -406,6 +407,87 @@ def requested_exact_shell_command(text: str) -> str | None:
         if command:
             return command
     return None
+
+
+def requested_git_diff_mode(text: str) -> str | None:
+    lowered = str(text or "").lower()
+    if "git_diff" not in lowered and "git diff" not in lowered:
+        return None
+    if any(phrase in lowered for phrase in ["working tree", "working-tree", "unstaged", "uncached", "cached false", "cached=false"]):
+        return "working-tree"
+    if any(phrase in lowered for phrase in ["staged", "cached true", "cached=true", "index diff"]):
+        return "staged"
+    return None
+
+
+def shell_command_looks_like_test_run(command: str) -> bool:
+    lowered = str(command or "").lower()
+    test_patterns = [
+        r"\bpytest\b",
+        r"\bunittest\b",
+        r"\bpython(?:3|\.exe)?\s+-m\s+unittest\b",
+        r"\bgo\s+test\b",
+        r"\bcargo\s+test\b",
+        r"\bnpm\s+(?:run\s+)?test\b",
+        r"\bpnpm\s+(?:run\s+)?test\b",
+        r"\byarn\s+test\b",
+        r"\bmvn\s+test\b",
+        r"\bgradle\s+test\b",
+    ]
+    return any(re.search(pattern, lowered) for pattern in test_patterns)
+
+
+def normalize_grep_shell_inspection(argv: list[str]) -> dict[str, object] | None:
+    if len(argv) < 3 or len(argv) > 5 or not argv:
+        return None
+    if argv[0].lower() not in {"grep", "rg", "ripgrep"}:
+        return None
+    index = 1
+    allowed_flags = {"-n", "--line-number", "-r", "-R", "--recursive"}
+    while index < len(argv) and argv[index].startswith("-"):
+        if argv[index] not in allowed_flags:
+            return None
+        index += 1
+    if len(argv) - index != 2:
+        return None
+    query, path = argv[index], argv[index + 1]
+    if query.startswith("-") or path.startswith("-"):
+        return None
+    return {"query": query, "path": path}
+
+
+def normalize_find_exec_grep_shell_command(command: str) -> dict[str, object] | None:
+    command = re.sub(r"(?i)^find\.(?=\s)", "find .", str(command or "").strip(), count=1)
+    if not command.lower().startswith("find "):
+        return None
+    if re.search(r"[|&<>`$\r\n]", command):
+        return None
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(argv) not in {10, 12}:
+        return None
+    if argv[0].lower() != "find" or argv[2] != "-name":
+        return None
+    path = argv[1]
+    file_glob = argv[3]
+    index = 4
+    if len(argv) == 12:
+        if argv[index] != "-type" or argv[index + 1].lower() not in {"f", "file"}:
+            return None
+        index += 2
+    if argv[index : index + 2] != ["-exec", "grep"]:
+        return None
+    grep_flag = argv[index + 2]
+    if grep_flag not in {"-l", "-H"}:
+        return None
+    query = argv[index + 3]
+    if argv[index + 4] != "{}" or argv[index + 5] != ";":
+        return None
+    if path.startswith("-") or file_glob.startswith("-") or query.startswith("-"):
+        return None
+    return {"query": query, "path": path, "file_glob": file_glob}
 
 
 def requested_read_file_path(text: str) -> str | None:

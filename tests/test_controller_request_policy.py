@@ -2,6 +2,8 @@ import unittest
 
 from ollama_code.controller.request_policy import (
     forbidden_tool_names_from_request,
+    normalize_find_exec_grep_shell_command,
+    normalize_grep_shell_inspection,
     path_looks_like_doc_target,
     path_looks_like_test_file,
     request_allows_any_validation,
@@ -43,6 +45,7 @@ from ollama_code.controller.request_policy import (
     requested_exact_shell_command,
     requested_exact_single_line_file_write,
     requested_find_implementation_target_spec,
+    requested_git_diff_mode,
     requested_git_tool_path,
     requested_list_files_path,
     requested_local_search_spec,
@@ -55,6 +58,7 @@ from ollama_code.controller.request_policy import (
     requested_symbol_read,
     requested_target_line_read,
     requested_tool_names_from_request,
+    shell_command_looks_like_test_run,
     tool_names_in_fragment,
     validation_preferences,
 )
@@ -249,6 +253,21 @@ class ControllerRequestPolicyTests(unittest.TestCase):
                 "Run exact e2e commands with run_test, not run_shell: `python -c \"print('e2e OK')\"`. Then summarize."
             )
         )
+
+    def test_shell_and_git_request_policy_is_controller_owned(self) -> None:
+        self.assertEqual(requested_git_diff_mode("Show git diff for the working tree."), "working-tree")
+        self.assertEqual(requested_git_diff_mode("Run git_diff with cached=true."), "staged")
+        self.assertIsNone(requested_git_diff_mode("Show status only."))
+        self.assertTrue(shell_command_looks_like_test_run("python -m unittest discover -s tests"))
+        self.assertTrue(shell_command_looks_like_test_run("npm run test"))
+        self.assertFalse(shell_command_looks_like_test_run("python scripts/tool.py"))
+        self.assertEqual(normalize_grep_shell_inspection(["rg", "-n", "needle", "src"]), {"query": "needle", "path": "src"})
+        self.assertIsNone(normalize_grep_shell_inspection(["rg", "--hidden", "needle", "src"]))
+        self.assertEqual(
+            normalize_find_exec_grep_shell_command("find . -name '*.py' -type f -exec grep -H TODO {} ;"),
+            {"query": "TODO", "path": ".", "file_glob": "*.py"},
+        )
+        self.assertIsNone(normalize_find_exec_grep_shell_command("find . -name '*.py' -exec grep -n TODO {} ;"))
 
 
 if __name__ == "__main__":
