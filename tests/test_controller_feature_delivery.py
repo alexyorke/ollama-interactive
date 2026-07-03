@@ -7,6 +7,7 @@ from ollama_code.controller.feature_delivery import (
     cli_test_additions,
     derive_request_obligations,
     request_is_cli_flag_bundle,
+    request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
@@ -23,6 +24,68 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         self.assertTrue(request_is_cli_flag_bundle("Support --priority in the CLI."))
         self.assertFalse(request_is_cli_flag_bundle("Mention --priority in README only."))
         self.assertFalse(request_is_cli_flag_bundle("Add a stats command without flags."))
+
+    def test_python_test_driven_repair_classifier_accepts_focused_source_request(self) -> None:
+        self.assertTrue(
+            request_looks_like_python_test_driven_repair(
+                request_text="Fix src/calculator.py from the tests and run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                default_test_command_configured=True,
+                requested_mutation_paths={"src/calculator.py"},
+                path_looks_like_test_file=lambda path: path.startswith("tests/") or path.endswith("_test.py"),
+            )
+        )
+
+    def test_python_test_driven_repair_classifier_rejects_broad_docs_or_api_work(self) -> None:
+        is_test_path = lambda path: path.startswith("tests/") or path.endswith("_test.py")
+
+        self.assertFalse(
+            request_looks_like_python_test_driven_repair(
+                request_text="Refactor src/api.py and update README docs.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                default_test_command_configured=True,
+                requested_mutation_paths={"src/api.py", "README.md"},
+                path_looks_like_test_file=is_test_path,
+            )
+        )
+        self.assertFalse(
+            request_looks_like_python_test_driven_repair(
+                request_text="Rename the public API in src/api.py and all callsites.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+                default_test_command_configured=True,
+                requested_mutation_paths={"src/api.py"},
+                path_looks_like_test_file=is_test_path,
+            )
+        )
+
+    def test_python_test_driven_repair_classifier_rejects_unsafe_runtime_context(self) -> None:
+        base = {
+            "request_text": "Implement the Python exercise from the tests.",
+            "session_memory_request": False,
+            "mutation_required": True,
+            "test_run_required": True,
+            "required_tool_names": set(),
+            "forbidden_tool_names": set(),
+            "default_test_command_configured": True,
+            "requested_mutation_paths": set(),
+            "path_looks_like_test_file": lambda path: path.startswith("tests/"),
+        }
+
+        self.assertFalse(request_looks_like_python_test_driven_repair(**{**base, "default_test_command_configured": False}))
+        self.assertFalse(request_looks_like_python_test_driven_repair(**{**base, "required_tool_names": {"read_file"}}))
+        self.assertFalse(request_looks_like_python_test_driven_repair(**{**base, "session_memory_request": True}))
 
     def test_cli_feature_capabilities_detect_due_before_priority_and_limit(self) -> None:
         source = "parser.add_parser('list')\nlist_parser.add_argument('--priority')\nlist_parser.add_argument('--due-before')\n"

@@ -38,6 +38,49 @@ def request_is_cli_flag_bundle(request_text: str) -> bool:
     return _request_is_cli_flag_bundle(request_text)
 
 
+def request_looks_like_python_test_driven_repair(
+    *,
+    request_text: str,
+    session_memory_request: bool,
+    mutation_required: bool,
+    test_run_required: bool,
+    required_tool_names: set[str],
+    forbidden_tool_names: set[str],
+    default_test_command_configured: bool,
+    requested_mutation_paths: set[str],
+    path_looks_like_test_file: Callable[[str], bool],
+) -> bool:
+    if session_memory_request or not mutation_required or not test_run_required:
+        return False
+    if required_tool_names or forbidden_tool_names:
+        return False
+    if not default_test_command_configured:
+        return False
+    lowered = request_text.lower()
+    source_paths = [
+        path for path in requested_mutation_paths if path.endswith(".py") and not path_looks_like_test_file(path)
+    ]
+    doc_or_aux_paths = [
+        path
+        for path in requested_mutation_paths
+        if path_looks_like_test_file(path) or path.startswith("docs/") or path.endswith((".md", ".rst", ".txt"))
+    ]
+    if len(source_paths) > 1 or doc_or_aux_paths:
+        return False
+    if re.search(r"\b(?:refactor|rename|callsites?|docs?|public api|api)\b", lowered) and (
+        len(source_paths) == 1 or "docs" in lowered or "callsite" in lowered
+    ):
+        return False
+    if source_paths:
+        return True
+    return bool(
+        re.search(
+            r"\b(?:python exercise|from the tests?|read source and tests|read tests and source|implement .*tests?|fix .*tests?)\b",
+            lowered,
+        )
+    )
+
+
 def merge_request_obligations(obligations: list[dict[str, Any]]) -> list[dict[str, Any]]:
     merged: list[dict[str, Any]] = []
     seen: set[str] = set()

@@ -7,6 +7,7 @@ from .feature_delivery import (
     derive_request_obligations,
     merge_request_obligations,
     request_is_cli_flag_bundle,
+    request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
     typed_cli_flag_protocol_enabled,
 )
@@ -261,6 +262,7 @@ __all__ = [
     "failed_test_still_needs_repair",
     "merge_request_obligations",
     "request_is_cli_flag_bundle",
+    "request_looks_like_python_test_driven_repair",
     "cli_patch_bundle_instruction",
     "repair_decision_for_tool",
     "repair_spec_broad_repair_hint",

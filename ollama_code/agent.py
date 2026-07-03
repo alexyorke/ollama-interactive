@@ -149,6 +149,7 @@ from ollama_code.controller import (
     request_is_broad_or_ambiguous as controller_request_is_broad_or_ambiguous,
     request_is_continue_prompt as controller_request_is_continue_prompt,
     request_is_cli_flag_bundle as feature_request_is_cli_flag_bundle,
+    request_looks_like_python_test_driven_repair as feature_request_looks_like_python_test_driven_repair,
     request_looks_like_issue_report as controller_request_looks_like_issue_report,
     request_mentions_repeated_read as controller_request_mentions_repeated_read,
     request_mentions_workspace_path as controller_request_mentions_workspace_path,
@@ -8625,33 +8626,16 @@ class OllamaCodeAgent:
         required_tool_names: set[str],
         forbidden_tool_names: set[str],
     ) -> bool:
-        if session_memory_request or not mutation_required or not test_run_required:
-            return False
-        if required_tool_names or forbidden_tool_names:
-            return False
-        if not self.tools.default_test_command:
-            return False
-        lowered = request_text.lower()
-        requested_paths = self._requested_mutation_paths(request_text)
-        source_paths = [path for path in requested_paths if path.endswith(".py") and not self._path_looks_like_test_file(path)]
-        doc_or_aux_paths = [
-            path
-            for path in requested_paths
-            if self._path_looks_like_test_file(path) or path.startswith("docs/") or path.endswith((".md", ".rst", ".txt"))
-        ]
-        if len(source_paths) > 1 or doc_or_aux_paths:
-            return False
-        if re.search(r"\b(?:refactor|rename|callsites?|docs?|public api|api)\b", lowered) and (
-            len(source_paths) == 1 or "docs" in lowered or "callsite" in lowered
-        ):
-            return False
-        if source_paths:
-            return True
-        return bool(
-            re.search(
-                r"\b(?:python exercise|from the tests?|read source and tests|read tests and source|implement .*tests?|fix .*tests?)\b",
-                lowered,
-            )
+        return feature_request_looks_like_python_test_driven_repair(
+            request_text=request_text,
+            session_memory_request=session_memory_request,
+            mutation_required=mutation_required,
+            test_run_required=test_run_required,
+            required_tool_names=required_tool_names,
+            forbidden_tool_names=forbidden_tool_names,
+            default_test_command_configured=bool(self.tools.default_test_command),
+            requested_mutation_paths=self._requested_mutation_paths(request_text),
+            path_looks_like_test_file=self._path_looks_like_test_file,
         )
 
     def _focused_python_repair_paths(self, request_text: str) -> tuple[str, str] | None:

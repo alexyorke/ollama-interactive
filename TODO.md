@@ -39,6 +39,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Symbol return-update request parsing, expression cleanup, and source-to-operation planning now live in `ollama_code.controller.operation_policy`; `agent.py` only loads source and passes tool requirements.
 - Optional-parameter request parsing, signature shaping, and docs/source operation planning now live in `ollama_code.controller.operation_policy`; `agent.py` only loads source and docs.
 - Test-grounded symbol-return parsing and exact successful-tool-call detection now live in `ollama_code.controller.operation_policy`; `agent.py` supplies only the test-path predicate.
+- Focused Python test-driven repair request classification now lives in `ollama_code.controller.feature_delivery`; `agent.py` supplies only runtime path/default-test context.
 - Final-claim detection and final-verification requirement policy now live in `ollama_code.controller.final_policy`; `agent.py` supplies runtime context.
 - Typed repair-protocol state now lives under `ollama_code.controller`, with the old top-level import kept as a compatibility shim.
 - Failed-edit repair-spec policy decisions for strategy selection, proof items, broad repair hints, and retry mutation allowance now live in controller modules.
