@@ -102,6 +102,7 @@ from ollama_code.controller import (
     final_claims_test_success as controller_final_claims_test_success,
     final_claims_timeout_success as controller_final_claims_timeout_success,
     final_requires_verification as controller_final_requires_verification,
+    focused_python_repair_test_score as feature_focused_python_repair_test_score,
     forbidden_tool_names_from_request as controller_forbidden_tool_names_from_request,
     mechanical_obligation_repair_failed_for as feature_mechanical_obligation_repair_failed_for,
     merge_request_obligations,
@@ -192,6 +193,7 @@ from ollama_code.controller import (
     shell_looks_like_file_mutation as controller_shell_looks_like_file_mutation,
     shell_command_looks_like_test_run as controller_shell_command_looks_like_test_run,
     select_cli_surface_repair_candidate as feature_select_cli_surface_repair_candidate,
+    select_focused_python_repair_test as feature_select_focused_python_repair_test,
     select_preemptive_repair_source as feature_select_preemptive_repair_source,
     select_preemptive_repair_test as feature_select_preemptive_repair_test,
     snippet_symbol_argument_looks_like_text as controller_snippet_symbol_argument_looks_like_text,
@@ -8678,23 +8680,21 @@ class OllamaCodeAgent:
             rel_test = self.tools.relative_label(path)
             if path.suffix.lower() != ".py" or not self._path_looks_like_test_file(rel_test):
                 continue
-            score = 0
             name = path.name.lower()
-            if source_stem in name:
-                score += 20
             try:
                 match = self.tools.find_implementation_target(test_path=rel_test, limit=8)
             except Exception:
                 match = {}
             targets = match.get("targets") if isinstance(match.get("targets"), list) else []
-            if any(isinstance(item, dict) and str(item.get("path") or "").strip() == rel_source for item in targets):
-                score += 100
+            score = feature_focused_python_repair_test_score(
+                source_stem=source_stem,
+                test_name=name,
+                rel_source=rel_source,
+                implementation_targets=targets,
+            )
             if score:
                 candidates.append((score, rel_test))
-        if candidates:
-            candidates.sort(key=lambda item: (-item[0], item[1]))
-            return candidates[0][1]
-        return None
+        return feature_select_focused_python_repair_test(candidates)
 
     def _repair_strategy_messages(
         self,

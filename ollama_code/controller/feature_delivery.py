@@ -191,6 +191,28 @@ def repair_state_spec_guided_paths(
     return None
 
 
+def focused_python_repair_test_score(
+    *,
+    source_stem: str,
+    test_name: str,
+    rel_source: str,
+    implementation_targets: list[dict[str, Any]],
+) -> int:
+    score = 0
+    if source_stem.lower() in test_name.lower():
+        score += 20
+    if any(isinstance(item, dict) and str(item.get("path") or "").strip() == rel_source for item in implementation_targets):
+        score += 100
+    return score
+
+
+def select_focused_python_repair_test(candidates: list[tuple[int, str]]) -> str | None:
+    if not candidates:
+        return None
+    ordered = sorted(candidates, key=lambda item: (-item[0], item[1]))
+    return ordered[0][1]
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,

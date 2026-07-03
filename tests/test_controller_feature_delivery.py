@@ -14,6 +14,7 @@ from ollama_code.controller.feature_delivery import (
     cli_test_update_plan,
     derive_request_obligations,
     effective_repair_test_command,
+    focused_python_repair_test_score,
     mechanical_obligation_repair_failed_for,
     normalized_test_or_source_stem,
     preemptive_repair_source_score,
@@ -24,6 +25,7 @@ from ollama_code.controller.feature_delivery import (
     request_obligation_proof_status,
     repair_state_spec_guided_paths,
     select_cli_surface_repair_candidate,
+    select_focused_python_repair_test,
     select_preemptive_repair_source,
     select_preemptive_repair_test,
     spec_guided_repair_has_actionable_spec,
@@ -240,6 +242,37 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
                 path_looks_like_test_file=is_test_path,
             )
         )
+
+    def test_focused_python_repair_test_score_and_selection(self) -> None:
+        self.assertEqual(
+            focused_python_repair_test_score(
+                source_stem="calculator",
+                test_name="test_calculator.py",
+                rel_source="src/calculator.py",
+                implementation_targets=[{"path": "src/calculator.py"}],
+            ),
+            120,
+        )
+        self.assertEqual(
+            focused_python_repair_test_score(
+                source_stem="calculator",
+                test_name="test_math.py",
+                rel_source="src/calculator.py",
+                implementation_targets=[],
+            ),
+            0,
+        )
+        self.assertEqual(
+            select_focused_python_repair_test(
+                [
+                    (20, "tests/test_z.py"),
+                    (120, "tests/test_b.py"),
+                    (120, "tests/test_a.py"),
+                ]
+            ),
+            "tests/test_a.py",
+        )
+        self.assertIsNone(select_focused_python_repair_test([]))
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:
         events = [
