@@ -22,6 +22,7 @@ from ollama_code.controller.feature_delivery import (
     request_likely_import_repair,
     request_looks_like_python_test_driven_repair,
     request_obligation_proof_status,
+    repair_state_spec_guided_paths,
     select_cli_surface_repair_candidate,
     select_preemptive_repair_source,
     select_preemptive_repair_test,
@@ -212,6 +213,32 @@ class ControllerFeatureDeliveryTests(unittest.TestCase):
         self.assertEqual(
             effective_repair_test_command(default_test_command="python -m unittest"),
             "python -m unittest",
+        )
+
+    def test_repair_state_spec_guided_paths_selects_first_valid_test_candidate(self) -> None:
+        is_test_path = lambda path: path.startswith("tests/") or path.endswith("_test.py")
+
+        self.assertEqual(
+            repair_state_spec_guided_paths(
+                source_path="./src/app.py",
+                test_candidates=["README.md", "tests\\test_app.py", "tests/test_later.py"],
+                path_looks_like_test_file=is_test_path,
+            ),
+            ("src/app.py", "tests/test_app.py"),
+        )
+        self.assertIsNone(
+            repair_state_spec_guided_paths(
+                source_path="tests/test_app.py",
+                test_candidates=["tests/test_app.py"],
+                path_looks_like_test_file=is_test_path,
+            )
+        )
+        self.assertIsNone(
+            repair_state_spec_guided_paths(
+                source_path="src/app.py",
+                test_candidates=["docs/test_app.md"],
+                path_looks_like_test_file=is_test_path,
+            )
         )
 
     def test_mechanical_obligation_repair_failed_for_matches_failed_event(self) -> None:

@@ -175,6 +175,22 @@ def effective_repair_test_command(
     return str(default_test_command or "").strip()
 
 
+def repair_state_spec_guided_paths(
+    *,
+    source_path: str,
+    test_candidates: list[str],
+    path_looks_like_test_file: Callable[[str], bool],
+) -> tuple[str, str] | None:
+    normalized_source = _normalize_repo_path(source_path)
+    if not normalized_source or not normalized_source.endswith(".py") or path_looks_like_test_file(normalized_source):
+        return None
+    for test_path in test_candidates:
+        normalized_test = _normalize_repo_path(test_path)
+        if normalized_test.endswith(".py") and path_looks_like_test_file(normalized_test):
+            return normalized_source, normalized_test
+    return None
+
+
 def mechanical_obligation_repair_failed_for(
     *,
     source_path: str,

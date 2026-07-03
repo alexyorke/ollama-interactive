@@ -168,6 +168,7 @@ from ollama_code.controller import (
     request_requires_mutation as controller_request_requires_mutation,
     request_requires_test_run as controller_request_requires_test_run,
     request_requires_tools as controller_request_requires_tools,
+    repair_state_spec_guided_paths as feature_repair_state_spec_guided_paths,
     request_targets_session_memory as controller_request_targets_session_memory,
     requested_tool_names_from_request as controller_requested_tool_names_from_request,
     requested_code_outline_path as controller_requested_code_outline_path,
@@ -9378,8 +9379,6 @@ class OllamaCodeAgent:
         successful_tool_results: list[dict[str, Any]],
     ) -> tuple[str, str] | None:
         source_path = str(state.get("path") or "").strip().replace("\\", "/").lstrip("./")
-        if not source_path or not source_path.endswith(".py") or self._path_looks_like_test_file(source_path):
-            return None
         test_candidates = [
             str(path).strip().replace("\\", "/").lstrip("./")
             for path in self._repair_spec_behavior_paths(state)
@@ -9387,10 +9386,11 @@ class OllamaCodeAgent:
         ]
         test_candidates.extend(reversed(self._recent_test_paths(successful_tool_results)))
         test_candidates.extend(self._related_tests_for_source(source_path))
-        for test_path in test_candidates:
-            if test_path.endswith(".py") and self._path_looks_like_test_file(test_path):
-                return source_path, test_path
-        return None
+        return feature_repair_state_spec_guided_paths(
+            source_path=source_path,
+            test_candidates=test_candidates,
+            path_looks_like_test_file=self._path_looks_like_test_file,
+        )
 
     def _repair_shell_command(self, args: list[str]) -> str:
         return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
