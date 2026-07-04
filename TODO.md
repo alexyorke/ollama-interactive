@@ -86,6 +86,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Prompt and primary-tool policy coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Prompt-context truncation and prompt-palette coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Clarification and question-planner coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
+- System-prompt, feature-profile, primary-think, and focused context-pack preload policy coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Subagent delegation/configuration/model-normalization coverage now lives in `tests/test_agent_subagent.py` instead of the omnibus `tests/test_agent.py`.
 - Basic final-verification lifecycle coverage now lives in `tests/test_agent_verification.py` instead of the omnibus `tests/test_agent.py`.
 - Assumption-audit retry, fail-closed, and grounded-skip coverage now lives in `tests/test_agent_assumption_audit.py` instead of the omnibus `tests/test_agent.py`.

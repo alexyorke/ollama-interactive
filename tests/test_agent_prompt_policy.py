@@ -81,6 +81,14 @@ class AgentPromptPolicyTests(AgentTestBase):
         self.assertIn("keep code, paths, commands, errors, JSON exact", prompt)
         self.assertIn("syntactically complete", prompt)
 
+    def test_system_prompt_advertises_add_function_edit_intent(self) -> None:
+        root, _client, _tools, agent = self._workspace_agent(debate_enabled=False)
+
+        prompt = agent._system_prompt_for_tools({"edit_intent"})
+
+        self.assertIn("add_import|add_function", prompt)
+        self.assertIn("edit_intent(path,intent=", prompt)
+
     def test_primary_tools_include_systems_lens_for_complex_tasks(self) -> None:
         selected = self._primary_tools_for_request(
             "Profile the slow edit pipeline and debug the controller design.",
@@ -150,6 +158,113 @@ class AgentPromptPolicyTests(AgentTestBase):
 
         self.assertIn("todo_read", selected)
         self.assertIn("todo_write", selected)
+
+    def test_agent_uses_schema_and_num_predict_feature_profile(self) -> None:
+        client = FakeClient(['{"type":"final","message":"ok"}'])
+        _root, _client, _tools, agent = self._workspace_agent(
+            client, debate_enabled=False, tool_kwargs={"test_command": "python -m unittest discover -s tests -v"}
+        )
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "schema,num-predict-caps"}):
+            result = agent.handle_user("say ok")
+
+        self.assertEqual(result.message, "ok")
+        call = client.calls[0]
+        self.assertIsInstance(call["response_format"], dict)
+        self.assertEqual(call["options"], {"num_predict": 256})
+
+    def test_primary_think_defaults_off_for_broad_coding_prompt(self) -> None:
+        _root, _client, _tools, agent = self._workspace_agent(
+            debate_enabled=False, tool_kwargs={"test_command": "python -m unittest discover -s tests -v"}
+        )
+
+        think = agent._primary_think_override(
+            request_text="Implement this Python exercise, read tests and source, edit implementation files, and run tests.",
+            requires_tools=False,
+            mutation_required=True,
+            test_run_required=True,
+            round_number=1,
+            tool_used_this_turn=False,
+        )
+
+        self.assertFalse(think)
+
+    def test_primary_think_keeps_default_for_simple_non_tool_prompt(self) -> None:
+        _root, _client, _tools, agent = self._workspace_agent(debate_enabled=False)
+
+        think = agent._primary_think_override(
+            request_text="Say ok.",
+            requires_tools=False,
+            mutation_required=False,
+            test_run_required=False,
+            round_number=1,
+            tool_used_this_turn=False,
+        )
+
+        self.assertIsNone(think)
+
+    def test_context_pack_preload_requires_path_for_focused_edit_prompt(self) -> None:
+        root, _client, _tools, agent = self._workspace_agent(
+            debate_enabled=False, tool_kwargs={"test_command": "python -m unittest discover -s tests -v"}
+        )
+        (root / "src").mkdir(exist_ok=True)
+        (root / "docs").mkdir(exist_ok=True)
+        (root / "src" / "client.py").write_text("def fetch_data(url: str) -> dict:\n    return {}\n", encoding="utf-8")
+        (root / "docs" / "client.md").write_text("Call `fetch_data(url)` to fetch data.\n", encoding="utf-8")
+
+        with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "context-pack"}):
+            should_preload = agent._should_preload_context_pack(
+                request_text="Fix src/app.py and run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip = agent._should_preload_context_pack(
+                request_text="Implement this Python exercise, read tests and source, edit implementation files, and run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip_project_rename = agent._should_preload_context_pack(
+                request_text=(
+                    "Refactor the pricing API from total(prices) to cart_total(prices). "
+                    "Update src/pricing.py, tests, and docs/pricing.md. Run tests."
+                ),
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip_optional_parameter_docs = agent._should_preload_context_pack(
+                request_text=(
+                    "Add an optional timeout: int = None parameter to fetch_data in src/client.py, update docs/client.md, "
+                    "and run tests."
+                ),
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+            should_skip_import_repair = agent._should_preload_context_pack(
+                request_text="Fix the import bug in src/app.py because it uses from .helpers import slugify when run as a script, then run tests.",
+                session_memory_request=False,
+                mutation_required=True,
+                test_run_required=True,
+                required_tool_names=set(),
+                forbidden_tool_names=set(),
+            )
+
+        self.assertTrue(should_preload)
+        self.assertFalse(should_skip)
+        self.assertFalse(should_skip_project_rename)
+        self.assertFalse(should_skip_optional_parameter_docs)
+        self.assertFalse(should_skip_import_repair)
 
     def test_primary_context_truncates_old_messages_before_recent_limit(self) -> None:
         root = self._workspace_scratch()
