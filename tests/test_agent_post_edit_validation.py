@@ -20,6 +20,141 @@ from tests.agent_test_support import (
 
 
 class AgentPostEditValidationTests(AgentTestBase):
+    def _cwd_agent(self, client: FakeClient | None = None, **kwargs: object) -> OllamaCodeAgent:
+        resolved_client = client if client is not None else FakeClient([])
+        return OllamaCodeAgent(
+            client=resolved_client,
+            tools=ToolExecutor(self._workspace_scratch(), approval_mode="auto"),
+            model="fake-model",
+            **kwargs,
+        )
+
+    def test_agent_requires_explicitly_named_tool_before_final_answer(self) -> None:
+        root = self._workspace_scratch()
+        (root / "note.txt").write_text("hello\n", encoding="utf-8")
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"list_files","arguments":{}}',
+                '{"type":"final","message":"done"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                '{"type":"final","message":"done"}',
+            ]
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        result = agent.handle_user("Use read_file on note.txt and then tell me when you are done.")
+
+        self.assertEqual(result.message, "done")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual([event["name"] for event in tool_calls], ["list_files", "read_file"])
+
+    def test_agent_allows_final_answer_after_requested_tool_failure_details(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"../outside.txt"}}',
+                '{"type":"final","message":"Path escapes the workspace: ../outside.txt"}',
+            ]
+        )
+        agent = self._cwd_agent(client, debate_enabled=False)
+
+        result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
+
+        self.assertIn("escapes the workspace", result.message)
+        self.assertEqual(len(client.calls), 0)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_short_circuits_exact_tool_error_with_debate_enabled(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"../outside.txt"}}',
+            ]
+        )
+        agent = self._cwd_agent(client)
+
+        result = agent.handle_user("Use read_file on ../outside.txt and tell me the exact tool error.")
+
+        self.assertIn("escapes the workspace", result.message)
+        self.assertEqual(len(client.calls), 0)
+        assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(assumption_audits), 0)
+
+    def test_agent_retries_after_unverified_file_mutation_claim(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"note.txt has been updated."}',
+                    '{"type":"final","message":"note.txt line 1 is hello"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use read_file on note.txt and tell me what line 1 says.")
+
+        self.assertEqual(result.message, "note.txt line 1 is hello")
+        self.assertEqual(len(client.calls), 3)
+
+    def test_agent_allows_file_mutation_claim_after_write_tool(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"note.txt","content":"changed\\n"}}',
+                    '{"type":"final","message":"note.txt has been updated."}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Create note.txt with changed on line 1.")
+            self.assertEqual((root / "note.txt").read_text(encoding="utf-8"), "changed\n")
+
+        self.assertEqual(result.message, "note.txt has been updated.")
+
+    def test_agent_rejects_final_before_required_workspace_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"final","message":"implement it by editing app.py"}',
+                    '{"type":"tool","name":"write_file","arguments":{"path":"app.py","content":"def f():\\n    return 1\\n"}}',
+                    '{"type":"final","message":"app.py updated"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Implement this by editing app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertEqual(final_text, "def f():\n    return 1\n")
+
+    def test_agent_requires_successful_run_test_after_requested_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = subprocess.list2cmdline([sys.executable, "-c", "print('ok')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def f():\n    return 1\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": command}}),
+                    json.dumps({"type": "final", "message": "app.py updated and tests passed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit app.py, run tests, and summarize.")
+
+        self.assertEqual(result.message, "app.py updated and tests passed")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
     def test_trajectory_validation_selects_targeted_tests_after_edit(self) -> None:
         root = self._workspace_scratch()
         (root / "src").mkdir()
