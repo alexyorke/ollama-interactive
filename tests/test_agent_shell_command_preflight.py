@@ -11,6 +11,144 @@ from tests.agent_test_support import AgentTestBase, CountingToolExecutor, FakeCl
 
 
 class AgentShellCommandPreflightTests(AgentTestBase):
+    def test_agent_audits_shell_tool_under_debate(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"python -c \\"print(123)\\""}}',
+                '{"type":"final","message":"done"}',
+                '{"verdict":"accept"}',
+            ]
+        )
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user('Use run_shell to execute python -c "print(123)" and then say done.')
+
+        self.assertEqual(result.message, "done")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["tool"], "run_shell")
+
+    def test_agent_recovers_exact_shell_command_after_invalid_json(self) -> None:
+        client = FakeClient(["not json"])
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
+
+        result = agent.handle_user(
+            f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
+        )
+
+        self.assertIn("Exit code: 5", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], exact_command)
+
+    def test_agent_recovers_exact_shell_command_skips_assumption_audit_under_debate(self) -> None:
+        client = FakeClient(["not json"])
+        root = self._workspace_scratch()
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+        exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
+
+        result = agent.handle_user(
+            f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
+        )
+
+        self.assertIn("Exit code: 5", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], exact_command)
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(audits, [])
+
+    def test_agent_salvages_malformed_assumption_audit_payload(self) -> None:
+        root = self._workspace_scratch()
+        exact_command = subprocess.list2cmdline([sys.executable, "-c", "print(42)"])
+        client = FakeClient(
+            [
+                json.dumps({"type": "tool", "name": "run_shell", "arguments": {"command": exact_command}}),
+                '{"verdict":"accept","reason":"Command directly answers the request.","assumptions":["Python is available."],"validation_steps":["Run the exact command."],"required_tools:["run_shell"],"forbidden_tools":[]}',
+                json.dumps({"type": "final", "message": "done"}),
+            ],
+            script_assumption_audit=True,
+        )
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user(f"Use run_shell to execute exactly: {exact_command}. Then say done.")
+
+        self.assertEqual(result.message, "done")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["verdict"], "accept")
+        self.assertIn("Run the exact command.", audits[0]["validation_steps"])
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_shell")
+
+    def test_agent_normalizes_vague_run_test_to_configured_command(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"tool","name":"run_test","arguments":{"command":"test"}}'])
+        tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_sample OK\')"')
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use run_test and tell me whether tests passed and which test module ran.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        self.assertIn("test_sample", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_sample OK\')"')
+
+    def test_agent_normalizes_test_tool_alias_to_configured_run_test(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"tool","name":"test","arguments":{}}'])
+        tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_alias OK\')"')
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Run tests and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_test")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_alias OK\')"')
+
+    def test_agent_normalizes_shell_test_to_configured_run_test(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"tool","name":"run_shell","arguments":{"command":"python -m unittest example_test.py"}}'])
+        tools = ToolExecutor(root, approval_mode="auto", test_command='python -c "print(\'test_polyglot OK\')"')
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Validate the project and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_test")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], 'python -c "print(\'test_polyglot OK\')"')
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "run_test")
+
+    def test_agent_normalizes_shell_test_to_original_run_test_without_configured_command(self) -> None:
+        root = self._workspace_scratch()
+        (root / "tests").mkdir()
+        (root / "tests" / "test_sample.py").write_text(
+            "import unittest\n\nclass SampleTests(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8",
+        )
+        client = FakeClient(['{"type":"tool","name":"run_shell","arguments":{"command":"python -m unittest discover -s tests -v"}}'])
+        tools = ToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Validate the project and tell me whether tests passed.")
+
+        self.assertIn("Tests passed: yes", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["name"], "run_test")
+        self.assertEqual(tool_calls[0]["arguments"]["command"], "python -m unittest discover -s tests -v")
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "run_test")
+        self.assertIn("original command", normalizations[0]["reason"])
+
     def test_agent_normalizes_bare_python_test_file_shell_command_to_run_test(self) -> None:
         root = self._workspace_scratch()
         (root / "tests").mkdir()
