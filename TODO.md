@@ -109,6 +109,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Failed-edit syntax, stub-repair, no-edit loop, and bulk-stub guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Initial spec-guided repair integration coverage now lives in `tests/test_agent_spec_guided_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Structured and preemptive spec-guided repair coverage now lives in `tests/test_agent_spec_guided_repair.py` instead of the omnibus `tests/test_agent.py`.
+- Spec-guided verifier retry, fail-closed, timeout fallback, and mechanical-candidate coverage now lives in `tests/test_agent_spec_guided_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Context-pack preload coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner grounding refinement coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
