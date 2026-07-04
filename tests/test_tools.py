@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
 from ollama_code.tools.validation import (
+    discover_validators_result,
     lint_typecheck_file_analysis,
     lint_typecheck_cache_hit_result,
     lint_typecheck_final_result,
@@ -5273,6 +5274,37 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(available.call_count, 2)
         self.assertEqual(len(result["validators"]), 2)
         self.assertTrue(all(item["available"] is True for item in result["validators"]))
+
+    def test_discover_validators_result_checks_availability_only_for_selected_limit(self) -> None:
+        calls: list[str] = []
+        result = discover_validators_result(
+            validators=[
+                {"kind": "test", "lang": "go", "command": "go test ./...", "reason": "Go files found."},
+                {"kind": "lint", "lang": "go", "command": "golangci-lint run", "reason": "Go files found."},
+                {"kind": "test", "lang": "rust", "command": "cargo test", "reason": "Rust files found."},
+            ],
+            limit=2,
+            path_label=".",
+            available_command=lambda command: calls.append(command) or command.startswith("go "),
+        )
+
+        self.assertEqual(calls, ["go test ./...", "golangci-lint run"])
+        self.assertEqual(result["count"], 2)
+        self.assertTrue(result["validators"][0]["available"])
+        self.assertFalse(result["validators"][1]["available"])
+        self.assertIn("go test ./... available=True", result["output"])
+
+    def test_discover_validators_result_formats_empty_result(self) -> None:
+        result = discover_validators_result(
+            validators=[],
+            limit=12,
+            path_label=".",
+            available_command=lambda _command: self.fail("no commands should be checked"),
+        )
+
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(result["validators"], [])
+        self.assertEqual(result["output"], "(no validators discovered)")
 
     def test_python_tool_command_resolution_is_cached_per_executor(self) -> None:
         with self._temp_tools() as (_root, tools):

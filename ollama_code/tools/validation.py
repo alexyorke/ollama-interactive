@@ -250,6 +250,28 @@ def select_tests_language_validator_result(
     }
 
 
+def discover_validators_result(
+    *,
+    validators: list[dict[str, Any]],
+    limit: int,
+    path_label: str,
+    available_command: Callable[[str], bool],
+) -> dict[str, Any]:
+    selected_limit = max(1, int(limit))
+    selected = [dict(item) for item in validators[:selected_limit]]
+    for item in selected:
+        item["available"] = available_command(str(item.get("command") or ""))
+    lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
+    return {
+        "ok": True,
+        "tool": "discover_validators",
+        "path": path_label,
+        "count": len(selected),
+        "validators": selected,
+        "output": "\n".join(lines) if lines else "(no validators discovered)",
+    }
+
+
 def collapse_validation_targets(labels: Iterable[str], *, limit: int = 100) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()

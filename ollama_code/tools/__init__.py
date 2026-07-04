@@ -150,6 +150,7 @@ from ollama_code.tools.synthesis import (
 )
 from ollama_code.tools.validation import (
     collapse_validation_targets,
+    discover_validators_result,
     ini_has_section,
     lint_typecheck_cache_key,
     lint_typecheck_cache_hit_result,
@@ -10799,18 +10800,12 @@ import string
             return command_to_text(tuple(command)) if command else command_to_text((executable, *args))
 
         def finalize() -> dict[str, Any]:
-            selected = [dict(item) for item in validators[:limit_value]]
-            for item in selected:
-                item["available"] = self._available_command(str(item.get("command") or ""), cwd=root)
-            lines = [f"{item['kind']} {item['lang']}: {item['command']} available={item['available']} reason={item['reason']}" for item in selected]
-            return {
-                "ok": True,
-                "tool": "discover_validators",
-                "path": self.relative_label(root),
-                "count": len(selected),
-                "validators": selected,
-                "output": "\n".join(lines) if lines else "(no validators discovered)",
-            }
+            return discover_validators_result(
+                validators=validators,
+                limit=limit_value,
+                path_label=self.relative_label(root),
+                available_command=lambda command: self._available_command(command, cwd=root),
+            )
 
         def reached_limit() -> bool:
             return len(validators) >= limit_value
