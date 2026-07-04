@@ -118,6 +118,44 @@ def test_source_match_score(
     return score, reasons
 
 
+def iter_python_test_files(
+    *,
+    workspace_root: Path,
+    iter_code_files: Callable[[Path], Iterable[Path]],
+    relative_label: Callable[[Path], str],
+) -> list[Path]:
+    candidates: list[Path] = []
+    for file_path in iter_code_files(workspace_root):
+        if file_path.suffix.lower() != ".py":
+            continue
+        rel = relative_label(file_path).replace("\\", "/")
+        if path_label_looks_like_test(rel, file_path.name):
+            candidates.append(file_path)
+    return candidates
+
+
+def test_matches_source(
+    *,
+    test_path: Path,
+    source_path: Path,
+    symbols: set[str],
+    relative_label: Callable[[Path], str],
+    python_import_targets: Callable[[Path], Iterable[dict[str, Any]]],
+) -> tuple[int, list[str]]:
+    text = test_path.read_text(encoding="utf-8", errors="replace")
+    imported_paths = {str(item.get("path", "")) for item in python_import_targets(test_path)}
+    rel_source = relative_label(source_path)
+    return test_source_match_score(
+        test_text=text,
+        test_stem=test_path.stem,
+        imported_paths=imported_paths,
+        rel_source=rel_source,
+        source_modules=source_module_labels(rel_source),
+        source_stem=source_path.stem,
+        symbols=symbols,
+    )
+
+
 def run_test_needs_command_recovery(
     result: dict[str, Any],
     *,

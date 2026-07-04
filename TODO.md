@@ -85,6 +85,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Failure-delta compaction coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Core loop, final normalization, LLM usage telemetry, and JSON response repair coverage now lives in `tests/test_agent_core_loop.py` instead of the omnibus `tests/test_agent.py`.
 - Prompt and primary-tool policy coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
+- ToolExecutor test-selection matching helpers now live in `ollama_code.tools.validation`; keep moving validator/synthesis helper seams out of `ollama_code.tools.__init__` before larger capability-family splits.
 - Prompt-context truncation and prompt-palette coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Primary-context compaction and session-memory context retention coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Clarification and question-planner coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.

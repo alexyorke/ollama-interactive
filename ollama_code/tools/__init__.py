@@ -159,17 +159,16 @@ from ollama_code.tools.validation import (
     lint_typecheck_scan_paths,
     lint_typecheck_target_plan,
     lint_typecheck_timeout_result,
+    iter_python_test_files,
     python_typechecker_configured,
     python_typechecker_targets,
     python_validation_targets,
     path_label_looks_like_test,
-    python_module_label,
     preferred_test_validator_command,
     requested_validator_file_hints,
     run_test_needs_command_recovery,
-    source_module_labels,
     targeted_unittest_command,
-    test_source_match_score,
+    test_matches_source,
     toml_tool_section,
 )
 
@@ -11186,43 +11185,8 @@ import string
             self._lint_typecheck_cache[cache_key] = deepcopy(result)
         return result
 
-    def _test_module_for_path(self, test_path: Path) -> str:
-        return python_module_label(self.relative_label(test_path))
-
-    def _source_modules_for_path(self, source_path: Path) -> set[str]:
-        return source_module_labels(self.relative_label(source_path))
-
-    def _iter_python_test_files(self) -> list[Path]:
-        candidates: list[Path] = []
-        for file_path in self._iter_code_files(self.workspace_root, limit=50000):
-            if file_path.suffix.lower() != ".py":
-                continue
-            rel = self.relative_label(file_path).replace("\\", "/")
-            name = file_path.name.lower()
-            if name.startswith("test_") or name.endswith("_test.py") or "/tests/" in rel:
-                candidates.append(file_path)
-        return candidates
-
     def _path_looks_like_test(self, path: Path) -> bool:
         return path_label_looks_like_test(self.relative_label(path), path.name)
-
-    def _test_matches_source(self, test_path: Path, source_path: Path, symbols: set[str]) -> tuple[int, list[str]]:
-        text = test_path.read_text(encoding="utf-8", errors="replace")
-        imported_paths = {str(item.get("path", "")) for item in self._python_import_targets(test_path)}
-        rel_source = self.relative_label(source_path)
-        return test_source_match_score(
-            test_text=text,
-            test_stem=test_path.stem,
-            imported_paths=imported_paths,
-            rel_source=rel_source,
-            source_modules=self._source_modules_for_path(source_path),
-            source_stem=source_path.stem,
-            symbols=symbols,
-        )
-
-    def _targeted_unittest_command(self, test_path: Path, symbols: set[str]) -> str:
-        test_dir = self.relative_label(test_path.parent)
-        return targeted_unittest_command(sys.executable, test_dir, test_path.name)
 
     def select_tests(
         self,
@@ -11276,11 +11240,22 @@ import string
                 }
             return {"ok": False, "tool": "select_tests", "summary": "No changed source files to map to tests."}
         ranked: list[tuple[int, Path, list[str]]] = []
-        for test_path in self._iter_python_test_files():
+        test_files = iter_python_test_files(
+            workspace_root=self.workspace_root,
+            iter_code_files=lambda root: self._iter_code_files(root, limit=50000),
+            relative_label=self.relative_label,
+        )
+        for test_path in test_files:
             score = 0
             reasons: list[str] = []
             for source_path in source_files:
-                item_score, item_reasons = self._test_matches_source(test_path, source_path, symbols)
+                item_score, item_reasons = test_matches_source(
+                    test_path=test_path,
+                    source_path=source_path,
+                    symbols=symbols,
+                    relative_label=self.relative_label,
+                    python_import_targets=self._python_import_targets,
+                )
                 score += item_score
                 reasons.extend(item_reasons)
             if score > 0:
@@ -11299,7 +11274,7 @@ import string
         commands: list[str] = []
         rows: list[dict[str, Any]] = []
         for score, test_path, reasons in selected:
-            command = self._targeted_unittest_command(test_path, symbols)
+            command = targeted_unittest_command(sys.executable, self.relative_label(test_path.parent), test_path.name)
             commands.append(command)
             rows.append(
                 {
