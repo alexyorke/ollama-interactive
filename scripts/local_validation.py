@@ -39,6 +39,7 @@ SMOKE_MODULES = (
 )
 
 AGENT_MODULES = (
+    "tests.test_agent_core_loop",
     "tests.test_agent_assumption_audit",
     "tests.test_agent_deterministic_tools",
     "tests.test_agent_prompt_policy",
@@ -56,6 +57,7 @@ AGENT_MODULES = (
     "tests.test_coding_benchmark_eval",
 )
 FOCUSED_AGENT_MODULES = (
+    "tests.test_agent_core_loop",
     "tests.test_agent_assumption_audit",
     "tests.test_agent_deterministic_tools",
     "tests.test_agent_prompt_policy",

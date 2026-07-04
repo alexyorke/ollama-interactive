@@ -83,6 +83,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Config env override package-repair feature-delivery coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Catalog patch-tags package-repair feature-delivery coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Failure-delta compaction coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
+- Core loop, final normalization, LLM usage telemetry, and JSON response repair coverage now lives in `tests/test_agent_core_loop.py` instead of the omnibus `tests/test_agent.py`.
 - Prompt and primary-tool policy coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Prompt-context truncation and prompt-palette coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
 - Primary-context compaction and session-memory context retention coverage now lives in `tests/test_agent_prompt_policy.py` instead of the omnibus `tests/test_agent.py`.
