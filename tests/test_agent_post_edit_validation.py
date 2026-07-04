@@ -239,6 +239,247 @@ class AgentPostEditValidationTests(AgentTestBase):
 
         self.assertEqual(result.message, "note.txt has been updated.")
 
+    def test_agent_normalizes_edit_file_alias_with_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "edit_file", "arguments": {"path": "app.py", "content": "def f():\n    return 2\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Edit app.py to return 2.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertEqual(final_text, "def f():\n    return 2\n")
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "write_file")
+
+    def test_agent_normalizes_implementation_edit_alias_to_edit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_implementation_target",
+                            "arguments": {
+                                "path": "app.py",
+                                "symbol": "add",
+                                "replacement": "def add(left, right):\n    return left + right\n",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Inspect app.py, then fix add.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return left + right", final_text)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "edit_intent")
+
+    def test_agent_normalizes_edit_symbol_alias_to_edit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_symbol",
+                            "arguments": {
+                                "path": "app.py",
+                                "symbol": "add",
+                                "content": "def add(left, right):\n    return left + right\n",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Fix add in app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return left + right", final_text)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "edit_intent")
+
+    def test_agent_normalizes_replace_body_alias_to_edit_intent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_body",
+                            "arguments": {
+                                "path": "app.py",
+                                "target": "add",
+                                "body": "return left + right",
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Fix add in app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn(result.message, {"app.py updated", "Ran validation after the latest edit: passed."})
+        self.assertIn("return left + right", final_text)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "edit_intent")
+
+    def test_agent_rejects_docs_only_edit_for_code_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "README.md", "content": "notes\n"}}),
+                    json.dumps({"type": "final", "message": "done"}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}}),
+                    json.dumps({"type": "final", "message": "done"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Fix the bug in the implementation.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "done")
+        self.assertIn("return left + right", final_text)
+        self.assertGreaterEqual(tools.execute_counts.get("write_file", 0), 2)
+
+    def test_agent_normalizes_snippet_replace_symbol_to_replace_in_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "replace_symbol", "arguments": {"path": "app.py", "symbol": "return left - right", "content": "return left + right"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Fix app.py so add uses addition.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "app.py updated")
+        self.assertIn("return left + right", final_text)
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+        self.assertIsNone(tools.execute_counts.get("replace_symbol"))
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(normalizations[0]["normalized_name"], "replace_in_file")
+
+    def test_agent_does_not_synthesize_read_symbol_final_for_fix_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_symbol", "arguments": {"path": "app.py", "symbol": "add", "include_context": 0}}),
+                    json.dumps({"type": "final", "message": "add returns left - right."}),
+                    json.dumps({"type": "tool", "name": "replace_in_file", "arguments": {"path": "app.py", "old": "left - right", "new": "left + right"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "Fixed app.py and tests passed."}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Issue: app.py add returns the wrong value. Inspect source, fix it, run tests, and summarize.")
+
+        self.assertEqual(result.message, "Fixed app.py and tests passed.")
+        self.assertIn("workspace change", " ".join(message["content"] for message in agent.messages if message["role"] == "user"))
+        self.assertEqual(tools.execute_counts.get("replace_in_file"), 1)
+
+    def test_agent_normalizes_edit_payload_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs.md").write_text("# Docs\n\ntotal total\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "replace_in_file", "arguments": {"path": "docs.md", "old": "total", "new": "cart_total", "all": True}}),
+                    json.dumps({"type": "final", "message": "docs updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Update docs.md replacing total with cart_total.")
+            final_text = (root / "docs.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "docs updated")
+        self.assertEqual(final_text, "# Docs\n\ncart_total cart_total\n")
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertIn("replace_all", json.dumps(normalizations[0]["normalized_arguments"]))
+
+    def test_agent_normalizes_replace_in_file_common_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs.md").write_text("# Docs\n\ntotal total totality\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_in_file",
+                            "arguments": {
+                                "path": "docs.md",
+                                "target": "total",
+                                "replacement": "cart_total",
+                                "all": True,
+                                "whole_word": True,
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "final", "message": "docs updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Update docs.md replacing total with cart_total.")
+            final_text = (root / "docs.md").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "docs updated")
+        self.assertEqual(final_text, "# Docs\n\ncart_total cart_total totality\n")
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertIn("match_whole_word", json.dumps(normalizations[0]["normalized_arguments"]))
+
     def test_agent_rejects_final_before_required_workspace_mutation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
