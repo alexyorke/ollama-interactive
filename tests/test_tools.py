@@ -27,6 +27,8 @@ from ollama_code.tools.validation import (
     lint_typecheck_scan_paths,
     lint_typecheck_target_plan,
     lint_typecheck_timeout_result,
+    runnable_test_validator_commands,
+    select_tests_language_validator_result,
 )
 from ollama_code.tools.synthesis import (
     candidate_signature_gate,
@@ -5922,6 +5924,36 @@ def double(value: int) -> int:
 
         self.assertFalse(result["ok"])
         self.assertIn("bad.py:1", result["output"])
+
+    def test_runnable_test_validator_commands_filters_test_validators(self) -> None:
+        commands = runnable_test_validator_commands(
+            {
+                "validators": [
+                    {"kind": "lint", "command": "ruff check ."},
+                    {"kind": "test", "command": "go test ./..."},
+                    {"kind": "test", "command": "npm test"},
+                    {"kind": "test", "command": ""},
+                ]
+            },
+            limit=1,
+        )
+
+        self.assertEqual(commands, ["go test ./..."])
+
+    def test_select_tests_language_validator_result_reports_no_command_fallback(self) -> None:
+        result = select_tests_language_validator_result(
+            paths=[Path("calc.go")],
+            commands=[],
+            symbols={"Add"},
+            relative_label=lambda path: path.as_posix(),
+            limit=4,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["confidence"], "low")
+        self.assertEqual(result["test_commands"], [])
+        self.assertEqual(result["tests"][0]["path"], "calc.go")
+        self.assertIn("No targeted tests found", result["summary"])
 
     def test_lint_typecheck_file_analysis_caches_by_file_signature(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

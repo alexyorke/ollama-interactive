@@ -166,7 +166,9 @@ from ollama_code.tools.validation import (
     path_label_looks_like_test,
     preferred_test_validator_command,
     requested_validator_file_hints,
+    runnable_test_validator_commands,
     run_test_needs_command_recovery,
+    select_tests_language_validator_result,
     targeted_unittest_command,
     test_matches_source,
     toml_tool_section,
@@ -11213,31 +11215,14 @@ import string
             if non_python_files:
                 root = self._project_root_for(non_python_files[0])
                 validators = self.discover_validators(self.relative_label(root), limit=8)
-                commands = [
-                    str(item.get("command"))
-                    for item in validators.get("validators", [])
-                    if isinstance(item, dict) and item.get("kind") == "test" and item.get("command")
-                ][: max(1, int(limit))]
-                rows = [
-                    {
-                        "path": self.relative_label(path),
-                        "command": commands[0] if commands else "",
-                        "score": 1,
-                        "reason": "language-level validator discovery",
-                    }
-                    for path in non_python_files[: max(1, int(limit))]
-                ]
-                return {
-                    "ok": True,
-                    "tool": "select_tests",
-                    "confidence": "low" if not commands else "medium",
-                    "changed_files": [self.relative_label(path) for path in non_python_files],
-                    "changed_symbols": sorted(symbols),
-                    "test_commands": commands,
-                    "tests": rows,
-                    "summary": "Selected language-level test commands from discover_validators." if commands else "No targeted tests found; use configured run_test.",
-                    "output": "\n".join(commands) if commands else "(no targeted tests found)",
-                }
+                commands = runnable_test_validator_commands(validators, limit=limit)
+                return select_tests_language_validator_result(
+                    paths=non_python_files,
+                    commands=commands,
+                    symbols=symbols,
+                    relative_label=self.relative_label,
+                    limit=limit,
+                )
             return {"ok": False, "tool": "select_tests", "summary": "No changed source files to map to tests."}
         ranked: list[tuple[int, Path, list[str]]] = []
         test_files = iter_python_test_files(

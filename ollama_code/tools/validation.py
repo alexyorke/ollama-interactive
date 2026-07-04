@@ -210,6 +210,46 @@ def preferred_test_validator_command(
     return str(selected[0]["command"])
 
 
+def runnable_test_validator_commands(validators: dict[str, Any], *, limit: int) -> list[str]:
+    selected_limit = max(1, int(limit))
+    return [
+        str(item.get("command"))
+        for item in validators.get("validators", [])
+        if isinstance(item, dict) and item.get("kind") == "test" and item.get("command")
+    ][:selected_limit]
+
+
+def select_tests_language_validator_result(
+    *,
+    paths: list[Path],
+    commands: list[str],
+    symbols: set[str],
+    relative_label: Callable[[Path], str],
+    limit: int,
+) -> dict[str, Any]:
+    selected_limit = max(1, int(limit))
+    rows = [
+        {
+            "path": relative_label(path),
+            "command": commands[0] if commands else "",
+            "score": 1,
+            "reason": "language-level validator discovery",
+        }
+        for path in paths[:selected_limit]
+    ]
+    return {
+        "ok": True,
+        "tool": "select_tests",
+        "confidence": "low" if not commands else "medium",
+        "changed_files": [relative_label(path) for path in paths],
+        "changed_symbols": sorted(symbols),
+        "test_commands": commands,
+        "tests": rows,
+        "summary": "Selected language-level test commands from discover_validators." if commands else "No targeted tests found; use configured run_test.",
+        "output": "\n".join(commands) if commands else "(no targeted tests found)",
+    }
+
+
 def collapse_validation_targets(labels: Iterable[str], *, limit: int = 100) -> list[str]:
     cleaned: list[str] = []
     seen: set[str] = set()
