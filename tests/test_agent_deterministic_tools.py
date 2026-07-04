@@ -18,6 +18,68 @@ class AgentDeterministicToolTests(AgentTestBase):
             **kwargs,
         )
 
+    def _assert_repo_tool_then_git_status_without_model_loop(
+        self,
+        request: str,
+        *,
+        first_tool_name: str,
+        expected_message_fragment: str,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._init_git_repo_or_skip(root)
+            (root / "docs").mkdir()
+            (root / "src").mkdir()
+            (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=root, capture_output=True, text=True, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=root, capture_output=True, text=True, check=True)
+            (root / "src" / "app.py").write_text("def answer() -> int:\n    return 99\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user(request)
+
+        self.assertIn(expected_message_fragment, result.message)
+        self.assertIn("src/app.py", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, [first_tool_name, "git_status"])
+
+    def _assert_follow_up_tool_chain_without_model_loop(
+        self,
+        request: str,
+        *,
+        expected_tool_names: list[str],
+        expected_message_fragments: list[str],
+        acceptable_follow_up_fragments: list[str] | None = None,
+        create_docs_fixture: bool = False,
+        test_file_content: str | None = None,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            if create_docs_fixture:
+                (root / "docs").mkdir()
+                (root / "docs" / "guide.md").write_text("TOKEN_42 lives here.\n", encoding="utf-8")
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                test_file_content
+                or "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user(request)
+
+        for fragment in expected_message_fragments:
+            self.assertIn(fragment, result.message)
+        if acceptable_follow_up_fragments is not None:
+            self.assertTrue(any(fragment in result.message for fragment in acceptable_follow_up_fragments))
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, expected_tool_names)
+
     def test_agent_deterministically_handles_git_diff_without_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -383,3 +445,82 @@ class AgentDeterministicToolTests(AgentTestBase):
         self.assertEqual(len(client.calls), 0)
         tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_names, ["discover_validators"])
+
+    def test_agent_chains_search_then_run_test_without_model_loop(self) -> None:
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "Search for TOKEN_42 in the repo, then run tests and tell me whether tests passed.",
+            expected_tool_names=["search", "run_test"],
+            expected_message_fragments=["docs/guide.md contains the match.", "Tests passed: yes"],
+            create_docs_fixture=True,
+            test_file_content="import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(6 * 7, 42)\n",
+        )
+
+    def test_agent_chains_discover_validators_then_run_test_without_model_loop(self) -> None:
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "Discover the test commands for this repo, then run tests and tell me whether they passed.",
+            expected_tool_names=["discover_validators", "run_test"],
+            expected_message_fragments=["test python:", "Tests passed: yes"],
+        )
+
+    def test_agent_chains_search_then_git_status_without_model_loop(self) -> None:
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "Search for TOKEN_42 in the repo, then show git status.",
+            first_tool_name="search",
+            expected_message_fragment="docs/guide.md contains the match.",
+        )
+
+    def test_agent_chains_search_and_git_status_without_then(self) -> None:
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "Search for TOKEN_42 in the repo and show git status.",
+            first_tool_name="search",
+            expected_message_fragment="docs/guide.md contains the match.",
+        )
+
+    def test_agent_chains_search_after_that_git_status_without_model_loop(self) -> None:
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "Search for TOKEN_42 in the repo, after that show git status.",
+            first_tool_name="search",
+            expected_message_fragment="docs/guide.md contains the match.",
+        )
+
+    def test_agent_chains_list_files_and_git_status_without_model_loop(self) -> None:
+        self._assert_repo_tool_then_git_status_without_model_loop(
+            "List files in the workspace and show git status.",
+            first_tool_name="list_files",
+            expected_message_fragment="docs/guide.md",
+        )
+
+    def test_agent_handles_literal_list_files_tool_request_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "docs").mkdir()
+            (root / "notes").mkdir()
+            (root / "src").mkdir()
+            (root / "src" / "sample.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Use list_files on . with a high enough limit to inspect the workspace. Reply with docs, notes, and src only.")
+
+        self.assertIn("docs", result.message)
+        self.assertIn("notes", result.message)
+        self.assertIn("src", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["list_files"])
+
+    def test_agent_chains_discover_validators_then_lint_without_model_loop(self) -> None:
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "List the test and validation commands for this repo, then run lint.",
+            expected_tool_names=["discover_validators", "lint_typecheck"],
+            expected_message_fragments=["lint python:"],
+            acceptable_follow_up_fragments=["All checks passed!", "Lint/typecheck passed.", "syntax ok:"],
+        )
+
+    def test_agent_chains_discover_validators_and_lint_without_then(self) -> None:
+        self._assert_follow_up_tool_chain_without_model_loop(
+            "List the test and validation commands for this repo and run lint.",
+            expected_tool_names=["discover_validators", "lint_typecheck"],
+            expected_message_fragments=["lint python:"],
+            acceptable_follow_up_fragments=["All checks passed!", "Lint/typecheck passed.", "syntax ok:"],
+        )
