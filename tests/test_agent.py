@@ -437,65 +437,6 @@ class AgentTests(AgentTestBase):
             },
         )
 
-    def test_test_to_source_bridge_maps_recent_test_evidence_to_source(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "ops.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
-            (root / "tests" / "test_ops.py").write_text(
-                "from src.ops import add\n\n"
-                "def test_add():\n"
-                "    assert add(1, 2) == 3\n",
-                encoding="utf-8",
-            )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-            successful_tool_results = [
-                {
-                    "name": "read_file",
-                    "arguments": {"path": "tests/test_ops.py"},
-                    "result": {"ok": True, "path": "tests/test_ops.py", "output": "from src.ops import add"},
-                }
-            ]
-
-            bridge = agent._test_to_source_bridge(successful_tool_results)
-
-        self.assertEqual(bridge, ("tests/test_ops.py", "src/ops.py"))
-
-    def test_failed_test_output_paths_guide_spec_repair_target(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "src").mkdir()
-            (root / "tests").mkdir()
-            (root / "src" / "core.py").write_text("def wrapped():\n    return 1\n", encoding="utf-8")
-            (root / "tests" / "test_pkg.py").write_text(
-                "from pkg import wrapped\n\n"
-                "def test_wrapped():\n"
-                "    assert wrapped() == 2\n",
-                encoding="utf-8",
-            )
-            client = FakeClient([])
-            tools = ToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-            failure_output = (
-                "ImportError: Failed to import test module: test_pkg\n"
-                '  File "tests/test_pkg.py", line 4, in <module>\n'
-                "    from pkg import wrapped\n"
-                '  File "src/core.py", line 1, in <module>\n'
-                "    from helpers import label\n"
-            )
-            successful_tool_results = [
-                {"name": "read_file", "result": {"ok": True, "path": "src/ops.py", "output": "old"}},
-                {"name": "run_test", "result": {"ok": False, "output": failure_output}},
-            ]
-            paths = agent._spec_guided_repair_paths(successful_tool_results)
-            hint = agent._failed_test_edit_target_hint(successful_tool_results)
-
-        self.assertEqual(paths, ("src/core.py", "tests/test_pkg.py"))
-        self.assertEqual(hint, "src/core.py")
-
     def test_agent_rejects_new_unimported_python_file_for_test_driven_fix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
