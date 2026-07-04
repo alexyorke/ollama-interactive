@@ -101,6 +101,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Deterministic project-rename routing coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Deterministic source-rewrite, optional-parameter, test-grounded repair, and import-repair coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Todo-read synthesis and read-only tool-cache coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
+- Deterministic symbol, outline, implementation-target, and symbol-edit coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Shell audit/recovery and run-test normalization coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
 - Exact shell preservation and run-test constraint coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
 - Remaining run-test extraction and shell-test command normalization coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.

@@ -946,3 +946,176 @@ class AgentDeterministicToolTests(AgentTestBase):
             expected_message_fragments=["lint python:"],
             acceptable_follow_up_fragments=["All checks passed!", "Lint/typecheck passed.", "syntax ok:"],
         )
+
+    def test_agent_can_use_symbol_tools_instead_of_full_file_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            filler = "\n\n".join(f"def filler_{index}():\n    return {index}" for index in range(160))
+            (root / "src" / "large_pricing.py").write_text(
+                f"{filler}\n\n"
+                "def calculate_discount(cart, percentage):\n"
+                "    marker = 'TOKEN_SYMBOL_750'\n"
+                "    return marker\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"search_symbols","arguments":{"query":"calculate_discount","path":"src"}}',
+                    '{"type":"tool","name":"read_symbol","arguments":{"path":"src/large_pricing.py","symbol":"calculate_discount","include_context":0}}',
+                    '{"type":"final","message":"TOKEN_SYMBOL_750"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Use search_symbols to find calculate_discount in src/large_pricing.py. Then use read_symbol on the exact match. Do not use read_file. Reply with the uppercase TOKEN_SYMBOL marker from that symbol only."
+            )
+
+        self.assertEqual(result.message, "TOKEN_SYMBOL_750")
+        self.assertEqual(len(client.calls), 0)
+        self.assertFalse(any(event["type"] == "assumption_audit" for event in agent.events))
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search_symbols", "read_symbol"])
+        symbol_results = [event for event in agent.events if event["type"] == "tool_result" and event["name"] == "read_symbol"]
+        self.assertIn("TOKEN_SYMBOL_750", symbol_results[0]["result"]["output"])
+        self.assertNotIn("filler_0", symbol_results[0]["result"]["output"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_synthesizes_symbol_return_value_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("def meaning() -> int:\n    return 42\n", encoding="utf-8")
+            client = FakeClient(['{"type":"final","message":"wrong"}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user(
+                "Use search_symbols to locate meaning in src/app.py, then use read_symbol on the exact match. Do not use read_file. Summarize what value it returns."
+            )
+
+        self.assertEqual(result.message, "meaning returns 42.")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search_symbols", "read_symbol"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_synthesizes_plain_language_symbol_return_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("def meaning() -> int:\n    return 42\n", encoding="utf-8")
+            client = FakeClient(['{"type":"final","message":"wrong"}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("What does function meaning in src/app.py return?")
+
+        self.assertEqual(result.message, "meaning returns 42.")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["read_symbol"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_deterministically_finds_implementation_file_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "core.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            (root / "tests" / "test_core.py").write_text(
+                "import unittest\nfrom src.core import add\n\n"
+                "class CoreTests(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(['{"type":"final","message":"wrong"}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Which implementation file corresponds to tests/test_core.py?")
+
+        self.assertEqual(result.message, "Relevant implementation file: src/core.py.")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["find_implementation_target"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_deterministically_handles_explicit_find_implementation_target_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "core.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+            (root / "tests" / "test_core.py").write_text(
+                "import unittest\nfrom src.core import add\n\n"
+                "class CoreTests(unittest.TestCase):\n"
+                "    def test_add(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient(['{"type":"final","message":"wrong"}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use find_implementation_target for tests/test_core.py and reply with the implementation file only.")
+
+        self.assertEqual(result.message, "src/core.py")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["find_implementation_target"])
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_synthesizes_search_symbols_name_only_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "session_task.py").write_text("def session_value() -> str:\n    return 'todo'\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use search_symbols to find session_value in src/session_task.py. Reply with the function name only.")
+
+        self.assertEqual(result.message, "session_value")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["search_symbols"])
+
+    def test_agent_synthesizes_code_outline_summary_without_model_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "app.py").write_text("def meaning() -> int:\n    return 42\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use code_outline on src/app.py and tell me which function is defined there.")
+
+        self.assertEqual(result.message, "The function defined in src/app.py is meaning.")
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["code_outline"])
+
+    def test_agent_deterministically_updates_js_return_after_symbol_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "src" / "math.js").write_text("export function double(n) {\n  return n + n;\n}\n", encoding="utf-8")
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use search_symbols and read_symbol on src/math.js, then change double(n) so it returns n * 2 instead of n + n. Do not use read_file.")
+            final_text = (root / "src" / "math.js").read_text(encoding="utf-8")
+
+        self.assertIn("Updated", result.message)
+        self.assertIn("return n * 2;", final_text)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names[:3], ["search_symbols", "read_symbol", "replace_in_file"])
+        self.assertEqual(tool_names[3:], ["lint_typecheck", "select_tests", "discover_validators"])
