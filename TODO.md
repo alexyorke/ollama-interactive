@@ -114,6 +114,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Context-pack preload coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner grounding refinement coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
+- Context-planner implementation-target and auto-outline coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Symbol-search disambiguation coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Basic shell-inspection normalization coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
 - Shell preview and find normalization coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
