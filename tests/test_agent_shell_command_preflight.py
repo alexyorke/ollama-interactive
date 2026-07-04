@@ -1,7 +1,9 @@
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from ollama_code.agent import OllamaCodeAgent
@@ -148,6 +150,144 @@ class AgentShellCommandPreflightTests(AgentTestBase):
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertEqual(normalizations[0]["normalized_name"], "run_test")
         self.assertIn("original command", normalizations[0]["reason"])
+
+    def test_agent_preserves_exact_user_requested_shell_test_command(self) -> None:
+        root = self._workspace_scratch()
+        client = FakeClient(['{"type":"tool","name":"run_shell","arguments":{"command":"python -m pytest --version"}}'])
+        tools = CountingToolExecutor(root, approval_mode="auto")
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+        result = agent.handle_user("Use run_shell to execute exactly: python -m pytest --version. Then tell me the exit code.")
+
+        self.assertIn("exit code", result.message.lower())
+        self.assertEqual(tools.execute_counts.get("run_shell"), 1)
+        self.assertIsNone(tools.execute_counts.get("run_test"))
+
+    def test_agent_treats_disabled_tools_as_forbidden_up_front(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_run_test scenario_git_tools"}}',
+                    '{"type":"tool","name":"run_test","arguments":{"command":"python -c \\"print(\'e2e OK\')\\""}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(
+                root,
+                approval_mode="auto",
+                disabled_tools=["run_shell"],
+            )
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Run exact e2e commands with run_test, not run_shell. "
+                "Use python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_run_test scenario_git_tools."
+            )
+
+        self.assertEqual(result.message, "done")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertTrue(tool_calls)
+        self.assertTrue(all(event["name"] == "run_test" for event in tool_calls))
+        self.assertFalse(any(event["name"] == "run_shell" for event in tool_calls))
+
+    def test_agent_reprompts_forbidden_run_shell_with_run_test_alternative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_run_test scenario_git_tools"}}',
+                    '{"type":"tool","name":"run_test","arguments":{"command":"python -c \\"print(\'e2e OK\')\\""}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(
+                root,
+                approval_mode="auto",
+                disabled_tools=["run_shell"],
+            )
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Run exact e2e commands with run_test, not run_shell. "
+                "Use python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_run_test scenario_git_tools."
+            )
+
+        self.assertEqual(result.message, "done")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertTrue(tool_calls)
+        self.assertTrue(all(event["name"] == "run_test" for event in tool_calls))
+        normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertTrue(any(event["normalized_name"] == "run_test" for event in normalizations))
+
+    def test_agent_forbids_non_available_tools_from_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_run_test scenario_git_tools"}}',
+                    '{"type":"tool","name":"run_test","arguments":{"command":"python -c \\"print(\'e2e OK\')\\""}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(
+                root,
+                approval_mode="auto",
+                enabled_tools=["run_test", "read_file"],
+            )
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Run exact e2e commands with run_test, not run_shell. "
+                "Use python scripts/e2e_suite.py --model gemma4:e4b --scenarios scenario_run_test scenario_git_tools."
+            )
+
+        self.assertEqual(result.message, "done")
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertTrue(tool_calls)
+        self.assertTrue(all(event["name"] == "run_test" for event in tool_calls))
+
+    def test_agent_normalizes_run_shell_to_run_test_for_explicit_benchmark_request(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["run_test", "read_file"],
+        )
+        client = FakeClient([])
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        name, arguments, reason = agent._normalize_shell_test_call(
+            "run_shell",
+            {"command": "python -c \"print('bench OK')\""},
+            request_text="Run one concrete coding benchmark case with run_test, not run_shell: `python -c \"print('bench OK')\"`.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(name, "run_test")
+        self.assertEqual(arguments["command"], "python -c \"print('bench OK')\"")
+        self.assertIn("explicitly requires run_test", reason)
+
+    def test_agent_normalizes_run_shell_to_run_test_for_explicit_e2e_request(self) -> None:
+        root = self._workspace_scratch()
+        tools = ToolExecutor(
+            root,
+            approval_mode="auto",
+            enabled_tools=["run_test", "read_file"],
+        )
+        client = FakeClient([])
+        agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+        name, arguments, reason = agent._normalize_shell_test_call(
+            "run_shell",
+            {"command": "python -c \"print('e2e OK')\""},
+            request_text="Run exact e2e commands with run_test, not run_shell: `python -c \"print('e2e OK')\"`.",
+            exact_shell_command=None,
+        )
+
+        self.assertEqual(name, "run_test")
+        self.assertEqual(arguments["command"], "python -c \"print('e2e OK')\"")
+        self.assertIn("explicitly requires run_test", reason)
 
     def test_agent_normalizes_bare_python_test_file_shell_command_to_run_test(self) -> None:
         root = self._workspace_scratch()
