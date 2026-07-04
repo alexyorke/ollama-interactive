@@ -11,20 +11,14 @@ import unittest
 from pathlib import Path
 
 from ollama_code.agent import (
-    GROUNDING_EVIDENCE_TOOL_NAMES,
     OllamaCodeAgent,
     extract_json_response,
 )
-from ollama_code.features import ENV_OLLAMA_CODE_FEATURE_PROFILE
-from ollama_code.ollama_client import OllamaError, TokenUsage
+from ollama_code.ollama_client import TokenUsage
 from ollama_code.tools import ToolExecutor
 from tests.agent_test_support import (
     AgentTestBase,
-    CountingToolExecutor,
-    EmptySelectTestsLintFallbackToolExecutor,
-    EmptySelectTestsToolExecutor,
     FakeClient,
-    WorkflowValidatorToolExecutor,
 )
 
 
@@ -244,116 +238,6 @@ class AgentTests(AgentTestBase):
     # Focused shell-inspection normalization coverage lives in test_agent_shell_command_preflight.py.
 
 
-    def test_passing_old_tests_do_not_satisfy_package_feature_request(self) -> None:
-        root = self._workspace_scratch()
-        (root / "reports").mkdir()
-        (root / "tests").mkdir()
-        (root / "reports" / "__init__.py").write_text(
-            "from .exporter import ReportRow, export_csv\n\n"
-            "__all__ = [\"ReportRow\", \"export_csv\"]\n",
-            encoding="utf-8",
-        )
-        (root / "reports" / "exporter.py").write_text(
-            "from __future__ import annotations\n\n"
-            "from dataclasses import dataclass\n\n\n"
-            "@dataclass(frozen=True)\n"
-            "class ReportRow:\n"
-            "    name: str\n"
-            "    count: int\n"
-            "    active: bool\n\n\n"
-            "def export_csv(rows: list[ReportRow]) -> str:\n"
-            "    lines = [\"name,count,active\"]\n"
-            "    for row in rows:\n"
-            "        lines.append(f\"{row.name},{row.count},{str(row.active).lower()}\")\n"
-            "    return \"\\n\".join(lines) + \"\\n\"\n",
-            encoding="utf-8",
-        )
-        (root / "tests" / "test_exporter.py").write_text(
-            "import unittest\n\n"
-            "from reports import ReportRow, export_csv\n\n\n"
-            "class ExporterTests(unittest.TestCase):\n"
-            "    def test_export_csv(self) -> None:\n"
-            "        self.assertEqual(export_csv([ReportRow(\"alpha\", 2, True)]), \"name,count,active\\nalpha,2,true\\n\")\n\n\n"
-            "if __name__ == \"__main__\":\n"
-            "    unittest.main()\n",
-            encoding="utf-8",
-        )
-        (root / "README.md").write_text("# Reports\n\nUse `export_csv(rows)` for CSV output.\n", encoding="utf-8")
-        command = f"{sys.executable} -m unittest discover -s tests -v"
-        tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
-        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
-        request_text = (
-            "Add an export_ndjson(rows) function to this report exporter. It should serialize each ReportRow "
-            "as one JSON object per line with keys name, count, and active in that order, preserve row order, "
-            "and end the output with a trailing newline when rows are present. It should return an empty string "
-            "for no rows. Export it from the package __init__.py. Update README with the new NDJSON export "
-            "behavior. Add tests for multiple rows, empty rows, and escaping names with quotes or newlines. "
-            "Run the tests and prove the behavior with a shell command."
-        )
-        obligations = agent._derive_request_obligations(
-            request_text=request_text,
-            required_tool_names=set(),
-            required_mutation_paths=set(),
-            code_mutation_required=True,
-            test_run_required=True,
-        )
-        blocked_shortcuts: set[str] = set()
-
-        result = agent._try_handle_deterministic_turn(
-            request_text=request_text,
-            exact_file_write=None,
-            target_line_read=None,
-            symbol_read=None,
-            exact_shell_command=None,
-            expected_exact_reply_text=None,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
-            session_memory_request=False,
-            requested_git_diff_mode=None,
-            successful_tool_results=[],
-            request_obligations=obligations,
-            blocked_deterministic_shortcuts=blocked_shortcuts,
-        )
-
-        self.assertIsNone(result)
-        self.assertEqual(tools.execute_counts.get("run_test"), 1)
-        self.assertEqual(blocked_shortcuts, {"old_tests_only_success"})
-        repeated_result = agent._try_handle_deterministic_turn(
-            request_text=request_text,
-            exact_file_write=None,
-            target_line_read=None,
-            symbol_read=None,
-            exact_shell_command=None,
-            expected_exact_reply_text=None,
-            required_tool_names=set(),
-            forbidden_tool_names=set(),
-            session_memory_request=False,
-            requested_git_diff_mode=None,
-            successful_tool_results=[],
-            request_obligations=obligations,
-            blocked_deterministic_shortcuts=blocked_shortcuts,
-        )
-
-        self.assertIsNone(repeated_result)
-        self.assertEqual(tools.execute_counts.get("run_test"), 1)
-        self.assertTrue(
-            any(
-                event.get("type") == "deterministic_turn"
-                and event.get("phase") == "blocked_old_tests_only_success"
-                for event in agent.events
-            )
-        )
-        self.assertFalse(
-            any(
-                event.get("type") == "assistant_synthesized"
-                and event.get("content") == "Tests already pass."
-                for event in agent.events
-            )
-        )
-
-
-
-
     # Focused shell preview and find normalization coverage lives in test_agent_shell_command_preflight.py.
 
     # Focused context-planner grounding refinement coverage lives in test_agent_grounding_path_repair.py.
@@ -367,23 +251,6 @@ class AgentTests(AgentTestBase):
 
 
     # Focused mutation-guard coverage lives in test_agent_post_edit_validation.py.
-
-    def test_keep_tests_green_creates_test_run_obligation(self) -> None:
-        tools = ToolExecutor(self._workspace_scratch(), approval_mode="auto")
-        agent = OllamaCodeAgent(client=FakeClient([]), tools=tools, model="fake-model", debate_enabled=False)
-
-        self.assertTrue(agent._request_requires_test_run("Add a stats command and keep tests green."))
-        self.assertTrue(agent._request_requires_test_run("Update the CLI and keep the tests passing."))
-
-
-
-
-
-
-
-
-
-
 
     # Focused missing-path final-claim coverage lives in test_agent_post_edit_validation.py.
 
@@ -436,53 +303,6 @@ class AgentTests(AgentTestBase):
                 },
             },
         )
-
-    def test_agent_rejects_new_unimported_python_file_for_test_driven_fix(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            (root / "list_ops.py").write_text("def reverse(items):\n    return None\n", encoding="utf-8")
-            (root / "list_ops_test.py").write_text(
-                "from list_ops import reverse\n\n"
-                "def test_reverse():\n"
-                "    assert reverse([1, 2]) == [2, 1]\n",
-                encoding="utf-8",
-            )
-            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
-            client = FakeClient(
-                [
-                    json.dumps({"strategy": "normal_loop", "reason": "exercise the generic write-file guard path"}),
-                    json.dumps(
-                        {
-                            "type": "tool",
-                            "name": "write_file",
-                            "arguments": {"path": "palindrome_solution.py", "content": "def is_palindrome(s):\n    return True\n"},
-                        }
-                    ),
-                    json.dumps(
-                        {
-                            "type": "tool",
-                            "name": "write_file",
-                            "arguments": {"path": "list_ops.py", "content": "def reverse(items):\n    return items[::-1]\n"},
-                        }
-                    ),
-                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
-                    json.dumps({"type": "final", "message": "list_ops.py fixed; tests passed."}),
-                ]
-            )
-            tools = CountingToolExecutor(root, approval_mode="auto", test_command=pass_command)
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
-
-            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
-                with patch.object(agent, "_try_structured_test_driven_repair", return_value=None):
-                    result = agent.handle_user(
-                        "Implement this Python Exercism exercise. Read tests and source, edit only implementation files, "
-                        "do not edit tests, replace stubs with complete code, run tests with configured test command."
-                    )
-
-            self.assertEqual(result.message, "list_ops.py fixed; tests passed.")
-            self.assertFalse((root / "palindrome_solution.py").exists())
-            self.assertEqual((root / "list_ops.py").read_text(encoding="utf-8"), "def reverse(items):\n    return items[::-1]\n")
-            self.assertTrue(any("Existing tests import implementation file(s): list_ops.py" in message["content"] for message in agent.messages if message["role"] == "user"))
 
     def test_agent_handles_multiturn_refactor_test_and_diff_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

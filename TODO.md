@@ -96,6 +96,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Final/tool obligation and post-edit success-claim coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Edit alias, edit payload, and docs-only code-fix rejection coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Static sanity, example-probe, edit-guard, and issue-report mutation coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
+- Feature-delivery old-test shortcut, keep-tests-green, and unimported-file fail-closed coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Deterministic git/tool rejection and session-memory coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Exact readback, file-read synthesis, and deterministic single-file read coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Exact shell, search-result, and validator-discovery synthesis coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
