@@ -96,6 +96,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Deterministic follow-up tool-chain coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Shell audit/recovery and run-test normalization coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
 - Exact shell preservation and run-test constraint coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
+- Remaining run-test extraction and shell-test command normalization coverage now lives in `tests/test_agent_shell_command_preflight.py` instead of the omnibus `tests/test_agent.py`.
 - Loop-cap failure-compression coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner broad-context guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
