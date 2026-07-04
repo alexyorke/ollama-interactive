@@ -534,7 +534,14 @@ class AgentFailureCompressionTests(AgentTestBase):
                 ]
             )
             tools = CountingToolExecutor(root, approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=10)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                max_tool_rounds=10,
+                disable_spec_guided_repair=True,
+            )
 
             with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "trajectory-guards"}):
                 result = agent.handle_user("Update src/app.py and docs/app.md, then run tests.")
@@ -574,6 +581,307 @@ class AgentFailureCompressionTests(AgentTestBase):
         self.assertIn("Validation already failed after a prior edit", result.message)
         reconciliations = [event for event in agent.events if event["type"] == "reconciliation"]
         self.assertEqual(len(reconciliations), 2)
+
+    def test_agent_blocks_repeated_identical_syntax_error_edit_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    return left - right\n", encoding="utf-8")
+            bad_edit = {
+                "type": "tool",
+                "name": "edit_intent",
+                "arguments": {
+                    "path": "app.py",
+                    "intent": "replace_body",
+                    "target": "add",
+                    "replacement": "if ':",
+                },
+            }
+            client = FakeClient(
+                [
+                    json.dumps(bad_edit),
+                    json.dumps(bad_edit),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}}),
+                    json.dumps({"type": "final", "message": "app.py updated"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=6)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Fix app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertIn(result.message, {"app.py updated", "Ran validation after the latest edit: passed."})
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertIn("return left + right", final_text)
+        guards = [event for event in agent.events if event["type"] == "tool_error_guard"]
+        self.assertEqual(guards[0]["error_class"], "syntax_error")
+
+    def test_agent_blocks_stub_like_repair_edit_after_failed_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            fail_command = subprocess.list2cmdline([sys.executable, "-c", "import sys; print('AssertionError: None != 3'); sys.exit(1)"])
+            pass_command = subprocess.list2cmdline([sys.executable, "-c", "print('OK')"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": fail_command}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "add", "replacement": "# Implementation goes here"}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {"command": pass_command}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                result = agent.handle_user("Fix app.py and run tests.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertIsNone(tools.execute_counts.get("edit_intent"))
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertIn("return left + right", final_text)
+        guards = [event for event in agent.events if event.get("guard") == "stub-repair-edit"]
+        self.assertEqual(len(guards), 1)
+
+    def test_agent_pivots_after_repeated_failed_mutating_edits_on_same_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_text", "target": "return missing", "replacement": "return left + right"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_text", "target": "return other_missing", "replacement": "return left + right"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "write_file", "arguments": {"path": "app.py", "content": "def add(left, right):\n    return left + right\n"}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                result = agent.handle_user("Fix app.py.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        self.assertEqual(tools.execute_counts.get("write_file"), 1)
+        self.assertIn("return left + right", final_text)
+        guards = [event for event in agent.events if event.get("guard") == "repeated-mutating-failure-pivot"]
+        self.assertEqual(len(guards), 1)
+
+    def test_failed_tests_feedback_includes_stubs_and_unittest_examples(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_adds(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"strategy": "normal_loop", "reason": "exercise failed-test feedback in the normal loop"}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
+
+            agent.handle_user("Implement app.py and run tests.")
+
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("Remaining stubs: app.py::add", feedback)
+        self.assertIn("Test examples:", feedback)
+        self.assertIn("add(1, 2) -> 3", feedback)
+
+    def test_context_guard_blocks_read_loop_after_failed_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_adds(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "add", "replacement": "return left + right"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                max_tool_rounds=10,
+                disable_spec_guided_repair=True,
+            )
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                    with patch.object(OllamaCodeAgent, "_try_preemptive_mechanical_spec_guided_repair", return_value=None):
+                        with patch.object(OllamaCodeAgent, "_try_spec_guided_mechanical_repair", return_value=None):
+                            result = agent.handle_user("Implement app.py and run tests.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "fixed")
+        read_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "read_file"]
+        self.assertLessEqual(len(read_calls), 3)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("diagnose_test_failure"), 1)
+        diagnosis_guards = [event for event in agent.events if event.get("guard") == "diagnose-first-failed-test"]
+        context_guards = [event for event in agent.events if event.get("guard") == "context-exhausted"]
+        self.assertEqual(len(diagnosis_guards), 1)
+        self.assertGreaterEqual(len(context_guards), 1)
+        feedback = "\n".join(message["content"] for message in agent.messages if message["role"] == "user")
+        self.assertIn("The latest run_test failed", feedback)
+        self.assertIn("edit the implementation before gathering more context", feedback)
+        self.assertIn("return left + right", final_text)
+
+    def test_bulk_stub_guard_blocks_rerun_until_compact_stub_file_is_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n\n\ndef sub(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add, sub\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_math(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "        self.assertEqual(sub(3, 1), 2)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "tool", "name": "edit_intent", "arguments": {"path": "app.py", "intent": "replace_body", "target": "add", "replacement": "return left + right"}}),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_symbols",
+                            "arguments": {
+                                "path": "app.py",
+                                "replacements": [
+                                    {"symbol": "add", "content": "def add(left, right):\n    return left + right\n"},
+                                    {"symbol": "sub", "content": "def sub(left, right):\n    return left - right\n"},
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                max_tool_rounds=9,
+                disable_spec_guided_repair=True,
+            )
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                    result = agent.handle_user("Implement app.py and run tests.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertEqual(tools.execute_counts.get("edit_intent"), None)
+        self.assertEqual(tools.execute_counts.get("replace_symbols"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 2)
+        guards = [event for event in agent.events if event.get("guard") == "bulk-stub-complete-edit"]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("return left + right", final_text)
+        self.assertIn("return left - right", final_text)
+
+    def test_bulk_stub_guard_allows_repeated_partial_edit_after_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "app.py").write_text("def add(left, right):\n    pass\n\n\ndef sub(left, right):\n    pass\n", encoding="utf-8")
+            (root / "app_test.py").write_text(
+                "import unittest\nfrom app import add, sub\n\n"
+                "class AppTest(unittest.TestCase):\n"
+                "    def test_math(self):\n"
+                "        self.assertEqual(add(1, 2), 3)\n"
+                "        self.assertEqual(sub(3, 1), 2)\n",
+                encoding="utf-8",
+            )
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-p", "*_test.py", "-v"])
+            partial_edit = {
+                "type": "tool",
+                "name": "edit_intent",
+                "arguments": {"path": "app.py", "intent": "replace_body", "target": "add", "replacement": "return left + right"},
+            }
+            client = FakeClient(
+                [
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app.py"}}),
+                    json.dumps({"type": "tool", "name": "read_file", "arguments": {"path": "app_test.py"}}),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps(partial_edit),
+                    json.dumps(partial_edit),
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "replace_symbols",
+                            "arguments": {
+                                "path": "app.py",
+                                "replacements": [
+                                    {"symbol": "sub", "content": "def sub(left, right):\n    return left - right\n"},
+                                ],
+                            },
+                        }
+                    ),
+                    json.dumps({"type": "tool", "name": "run_test", "arguments": {}}),
+                    json.dumps({"type": "final", "message": "fixed"}),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                max_tool_rounds=10,
+                disable_spec_guided_repair=True,
+            )
+
+            with patch.dict("os.environ", {ENV_OLLAMA_CODE_FEATURE_PROFILE: "baseline"}):
+                with patch.object(OllamaCodeAgent, "_spec_guided_repair_has_actionable_spec", return_value=False):
+                    result = agent.handle_user("Implement app.py and run tests.")
+            final_text = (root / "app.py").read_text(encoding="utf-8")
+
+        self.assertEqual(result.message, "fixed")
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        guards = [event for event in agent.events if event.get("guard") == "bulk-stub-complete-edit"]
+        self.assertEqual(len(guards), 1)
+        self.assertIn("return left + right", final_text)
+        self.assertIn("return left - right", final_text)
 
     def test_trajectory_loop_cap_blocks_fourth_context_tool(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
