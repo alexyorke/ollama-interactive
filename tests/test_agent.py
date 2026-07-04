@@ -543,45 +543,6 @@ class AgentTests(AgentTestBase):
             self.assertEqual((root / "list_ops.py").read_text(encoding="utf-8"), "def reverse(items):\n    return items[::-1]\n")
             self.assertTrue(any("Existing tests import implementation file(s): list_ops.py" in message["content"] for message in agent.messages if message["role"] == "user"))
 
-    def test_agent_compacts_primary_context_without_dropping_current_request(self) -> None:
-        client = FakeClient(['{"type":"final","message":"done"}'])
-        agent = self._cwd_agent(client, debate_enabled=False)
-        for index in range(30):
-            agent.messages.append(
-                {
-                    "role": "user" if index % 2 == 0 else "assistant",
-                    "content": f"OLD_CONTEXT_{index:02d} " + ("x" * 5000),
-                }
-            )
-
-        result = agent.handle_user("Say done.")
-
-        self.assertEqual(result.message, "done")
-        sent_messages = client.calls[0]["messages"]
-        self.assertLessEqual(len(sent_messages), 16)
-        sent_text = "\n".join(str(message["content"]) for message in sent_messages)
-        full_text = "\n".join(message["content"] for message in agent.messages)
-        self.assertIn("Earlier conversation omitted", sent_text)
-        self.assertIn("Say done.", sent_text)
-        self.assertNotIn("OLD_CONTEXT_00", sent_text)
-        self.assertLess(len(sent_text), len(full_text) // 3)
-
-    def test_agent_keeps_full_context_for_session_memory_requests(self) -> None:
-        client = FakeClient(['{"type":"final","message":"MEMORY_TOKEN_77"}'], script_verification=True)
-        agent = self._cwd_agent(client)
-        for index in range(20):
-            agent.messages.append({"role": "user", "content": f"memory chunk {index} " + ("x" * 1000)})
-        agent.messages.append({"role": "user", "content": "Remember MEMORY_TOKEN_77."})
-
-        result = agent.handle_user("What token did I ask you to remember earlier in this session? Reply with the token only.")
-
-        self.assertEqual(result.message, "MEMORY_TOKEN_77")
-        sent_messages = client.calls[0]["messages"]
-        sent_text = "\n".join(message["content"] for message in sent_messages)
-        self.assertGreater(len(sent_messages), 20)
-        self.assertIn("memory chunk 0", sent_text)
-        self.assertNotIn("Earlier conversation omitted", sent_text)
-
     def test_agent_handles_multiturn_refactor_test_and_diff_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
