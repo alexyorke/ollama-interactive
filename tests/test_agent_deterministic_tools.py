@@ -5,7 +5,7 @@ from pathlib import Path
 
 from ollama_code.agent import OllamaCodeAgent
 from ollama_code.tools import ToolExecutor
-from tests.agent_test_support import AgentTestBase, FakeClient
+from tests.agent_test_support import AgentTestBase, CountingToolExecutor, FakeClient
 
 
 class AgentDeterministicToolTests(AgentTestBase):
@@ -208,6 +208,48 @@ class AgentDeterministicToolTests(AgentTestBase):
         self.assertEqual(result.message, "CONTINUE_TOKEN_99")
         self.assertEqual(len(client.calls), 1)
         self.assertFalse(any(event["type"] == "verification" for event in agent.events))
+
+    def test_agent_synthesizes_todo_statuses_after_todo_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"todo_write","arguments":{"items":[{"content":"inspect","status":"completed"},{"content":"report","status":"pending"}]}}',
+                    '{"type":"tool","name":"todo_read","arguments":{}}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="read-only")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user(
+                "Use todo_write to create a todo list with one completed item named inspect and one pending item named report. Then use todo_read and reply with the todo statuses only."
+            )
+
+        self.assertIn("[completed] inspect", result.message)
+        self.assertIn("[pending] report", result.message)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" and event.get("tool") == "todo_read" for event in agent.events))
+
+    def test_agent_caches_repeated_read_only_tool_calls_within_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("hello world\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"tool","name":"read_file","arguments":{"path":"note.txt"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Read note.txt twice, then say done.")
+
+        self.assertEqual(result.message, "done")
+        self.assertEqual(tools.execute_counts.get("read_file"), 1)
+        tool_results = [event for event in agent.events if event["type"] == "tool_result"]
+        self.assertEqual(len(tool_results), 2)
+        self.assertFalse(tool_results[0].get("cached", False))
+        self.assertTrue(tool_results[1].get("cached", False))
 
     def test_agent_requires_exact_readback_match_before_final_answer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

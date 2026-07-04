@@ -220,6 +220,25 @@ class AgentShellCommandPreflightTests(AgentTestBase):
         normalizations = [event for event in agent.events if event["type"] == "tool_normalized"]
         self.assertTrue(any(event["normalized_name"] == "run_test" for event in normalizations))
 
+    def test_agent_rejects_shell_mutation_when_file_tools_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"echo hi > scratch/file.txt"}}',
+                    '{"type":"tool","name":"write_file","arguments":{"path":"scratch/file.txt","content":"hi\\n"}}',
+                    '{"type":"final","message":"done"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            result = agent.handle_user("Create scratch/file.txt with hi and a newline.")
+
+        self.assertEqual(result.message, "done")
+        write_calls = [event for event in agent.events if event.get("type") == "tool_call" and event.get("name") == "write_file"]
+        self.assertTrue(write_calls)
+        self.assertFalse(any(event.get("name") == "run_shell" for event in agent.events if event["type"] == "tool_call"))
+
     def test_agent_forbids_non_available_tools_from_allowlist(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
