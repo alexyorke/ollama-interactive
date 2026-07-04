@@ -90,6 +90,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Assumption-audit retry, fail-closed, and grounded-skip coverage now lives in `tests/test_agent_assumption_audit.py` instead of the omnibus `tests/test_agent.py`.
 - Final-verification retry, rewrite, verifier-model, and retry-constraint coverage now lives in `tests/test_agent_verification.py` instead of the omnibus `tests/test_agent.py`.
 - Final/tool obligation and post-edit success-claim coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
+- Deterministic git/tool rejection and session-memory coverage now lives in `tests/test_agent_deterministic_tools.py` instead of the omnibus `tests/test_agent.py`.
 - Loop-cap failure-compression coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner broad-context guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
