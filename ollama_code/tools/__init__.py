@@ -150,6 +150,7 @@ from ollama_code.tools.synthesis import (
 )
 from ollama_code.tools.validation import (
     collapse_validation_targets,
+    discover_validator_file_signals,
     discover_validators_result,
     ini_has_section,
     lint_typecheck_cache_key,
@@ -166,7 +167,6 @@ from ollama_code.tools.validation import (
     python_validation_targets,
     path_label_looks_like_test,
     preferred_test_validator_command,
-    requested_validator_file_hints,
     runnable_test_validator_commands,
     run_test_needs_command_recovery,
     select_tests_language_validator_result,
@@ -10812,40 +10812,22 @@ import string
 
         pyproject = self._read_toml(root / "pyproject.toml")
         repo_files = self._iter_repo_files(root, limit=50000)
-        suffixes: set[str] = set()
-        file_names: set[str] = set()
-        hints = requested_validator_file_hints(requested_rel)
-        workflow_file = hints["workflow_file"]
-        yaml_file = hints["yaml_file"]
-        shell_script = hints["shell_script"]
-        dockerfile = hints["dockerfile"]
-        markdown_file = hints["markdown_file"]
-        sql_file = hints["sql_file"]
-        schema_file = hints["schema_file"]
-        python_tests = False
-        for file_path in repo_files:
-            suffix = file_path.suffix.lower()
-            name = file_path.name.lower()
-            suffixes.add(suffix)
-            file_names.add(name)
-            if not python_tests and ((name.startswith("test") and name.endswith(".py")) or name.endswith("_test.py")):
-                python_tests = True
-            if suffix in {".yml", ".yaml"} and (not yaml_file or not workflow_file):
-                rel = self.relative_label(file_path).replace("\\", "/")
-                if not yaml_file:
-                    yaml_file = rel
-                if rel.lower().startswith(".github/workflows/"):
-                    workflow_file = rel
-            if not shell_script and suffix in SHELL_SCRIPT_SUFFIXES:
-                shell_script = self.relative_label(file_path).replace("\\", "/")
-            if not dockerfile and (name == "dockerfile" or name.endswith(".dockerfile")):
-                dockerfile = self.relative_label(file_path).replace("\\", "/")
-            if not markdown_file and suffix in {".md", ".markdown"}:
-                markdown_file = self.relative_label(file_path).replace("\\", "/")
-            if not sql_file and suffix == ".sql":
-                sql_file = self.relative_label(file_path).replace("\\", "/")
-            if not schema_file and (name.endswith(".schema.json") or name.endswith(".jsonschema")):
-                schema_file = self.relative_label(file_path).replace("\\", "/")
+        file_signals = discover_validator_file_signals(
+            repo_files=repo_files,
+            requested_rel=requested_rel,
+            relative_label=self.relative_label,
+            shell_script_suffixes=SHELL_SCRIPT_SUFFIXES,
+        )
+        suffixes = file_signals["suffixes"]
+        file_names = file_signals["file_names"]
+        workflow_file = file_signals["workflow_file"]
+        yaml_file = file_signals["yaml_file"]
+        shell_script = file_signals["shell_script"]
+        dockerfile = file_signals["dockerfile"]
+        markdown_file = file_signals["markdown_file"]
+        sql_file = file_signals["sql_file"]
+        schema_file = file_signals["schema_file"]
+        python_tests = bool(file_signals["python_tests"])
         if (root / ".pre-commit-config.yaml").exists() or (root / ".pre-commit-config.yml").exists():
             add("validate", "repo", python_tool_command_text("pre-commit", "pre_commit", "run", "--all-files"), "pre-commit config found.")
         python_files = ".py" in suffixes

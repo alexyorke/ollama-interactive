@@ -62,6 +62,61 @@ def requested_validator_file_hints(requested_rel: str) -> dict[str, str]:
     return hints
 
 
+def discover_validator_file_signals(
+    *,
+    repo_files: Iterable[Path],
+    requested_rel: str,
+    relative_label: Callable[[Path], str],
+    shell_script_suffixes: set[str],
+) -> dict[str, Any]:
+    suffixes: set[str] = set()
+    file_names: set[str] = set()
+    hints = requested_validator_file_hints(requested_rel)
+    workflow_file = hints["workflow_file"]
+    yaml_file = hints["yaml_file"]
+    shell_script = hints["shell_script"]
+    dockerfile = hints["dockerfile"]
+    markdown_file = hints["markdown_file"]
+    sql_file = hints["sql_file"]
+    schema_file = hints["schema_file"]
+    python_tests = False
+    for file_path in repo_files:
+        suffix = file_path.suffix.lower()
+        name = file_path.name.lower()
+        suffixes.add(suffix)
+        file_names.add(name)
+        if not python_tests and ((name.startswith("test") and name.endswith(".py")) or name.endswith("_test.py")):
+            python_tests = True
+        if suffix in {".yml", ".yaml"} and (not yaml_file or not workflow_file):
+            rel = relative_label(file_path).replace("\\", "/")
+            if not yaml_file:
+                yaml_file = rel
+            if rel.lower().startswith(".github/workflows/"):
+                workflow_file = rel
+        if not shell_script and suffix in shell_script_suffixes:
+            shell_script = relative_label(file_path).replace("\\", "/")
+        if not dockerfile and (name == "dockerfile" or name.endswith(".dockerfile")):
+            dockerfile = relative_label(file_path).replace("\\", "/")
+        if not markdown_file and suffix in {".md", ".markdown"}:
+            markdown_file = relative_label(file_path).replace("\\", "/")
+        if not sql_file and suffix == ".sql":
+            sql_file = relative_label(file_path).replace("\\", "/")
+        if not schema_file and (name.endswith(".schema.json") or name.endswith(".jsonschema")):
+            schema_file = relative_label(file_path).replace("\\", "/")
+    return {
+        "suffixes": suffixes,
+        "file_names": file_names,
+        "workflow_file": workflow_file,
+        "yaml_file": yaml_file,
+        "shell_script": shell_script,
+        "dockerfile": dockerfile,
+        "markdown_file": markdown_file,
+        "sql_file": sql_file,
+        "schema_file": schema_file,
+        "python_tests": python_tests,
+    }
+
+
 def python_module_label(label: str) -> str:
     rel = str(label or "").replace("\\", "/")
     if rel.endswith(".py"):

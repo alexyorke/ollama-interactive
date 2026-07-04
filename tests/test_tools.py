@@ -20,6 +20,7 @@ from uuid import uuid4
 
 from ollama_code.tools import ToolExecutor, format_compact_tool_help, format_tool_group_help
 from ollama_code.tools.validation import (
+    discover_validator_file_signals,
     discover_validators_result,
     lint_typecheck_file_analysis,
     lint_typecheck_cache_hit_result,
@@ -5305,6 +5306,41 @@ class ToolExecutorTests(unittest.TestCase):
         self.assertEqual(result["count"], 0)
         self.assertEqual(result["validators"], [])
         self.assertEqual(result["output"], "(no validators discovered)")
+
+    def test_discover_validator_file_signals_prefers_requested_file_hints(self) -> None:
+        files = [
+            Path("docs/example.yaml"),
+            Path(".github/workflows/nightly.yml"),
+            Path("README.md"),
+            Path("scripts/check.sh"),
+            Path("tests/test_app.py"),
+        ]
+
+        result = discover_validator_file_signals(
+            repo_files=files,
+            requested_rel="docs/example.yaml",
+            relative_label=lambda path: path.as_posix(),
+            shell_script_suffixes={".sh", ".bash"},
+        )
+
+        self.assertEqual(result["yaml_file"], "docs/example.yaml")
+        self.assertEqual(result["workflow_file"], ".github/workflows/nightly.yml")
+        self.assertEqual(result["shell_script"], "scripts/check.sh")
+        self.assertEqual(result["markdown_file"], "README.md")
+        self.assertTrue(result["python_tests"])
+        self.assertIn(".yaml", result["suffixes"])
+        self.assertIn("test_app.py", result["file_names"])
+
+    def test_discover_validator_file_signals_uses_requested_workflow_file(self) -> None:
+        result = discover_validator_file_signals(
+            repo_files=[Path("other.yml")],
+            requested_rel=".github/workflows/ci.yml",
+            relative_label=lambda path: path.as_posix(),
+            shell_script_suffixes={".sh", ".bash"},
+        )
+
+        self.assertEqual(result["workflow_file"], ".github/workflows/ci.yml")
+        self.assertEqual(result["yaml_file"], ".github/workflows/ci.yml")
 
     def test_python_tool_command_resolution_is_cached_per_executor(self) -> None:
         with self._temp_tools() as (_root, tools):
