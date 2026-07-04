@@ -20,11 +20,17 @@ from tests.agent_test_support import (
 
 
 class AgentPostEditValidationTests(AgentTestBase):
-    def _cwd_agent(self, client: FakeClient | None = None, **kwargs: object) -> OllamaCodeAgent:
+    def _cwd_agent(
+        self,
+        client: FakeClient | None = None,
+        *,
+        approval_mode: str = "auto",
+        **kwargs: object,
+    ) -> OllamaCodeAgent:
         resolved_client = client if client is not None else FakeClient([])
         return OllamaCodeAgent(
             client=resolved_client,
-            tools=ToolExecutor(self._workspace_scratch(), approval_mode="auto"),
+            tools=ToolExecutor(Path.cwd(), approval_mode=approval_mode),
             model="fake-model",
             **kwargs,
         )
@@ -78,6 +84,124 @@ class AgentPostEditValidationTests(AgentTestBase):
         self.assertEqual(len(client.calls), 0)
         assumption_audits = [event for event in agent.events if event["type"] == "assumption_audit"]
         self.assertEqual(len(assumption_audits), 0)
+
+    def test_agent_audits_mutating_tool_under_debate(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "note.txt").write_text("old\n", encoding="utf-8")
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"replace_in_file","arguments":{"path":"note.txt","old":"old","new":"new"}}',
+                    '{"type":"final","message":"updated"}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model")
+
+            result = agent.handle_user("Update note.txt by replacing old with new.")
+
+        self.assertEqual(result.message, "updated")
+        audits = [event for event in agent.events if event["type"] == "assumption_audit"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]["tool"], "replace_in_file")
+
+    def test_agent_retries_after_bad_tool_arguments_do_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"start":1}}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"readme loaded"}',
+            ]
+        )
+        agent = self._cwd_agent(client, debate_enabled=False)
+
+        result = agent.handle_user("Read README.md and summarize it.")
+
+        self.assertEqual(result.message, "readme loaded")
+        self.assertIn("Bad arguments for read_file", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+
+    def test_agent_retries_after_tool_failure_does_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"read_file","arguments":{"path":"../secret.txt"}}',
+                '{"type":"final","message":"secret loaded"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"readme loaded"}',
+            ]
+        )
+        agent = self._cwd_agent(client, debate_enabled=False)
+
+        result = agent.handle_user("Read README.md and summarize it.")
+
+        self.assertEqual(result.message, "readme loaded")
+        self.assertIn("escapes the workspace", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+        self.assertEqual(len(client.calls), 4)
+
+    def test_agent_retries_after_approval_denial_does_not_count_as_real_tool_use(self) -> None:
+        client = FakeClient(
+            [
+                '{"type":"tool","name":"run_shell","arguments":{"command":"cat README.md"}}',
+                '{"type":"final","message":"README loaded from shell"}',
+                '{"type":"tool","name":"read_file","arguments":{"path":"README.md"}}',
+                '{"type":"final","message":"README loaded from file"}',
+            ]
+        )
+        agent = self._cwd_agent(client, approval_mode="read-only", debate_enabled=False)
+
+        result = agent.handle_user("Read README.md and summarize it.")
+
+        self.assertEqual(result.message, "README loaded from file")
+        self.assertIn("denied because approval mode is read-only", agent.events[2]["result"]["summary"])
+        self.assertEqual(agent.events[3]["name"], "read_file")
+        self.assertEqual(len(client.calls), 4)
+
+    def test_agent_synthesizes_read_only_denial_when_user_asks_why_mutation_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"write_file","arguments":{"path":"blocked.txt","content":"blocked"}}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="read-only")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Try to create blocked.txt with any content. If you cannot, explain why.")
+
+        self.assertIn("read-only", result.message.lower())
+        self.assertFalse((root / "blocked.txt").exists())
+        self.assertEqual(len(client.calls), 1)
+        write_result = next(event for event in agent.events if event.get("type") == "tool_result" and event.get("name") == "write_file")
+        self.assertIn("approval mode is read-only", str(write_result["result"]["summary"]).lower())
+
+    def test_agent_probes_read_only_file_creation_after_non_mutating_model_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"final","message":"I cannot complete that request."}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="read-only")
+            agent = OllamaCodeAgent(
+                client=client,
+                tools=tools,
+                model="fake-model",
+                debate_enabled=False,
+                require_llm_for_turn=True,
+            )
+
+            result = agent.handle_user("Try to create blocked.txt with any content. If you cannot, explain why.")
+
+        self.assertIn("read-only", result.message.lower())
+        self.assertFalse((root / "blocked.txt").exists())
+        self.assertEqual(len(client.calls), 1)
+        tool_names = [event["name"] for event in agent.events if event.get("type") == "tool_call"]
+        self.assertIn("write_file", tool_names)
+        write_result = next(event for event in agent.events if event.get("type") == "tool_result" and event.get("name") == "write_file")
+        self.assertIn("approval mode is read-only", str(write_result["result"]["summary"]).lower())
 
     def test_agent_retries_after_unverified_file_mutation_claim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
