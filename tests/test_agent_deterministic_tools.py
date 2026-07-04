@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -123,6 +124,120 @@ class AgentDeterministicToolTests(AgentTestBase):
         self.assertEqual(len(client.calls), 1)
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual(tool_calls[0]["name"], "git_diff")
+
+    def test_deterministic_project_function_rename_skips_primary_llm(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "pricing.py").write_text("def total(prices: list[int]) -> int:\n    return sum(prices)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text(
+                "import sys\nimport unittest\nsys.path.insert(0, 'src')\nfrom pricing import cart_total\n\n"
+                "class PricingTest(unittest.TestCase):\n"
+                "    def test_total(self):\n"
+                "        self.assertEqual(cart_total([2, 3]), 5)\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "pricing.md").write_text("Call `total(prices)` to compute totals.\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            client = FakeClient([])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=8)
+
+            result = agent.handle_user("Refactor the pricing API from total(prices) to cart_total(prices). Update src/pricing.py, tests, and docs/pricing.md. Run tests.")
+            source = (root / "src" / "pricing.py").read_text(encoding="utf-8")
+            docs = (root / "docs" / "pricing.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertEqual(len(client.calls), 0)
+        self.assertIn("def cart_total", source)
+        self.assertIn("cart_total(prices)", docs)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
+    def test_require_llm_for_turn_allows_deterministic_followup_after_first_call(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "pricing.py").write_text("def total(prices: list[int]) -> int:\n    return sum(prices)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text(
+                "import sys\nimport unittest\nsys.path.insert(0, 'src')\nfrom pricing import cart_total\n\n"
+                "class PricingTest(unittest.TestCase):\n"
+                "    def test_total(self):\n"
+                "        self.assertEqual(cart_total([2, 3]), 5)\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "pricing.md").write_text("Call `total(prices)` to compute totals.\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            client = FakeClient(
+                [
+                    json.dumps(
+                        {
+                            "type": "tool",
+                            "name": "edit_intent",
+                            "arguments": {"path": "src/pricing.py", "intent": "rename_symbol", "target": "total", "replacement": "cart_total"},
+                        }
+                    ),
+                ]
+            )
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, require_llm_for_turn=True, max_tool_rounds=8)
+
+            result = agent.handle_user("Refactor the pricing API from total(prices) to cart_total(prices). Update src/pricing.py, tests, and docs/pricing.md. Run tests.")
+            source = (root / "src" / "pricing.py").read_text(encoding="utf-8")
+            docs = (root / "docs" / "pricing.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Renamed symbol project-wide", result.message)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIn("def cart_total", source)
+        self.assertIn("cart_total(prices)", docs)
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+
+    def test_require_llm_for_turn_normalizes_initial_list_files_for_project_rename_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "pricing.py").write_text("def total(prices: list[int]) -> int:\n    return sum(prices)\n", encoding="utf-8")
+            (root / "tests" / "test_pricing.py").write_text(
+                "import sys\nimport unittest\nsys.path.insert(0, 'src')\nfrom pricing import cart_total\n\n"
+                "class PricingTest(unittest.TestCase):\n"
+                "    def test_total(self):\n"
+                "        self.assertEqual(cart_total([2, 3]), 5)\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "pricing.md").write_text("Call `total(prices)` to compute totals.\n", encoding="utf-8")
+            command = subprocess.list2cmdline([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"])
+            client = FakeClient([json.dumps({"type": "tool", "name": "list_files", "arguments": {"path": "."}})])
+            tools = CountingToolExecutor(root, approval_mode="auto", test_command=command)
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, require_llm_for_turn=True, max_tool_rounds=8)
+
+            result = agent.handle_user("Refactor the pricing API from total(prices) to cart_total(prices). Update src/pricing.py, tests, and docs/pricing.md. Run tests.")
+            source = (root / "src" / "pricing.py").read_text(encoding="utf-8")
+            docs = (root / "docs" / "pricing.md").read_text(encoding="utf-8")
+
+        self.assertTrue(result.completed)
+        self.assertIn("Renamed symbol project-wide", result.message)
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNone(tools.execute_counts.get("list_files"))
+        self.assertEqual(tools.execute_counts.get("edit_intent"), 1)
+        self.assertEqual(tools.execute_counts.get("run_test"), 1)
+        self.assertIn("def cart_total", source)
+        self.assertIn("cart_total(prices)", docs)
+        tool_names = [event.get("name") for event in agent.events if event.get("type") == "tool_call"]
+        non_context_tool_names = [name for name in tool_names if name != "context_pack"]
+        self.assertGreaterEqual(len(non_context_tool_names), 1)
+        self.assertEqual(non_context_tool_names[0], "edit_intent")
+        normalized = [event for event in agent.events if event.get("type") == "tool_normalized"]
+        self.assertEqual(len(normalized), 1)
+        self.assertEqual(normalized[0].get("original_name"), "list_files")
+        self.assertEqual(normalized[0].get("normalized_name"), "edit_intent")
 
     def test_agent_retries_after_unknown_tool_does_not_count_as_real_tool_use(self) -> None:
         client = FakeClient(
