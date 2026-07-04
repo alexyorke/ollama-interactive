@@ -1,4 +1,5 @@
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -278,3 +279,107 @@ class AgentDeterministicToolTests(AgentTestBase):
         self.assertEqual(len(client.calls), 0)
         tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
         self.assertEqual([event["name"] for event in tool_calls], ["read_file"])
+
+    def test_agent_normalizes_exact_shell_command_and_synthesizes_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient(
+                [
+                    '{"type":"tool","name":"run_shell","arguments":{"command":"python -c \\"print(1)\\""}}',
+                ]
+            )
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            exact_command = 'python -c "import sys; print(\'boom\'); sys.exit(5)"'
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me the exit code and the printed word."
+            )
+
+        self.assertIn("Exit code: 5", result.message)
+        self.assertIn("boom", result.message)
+        tool_calls = [event for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_calls[0]["arguments"]["command"], exact_command)
+        self.assertEqual(len(client.calls), 0)
+        normalized = [event for event in agent.events if event["type"] == "tool_normalized"]
+        self.assertEqual(len(normalized), 0)
+
+    def test_agent_synthesizes_exact_shell_output_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            exact_command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "import os; print(os.getcwd()); print(6*7)",
+                ]
+            )
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me the number and the directory."
+            )
+
+        self.assertIn("42", result.message)
+        self.assertIn(str(root), result.message)
+        self.assertEqual(len(client.calls), 0)
+
+    def test_agent_synthesizes_exact_shell_artifact_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "scratch").mkdir()
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+            exact_command = subprocess.list2cmdline(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; Path('scratch/artifact.txt').write_text('ok\\n')",
+                ]
+            )
+
+            result = agent.handle_user(
+                f"Use run_shell to execute exactly: {exact_command}. Then tell me what artifact was written."
+            )
+            artifact_exists = (root / "scratch" / "artifact.txt").exists()
+
+        self.assertEqual(result.message, "Artifact written: scratch/artifact.txt.")
+        self.assertEqual(len(client.calls), 0)
+        self.assertTrue(artifact_exists)
+
+    def test_agent_synthesizes_file_from_search_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "notes").mkdir()
+            (root / "notes" / "repl.txt").write_text("repl ok\n", encoding="utf-8")
+            client = FakeClient(['{"type":"tool","name":"search","arguments":{"query":"repl ok","path":"."}}'])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("Use search to find repl ok and tell me which file contains it.")
+
+        self.assertEqual(result.message, "notes/repl.txt contains the match.")
+        self.assertEqual(len(client.calls), 0)
+        self.assertTrue(any(event["type"] == "assistant_synthesized" for event in agent.events))
+
+    def test_agent_synthesizes_discover_validators_for_natural_phrase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests").mkdir()
+            (root / "tests" / "test_sample.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+                encoding="utf-8",
+            )
+            client = FakeClient([])
+            tools = ToolExecutor(root, approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False)
+
+            result = agent.handle_user("List the test and validation commands for this repo.")
+
+        self.assertIn("test python:", result.message)
+        self.assertEqual(len(client.calls), 0)
+        tool_names = [event["name"] for event in agent.events if event["type"] == "tool_call"]
+        self.assertEqual(tool_names, ["discover_validators"])
