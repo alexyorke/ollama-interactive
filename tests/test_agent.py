@@ -273,15 +273,6 @@ class AgentTests(AgentTestBase):
 
     # Focused prompt and primary-tool policy coverage lives in test_agent_prompt_policy.py.
 
-    def test_agent_stops_after_max_rounds(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            client = FakeClient(['{"type":"tool","name":"list_files","arguments":{}}'] * 2)
-            tools = ToolExecutor(Path(tmp), approval_mode="auto")
-            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=1, debate_enabled=False)
-            result = agent.handle_user("loop forever")
-
-        self.assertIn("maximum tool rounds", result.message)
-
     # Focused failed-edit recovery coverage lives in test_agent_grounding_path_repair.py
     # and test_agent_post_edit_validation.py; keep this omnibus file for legacy broad behavior only.
 

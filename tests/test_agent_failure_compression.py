@@ -22,6 +22,15 @@ class AgentFailureCompressionTests(AgentTestBase):
             **kwargs,
         )
 
+    def test_agent_stops_after_max_rounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            client = FakeClient(['{"type":"tool","name":"list_files","arguments":{}}'] * 2)
+            tools = ToolExecutor(Path(tmp), approval_mode="auto")
+            agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", max_tool_rounds=1, debate_enabled=False)
+            result = agent.handle_user("loop forever")
+
+        self.assertIn("maximum tool rounds", result.message)
+
     def test_trajectory_failure_delta_compacts_repeated_test_failure(self) -> None:
         root = self._workspace_scratch()
         tools = ToolExecutor(root, approval_mode="auto")
