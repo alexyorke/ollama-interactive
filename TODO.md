@@ -9,6 +9,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Treat `scripts/product_readiness_report.py --strict` as the current-state release summary after refreshing doctor, validation, live-gate, and benchmark artifacts.
 - When readiness artifacts are stale, `scripts/product_readiness_report.py --strict` prints the exact refresh commands for the blocking checks.
 - `local_small` readiness is proven from the selected model benchmark artifact referenced by the live-gate summary when that artifact exists.
+- Current live-gate claim: `granite4.1:8b` remains the default over `gemma4:e4b` and `qwen3:8b` by the token tie-break recorded in `scratch/live-model-gate/live-model-gate-summary.json`.
 
 ## Completed Controller Tranche
 
