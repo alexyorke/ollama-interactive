@@ -103,6 +103,7 @@ Current roadmap: keep Ollama Code ready as a reliable local coding agent for ord
 - Tool-failure retry and read-only mutation-denial coverage now lives in `tests/test_agent_post_edit_validation.py` instead of the omnibus `tests/test_agent.py`.
 - Loop-cap failure-compression coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner broad-context guard coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
+- Tool-result compaction and failure-feedback guidance coverage now lives in `tests/test_agent_failure_compression.py` instead of the omnibus `tests/test_agent.py`.
 - Identifier-search and context-pack grounding planner coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Context-pack preload coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
 - Context-planner grounding refinement coverage now lives in `tests/test_agent_grounding_path_repair.py` instead of the omnibus `tests/test_agent.py`.
