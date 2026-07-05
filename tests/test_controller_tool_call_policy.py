@@ -545,7 +545,7 @@ class ControllerToolCallPolicyTests(unittest.TestCase):
             source_file.write_text("print('app')\n", encoding="utf-8")
 
             def resolve_path(raw_path: str) -> Path:
-                candidate = root / raw_path.replace("/", "\\")
+                candidate = root.joinpath(*raw_path.replace("\\", "/").split("/"))
                 if not candidate.exists():
                     raise FileNotFoundError(raw_path)
                 return candidate

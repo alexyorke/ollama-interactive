@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import warnings
 from pathlib import Path
@@ -6453,6 +6454,8 @@ def double(value: int) -> int:
                             first = tools.lint_typecheck("src")
                             second = tools.lint_typecheck("src")
                             target.write_text("VALUE = 2\n", encoding="utf-8")
+                            updated_timestamp = time.time() + 1.0
+                            os.utime(target, (updated_timestamp, updated_timestamp))
                             third = tools.lint_typecheck("src")
 
         self.assertTrue(first["ok"], first["output"])

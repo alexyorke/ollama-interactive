@@ -48,6 +48,34 @@ class TrajectoryErrorProfileTests(unittest.TestCase):
         self.assertEqual(payload["datasets"][0]["result_events"], 0)
         self.assertEqual(payload["data_root"], root.as_posix())
 
+    def test_main_allows_empty_dataset_without_pyarrow(self) -> None:
+        original_pq = error_profile.pq
+        try:
+            error_profile.pq = None
+            with _temp_root() as root:
+                output_path = root / "trajectory-error-profile.json"
+
+                exit_code = error_profile.main(
+                    [
+                        "--data-root",
+                        str(root),
+                        "--datasets",
+                        "trace-commons-agent-traces",
+                        "--max-rows",
+                        "0",
+                        "--output",
+                        str(output_path),
+                    ]
+                )
+
+                payload = json.loads(output_path.read_text(encoding="utf-8"))
+        finally:
+            error_profile.pq = original_pq
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["datasets"][0]["rows_profiled"], 0)
+        self.assertEqual(payload["datasets"][0]["result_events"], 0)
+
     def test_does_not_classify_code_snippets_as_test_or_timeout_errors(self) -> None:
         rows = [
             {

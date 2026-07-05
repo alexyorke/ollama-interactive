@@ -10426,18 +10426,33 @@ class OllamaCodeAgent:
         )
         if test_result.get("ok") is not True:
             return None
+        proof_path = "_ollama_code_ndjson_proof.py"
         proof_code = (
-            "from reports import ReportRow, export_ndjson; "
-            "import json; "
-            "out=export_ndjson([ReportRow('a\"b',2,True), ReportRow('line\\nname',0,False)]); "
-            "rows=[json.loads(line) for line in out.splitlines()]; "
-            "assert rows == [{'name':'a\"b','count':2,'active':True},{'name':'line\\nname','count':0,'active':False}]; "
-            "assert out.endswith('\\n'); "
-            "print(out, end='')"
+            "from reports import ReportRow, export_ndjson\n"
+            "import json\n\n"
+            "out = export_ndjson([ReportRow('a\"b', 2, True), ReportRow('line\\nname', 0, False)])\n"
+            "rows = [json.loads(line) for line in out.splitlines()]\n"
+            "assert rows == [\n"
+            "    {'name': 'a\"b', 'count': 2, 'active': True},\n"
+            "    {'name': 'line\\nname', 'count': 0, 'active': False},\n"
+            "]\n"
+            "assert out.endswith('\\n')\n"
+            "print(out, end='')\n"
         )
+        proof_write = self._execute_controller_tool(
+            name="write_file",
+            arguments={"path": proof_path, "content": proof_code},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if proof_write.get("ok") is not True:
+            return None
         proof_result = self._execute_controller_tool(
             name="run_shell",
-            arguments={"command": self._repair_shell_command([sys.executable, "-c", proof_code]), "timeout": 30},
+            arguments={"command": self._repair_shell_command([sys.executable, proof_path]), "timeout": 30},
             request_text=request_text,
             round_number=round_number,
             successful_tool_results=successful_tool_results,
@@ -10871,14 +10886,37 @@ class OllamaCodeAgent:
         )
         if test_result.get("ok") is not True:
             return None
+        proof_path = "_ollama_code_catalog_patch_tags_proof.py"
         proof_code = (
-            "from catalog import route_request; from catalog.store import new_store; "
-            "s=new_store(); r=route_request('PATCH','/items/pen/tags','{\"tags\":[\"office\",\"favorite\"]}',store=s); "
-            "print(r); print(s['pen']['tags'])"
+            "from catalog import route_request\n"
+            "from catalog.store import new_store\n\n"
+            "store = new_store()\n"
+            "response = route_request(\n"
+            "    'PATCH',\n"
+            "    '/items/pen/tags',\n"
+            "    '{\"tags\":[\"office\",\"favorite\"]}',\n"
+            "    store=store,\n"
+            ")\n"
+            "assert response.status == 200\n"
+            "assert response.body['item']['tags'] == ['office', 'favorite']\n"
+            "assert store['pen']['tags'] == ['office', 'favorite']\n"
+            "print(response)\n"
+            "print(store['pen']['tags'])\n"
         )
+        proof_write = self._execute_controller_tool(
+            name="write_file",
+            arguments={"path": proof_path, "content": proof_code},
+            request_text=request_text,
+            round_number=round_number,
+            successful_tool_results=successful_tool_results,
+            satisfied_tool_names=satisfied_tool_names,
+            tool_calls_this_turn=tool_calls_this_turn,
+        )
+        if proof_write.get("ok") is not True:
+            return None
         proof_result = self._execute_controller_tool(
             name="run_shell",
-            arguments={"command": self._repair_shell_command([sys.executable, "-c", proof_code]), "timeout": 30},
+            arguments={"command": self._repair_shell_command([sys.executable, proof_path]), "timeout": 30},
             request_text=request_text,
             round_number=round_number,
             successful_tool_results=successful_tool_results,

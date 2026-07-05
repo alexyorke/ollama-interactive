@@ -629,6 +629,9 @@ def summarize_dataset(name: str, adapter: str, rows: Iterable[dict[str, Any]]) -
 
 
 def _iter_projected_parquet_rows(paths: Iterable[Path], *, columns: list[str], max_rows: int | None = None) -> Iterable[dict[str, Any]]:
+    paths = list(paths)
+    if not paths:
+        return
     if pq is None:
         raise RuntimeError("trajectory error profiling requires optional dependency pyarrow")
     emitted = 0

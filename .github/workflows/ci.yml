@@ -43,10 +43,10 @@ jobs:
           cache: pip
 
       - name: Install package
-        run: python -m pip install --upgrade pip && python -m pip install -e .
+        run: python -m pip install --upgrade pip && python -m pip install -e . pytest pytest-xdist
 
       - name: Run unit tests
-        run: python -m unittest discover -v
+        run: python scripts/local_validation.py --tier full
 
   docker-image:
     name: Docker Image
@@ -64,7 +64,7 @@ jobs:
         run: docker run --rm ollama-code:test --help
 
       - name: Run unit tests in Docker image
-        run: docker run --rm --entrypoint python ollama-code:test -m unittest discover -s tests -v
+        run: docker run --rm --entrypoint python ollama-code:test scripts/local_validation.py --tier full --jobs off
 
   build:
     name: Build distribution
