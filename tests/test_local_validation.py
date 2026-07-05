@@ -702,6 +702,45 @@ class LocalValidationTests(unittest.TestCase):
         self.assertIn("live_gate_claims_ok=True", stdout.getvalue())
         self.assertIn('"timing_summary"', written_text["value"])
 
+    def test_main_prints_failed_command_output_tail(self) -> None:
+        payload = {
+            "ok": False,
+            "commands": [
+                {
+                    "name": "agent",
+                    "runner": "pytest",
+                    "resolved_jobs": "off",
+                    "ok": False,
+                    "elapsed_s": 1.2,
+                    "returncode": 1,
+                    "elapsed_share_pct": 100.0,
+                    "output_tail": "FAILED tests/test_example.py::ExampleTests::test_failure",
+                }
+            ],
+            "timing_summary": {"total_elapsed_s": 1.2, "slowest_commands": []},
+            "coverage_summary": {},
+            "live_gate_claim_consistency": {},
+            "baseline_compare": {"requested": False, "ran": False, "skipped_reason": None},
+        }
+        output_path = Path.cwd() / "scratch" / "validation" / "test-local-validation-failed-tail.json"
+        written_text: dict[str, str] = {}
+
+        def fake_write_text(text: str, encoding: str = "utf-8") -> int:
+            written_text["value"] = text
+            return len(text)
+
+        stdout = StringIO()
+        with patch.object(local_validation, "run_validation", return_value=payload):
+            with patch.object(Path, "write_text", autospec=True, side_effect=lambda self, text, encoding="utf-8": fake_write_text(text, encoding)):
+                with patch.object(sys, "stdout", stdout):
+                    exit_code = local_validation.main(["--tier", "agent", "--output", str(output_path)])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("failure_output_tail_start", stdout.getvalue())
+        self.assertIn("tests/test_example.py::ExampleTests::test_failure", stdout.getvalue())
+        self.assertIn("failure_output_tail_end", stdout.getvalue())
+        self.assertIn('"output_tail"', written_text["value"])
+
     def test_main_returns_nonzero_when_coverage_plan_is_incomplete(self) -> None:
         payload = {
             "ok": False,

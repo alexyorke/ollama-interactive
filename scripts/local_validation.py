@@ -735,6 +735,10 @@ def main(argv: list[str] | None = None) -> int:
             + f" elapsed_s={row['elapsed_s']}"
             + f" returncode={row['returncode']}"
         )
+        if not row.get("ok") and row.get("output_tail"):
+            print("[local-validation] failure_output_tail_start")
+            print(str(row["output_tail"]).rstrip())
+            print("[local-validation] failure_output_tail_end")
     timing_summary = payload.get("timing_summary") or {}
     slowest_commands = timing_summary.get("slowest_commands") or []
     if slowest_commands:
