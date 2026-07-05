@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import sys
 import tempfile
 import unittest
 import os
@@ -271,7 +272,7 @@ class ToolDependencyTests(unittest.TestCase):
     def test_resolve_tool_executable_prefers_python_script_roots_before_path_lookup(self) -> None:
         clear_dependency_status_cache()
         with tempfile.TemporaryDirectory() as tmp:
-            scripts_root = Path(tmp) / "Python312" / "Scripts"
+            scripts_root = Path(tmp) / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts"
             scripts_root.mkdir(parents=True)
             executable_name = "demo-tool.exe" if os.name == "nt" else "demo-tool"
             executable = scripts_root / executable_name
