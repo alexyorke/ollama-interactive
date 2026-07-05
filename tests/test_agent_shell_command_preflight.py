@@ -12,6 +12,20 @@ from ollama_code.tools import ToolExecutor
 from tests.agent_test_support import AgentTestBase, CountingToolExecutor, FakeClient
 
 
+class SuccessfulRunShellToolExecutor(CountingToolExecutor):
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
+        if name == "run_shell":
+            return {
+                "ok": True,
+                "tool": "run_shell",
+                "summary": "Command completed.",
+                "output": "needle\n",
+                "returncode": 0,
+            }
+        return ToolExecutor.execute(self, name, arguments)
+
+
 class AgentShellCommandPreflightTests(AgentTestBase):
     def test_agent_audits_shell_tool_under_debate(self) -> None:
         client = FakeClient(
@@ -530,7 +544,7 @@ class AgentShellCommandPreflightTests(AgentTestBase):
             ]
         )
         root = self._workspace_scratch()
-        tools = CountingToolExecutor(root, approval_mode="auto")
+        tools = SuccessfulRunShellToolExecutor(root, approval_mode="auto")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=3)
         (root / "README.md").write_text("needle\n", encoding="utf-8")
 

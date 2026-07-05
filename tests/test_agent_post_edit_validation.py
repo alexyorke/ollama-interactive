@@ -19,6 +19,19 @@ from tests.agent_test_support import (
 )
 
 
+class FailingLintToolExecutor(CountingToolExecutor):
+    def execute(self, name: str, arguments: dict[str, object]) -> dict[str, object]:
+        self.execute_counts[name] = self.execute_counts.get(name, 0) + 1
+        if name == "lint_typecheck":
+            return {
+                "ok": False,
+                "tool": "lint_typecheck",
+                "summary": "duplicate import in app.py",
+                "output": "app.py:1:1 duplicate import",
+            }
+        return ToolExecutor.execute(self, name, arguments)
+
+
 class AgentPostEditValidationTests(AgentTestBase):
     def _cwd_agent(
         self,
@@ -3005,7 +3018,7 @@ class AgentPostEditValidationTests(AgentTestBase):
                 '{"type":"final","message":"still repairing"}',
             ]
         )
-        tools = CountingToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover")
+        tools = FailingLintToolExecutor(root, approval_mode="auto", test_command=f"{sys.executable} -m unittest discover")
         agent = OllamaCodeAgent(client=client, tools=tools, model="fake-model", debate_enabled=False, max_tool_rounds=5)
 
         result = agent.handle_user("Update app.py and keep validation green.")
