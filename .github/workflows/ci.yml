@@ -46,7 +46,7 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -e . pytest pytest-xdist
 
       - name: Run unit tests
-        run: python scripts/local_validation.py --tier full
+        run: python scripts/local_validation.py --tier full --jobs off
 
   docker-image:
     name: Docker Image
