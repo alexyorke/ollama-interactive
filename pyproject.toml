@@ -39,7 +39,7 @@ tools = [
     "sqlfluff",
     "tree-sitter",
     "tree-sitter-language-pack",
-    "tox<4.57",
+    "tox<4.59",
     "uv",
     "vulture",
     "yamllint",
